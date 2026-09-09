@@ -130,7 +130,7 @@ env.bak/
 venv.bak/
 
 # VSCode project settins
-.vscode/
+# .vscode/  # Commented out to allow VSCode settings for local development
 
 # Spyder project settings
 .spyderproject
