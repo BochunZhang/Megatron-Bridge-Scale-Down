@@ -129,8 +129,11 @@ ENV/
 env.bak/
 venv.bak/
 
-# VSCode project settins
-# .vscode/  # Commented out to allow VSCode settings for local development
+# VSCode project settings
+.vscode/
+
+# Claude Code settings
+.claude/
 
 # Spyder project settings
 .spyderproject
