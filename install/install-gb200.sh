@@ -80,8 +80,8 @@ export UV_LINK_MODE=copy
 
 echo "=== Creating virtual environment at ${VENV_DIR} ==="
 
-# Create virtual environment with Python 3.12
-uv venv "${VENV_PATH}" --python python3.12
+# Create virtual environment with Python 3.12 using virtualenv
+virtualenv -p python3.12 "${VENV_PATH}"
 
 # Append UV_PROJECT_ENVIRONMENT to activate script
 echo "export UV_PROJECT_ENVIRONMENT=\"\$VIRTUAL_ENV\"" >> "${VENV_PATH}/bin/activate"
