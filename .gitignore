@@ -188,3 +188,6 @@ slurm*.out
 
 # UV package manager
 .uv/
+
+# Installation temporary directory
+.tmp/
