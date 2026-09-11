@@ -113,7 +113,7 @@ mkdir -p "${TMP_DIR}"
 echo "=== Installing setuptools ==="
 uv pip install setuptools
 
-echo "=== Installing PyTorch 2.13.0 with Blackwell (12.0) support ==="
+echo "=== Installing PyTorch 2.13.0 with Blackwell (10.0) support ==="
 uv pip install torch==2.13.0 torchvision==0.28.0
 
 ##############################################################################
@@ -232,8 +232,8 @@ export CAUSAL_CONV1D_FORCE_BUILD=TRUE
 export FAST_HADAMARD_TRANSFORM_FORCE_BUILD=TRUE
 
 echo "=== Running uv sync ==="
-uv sync --only-group build --no-clean && \
-    uv sync --link-mode copy --all-extras --all-groups --no-group diffusion --no-clean
+uv sync --inexact --only-group build && \
+    uv sync --inexact --link-mode copy --all-extras --all-groups --no-group diffusion
 
 # Create symlink for tilelang's libcudart_stub.so if tilelang is installed
 if [[ -f "${VENV_PATH}/lib/python3.12/site-packages/tilelang/lib/libcudart_stub.so" ]]; then
