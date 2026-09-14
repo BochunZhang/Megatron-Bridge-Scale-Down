@@ -28,7 +28,7 @@ from megatron.bridge.training.mixed_precision import bf16_mixed, bf16_with_mxfp8
 
 _QWEN35_9B_BASE = "Qwen/Qwen3.5-9B-Base"
 _QWEN35_35B_A3B_BASE = "Qwen/Qwen3.5-35B-A3B-Base"
-_QWEN35_27B_BASE = "Qwen/Qwen3.5-27B-Base"
+_QWEN35_27B_BASE = "Qwen/Qwen3.5-27B"
 
 def qwen35_text_9b_pretrain_8gpu_gb200_bf16_config() -> ConfigContainer:
     """Return a text-only Qwen3.5-9B pretraining config for eight GB200 GPUs."""
@@ -335,7 +335,7 @@ def qwen35_text_27b_pretrain_4gpu_gb200_bf16_fsdp1_config() -> ConfigContainer:
     """
     cfg = _pretrain_common()
 
-    text_config = AutoConfig.from_pretrained(_QWEN35_27B_BASE)
+    text_config = AutoConfig.from_pretrained(_QWEN35_27B_BASE).text_config
     # Set architecture for AutoBridge to select the correct bridge
     text_config.architectures = ["Qwen3_5ForCausalLM"]
     cfg.model = AutoBridge.from_hf_config(text_config).to_megatron_provider(load_weights=False)
