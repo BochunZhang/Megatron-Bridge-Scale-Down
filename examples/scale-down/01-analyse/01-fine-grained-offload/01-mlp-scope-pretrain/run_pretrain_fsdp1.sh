@@ -21,7 +21,8 @@
 #       --recompute-modules <value> --fine-grained-offload <true|false> \
 #       --offload-modules <value> \
 #       [--train-iters <iters>] [--global-batch-size <gbs>] [--micro-batch-size <mbs>] \
-#       [--profile-step-start <start>] [--profile-step-end <end>]
+#       [--profile-step-start <start>] [--profile-step-end <end>] \
+#       [--disable-nsys]
 
 set -euo pipefail
 
@@ -57,6 +58,7 @@ Optional training parameters (with defaults):
     --micro-batch-size    Micro batch size (default: 1)
     --profile-step-start  Profile start step (default: 7)
     --profile-step-end    Profile end step (default: 8)
+    --disable-nsys        Disable nsys profiling (default: enabled)
 EOF
 }
 
@@ -75,6 +77,7 @@ GLOBAL_BATCH_SIZE=""
 MICRO_BATCH_SIZE=""
 PROFILE_STEP_START=""
 PROFILE_STEP_END=""
+ENABLE_NSYS="${ENABLE_NSYS:-true}"
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -143,6 +146,10 @@ while [[ $# -gt 0 ]]; do
             PROFILE_STEP_END="$2"
             shift 2
             ;;
+        --disable-nsys)
+            ENABLE_NSYS=false
+            shift
+            ;;
         -h|--help)
             usage
             exit 0
@@ -207,7 +214,7 @@ if ! [[ "${PROFILE_STEP_START}" =~ ^[0-9]+$ && "${PROFILE_STEP_END}" =~ ^[0-9]+$
     exit 2
 fi
 
-mkdir -p "${RESULT_DIR}/memory" "${RESULT_DIR}/rank_logs" \
+mkdir -p "${RESULT_DIR}/memory" "${RESULT_DIR}/rank_logs" "${RESULT_DIR}/profile" \
     "${HF_CACHE}" "${NEMO_CACHE}/datasets" "${NEMO_CACHE}/models" "${UV_CACHE}"
 
 export HF_HOME="${HF_CACHE}"
@@ -221,6 +228,13 @@ export NVTE_CPU_OFFLOAD_V1="1"
 export TORCH_NCCL_AVOID_RECORD_STREAMS="1"
 export NCCL_NVLS_ENABLE="0"
 export RESULT_DIR MODEL MODEL_ID RESULT_MODEL_NAME PRECISION RUN_NAME RUN_TIME RECIPE
+
+# Set profiling config based on nsys enablement
+if [[ "${ENABLE_NSYS}" == true ]]; then
+    USE_NSYS_PROFILER="true"
+else
+    USE_NSYS_PROFILER="false"
+fi
 
 OVERRIDES=(
     "model.seq_length=4096"
@@ -245,7 +259,7 @@ OVERRIDES=(
     "logger.log_interval=1"
     "logger.tensorboard_dir=null"
     "logger.save_config_filepath=${RESULT_DIR}/config.yaml"
-    "profiling.use_nsys_profiler=false"
+    "profiling.use_nsys_profiler=${USE_NSYS_PROFILER}"
     "profiling.profile_step_start=${PROFILE_STEP_START}"
     "profiling.profile_step_end=${PROFILE_STEP_END}"
     "profiling.profile_ranks=[0,1,2,3]"
@@ -274,13 +288,26 @@ uv run --no-sync python -c 'import json, os, re; pattern = re.compile(r"(^|_)(TO
 
 printf 'model=%s precision=%s run_name=%s run_time=%s\n' "${MODEL}" "${PRECISION}" "${RUN_NAME}" "${RUN_TIME}" | tee "${RESULT_DIR}/run_info.txt"
 printf 'train_iters=%s global_batch_size=%s micro_batch_size=%s\n' "${TRAIN_ITERS}" "${GLOBAL_BATCH_SIZE}" "${MICRO_BATCH_SIZE}" | tee -a "${RESULT_DIR}/run_info.txt"
-printf 'profile_step_start=%s profile_step_end=%s\n' "${PROFILE_STEP_START}" "${PROFILE_STEP_END}" | tee -a "${RESULT_DIR}/run_info.txt"
+printf 'profile_step_start=%s profile_step_end=%s enable_nsys=%s\n' "${PROFILE_STEP_START}" "${PROFILE_STEP_END}" "${ENABLE_NSYS}" | tee -a "${RESULT_DIR}/run_info.txt"
 printf 'result_dir=%s\nprofile_ranks=0,1,2,3\ncommand=%s\n' "${RESULT_DIR}" "${COMMAND_TEXT}" | tee -a "${RESULT_DIR}/run_info.txt"
 
-set +e
-"${COMMAND[@]}" 2>&1 | tee "${RESULT_DIR}/train.log"
-RUN_STATUS=${PIPESTATUS[0]}
-set -e
+# Run training with optional nsys profiling (enabled by default)
+if [[ "${ENABLE_NSYS}" == true ]]; then
+    printf 'Running with nsys profiling enabled...\n' | tee -a "${RESULT_DIR}/run_info.txt"
+    set +e
+    nsys profile \
+        -o "${RESULT_DIR}/profile/profile_%p_%h" \
+        --force-overwrite=true \
+        "${COMMAND[@]}" 2>&1 | tee "${RESULT_DIR}/train.log"
+    RUN_STATUS=${PIPESTATUS[0]}
+    set -e
+else
+    printf 'Running without nsys profiling...\n' | tee -a "${RESULT_DIR}/run_info.txt"
+    set +e
+    "${COMMAND[@]}" 2>&1 | tee "${RESULT_DIR}/train.log"
+    RUN_STATUS=${PIPESTATUS[0]}
+    set -e
+fi
 
 export RUN_STATUS
 uv run --no-sync python -c 'import json, os; root = os.environ["RESULT_DIR"]; result = {"status": int(os.environ["RUN_STATUS"]), "model": os.environ["MODEL"], "precision": os.environ["PRECISION"], "run_name": os.environ["RUN_NAME"], "run_time": os.environ["RUN_TIME"], "recipe": os.environ["RECIPE"], "result_dir": root, "profile_ranks": [0, 1, 2, 3]}; json.dump(result, open(os.path.join(root, "summary.json"), "w"), indent=2, sort_keys=True); raise SystemExit(result["status"])'
