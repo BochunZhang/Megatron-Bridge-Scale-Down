@@ -276,11 +276,3 @@ def qwen38_text_27b_pretrain_4gpu_gb200_fp8mx_fsdp1_config() -> ConfigContainer:
     cfg.mixed_precision.fp8_param_gather = False
     cfg.mixed_precision.reuse_grad_buf_for_mxfp8_param_ag = False
     return cfg
-
-
-__all__ = [
-    "qwen38_text_35b_a3b_pretrain_4gpu_gb200_bf16_fsdp1_config",
-    "qwen38_text_35b_a3b_pretrain_4gpu_gb200_fp8mx_fsdp1_config",
-    "qwen38_text_27b_pretrain_4gpu_gb200_bf16_fsdp1_config",
-    "qwen38_text_27b_pretrain_4gpu_gb200_fp8mx_fsdp1_config",
-]
