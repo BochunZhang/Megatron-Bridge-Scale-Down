@@ -33,6 +33,8 @@ from megatron.core.utils import (
     get_model_config,
     get_pg_rank,
     get_pg_size,
+    nvtx_range_pop,
+    nvtx_range_push,
     unwrap_model,
 )
 
@@ -374,6 +376,7 @@ def _forward_step_common(
     use_mtp = (getattr(config, "mtp_num_layers", None) or 0) > 0
     vp_stage = get_model_chunk_vp_stage(model)
 
+    nvtx_range_push("get_batch")
     timers("batch-generator", log_level=2).start()
     with straggler_timer(bdata=True):
         (
@@ -391,6 +394,7 @@ def _forward_step_common(
             vp_stage=vp_stage,
         )
     timers("batch-generator").stop()
+    nvtx_range_pop("get_batch")
 
     # Accumulate FLOPS metadata across micro-batches. The THD attention term Σᵢ sᵢ² is
     # derived inline from cu_seqlens (kept on-device, sync-free); see

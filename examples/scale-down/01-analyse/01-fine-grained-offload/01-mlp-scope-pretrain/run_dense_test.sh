@@ -19,9 +19,9 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 RUN_ONE="${SCRIPT_DIR}/run_pretrain_fsdp1.sh"
 
 PRECISION="${PRECISION:-bf16}"
-MODEL="qwen38_text_27b"
-RECIPE_BF16="qwen38_text_27b_pretrain_4gpu_gb200_bf16_fsdp1_config"
-RECIPE_FP8MX="qwen38_text_27b_pretrain_4gpu_gb200_fp8mx_fsdp1_config"
+MODEL="qwen35_text_27b"
+RECIPE_BF16="qwen35_text_27b_pretrain_4gpu_gb200_bf16_fsdp1_config"
+RECIPE_FP8MX="qwen35_text_27b_pretrain_4gpu_gb200_fp8mx_fsdp1_config"
 TEST_ONLY=false
 
 # Training parameters with defaults (can be overridden via environment variables)

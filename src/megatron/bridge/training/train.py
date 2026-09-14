@@ -864,9 +864,14 @@ def train_step(
     rerun_state_machine = get_rerun_state_machine()
     while rerun_state_machine.should_run_forward_backward(data_iterator):
         # Set grad to zero.
+        nvtx_range_push(suffix="zero_grad_buffer")
         for model_chunk in model:
             model_chunk.zero_grad_buffer()
+        nvtx_range_pop(suffix="zero_grad_buffer")
+
+        nvtx_range_push(suffix="zero_grad")
         optimizer.zero_grad()
+        nvtx_range_pop(suffix="zero_grad")
 
         _handle_mxfp8_param_buffer_copy(
             optimizer=optimizer,
