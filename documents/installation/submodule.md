@@ -1,0 +1,1 @@
+git submodule update --init --remote 3rdparty/Megatron-LM
