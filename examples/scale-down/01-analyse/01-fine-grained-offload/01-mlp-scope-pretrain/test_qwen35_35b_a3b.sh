@@ -18,8 +18,8 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 RUN_ONE="${SCRIPT_DIR}/run_pretrain_fsdp1.sh"
 
-MODEL="qwen35_text_9b"
-RECIPE="qwen35_text_9b_pretrain_8gpu_gb200_bf16_config"
+MODEL="qwen35_text_35b_a3b"
+RECIPE="qwen35_text_35b_a3b_pretrain_4gpu_gb200_bf16_fsdp1_config"
 PRECISION="bf16"
 
 # Training parameters with defaults (can be overridden via environment variables or command line)
@@ -31,17 +31,17 @@ PROFILE_STEP_END="${PROFILE_STEP_END:-8}"
 
 usage() {
     cat <<'EOF'
-Usage: run_qwen35_9b_test.sh [OPTIONS]
+Usage: test_qwen35_35b_a3b.sh [OPTIONS]
 
 Options:
     --train-iters <n>     Number of training iterations (default: 10)
-    --global-batch-size <n>   Global batch size (default: 8)
+    --global-batch-size <n>   Global batch size (default: 32)
     --micro-batch-size <n>  Micro batch size (default: 1)
     --profile-step-start <n>  Profile start step (default: 7)
     --profile-step-end <n>    Profile end step (default: 8)
     -h, --help            Show this help message
 
-Runs a baseline configuration for qwen35_text_9b model.
+Runs a baseline configuration for qwen35_text_35b_a3b using bf16 and FSDP1.
 EOF
 }
 

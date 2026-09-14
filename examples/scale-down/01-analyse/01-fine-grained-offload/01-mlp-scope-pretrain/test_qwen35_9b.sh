@@ -18,13 +18,11 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 RUN_ONE="${SCRIPT_DIR}/run_pretrain_fsdp1.sh"
 
-PRECISION="${PRECISION:-bf16}"
-MODEL="qwen35_text_27b"
-RECIPE_BF16="qwen35_text_27b_pretrain_4gpu_gb200_bf16_fsdp1_config"
-RECIPE_FP8MX="qwen35_text_27b_pretrain_4gpu_gb200_fp8mx_fsdp1_config"
-TEST_ONLY=false
+MODEL="qwen35_text_9b"
+RECIPE="qwen35_text_9b_pretrain_4gpu_gb200_bf16_fsdp1_config"
+PRECISION="bf16"
 
-# Training parameters with defaults (can be overridden via environment variables)
+# Training parameters with defaults (can be overridden via environment variables or command line)
 TRAIN_ITERS="${TRAIN_ITERS:-10}"
 GLOBAL_BATCH_SIZE="${GLOBAL_BATCH_SIZE:-32}"
 MICRO_BATCH_SIZE="${MICRO_BATCH_SIZE:-1}"
@@ -33,34 +31,22 @@ PROFILE_STEP_END="${PROFILE_STEP_END:-8}"
 
 usage() {
     cat <<'EOF'
-Usage: run_dense_test.sh [OPTIONS]
+Usage: test_qwen35_9b.sh [OPTIONS]
 
 Options:
-    --test                Run one short baseline to validate the environment
-    --precision <bf16|fp8mx>  Precision mode (default: bf16)
     --train-iters <n>     Number of training iterations (default: 10)
-    --global-batch-size <n>   Global batch size (default: 8)
+    --global-batch-size <n>   Global batch size (default: 32)
     --micro-batch-size <n>  Micro batch size (default: 1)
     --profile-step-start <n>  Profile start step (default: 7)
     --profile-step-end <n>    Profile end step (default: 8)
     -h, --help            Show this help message
 
-Without --test, run baseline, recompute-1/2, and offload-1/2 in order.
-With --test, run one short baseline to validate the four-GPU environment.
+Runs a baseline configuration for qwen35_text_9b using bf16 and FSDP1.
 EOF
 }
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
-        --test)
-            TEST_ONLY=true
-            shift
-            ;;
-        --precision)
-            [[ $# -ge 2 ]] || { usage >&2; exit 2; }
-            PRECISION="$2"
-            shift 2
-            ;;
         --train-iters)
             [[ $# -ge 2 ]] || { usage >&2; exit 2; }
             TRAIN_ITERS="$2"
@@ -98,15 +84,6 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
-if [[ "${PRECISION}" == bf16 ]]; then
-    RECIPE="${RECIPE_BF16}"
-elif [[ "${PRECISION}" == fp8mx ]]; then
-    RECIPE="${RECIPE_FP8MX}"
-else
-    echo "Unsupported precision: ${PRECISION}" >&2
-    exit 2
-fi
-
 run_config() {
     local run_name="$1"
     local recompute_granularity="$2"
@@ -130,29 +107,4 @@ run_config() {
         --profile-step-end "${PROFILE_STEP_END}"
 }
 
-if [[ "${TEST_ONLY}" == true ]]; then
-    # For test mode, use smaller defaults
-    TEST_TRAIN_ITERS="${TEST_TRAIN_ITERS:-2}"
-    TEST_GLOBAL_BATCH_SIZE="${TEST_GLOBAL_BATCH_SIZE:-4}"
-    "${RUN_ONE}" \
-        --model "${MODEL}" \
-        --recipe "${RECIPE}" \
-        --precision "${PRECISION}" \
-        --run-name baseline \
-        --recompute-granularity null \
-        --recompute-modules null \
-        --fine-grained-offload false \
-        --offload-modules null \
-        --train-iters "${TEST_TRAIN_ITERS}" \
-        --global-batch-size "${TEST_GLOBAL_BATCH_SIZE}" \
-        --micro-batch-size "${MICRO_BATCH_SIZE}" \
-        --profile-step-start 0 \
-        --profile-step-end 1
-    exit 0
-fi
-
 run_config baseline null null false null
-run_config recompute-1 selective "[layernorm,mlp]" false null
-run_config recompute-2 selective "[layernorm,mlp]" true "[mlp_norm]"
-run_config offload-1 selective "[layernorm,mlp_act]" true "[mlp_act]"
-run_config offload-2 selective "[layernorm,mlp_act]" true "[mlp_norm,mlp_act]"

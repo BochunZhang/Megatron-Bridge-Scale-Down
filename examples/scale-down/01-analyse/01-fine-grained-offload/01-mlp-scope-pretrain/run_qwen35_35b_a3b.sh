@@ -33,13 +33,13 @@ PROFILE_STEP_END="${PROFILE_STEP_END:-8}"
 
 usage() {
     cat <<'EOF'
-Usage: run_expert_test.sh [OPTIONS]
+Usage: run_qwen35_35b_a3b.sh [OPTIONS]
 
 Options:
     --test                Run one short baseline to validate the environment
     --precision <bf16|fp8mx>  Precision mode (default: bf16)
     --train-iters <n>     Number of training iterations (default: 10)
-    --global-batch-size <n>   Global batch size (default: 8)
+    --global-batch-size <n>   Global batch size (default: 32)
     --micro-batch-size <n>  Micro batch size (default: 1)
     --profile-step-start <n>  Profile start step (default: 7)
     --profile-step-end <n>    Profile end step (default: 8)

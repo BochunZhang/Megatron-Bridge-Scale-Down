@@ -18,8 +18,8 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 RUN_ONE="${SCRIPT_DIR}/run_pretrain_fsdp1.sh"
 
-MODEL="qwen35_text_35b_a3b"
-RECIPE="qwen35_text_35b_a3b_pretrain_8gpu_gb200_bf16_config"
+MODEL="qwen35_text_27b"
+RECIPE="qwen35_text_27b_pretrain_4gpu_gb200_bf16_fsdp1_config"
 PRECISION="bf16"
 
 # Training parameters with defaults (can be overridden via environment variables or command line)
@@ -31,17 +31,17 @@ PROFILE_STEP_END="${PROFILE_STEP_END:-8}"
 
 usage() {
     cat <<'EOF'
-Usage: run_qwen35_35b_a3b_test.sh [OPTIONS]
+Usage: test_qwen35_27b.sh [OPTIONS]
 
 Options:
     --train-iters <n>     Number of training iterations (default: 10)
-    --global-batch-size <n>   Global batch size (default: 8)
+    --global-batch-size <n>   Global batch size (default: 32)
     --micro-batch-size <n>  Micro batch size (default: 1)
     --profile-step-start <n>  Profile start step (default: 7)
     --profile-step-end <n>    Profile end step (default: 8)
     -h, --help            Show this help message
 
-Runs a baseline configuration for qwen35_text_35b_a3b model.
+Runs a baseline configuration for qwen35_text_27b using bf16 and FSDP1.
 EOF
 }
 
@@ -84,27 +84,17 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
-run_config() {
-    local run_name="$1"
-    local recompute_granularity="$2"
-    local recompute_modules="$3"
-    local fine_grained_offload="$4"
-    local offload_modules="$5"
-
-    "${RUN_ONE}" \
-        --model "${MODEL}" \
-        --recipe "${RECIPE}" \
-        --precision "${PRECISION}" \
-        --run-name "${run_name}" \
-        --recompute-granularity "${recompute_granularity}" \
-        --recompute-modules "${recompute_modules}" \
-        --fine-grained-offload "${fine_grained_offload}" \
-        --offload-modules "${offload_modules}" \
-        --train-iters "${TRAIN_ITERS}" \
-        --global-batch-size "${GLOBAL_BATCH_SIZE}" \
-        --micro-batch-size "${MICRO_BATCH_SIZE}" \
-        --profile-step-start "${PROFILE_STEP_START}" \
-        --profile-step-end "${PROFILE_STEP_END}"
-}
-
-run_config baseline null null false null
+"${RUN_ONE}" \
+    --model "${MODEL}" \
+    --recipe "${RECIPE}" \
+    --precision "${PRECISION}" \
+    --run-name baseline \
+    --recompute-granularity null \
+    --recompute-modules null \
+    --fine-grained-offload false \
+    --offload-modules null \
+    --train-iters "${TRAIN_ITERS}" \
+    --global-batch-size "${GLOBAL_BATCH_SIZE}" \
+    --micro-batch-size "${MICRO_BATCH_SIZE}" \
+    --profile-step-start "${PROFILE_STEP_START}" \
+    --profile-step-end "${PROFILE_STEP_END}"
