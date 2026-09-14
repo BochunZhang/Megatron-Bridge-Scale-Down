@@ -437,3 +437,102 @@ def qwen35_text_27b_pretrain_4gpu_gb200_fp8mx_fsdp1_config() -> ConfigContainer:
     cfg.mixed_precision.fp8_param_gather = False
     cfg.mixed_precision.reuse_grad_buf_for_mxfp8_param_ag = False
     return cfg
+
+
+def qwen35_text_9b_pretrain_4gpu_gb200_bf16_fsdp1_config() -> ConfigContainer:
+    """Return a 4-GPU GB200 Qwen3.5 9B dense model FSDP1 config."""
+    cfg = _pretrain_common()
+
+    text_config = AutoConfig.from_pretrained(_QWEN35_9B_BASE).text_config
+    # Set architecture for AutoBridge to select the correct bridge
+    text_config.architectures = ["Qwen3_5ForCausalLM"]
+    cfg.model = AutoBridge.from_hf_config(text_config).to_megatron_provider(load_weights=False)
+    cfg.tokenizer.tokenizer_model = _QWEN35_9B_BASE
+    cfg.dataset.seq_length = 4096
+    cfg.dataset.blend = None
+    cfg.dataset.num_workers = 8
+
+    # Four-GPU GB200 topology: one data-parallel group.
+    cfg.model.tensor_model_parallel_size = 1
+    cfg.model.pipeline_model_parallel_size = 1
+    cfg.model.pipeline_model_parallel_layout = None
+    cfg.model.pipeline_dtype = torch.bfloat16
+    cfg.model.virtual_pipeline_model_parallel_size = None
+    cfg.model.context_parallel_size = 1
+    cfg.model.expert_model_parallel_size = 1
+    cfg.model.expert_tensor_parallel_size = 1
+    cfg.model.sequence_parallel = False
+    cfg.model.seq_length = 4096
+    cfg.model.init_method_std = 0.02
+    cfg.train.global_batch_size = 512
+    cfg.train.micro_batch_size = 1
+
+    cfg.model.transformer_impl = "transformer_engine"
+    cfg.model.bias_activation_fusion = True
+    cfg.model.apply_rope_fusion = True
+    cfg.model.moe_router_fusion = False
+    cfg.model.moe_permute_fusion = False
+    cfg.model.moe_grouped_gemm = False
+    cfg.model.cross_entropy_loss_fusion = True
+    cfg.model.cross_entropy_fusion_impl = "native"
+
+    cfg.model.recompute_granularity = None
+    cfg.model.recompute_method = None
+    cfg.model.recompute_num_layers = None
+    cfg.model.recompute_modules = None
+    cfg.model.fine_grained_activation_offloading = False
+    cfg.model.offload_modules = None
+
+    cfg.model.cuda_graph_impl = "transformer_engine"
+    cfg.model.cuda_graph_scope = None
+    cfg.model.cuda_graph_modules = ["attn"]
+    cfg.model.cuda_graph_warmup_steps = 3
+    cfg.model.use_te_rng_tracker = True
+    cfg.rng.te_rng_tracker = True
+
+    cfg.optimizer.use_precision_aware_optimizer = False
+    cfg.optimizer.main_grads_dtype = torch.float32
+    cfg.optimizer.main_params_dtype = torch.float32
+    cfg.optimizer.exp_avg_dtype = torch.float32
+    cfg.optimizer.exp_avg_sq_dtype = torch.float32
+    cfg.optimizer.overlap_param_gather_with_optimizer_step = False
+
+    cfg.checkpoint.ckpt_format = "fsdp_dtensor"
+    cfg.checkpoint.load = None
+    cfg.checkpoint.save = None
+    cfg.rerun_state_machine.check_for_nan_in_loss = True
+
+    # Megatron FSDP1 settings.
+    cfg.ddp.overlap_grad_reduce = False
+    cfg.ddp.overlap_param_gather = False
+    cfg.ddp.check_for_nan_in_grad = True
+    cfg.ddp.use_distributed_optimizer = True
+    cfg.ddp.grad_reduce_in_fp32 = True
+
+    cfg.ddp.average_in_collective = True
+    cfg.ddp.data_parallel_sharding_strategy = "optim"
+    cfg.ddp.use_megatron_fsdp = True
+    cfg.ddp.fsdp_double_buffer = True
+    cfg.ddp.megatron_fsdp_max_pool_double_buffer = True
+    cfg.ddp.nccl_ub = False
+    cfg.ddp.fsdp_db_use_persist_buf_on_alloc_fail = True
+    cfg.ddp.num_distributed_optimizer_instances = 1
+
+    cfg.mixed_precision = bf16_mixed()
+    cfg.mixed_precision.grad_reduce_in_fp32 = True
+    
+    cfg.comm_overlap = CommOverlapConfig(
+        tp_comm_overlap=False,
+        overlap_grad_reduce=False,
+        overlap_param_gather=False,
+    )
+    return cfg
+
+
+def qwen35_text_9b_pretrain_4gpu_gb200_fp8mx_fsdp1_config() -> ConfigContainer:
+    """Return a 4-GPU GB200 Qwen3.5 9B dense model MXFP8 FSDP1 config."""
+    cfg = qwen35_text_9b_pretrain_4gpu_gb200_bf16_fsdp1_config()
+    cfg.mixed_precision = bf16_with_mxfp8_mixed()
+    cfg.mixed_precision.fp8_param_gather = False
+    cfg.mixed_precision.reuse_grad_buf_for_mxfp8_param_ag = False
+    return cfg

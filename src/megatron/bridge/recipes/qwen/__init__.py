@@ -25,6 +25,8 @@ from .gb200.qwen35 import (
     qwen35_text_35b_a3b_pretrain_4gpu_gb200_fp8mx_fsdp1_config,
     qwen35_text_27b_pretrain_4gpu_gb200_bf16_fsdp1_config,
     qwen35_text_27b_pretrain_4gpu_gb200_fp8mx_fsdp1_config,
+    qwen35_text_9b_pretrain_4gpu_gb200_bf16_fsdp1_config,
+    qwen35_text_9b_pretrain_4gpu_gb200_fp8mx_fsdp1_config,
 )
 
 # Qwen2 models
@@ -180,6 +182,8 @@ __all__ = [
     "qwen35_text_35b_a3b_pretrain_config",
     "qwen35_text_35b_a3b_pretrain_8gpu_gb200_bf16_config",
     # Qwen3.5 text models
+    "qwen35_text_9b_pretrain_4gpu_gb200_bf16_fsdp1_config",
+    "qwen35_text_9b_pretrain_4gpu_gb200_fp8mx_fsdp1_config",
     "qwen35_text_27b_pretrain_4gpu_gb200_bf16_fsdp1_config",
     "qwen35_text_27b_pretrain_4gpu_gb200_fp8mx_fsdp1_config",
     "qwen35_text_35b_a3b_pretrain_4gpu_gb200_bf16_fsdp1_config",
