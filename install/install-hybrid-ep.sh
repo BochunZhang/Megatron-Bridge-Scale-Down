@@ -63,8 +63,9 @@ pushd "${TMP_DIR}"
         ln -sf "${NVSHMEM_LIB_PATH}/libnvshmem_host.so.3" "${NVSHMEM_LIB_PATH}/libnvshmem_host.so"
     fi
 
-    apt-get update
-    apt-get install -y --no-install-recommends libnvidia-ml-dev
+    # apt-get update
+    # apt-get install -y --no-install-recommends libnvidia-ml-dev
+    # 会触发 nvidia-msi 报错
     TORCH_CUDA_ARCH_LIST="10.0" uv pip install --no-cache-dir --no-build-isolation -v . 
 popd
 
