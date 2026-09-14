@@ -22,7 +22,7 @@ TMP_DIR="$(pwd)/.tmp"
 mkdir -p "${TMP_DIR}"
 
 export HYBRID_EP_MULTINODE=1
-export RDMA_CORE_HOME='${TMP_DIR}/hybrid/build'
+export RDMA_CORE_HOME="${TMP_DIR}/hybrid/build"
 
 
 # DeepEP commit for hybrid EP mode
