@@ -1,3 +1,4 @@
 [submodule "3rdparty/Megatron-LM"]
 	path = 3rdparty/Megatron-LM
 	url = https://github.com/BochunZhang/Megatron-LM-Scale-Down.git
+	branch = core_v0.19.0_scale_down
