@@ -226,7 +226,12 @@ export NEMO_MODELS_CACHE="${NEMO_CACHE}/models"
 export UV_CACHE_DIR="${UV_CACHE}"
 export NVTE_CPU_OFFLOAD_V1="1"
 export TORCH_NCCL_AVOID_RECORD_STREAMS="1"
+export NVLINK_DOMAIN_SIZE="72"
+export PYTORCH_CUDA_ALLOC_CONF="expandable_segments:True"
 export NCCL_NVLS_ENABLE="0"
+export NCCL_DEBUG="WARN"
+export NCCL_GRAPH_REGISTER="0"
+export TOKENIZERS_PARALLELISM="false"
 export RESULT_DIR MODEL MODEL_ID RESULT_MODEL_NAME PRECISION RUN_NAME RUN_TIME RECIPE
 
 # Set profiling config based on nsys enablement
