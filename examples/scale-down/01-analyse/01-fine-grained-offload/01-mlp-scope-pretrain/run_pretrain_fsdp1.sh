@@ -19,7 +19,9 @@
 #   run_pretrain_fsdp1.sh --model <model> --recipe <recipe> --precision <precision> \
 #       --run-name <run-name> --recompute-granularity <value> \
 #       --recompute-modules <value> --fine-grained-offload <true|false> \
-#       --offload-modules <value>
+#       --offload-modules <value> \
+#       [--train-iters <iters>] [--global-batch-size <gbs>] [--micro-batch-size <mbs>] \
+#       [--profile-step-start <start>] [--profile-step-end <end>]
 
 set -euo pipefail
 
@@ -38,11 +40,23 @@ Usage: run_pretrain_fsdp1.sh \
     --recompute-granularity <null|selective> \
     --recompute-modules <value> \
     --fine-grained-offload <true|false> \
-    --offload-modules <value>
+    --offload-modules <value> \
+    [--train-iters <iters>] \
+    [--global-batch-size <gbs>] \
+    [--micro-batch-size <mbs>] \
+    [--profile-step-start <start>] \
+    [--profile-step-end <end>]
 
 The model, recipe, and precision are selected by the caller and are passed
 through without model/precision combination logic. Hydra values such as null,
 selective, [layernorm,mlp], or [expert_fc1,moe_act] are accepted.
+
+Optional training parameters (with defaults):
+    --train-iters         Number of training iterations (default: 10)
+    --global-batch-size   Global batch size (default: 8)
+    --micro-batch-size    Micro batch size (default: 1)
+    --profile-step-start  Profile start step (default: 7)
+    --profile-step-end    Profile end step (default: 8)
 EOF
 }
 
@@ -54,6 +68,13 @@ RECOMPUTE_GRANULARITY=""
 RECOMPUTE_MODULES=""
 FINE_GRAINED_OFFLOAD=""
 OFFLOAD_MODULES=""
+
+# Training parameters with defaults
+TRAIN_ITERS=""
+GLOBAL_BATCH_SIZE=""
+MICRO_BATCH_SIZE=""
+PROFILE_STEP_START=""
+PROFILE_STEP_END=""
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -97,6 +118,31 @@ while [[ $# -gt 0 ]]; do
             OFFLOAD_MODULES="$2"
             shift 2
             ;;
+        --train-iters)
+            [[ $# -ge 2 ]] || { usage >&2; exit 2; }
+            TRAIN_ITERS="$2"
+            shift 2
+            ;;
+        --global-batch-size)
+            [[ $# -ge 2 ]] || { usage >&2; exit 2; }
+            GLOBAL_BATCH_SIZE="$2"
+            shift 2
+            ;;
+        --micro-batch-size)
+            [[ $# -ge 2 ]] || { usage >&2; exit 2; }
+            MICRO_BATCH_SIZE="$2"
+            shift 2
+            ;;
+        --profile-step-start)
+            [[ $# -ge 2 ]] || { usage >&2; exit 2; }
+            PROFILE_STEP_START="$2"
+            shift 2
+            ;;
+        --profile-step-end)
+            [[ $# -ge 2 ]] || { usage >&2; exit 2; }
+            PROFILE_STEP_END="$2"
+            shift 2
+            ;;
         -h|--help)
             usage
             exit 0
@@ -116,6 +162,13 @@ for required in MODEL RECIPE PRECISION RUN_NAME RECOMPUTE_GRANULARITY RECOMPUTE_
         exit 2
     fi
 done
+
+# Apply defaults for optional training parameters
+TRAIN_ITERS="${TRAIN_ITERS:-10}"
+GLOBAL_BATCH_SIZE="${GLOBAL_BATCH_SIZE:-8}"
+MICRO_BATCH_SIZE="${MICRO_BATCH_SIZE:-1}"
+PROFILE_STEP_START="${PROFILE_STEP_START:-7}"
+PROFILE_STEP_END="${PROFILE_STEP_END:-8}"
 
 MODEL_ID="${MODEL}"
 RESULT_MODEL_NAME="${MODEL}"
@@ -139,11 +192,6 @@ RESULT_DIR="${RESULTS_ROOT}/${RESULT_MODEL_NAME}/${PRECISION}/${RUN_NAME}/${RUN_
 HF_CACHE="${REPO_ROOT}/.cache/huggingface"
 NEMO_CACHE="${REPO_ROOT}/.cache/nemo"
 UV_CACHE="${REPO_ROOT}/.cache/uv"
-TRAIN_ITERS="${TRAIN_ITERS:-120}"
-GLOBAL_BATCH_SIZE="${GLOBAL_BATCH_SIZE:-512}"
-MICRO_BATCH_SIZE="${MICRO_BATCH_SIZE:-1}"
-PROFILE_STEP_START="${PROFILE_STEP_START:-20}"
-PROFILE_STEP_END="${PROFILE_STEP_END:-120}"
 MASTER_PORT="${MASTER_PORT:-29501}"
 
 if ! [[ "${TRAIN_ITERS}" =~ ^[0-9]+$ && "${GLOBAL_BATCH_SIZE}" =~ ^[0-9]+$ && "${MICRO_BATCH_SIZE}" =~ ^[0-9]+$ ]]; then
@@ -225,6 +273,8 @@ export COMMAND_TEXT
 uv run --no-sync python -c 'import json, os, re; pattern = re.compile(r"(^|_)(TOKEN|SECRET|PASSWORD|PASSWD|API_KEY|ACCESS_KEY|SECRET_KEY|PRIVATE_KEY|AUTHORIZATION)(_|$)", re.I); root = os.environ["RESULT_DIR"]; env = {k: ("[REDACTED]" if pattern.search(k) else v) for k, v in sorted(os.environ.items())}; json.dump(env, open(os.path.join(root, "environment.json"), "w"), indent=2, sort_keys=True); open(os.path.join(root, "command.txt"), "w").write(os.environ["COMMAND_TEXT"] + "\n"); config = {"model": os.environ["MODEL"], "model_id": os.environ["MODEL_ID"], "precision": os.environ["PRECISION"], "run_name": os.environ["RUN_NAME"], "run_time": os.environ["RUN_TIME"], "recipe": os.environ["RECIPE"], "result_dir": root, "profile_ranks": [0, 1, 2, 3], "cache_paths": {"hf": env["HF_HOME"], "nemo": env["NEMO_HOME"]}, "cli": os.environ["COMMAND_TEXT"]}; json.dump(config, open(os.path.join(root, "config.json"), "w"), indent=2, sort_keys=True)'
 
 printf 'model=%s precision=%s run_name=%s run_time=%s\n' "${MODEL}" "${PRECISION}" "${RUN_NAME}" "${RUN_TIME}" | tee "${RESULT_DIR}/run_info.txt"
+printf 'train_iters=%s global_batch_size=%s micro_batch_size=%s\n' "${TRAIN_ITERS}" "${GLOBAL_BATCH_SIZE}" "${MICRO_BATCH_SIZE}" | tee -a "${RESULT_DIR}/run_info.txt"
+printf 'profile_step_start=%s profile_step_end=%s\n' "${PROFILE_STEP_START}" "${PROFILE_STEP_END}" | tee -a "${RESULT_DIR}/run_info.txt"
 printf 'result_dir=%s\nprofile_ranks=0,1,2,3\ncommand=%s\n' "${RESULT_DIR}" "${COMMAND_TEXT}" | tee -a "${RESULT_DIR}/run_info.txt"
 
 set +e

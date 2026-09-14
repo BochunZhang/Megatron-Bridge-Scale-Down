@@ -17,35 +17,37 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 RUN_ONE="${SCRIPT_DIR}/run_pretrain_fsdp1.sh"
+
 PRECISION="${PRECISION:-bf16}"
 MODEL="qwen38_text_35b_a3b"
 RECIPE_BF16="qwen38_text_35b_a3b_pretrain_4gpu_gb200_bf16_fsdp1_config"
 RECIPE_FP8MX="qwen38_text_35b_a3b_pretrain_4gpu_gb200_fp8mx_fsdp1_config"
 TEST_ONLY=false
 
+# Training parameters with defaults (can be overridden via environment variables)
+TRAIN_ITERS="${TRAIN_ITERS:-10}"
+GLOBAL_BATCH_SIZE="${GLOBAL_BATCH_SIZE:-8}"
+MICRO_BATCH_SIZE="${MICRO_BATCH_SIZE:-1}"
+PROFILE_STEP_START="${PROFILE_STEP_START:-7}"
+PROFILE_STEP_END="${PROFILE_STEP_END:-8}"
+
 usage() {
     cat <<'EOF'
-Usage: run_expert_test.sh [--test] [--precision bf16|fp8mx]
+Usage: run_expert_test.sh [OPTIONS]
 
-Without --test, run one baseline, recompute-1/2, and offload-1/2 in order.
+Options:
+    --test                Run one short baseline to validate the environment
+    --precision <bf16|fp8mx>  Precision mode (default: bf16)
+    --train-iters <n>     Number of training iterations (default: 10)
+    --global-batch-size <n>   Global batch size (default: 8)
+    --micro-batch-size <n>  Micro batch size (default: 1)
+    --profile-step-start <n>  Profile start step (default: 7)
+    --profile-step-end <n>    Profile end step (default: 8)
+    -h, --help            Show this help message
+
+Without --test, run baseline, recompute-1/2, and offload-1/2 in order.
 With --test, run one short baseline to validate the four-GPU environment.
 EOF
-}
-
-run_baseline_test() {
-    TRAIN_ITERS="${TEST_TRAIN_ITERS:-2}" \
-    GLOBAL_BATCH_SIZE="${TEST_GLOBAL_BATCH_SIZE:-4}" \
-    PROFILE_STEP_START=0 \
-    PROFILE_STEP_END=1 \
-    "${RUN_ONE}" \
-        --model "${MODEL}" \
-        --recipe "${RECIPE}" \
-        --precision "${PRECISION}" \
-        --run-name baseline \
-        --recompute-granularity null \
-        --recompute-modules null \
-        --fine-grained-offload false \
-        --offload-modules null
 }
 
 while [[ $# -gt 0 ]]; do
@@ -57,6 +59,31 @@ while [[ $# -gt 0 ]]; do
         --precision)
             [[ $# -ge 2 ]] || { usage >&2; exit 2; }
             PRECISION="$2"
+            shift 2
+            ;;
+        --train-iters)
+            [[ $# -ge 2 ]] || { usage >&2; exit 2; }
+            TRAIN_ITERS="$2"
+            shift 2
+            ;;
+        --global-batch-size)
+            [[ $# -ge 2 ]] || { usage >&2; exit 2; }
+            GLOBAL_BATCH_SIZE="$2"
+            shift 2
+            ;;
+        --micro-batch-size)
+            [[ $# -ge 2 ]] || { usage >&2; exit 2; }
+            MICRO_BATCH_SIZE="$2"
+            shift 2
+            ;;
+        --profile-step-start)
+            [[ $# -ge 2 ]] || { usage >&2; exit 2; }
+            PROFILE_STEP_START="$2"
+            shift 2
+            ;;
+        --profile-step-end)
+            [[ $# -ge 2 ]] || { usage >&2; exit 2; }
+            PROFILE_STEP_END="$2"
             shift 2
             ;;
         -h|--help)
@@ -95,11 +122,32 @@ run_config() {
         --recompute-granularity "${recompute_granularity}" \
         --recompute-modules "${recompute_modules}" \
         --fine-grained-offload "${fine_grained_offload}" \
-        --offload-modules "${offload_modules}"
+        --offload-modules "${offload_modules}" \
+        --train-iters "${TRAIN_ITERS}" \
+        --global-batch-size "${GLOBAL_BATCH_SIZE}" \
+        --micro-batch-size "${MICRO_BATCH_SIZE}" \
+        --profile-step-start "${PROFILE_STEP_START}" \
+        --profile-step-end "${PROFILE_STEP_END}"
 }
 
 if [[ "${TEST_ONLY}" == true ]]; then
-    run_baseline_test
+    # For test mode, use smaller defaults
+    TEST_TRAIN_ITERS="${TEST_TRAIN_ITERS:-2}"
+    TEST_GLOBAL_BATCH_SIZE="${TEST_GLOBAL_BATCH_SIZE:-4}"
+    "${RUN_ONE}" \
+        --model "${MODEL}" \
+        --recipe "${RECIPE}" \
+        --precision "${PRECISION}" \
+        --run-name baseline \
+        --recompute-granularity null \
+        --recompute-modules null \
+        --fine-grained-offload false \
+        --offload-modules null \
+        --train-iters "${TEST_TRAIN_ITERS}" \
+        --global-batch-size "${TEST_GLOBAL_BATCH_SIZE}" \
+        --micro-batch-size "${MICRO_BATCH_SIZE}" \
+        --profile-step-start 0 \
+        --profile-step-end 1
     exit 0
 fi
 
