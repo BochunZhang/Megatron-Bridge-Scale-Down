@@ -24,7 +24,7 @@ PRECISION="bf16"
 
 # Training parameters with defaults (can be overridden via environment variables or command line)
 TRAIN_ITERS="${TRAIN_ITERS:-10}"
-GLOBAL_BATCH_SIZE="${GLOBAL_BATCH_SIZE:-8}"
+GLOBAL_BATCH_SIZE="${GLOBAL_BATCH_SIZE:-32}"
 MICRO_BATCH_SIZE="${MICRO_BATCH_SIZE:-1}"
 PROFILE_STEP_START="${PROFILE_STEP_START:-7}"
 PROFILE_STEP_END="${PROFILE_STEP_END:-8}"

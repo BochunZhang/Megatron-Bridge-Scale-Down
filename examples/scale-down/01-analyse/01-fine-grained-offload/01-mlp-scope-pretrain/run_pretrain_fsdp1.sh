@@ -303,11 +303,19 @@ if [[ "${ENABLE_NSYS}" == true ]]; then
     printf 'Running with nsys profiling enabled...\n' | tee -a "${RESULT_DIR}/run_info.txt"
     set +e
     nsys profile \
+        -s none \
+        -t cuda,nvtx \
+        --capture-range=cudaProfilerApi \
+        --capture-range-end=stop \
         -o "${RESULT_DIR}/profile/profile_%p_%h" \
         --force-overwrite=true \
         "${COMMAND[@]}" 2>&1 | tee "${RESULT_DIR}/train.log"
     RUN_STATUS=${PIPESTATUS[0]}
     set -e
+    if compgen -G "${RESULT_DIR}/profile/*.nsys-rep" > /dev/null; then
+        printf 'nsys profile reports (written after training):\n' | tee -a "${RESULT_DIR}/run_info.txt"
+        find "${RESULT_DIR}/profile" -maxdepth 1 -type f -name '*.nsys-rep' -print | sort | tee -a "${RESULT_DIR}/run_info.txt"
+    fi
 else
     printf 'Running without nsys profiling...\n' | tee -a "${RESULT_DIR}/run_info.txt"
     set +e
