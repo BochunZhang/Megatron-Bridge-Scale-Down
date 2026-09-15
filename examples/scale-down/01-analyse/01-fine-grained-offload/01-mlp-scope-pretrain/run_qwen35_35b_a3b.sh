@@ -23,6 +23,7 @@ MODEL="qwen35_text_35b_a3b"
 RECIPE_BF16="qwen35_text_35b_a3b_pretrain_4gpu_gb200_bf16_fsdp1_config"
 RECIPE_FP8MX="qwen35_text_35b_a3b_pretrain_4gpu_gb200_fp8mx_fsdp1_config"
 TEST_ONLY=false
+PROFILE=false
 
 # Training parameters with defaults (can be overridden via environment variables)
 TRAIN_ITERS="${TRAIN_ITERS:-10}"
@@ -37,6 +38,7 @@ Usage: run_qwen35_35b_a3b.sh [OPTIONS]
 
 Options:
     --test                Run one short baseline to validate the environment
+    --profile             Enable nsys, NVTX, and memory-history recording
     --precision <bf16|fp8mx>  Precision mode (default: bf16)
     --train-iters <n>     Number of training iterations (default: 10)
     --global-batch-size <n>   Global batch size (default: 32)
@@ -46,7 +48,7 @@ Options:
     -h, --help            Show this help message
 
 Without --test, run baseline, recompute-1/2, and offload-1/2 in order.
-With --test, run one short baseline to validate the four-GPU environment.
+With --test, use the configured test iteration count; with --profile, record steps 0..10.
 EOF
 }
 
@@ -54,6 +56,10 @@ while [[ $# -gt 0 ]]; do
     case "$1" in
         --test)
             TEST_ONLY=true
+            shift
+            ;;
+        --profile)
+            PROFILE=true
             shift
             ;;
         --precision)
@@ -98,6 +104,11 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
+PROFILE_ARGS=()
+if [[ "${PROFILE}" == true ]]; then
+    PROFILE_ARGS=(--profile)
+fi
+
 if [[ "${PRECISION}" == bf16 ]]; then
     RECIPE="${RECIPE_BF16}"
 elif [[ "${PRECISION}" == fp8mx ]]; then
@@ -115,6 +126,7 @@ run_config() {
     local offload_modules="$5"
 
     "${RUN_ONE}" \
+        "${PROFILE_ARGS[@]}" \
         --model "${MODEL}" \
         --recipe "${RECIPE}" \
         --precision "${PRECISION}" \
@@ -131,10 +143,8 @@ run_config() {
 }
 
 if [[ "${TEST_ONLY}" == true ]]; then
-    # For test mode, use smaller defaults
-    TEST_TRAIN_ITERS="${TEST_TRAIN_ITERS:-2}"
-    TEST_GLOBAL_BATCH_SIZE="${TEST_GLOBAL_BATCH_SIZE:-4}"
     "${RUN_ONE}" \
+        "${PROFILE_ARGS[@]}" \
         --model "${MODEL}" \
         --recipe "${RECIPE}" \
         --precision "${PRECISION}" \
@@ -143,11 +153,11 @@ if [[ "${TEST_ONLY}" == true ]]; then
         --recompute-modules null \
         --fine-grained-offload false \
         --offload-modules null \
-        --train-iters "${TEST_TRAIN_ITERS}" \
-        --global-batch-size "${TEST_GLOBAL_BATCH_SIZE}" \
+        --train-iters "${TRAIN_ITERS}" \
+        --global-batch-size "${GLOBAL_BATCH_SIZE}" \
         --micro-batch-size "${MICRO_BATCH_SIZE}" \
         --profile-step-start 0 \
-        --profile-step-end 1
+        --profile-step-end 10
     exit 0
 fi
 

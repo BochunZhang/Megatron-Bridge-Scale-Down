@@ -22,7 +22,7 @@
 #       --offload-modules <value> \
 #       [--train-iters <iters>] [--global-batch-size <gbs>] [--micro-batch-size <mbs>] \
 #       [--profile-step-start <start>] [--profile-step-end <end>] \
-#       [--disable-nsys]
+#       [--profile]
 
 set -euo pipefail
 
@@ -46,7 +46,8 @@ Usage: run_pretrain_fsdp1.sh \
     [--global-batch-size <gbs>] \
     [--micro-batch-size <mbs>] \
     [--profile-step-start <start>] \
-    [--profile-step-end <end>]
+    [--profile-step-end <end>] \
+    [--profile] [--disable-profile]
 
 The model, recipe, and precision are selected by the caller and are passed
 through without model/precision combination logic. Hydra values such as null,
@@ -58,7 +59,7 @@ Optional training parameters (with defaults):
     --micro-batch-size    Micro batch size (default: 1)
     --profile-step-start  Profile start step (default: 7)
     --profile-step-end    Profile end step (default: 8)
-    --disable-nsys        Disable nsys profiling (default: enabled)
+    --profile             Enable nsys, NVTX, and memory-history recording
 EOF
 }
 
@@ -77,7 +78,7 @@ GLOBAL_BATCH_SIZE=""
 MICRO_BATCH_SIZE=""
 PROFILE_STEP_START=""
 PROFILE_STEP_END=""
-ENABLE_NSYS="${ENABLE_NSYS:-true}"
+PROFILE="${PROFILE:-false}"
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -146,8 +147,9 @@ while [[ $# -gt 0 ]]; do
             PROFILE_STEP_END="$2"
             shift 2
             ;;
-        --disable-nsys)
-            ENABLE_NSYS=false
+        --profile)
+            PROFILE=true
+            ENABLE_NSYS=true
             shift
             ;;
         -h|--help)
@@ -209,9 +211,11 @@ if (( TRAIN_ITERS < 1 || GLOBAL_BATCH_SIZE < 1 || MICRO_BATCH_SIZE < 1 )); then
     echo "Training sizes must be positive" >&2
     exit 2
 fi
-if ! [[ "${PROFILE_STEP_START}" =~ ^[0-9]+$ && "${PROFILE_STEP_END}" =~ ^[0-9]+$ ]] || (( PROFILE_STEP_END <= PROFILE_STEP_START || PROFILE_STEP_END > TRAIN_ITERS )); then
-    echo "Require PROFILE_STEP_START < PROFILE_STEP_END <= TRAIN_ITERS" >&2
-    exit 2
+if [[ "${PROFILE}" == true ]]; then
+    if ! [[ "${PROFILE_STEP_START}" =~ ^[0-9]+$ && "${PROFILE_STEP_END}" =~ ^[0-9]+$ ]] || (( PROFILE_STEP_END <= PROFILE_STEP_START || PROFILE_STEP_END > TRAIN_ITERS )); then
+        echo "Require PROFILE_STEP_START < PROFILE_STEP_END <= TRAIN_ITERS when --profile is enabled" >&2
+        exit 2
+    fi
 fi
 
 mkdir -p "${RESULT_DIR}/memory" "${RESULT_DIR}/rank_logs" "${RESULT_DIR}/profile" \
@@ -234,8 +238,17 @@ export NCCL_GRAPH_REGISTER="0"
 export TOKENIZERS_PARALLELISM="false"
 export RESULT_DIR MODEL MODEL_ID RESULT_MODEL_NAME PRECISION RUN_NAME RUN_TIME RECIPE
 
-# Set profiling config based on nsys enablement
-if [[ "${ENABLE_NSYS}" == true ]]; then
+# --disable-nsys only disables the nsys wrapper while retaining NVTX and memory
+# history when --profile is enabled. The run_qwen wrappers explicitly pass
+# --disable-profile unless the user requests --profile.
+if [[ "${PROFILE}" == true ]]; then
+    RECORD_MEMORY_HISTORY="true"
+    NVTX_RANGES="true"
+else
+    RECORD_MEMORY_HISTORY="false"
+    NVTX_RANGES="false"
+fi
+if [[ "${PROFILE}" == true && "${ENABLE_NSYS}" == true ]]; then
     USE_NSYS_PROFILER="true"
 else
     USE_NSYS_PROFILER="false"
@@ -270,9 +283,9 @@ OVERRIDES=(
     "profiling.profile_step_start=${PROFILE_STEP_START}"
     "profiling.profile_step_end=${PROFILE_STEP_END}"
     "profiling.profile_ranks=[0,1,2,3]"
-    "profiling.record_memory_history=true"
+    "profiling.record_memory_history=${RECORD_MEMORY_HISTORY}"
     "profiling.memory_snapshot_path=${RESULT_DIR}/memory/snapshot.pickle"
-    "profiling.nvtx_ranges=true"
+    "profiling.nvtx_ranges=${NVTX_RANGES}"
 )
 
 COMMAND=(
@@ -295,11 +308,13 @@ uv run --no-sync python -c 'import json, os, re; pattern = re.compile(r"(^|_)(TO
 
 printf 'model=%s precision=%s run_name=%s run_time=%s\n' "${MODEL}" "${PRECISION}" "${RUN_NAME}" "${RUN_TIME}" | tee "${RESULT_DIR}/run_info.txt"
 printf 'train_iters=%s global_batch_size=%s micro_batch_size=%s\n' "${TRAIN_ITERS}" "${GLOBAL_BATCH_SIZE}" "${MICRO_BATCH_SIZE}" | tee -a "${RESULT_DIR}/run_info.txt"
-printf 'profile_step_start=%s profile_step_end=%s enable_nsys=%s\n' "${PROFILE_STEP_START}" "${PROFILE_STEP_END}" "${ENABLE_NSYS}" | tee -a "${RESULT_DIR}/run_info.txt"
+printf 'profile=%s profile_step_start=%s profile_step_end=%s enable_nsys=%s record_memory_history=%s nvtx_ranges=%s\n' \
+    "${PROFILE}" "${PROFILE_STEP_START}" "${PROFILE_STEP_END}" "${ENABLE_NSYS}" \
+    "${RECORD_MEMORY_HISTORY}" "${NVTX_RANGES}" | tee -a "${RESULT_DIR}/run_info.txt"
 printf 'result_dir=%s\nprofile_ranks=0,1,2,3\ncommand=%s\n' "${RESULT_DIR}" "${COMMAND_TEXT}" | tee -a "${RESULT_DIR}/run_info.txt"
 
-# Run training with optional nsys profiling (enabled by default)
-if [[ "${ENABLE_NSYS}" == true ]]; then
+# Run training with optional nsys profiling.
+if [[ "${USE_NSYS_PROFILER}" == true ]]; then
     printf 'Running with nsys profiling enabled...\n' | tee -a "${RESULT_DIR}/run_info.txt"
     set +e
     nsys profile \
