@@ -79,7 +79,7 @@ MICRO_BATCH_SIZE=""
 PROFILE_STEP_START=""
 PROFILE_STEP_END=""
 PROFILE="${PROFILE:-false}"
-
+ENABLE_NSYS="${ENABLE_NSYS:-false}"
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --model)
