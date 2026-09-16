@@ -106,5 +106,6 @@ backward 产生的 `param.grad` 不是连续的通信 buffer。对需要 reduce-
 
 ### 3.3 zero-grad
 
-对于 FSDP-1/2/3，需要在 iteration 开始前执行 zero-grad，清空 buffer
+对于 FSDP-1/2/3，需要在 iteration 开始前执行 zero-grad，清空 buffer.
+
 在开启 offload 之后，第一个 backward 期间没必要从 cpu reload main_grad，因为我们期望的 grad 时被清空的，我们直接将从 allocator 的申请的 gpu_bucket / gpu_data 情况即可.
