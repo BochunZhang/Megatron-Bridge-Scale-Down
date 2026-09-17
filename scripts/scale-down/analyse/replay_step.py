@@ -41,6 +41,7 @@ _SKILL_SCRIPTS = os.path.join(_REPO_ROOT, "skills", "nemo-mbridge-memory-snapsho
 sys.path.insert(0, _SKILL_SCRIPTS)
 from common import (
     TRUST_EPILOG,
+    ReplayResult,
     compute_baseline,
     compute_step_start_deltas,
     find_active_device,
@@ -166,68 +167,6 @@ def get_phase_intervals(
     return phases, overlaps, start_times
 
 
-def replay_phase_intervals(
-    traces: list,
-    intervals: list[dict],
-    top_n: int = 15,
-    frame_depth: int = 1,
-) -> list[dict]:
-    """Replay each phase interval as an independent time window.
-
-    Uses the established slicing pattern (``get_step_events`` +
-    ``live_set_before`` seed + ``replay_events``) per interval, so the replay
-    engine in ``common.py`` is reused unmodified and overlapping intervals are
-    naturally supported: events inside an overlap are counted once per
-    interval, which is the intended wall-clock-window semantics (strategy A).
-
-    Per interval, ``peak_delta`` is the peak net change measured from the
-    interval's own start (the seeded pre-existing live set does not contribute
-    to it but does appear in source attribution), and ``end_delta`` is the net
-    memory change across the whole interval — the "memory variation of the
-    forward/backward region" this analysis targets.
-
-    Args:
-        traces: device trace event list for the selected device.
-        intervals: interval dicts for one step, as produced by
-            :func:`get_phase_intervals`.
-        top_n: number of top sources at peak to keep per interval.
-        frame_depth: stack frame depth for source grouping.
-
-    Returns:
-        One result dict per interval, in the same order as ``intervals``.
-    """
-    results = []
-    for interval in intervals:
-        start = interval["start"]
-        end = interval["end"]
-        events = get_step_events(traces, start, end)
-        # Seed with what was live when the interval opened so the source table
-        # accounts for memory carried in (weights, earlier microbatch
-        # activations, optimizer state), not only what the interval allocated.
-        result = replay_events(events, initial_live=live_set_before(traces, start))
-        sources = group_by_source(result.peak_live_set, depth=frame_depth)
-        results.append(
-            {
-                "phase": interval["phase"],
-                "name": interval["name"],
-                "idx": interval["idx"],
-                "start_us": start,
-                "end_us": end,
-                "complete": end is not None,
-                "duration_ms": (end - start) / 1000 if end is not None else None,
-                "alloc_count": result.alloc_count,
-                "free_count": result.free_count,
-                "total_throughput": result.total_alloc_bytes,
-                "peak_delta": result.peak_delta,
-                "end_delta": result.end_delta,
-                "unmatched_frees": result.unmatched_free_count,
-                "unmatched_free_bytes": result.unmatched_free_bytes,
-                "top_sources_at_peak": sources[:top_n],
-                "overlaps": interval["overlaps"],
-            }
-        )
-    return results
-
 
 def replay_one_step(
     traces: list,
@@ -250,6 +189,59 @@ def replay_one_step(
     sources = group_by_source(result.peak_live_set, depth=frame_depth)
     ann_counts = get_step_annotations(annotations, start, end)
 
+    # Phase-level breakdown: parse forward/backward/optimizer annotations
+    # inside this step window, then replay each phase interval separately.
+    phases, overlaps, phase_start_times = get_phase_intervals(annotations, start, end)
+
+    # Net delta at each phase start, measured relative to the step start:
+    # replay only the step-window events. The phases dict mirrors the
+    # ``{key: {"start": us, "end": us | None}}`` shape returned by
+    # ``get_profiler_steps`` (keyed by annotation name instead of step number,
+    # plus extra "phase"/"mbs" fields that are ignored here), so
+    # ``compute_step_start_deltas`` consumes it as-is.
+    phase_deltas = compute_step_start_deltas(events, phases)
+
+    phase_results: dict[str, dict] = {}
+    for name, entry in sorted(phases.items(), key=lambda kv: kv[1]["start"]):
+        p_start = entry["start"]
+        p_end = entry["end"]
+        p_events = get_step_events(traces, p_start, p_end)
+        p_result = replay_events(p_events, initial_live=live_set_before(traces, p_start))
+        p_sources = group_by_source(p_result.peak_live_set, depth=frame_depth)
+        p_ann_counts = get_step_annotations(annotations, p_start, p_end)
+        p_delta_at_start = phase_deltas.get(name, 0)
+        # Expand raw overlap entries ({"name", "range": (ov_start, ov_end)}) into
+        # explicit records so JSON consumers do not need to know the tuple layout.
+        # ov_end is None when either side of the overlap is incomplete.
+        p_overlaps = [
+            {
+                "name": o["name"],
+                "overlap_start": o["range"][0],
+                "overlap_end": o["range"][1],
+                "overlap_ms": (o["range"][1] - o["range"][0]) / 1000 if o["range"][1] is not None else None,
+            }
+            for o in overlaps.get(name, [])
+        ]
+        phase_results[name] = {
+            "phase": entry["phase"],
+            "mbs": entry["mbs"],
+            "start": p_start,
+            "end": p_end,
+            "duration_ms": (p_end - p_start) / 1000 if p_end is not None else None,
+            "delta_at_start": p_delta_at_start,
+            "alloc_count": p_result.alloc_count,
+            "free_count": p_result.free_count,
+            "total_throughput": p_result.total_alloc_bytes,
+            "peak_delta": p_result.peak_delta,
+            "absolute_peak": baseline_at_start + step_start_delta + p_delta_at_start + p_result.peak_delta,
+            "end_delta": p_result.end_delta,
+            "unmatched_frees": p_result.unmatched_free_count,
+            "unmatched_free_bytes": p_result.unmatched_free_bytes,
+            "overlaps": p_overlaps,
+            "top_sources_at_peak": p_sources[:top_n],
+            "annotations": p_ann_counts,
+        }
+
     complete = end is not None
     duration_ms = (end - start) / 1000 if complete else None
 
@@ -269,6 +261,9 @@ def replay_one_step(
         "unmatched_free_bytes": result.unmatched_free_bytes,
         "top_sources_at_peak": sources[:top_n],
         "annotations": ann_counts,
+        "phase_start_times": phase_start_times,
+        "phase_deltas": phase_deltas,
+        "phases": phase_results,
     }
 
     if not as_json:
@@ -291,6 +286,29 @@ def replay_one_step(
             print("\n  --- Active Annotations ---")
             for name, count in sorted(ann_counts.items(), key=lambda x: -x[1]):
                 print(f"    {count:>5}x  {name}")
+
+        if phase_results:
+            print("\n  --- Phases (deltas relative to step start) ---")
+            header = (
+                f"    {'Phase':<24} {'Dur(ms)':>9} {'StartΔ':>11} {'PeakΔ':>11} "
+                f"{'EndΔ':>11} {'Thruput':>11} {'Allocs':>7} {'Frees':>7} {'Unmatched':>9}"
+            )
+            print(header)
+            print(f"    {'─' * 24} {'─' * 9} {'─' * 11} {'─' * 11} {'─' * 11} {'─' * 11} {'─' * 7} {'─' * 7} {'─' * 9}")
+            for name, p in phase_results.items():
+                dur = f"{p['duration_ms']:.1f}" if p["duration_ms"] is not None else "-"
+                print(
+                    f"    {name:<24} {dur:>9} {format_size(p['delta_at_start']):>11} "
+                    f"{format_size(p['peak_delta']):>11} {format_size(p['end_delta']):>11} "
+                    f"{format_size(p['total_throughput']):>11} "
+                    f"{p['alloc_count']:>7,} {p['free_count']:>7,} {p['unmatched_frees']:>9,}"
+                )
+            for name, p in phase_results.items():
+                for o in p["overlaps"]:
+                    ov_end = o["overlap_end"]
+                    dur = f"{o['overlap_ms']:.1f} ms" if o["overlap_ms"] is not None else "open"
+                    end_str = str(ov_end) if ov_end is not None else "?"
+                    print(f"    ! {name} overlaps {o['name']}  [{o['overlap_start']} - {end_str}] ({dur})")
 
         print(f"\n  --- Top {min(top_n, len(sources))} Sources at Peak (by size) ---")
         if sources:
