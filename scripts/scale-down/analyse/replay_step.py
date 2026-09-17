@@ -168,6 +168,20 @@ def get_phase_intervals(
 
 
 
+GIB = 1024**3
+
+
+def bytes_to_gigabtyes(num_bytes: int) -> float:
+    """Convert bytes to GiB rounded to 3 decimals (None passes through)."""
+    return round(num_bytes / GIB, 3)
+
+
+
+def us_to_ms(time_us: float) -> float:
+    """Convert microseconds to milliseconds and round to 3 decimals (None passes through)."""
+    return round(time_us / 1000, 3)
+
+
 def replay_one_step(
     traces: list,
     annotations: list,
@@ -225,21 +239,22 @@ def replay_one_step(
         phase_results[name] = {
             "phase": entry["phase"],
             "mbs": entry["mbs"],
-            "start": p_start,
-            "end": p_end,
-            "duration_ms": (p_end - p_start) / 1000 if p_end is not None else None,
-            "delta_at_start": p_delta_at_start,
+            "phase.stt-step.stt[ms]": us_to_ms(p_start - start),
+            "phase.end-step.end[ms]": us_to_ms(p_end - start) if p_end is not None else None,
+            "phase.duration[ms]": (p_end - p_start) / 1000 if p_end is not None else None,
             "alloc_count": p_result.alloc_count,
             "free_count": p_result.free_count,
-            "total_throughput": p_result.total_alloc_bytes,
-            "peak_delta": p_result.peak_delta,
-            "absolute_peak": baseline_at_start + step_start_delta + p_delta_at_start + p_result.peak_delta,
-            "end_delta": p_result.end_delta,
             "unmatched_frees": p_result.unmatched_free_count,
             "unmatched_free_bytes": p_result.unmatched_free_bytes,
+            "annotations": p_ann_counts,
+
+            "total_throughput": bytes_to_gigabtyes(p_result.total_alloc_bytes),
+            "phase.memory.stt-step.memory.stt[GiB]": bytes_to_gigabtyes(p_delta_at_start),
+            "phase.memory.end-phase.memory.stt[GiB]": bytes_to_gigabtyes(p_result.end_delta),
+            "phase.memory.peak-phase.memory.stt[GiB]": bytes_to_gigabtyes(p_result.peak_delta),
+            "phase.memory.peak[GiB]": bytes_to_gigabtyes(baseline_at_start + step_start_delta + p_delta_at_start + p_result.peak_delta),
             "overlaps": p_overlaps,
             "top_sources_at_peak": p_sources[:top_n],
-            "annotations": p_ann_counts,
         }
 
     complete = end is not None
@@ -250,11 +265,13 @@ def replay_one_step(
     step_result = {
         "step": step_num,
         "complete": complete,
+        "start_ms": us_to_ms(start),
+        "end_ms": us_to_ms(end) if end is not None else None,
         "duration_ms": duration_ms,
         "alloc_count": result.alloc_count,
         "free_count": result.free_count,
-        "total_throughput": result.total_alloc_bytes,
-        "peak_delta": result.peak_delta,
+        "total_throughput_gib": bytes_to_gigabtyes(result.total_alloc_bytes),
+        "peak_delta_gib": bytes_to_gigabtyes(result.peak_delta),
         "absolute_peak": absolute_peak,
         "end_delta": result.end_delta,
         "unmatched_frees": result.unmatched_free_count,
@@ -266,58 +283,58 @@ def replay_one_step(
         "phases": phase_results,
     }
 
-    if not as_json:
-        print(f"\n{'=' * 70}")
-        print(f"  Step {step_num}" + (" (incomplete)" if not complete else ""))
-        print(f"{'=' * 70}")
-        if duration_ms:
-            print(f"  Duration:       {duration_ms:.1f} ms")
-        print(f"  Allocs:         {result.alloc_count:,}")
-        print(f"  Frees:          {result.free_count:,}")
-        print(f"  Throughput:     {format_size(result.total_alloc_bytes)}")
-        print(f"  Peak delta:     {format_size(result.peak_delta)}")
-        if baseline_at_start > 0:
-            print(f"  Absolute peak:  {format_size(absolute_peak)}")
-        print(f"  End delta:      {format_size(result.end_delta)}")
-        if result.unmatched_free_count > 0:
-            print(f"  Pre-existing frees: {result.unmatched_free_count} ({format_size(result.unmatched_free_bytes)})")
+    # if not as_json:
+    #     print(f"\n{'=' * 70}")
+    #     print(f"  Step {step_num}" + (" (incomplete)" if not complete else ""))
+    #     print(f"{'=' * 70}")
+    #     if duration_ms:
+    #         print(f"  Duration:       {duration_ms:.1f} ms")
+    #     print(f"  Allocs:         {result.alloc_count:,}")
+    #     print(f"  Frees:          {result.free_count:,}")
+    #     print(f"  Throughput:     {format_size(result.total_alloc_bytes)}")
+    #     print(f"  Peak delta:     {format_size(result.peak_delta)}")
+    #     if baseline_at_start > 0:
+    #         print(f"  Absolute peak:  {format_size(absolute_peak)}")
+    #     print(f"  End delta:      {format_size(result.end_delta)}")
+    #     if result.unmatched_free_count > 0:
+    #         print(f"  Pre-existing frees: {result.unmatched_free_count} ({format_size(result.unmatched_free_bytes)})")
 
-        if ann_counts:
-            print("\n  --- Active Annotations ---")
-            for name, count in sorted(ann_counts.items(), key=lambda x: -x[1]):
-                print(f"    {count:>5}x  {name}")
+    #     if ann_counts:
+    #         print("\n  --- Active Annotations ---")
+    #         for name, count in sorted(ann_counts.items(), key=lambda x: -x[1]):
+    #             print(f"    {count:>5}x  {name}")
 
-        if phase_results:
-            print("\n  --- Phases (deltas relative to step start) ---")
-            header = (
-                f"    {'Phase':<24} {'Dur(ms)':>9} {'StartΔ':>11} {'PeakΔ':>11} "
-                f"{'EndΔ':>11} {'Thruput':>11} {'Allocs':>7} {'Frees':>7} {'Unmatched':>9}"
-            )
-            print(header)
-            print(f"    {'─' * 24} {'─' * 9} {'─' * 11} {'─' * 11} {'─' * 11} {'─' * 11} {'─' * 7} {'─' * 7} {'─' * 9}")
-            for name, p in phase_results.items():
-                dur = f"{p['duration_ms']:.1f}" if p["duration_ms"] is not None else "-"
-                print(
-                    f"    {name:<24} {dur:>9} {format_size(p['delta_at_start']):>11} "
-                    f"{format_size(p['peak_delta']):>11} {format_size(p['end_delta']):>11} "
-                    f"{format_size(p['total_throughput']):>11} "
-                    f"{p['alloc_count']:>7,} {p['free_count']:>7,} {p['unmatched_frees']:>9,}"
-                )
-            for name, p in phase_results.items():
-                for o in p["overlaps"]:
-                    ov_end = o["overlap_end"]
-                    dur = f"{o['overlap_ms']:.1f} ms" if o["overlap_ms"] is not None else "open"
-                    end_str = str(ov_end) if ov_end is not None else "?"
-                    print(f"    ! {name} overlaps {o['name']}  [{o['overlap_start']} - {end_str}] ({dur})")
+    #     if phase_results:
+    #         print("\n  --- Phases (deltas relative to step start) ---")
+    #         header = (
+    #             f"    {'Phase':<24} {'Dur(ms)':>9} {'StartΔ':>11} {'PeakΔ':>11} "
+    #             f"{'EndΔ':>11} {'Thruput':>11} {'Allocs':>7} {'Frees':>7} {'Unmatched':>9}"
+    #         )
+    #         print(header)
+    #         print(f"    {'─' * 24} {'─' * 9} {'─' * 11} {'─' * 11} {'─' * 11} {'─' * 11} {'─' * 7} {'─' * 7} {'─' * 9}")
+    #         for name, p in phase_results.items():
+    #             dur = f"{p['duration_ms']:.1f}" if p["duration_ms"] is not None else "-"
+    #             print(
+    #                 f"    {name:<24} {dur:>9} {format_size(p['delta_at_start']):>11} "
+    #                 f"{format_size(p['peak_delta']):>11} {format_size(p['end_delta']):>11} "
+    #                 f"{format_size(p['total_throughput']):>11} "
+    #                 f"{p['alloc_count']:>7,} {p['free_count']:>7,} {p['unmatched_frees']:>9,}"
+    #             )
+    #         for name, p in phase_results.items():
+    #             for o in p["overlaps"]:
+    #                 ov_end = o["overlap_end"]
+    #                 dur = f"{o['overlap_ms']:.1f} ms" if o["overlap_ms"] is not None else "open"
+    #                 end_str = str(ov_end) if ov_end is not None else "?"
+    #                 print(f"    ! {name} overlaps {o['name']}  [{o['overlap_start']} - {end_str}] ({dur})")
 
-        print(f"\n  --- Top {min(top_n, len(sources))} Sources at Peak (by size) ---")
-        if sources:
-            print(f"  {'#':>3}  {'Size':>12}  {'Count':>6}  Source")
-            print(f"  {'─' * 3}  {'─' * 12}  {'─' * 6}  {'─' * 40}")
-            for i, (key, total, count) in enumerate(sources[:top_n], 1):
-                print(f"  {i:>3}  {format_size(total):>12}  {count:>6}  {key}")
-        else:
-            print("  (no live allocations at peak)")
+    #     print(f"\n  --- Top {min(top_n, len(sources))} Sources at Peak (by size) ---")
+    #     if sources:
+    #         print(f"  {'#':>3}  {'Size':>12}  {'Count':>6}  Source")
+    #         print(f"  {'─' * 3}  {'─' * 12}  {'─' * 6}  {'─' * 40}")
+    #         for i, (key, total, count) in enumerate(sources[:top_n], 1):
+    #             print(f"  {i:>3}  {format_size(total):>12}  {count:>6}  {key}")
+    #     else:
+    #         print("  (no live allocations at peak)")
 
     return step_result
 
