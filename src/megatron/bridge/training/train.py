@@ -941,6 +941,8 @@ def train_step(
     # Update parameters.
     nvtx_range_push(suffix="optimizer_step")
     timers("optimizer", log_level=1).start(barrier=optim_config.barrier_with_L1_time)
+    handle = torch.autograd.profiler.record_function('optimizer_step')
+    handle.__enter__()
     update_successful, grad_norm, num_zeros_in_grad = optimizer.step()
 
     # get max attention logit for logging and run clip_qk()
@@ -949,6 +951,7 @@ def train_step(
     if hasattr(cfg.model, "qk_clip") and cfg.model.qk_clip:
         log_max_attention_logit = clip_qk(model)
 
+    handle.__exit__(None, None, None)
     timers("optimizer").stop()
     nvtx_range_pop(suffix="optimizer_step")
 
