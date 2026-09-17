@@ -59,7 +59,7 @@ Optional training parameters (with defaults):
     --micro-batch-size    Micro batch size (default: 1)
     --profile-step-start  Profile start step (default: 7)
     --profile-step-end    Profile end step (default: 8)
-    --profile             Enable nsys, NVTX, and memory-history recording
+    --profile             Enable nsys, NVTX, memory history, and nvidia-smi tracing
 EOF
 }
 
@@ -80,6 +80,7 @@ PROFILE_STEP_START=""
 PROFILE_STEP_END=""
 PROFILE="${PROFILE:-false}"
 ENABLE_NSYS="${ENABLE_NSYS:-false}"
+GPU_MEMORY_TRACE_INTERVAL="${GPU_MEMORY_TRACE_INTERVAL:-1.0}"
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --model)
@@ -178,6 +179,7 @@ GLOBAL_BATCH_SIZE="${GLOBAL_BATCH_SIZE:-8}"
 MICRO_BATCH_SIZE="${MICRO_BATCH_SIZE:-1}"
 PROFILE_STEP_START="${PROFILE_STEP_START:-7}"
 PROFILE_STEP_END="${PROFILE_STEP_END:-8}"
+USE_PYTORCH_PROFILER="${USE_PYTORCH_PROFILER:-false}"
 
 MODEL_ID="${MODEL}"
 RESULT_MODEL_NAME="${MODEL}"
@@ -219,6 +221,7 @@ if [[ "${PROFILE}" == true ]]; then
 fi
 
 mkdir -p "${RESULT_DIR}/memory" "${RESULT_DIR}/rank_logs" "${RESULT_DIR}/profile" \
+    "${RESULT_DIR}/gpu_memory" \
     "${HF_CACHE}" "${NEMO_CACHE}/datasets" "${NEMO_CACHE}/models" "${UV_CACHE}"
 
 export HF_HOME="${HF_CACHE}"
@@ -250,6 +253,7 @@ else
 fi
 if [[ "${PROFILE}" == true && "${ENABLE_NSYS}" == true ]]; then
     USE_NSYS_PROFILER="true"
+    USE_PYTORCH_PROFILER="true"
 else
     USE_NSYS_PROFILER="false"
 fi
@@ -279,6 +283,7 @@ OVERRIDES=(
     "logger.log_interval=1"
     "logger.tensorboard_dir=null"
     "logger.save_config_filepath=${RESULT_DIR}/config.yaml"
+    "profiling.use_pytorch_profiler=${USE_PYTORCH_PROFILER}"
     "profiling.use_nsys_profiler=${USE_NSYS_PROFILER}"
     "profiling.profile_step_start=${PROFILE_STEP_START}"
     "profiling.profile_step_end=${PROFILE_STEP_END}"
@@ -308,10 +313,57 @@ uv run --no-sync python -c 'import json, os, re; pattern = re.compile(r"(^|_)(TO
 
 printf 'model=%s precision=%s run_name=%s run_time=%s\n' "${MODEL}" "${PRECISION}" "${RUN_NAME}" "${RUN_TIME}" | tee "${RESULT_DIR}/run_info.txt"
 printf 'train_iters=%s global_batch_size=%s micro_batch_size=%s\n' "${TRAIN_ITERS}" "${GLOBAL_BATCH_SIZE}" "${MICRO_BATCH_SIZE}" | tee -a "${RESULT_DIR}/run_info.txt"
-printf 'profile=%s profile_step_start=%s profile_step_end=%s enable_nsys=%s record_memory_history=%s nvtx_ranges=%s\n' \
+printf 'profile=%s profile_step_start=%s profile_step_end=%s enable_nsys=%s use_pytorch_profiler=%s record_memory_history=%s nvtx_ranges=%s gpu_memory_trace_interval=%s\n' \
     "${PROFILE}" "${PROFILE_STEP_START}" "${PROFILE_STEP_END}" "${ENABLE_NSYS}" \
-    "${RECORD_MEMORY_HISTORY}" "${NVTX_RANGES}" | tee -a "${RESULT_DIR}/run_info.txt"
+    "${USE_PYTORCH_PROFILER}" "${RECORD_MEMORY_HISTORY}" "${NVTX_RANGES}" \
+    "${GPU_MEMORY_TRACE_INTERVAL}" | tee -a "${RESULT_DIR}/run_info.txt"
 printf 'result_dir=%s\nprofile_ranks=0,1,2,3\ncommand=%s\n' "${RESULT_DIR}" "${COMMAND_TEXT}" | tee -a "${RESULT_DIR}/run_info.txt"
+
+GPU_MONITOR_PID=""
+GPU_MONITOR_READY_FILE="${RESULT_DIR}/.gpu-monitor-ready"
+
+start_gpu_memory_monitor() {
+    rm -f "${GPU_MONITOR_READY_FILE}"
+    uv run --no-sync python "${REPO_ROOT}/scripts/nvidia-smi/check_gpu.py" \
+        --interval "${GPU_MEMORY_TRACE_INTERVAL}" \
+        --ready-file "${GPU_MONITOR_READY_FILE}" \
+        --output-dir "${RESULT_DIR}/gpu_memory" &
+    GPU_MONITOR_PID=$!
+
+    while [[ ! -e "${GPU_MONITOR_READY_FILE}" ]]; do
+        if ! kill -0 "${GPU_MONITOR_PID}" 2>/dev/null; then
+            wait "${GPU_MONITOR_PID}" || true
+            GPU_MONITOR_PID=""
+            echo "GPU memory monitor failed before its first sample." >&2
+            return 1
+        fi
+        sleep 0.05
+    done
+}
+
+stop_gpu_memory_monitor() {
+    local monitor_status=0
+    if [[ -n "${GPU_MONITOR_PID}" ]]; then
+        kill -TERM "${GPU_MONITOR_PID}" 2>/dev/null || true
+        wait "${GPU_MONITOR_PID}" || monitor_status=$?
+        GPU_MONITOR_PID=""
+    fi
+    rm -f "${GPU_MONITOR_READY_FILE}"
+    return "${monitor_status}"
+}
+
+cleanup_gpu_memory_monitor() {
+    local exit_status=$?
+    stop_gpu_memory_monitor || true
+    return "${exit_status}"
+}
+
+trap cleanup_gpu_memory_monitor EXIT
+
+if [[ "${PROFILE}" == true ]]; then
+    printf 'Starting nvidia-smi memory monitor...\n' | tee -a "${RESULT_DIR}/run_info.txt"
+    start_gpu_memory_monitor
+fi
 
 # Run training with optional nsys profiling.
 if [[ "${USE_NSYS_PROFILER}" == true ]]; then
@@ -337,6 +389,19 @@ else
     "${COMMAND[@]}" 2>&1 | tee "${RESULT_DIR}/train.log"
     RUN_STATUS=${PIPESTATUS[0]}
     set -e
+fi
+
+if [[ "${PROFILE}" == true ]]; then
+    stop_gpu_memory_monitor || {
+        MONITOR_STATUS=$?
+        printf 'GPU memory monitor failed with status %s.\n' "${MONITOR_STATUS}" \
+            | tee -a "${RESULT_DIR}/run_info.txt" >&2
+        if [[ "${RUN_STATUS}" -eq 0 ]]; then
+            RUN_STATUS="${MONITOR_STATUS}"
+        fi
+    }
+    printf 'GPU memory traces: %s\n' "${RESULT_DIR}/gpu_memory" \
+        | tee -a "${RESULT_DIR}/run_info.txt"
 fi
 
 export RUN_STATUS
