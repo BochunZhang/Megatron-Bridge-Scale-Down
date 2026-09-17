@@ -64,7 +64,9 @@ Optional training parameters (with defaults):
     --linear-attention-freq  Override model.linear_attention_freq
     --profile-step-start  Profile start step (default: 7)
     --profile-step-end    Profile end step (default: 8)
-    --profile             Enable nsys, NVTX, memory history, and nvidia-smi tracing
+    --profile             Enable nsys, NVTX, memory history, and nvidia-smi tracing;
+                          after training, replay each memory snapshot pickle into
+                          a sibling per-rank JSON report
 EOF
 }
 
@@ -429,6 +431,31 @@ if [[ "${PROFILE}" == true ]]; then
     }
     printf 'GPU memory traces: %s\n' "${RESULT_DIR}/gpu_memory" \
         | tee -a "${RESULT_DIR}/run_info.txt"
+
+    # Replay each per-rank memory snapshot into a sibling JSON report
+    # (snapshot_N.pickle -> snapshot_N.json) using the scale-down replay_step
+    # analysis. Failures are logged but do not fail the training run: a
+    # snapshot without ProfilerStep markers is an analysis gap, not a training
+    # failure.
+    printf 'Replaying memory snapshots to JSON...\n' | tee -a "${RESULT_DIR}/run_info.txt"
+    shopt -s nullglob
+    MEMORY_PICKLES=("${RESULT_DIR}"/memory/snapshot*.pickle)
+    shopt -u nullglob
+    if (( ${#MEMORY_PICKLES[@]} == 0 )); then
+        printf 'No memory snapshots found under %s/memory.\n' "${RESULT_DIR}" \
+            | tee -a "${RESULT_DIR}/run_info.txt" >&2
+    fi
+    for snapshot_pickle in ${MEMORY_PICKLES[@]+"${MEMORY_PICKLES[@]}"}; do
+        snapshot_json="${snapshot_pickle%.pickle}.json"
+        if uv run --no-sync python "${REPO_ROOT}/scripts/scale-down/analyse/replay_step.py" \
+                "${snapshot_pickle}" --all-steps --json > "${snapshot_json}"; then
+            printf 'Memory replay JSON: %s\n' "${snapshot_json}" | tee -a "${RESULT_DIR}/run_info.txt"
+        else
+            printf 'replay_step.py failed for %s; removed partial JSON.\n' "${snapshot_pickle}" \
+                | tee -a "${RESULT_DIR}/run_info.txt" >&2
+            rm -f "${snapshot_json}"
+        fi
+    done
 fi
 
 GPU_UTILIZATION_PATH="${RESULT_DIR}/gpu_utilization.json"
