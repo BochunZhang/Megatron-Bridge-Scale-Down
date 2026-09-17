@@ -23,7 +23,7 @@
 #       [--train-iters <iters>] [--global-batch-size <gbs>] [--micro-batch-size <mbs>] \
 #       [--num-layers <layers>] [--linear-attention-freq <value>] \
 #       [--profile-step-start <start>] [--profile-step-end <end>] \
-#       [--profile]
+#       [--profile <nsys|torch>]
 
 set -euo pipefail
 
@@ -50,7 +50,7 @@ Usage: run_pretrain_fsdp1.sh \
     [--linear-attention-freq <value>] \
     [--profile-step-start <start>] \
     [--profile-step-end <end>] \
-    [--profile] [--disable-profile]
+    [--profile <nsys|torch>]
 
 The model, recipe, and precision are selected by the caller and are passed
 through without model/precision combination logic. Hydra values such as null,
@@ -64,9 +64,16 @@ Optional training parameters (with defaults):
     --linear-attention-freq  Override model.linear_attention_freq
     --profile-step-start  Profile start step (default: 7)
     --profile-step-end    Profile end step (default: 8)
-    --profile             Enable nsys, NVTX, memory history, and nvidia-smi tracing;
-                          after training, replay each memory snapshot pickle into
-                          a sibling per-rank JSON report
+    --profile <nsys|torch>
+                          Select the profiling backend (omit to disable
+                          profiling entirely):
+                            nsys   Wrap the training command in nsys profile;
+                                   enables NVTX ranges and memory history.
+                            torch  Enable the PyTorch profiler plus NVTX ranges
+                                   and memory history; trace GPU memory with
+                                   nvidia-smi during the run, then replay each
+                                   memory snapshot pickle into a sibling
+                                   per-rank JSON phase report via replay_step.py
 EOF
 }
 
@@ -87,8 +94,7 @@ NUM_LAYERS=""
 LINEAR_ATTENTION_FREQ=""
 PROFILE_STEP_START=""
 PROFILE_STEP_END=""
-PROFILE="${PROFILE:-false}"
-ENABLE_NSYS="${ENABLE_NSYS:-false}"
+PROFILE="${PROFILE:-none}"
 GPU_MEMORY_TRACE_INTERVAL="${GPU_MEMORY_TRACE_INTERVAL:-1.0}"
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -168,9 +174,9 @@ while [[ $# -gt 0 ]]; do
             shift 2
             ;;
         --profile)
-            PROFILE=true
-            ENABLE_NSYS=true
-            shift
+            [[ $# -ge 2 ]] || { usage >&2; exit 2; }
+            PROFILE="$2"
+            shift 2
             ;;
         -h|--help)
             usage
@@ -198,7 +204,6 @@ GLOBAL_BATCH_SIZE="${GLOBAL_BATCH_SIZE:-8}"
 MICRO_BATCH_SIZE="${MICRO_BATCH_SIZE:-1}"
 PROFILE_STEP_START="${PROFILE_STEP_START:-7}"
 PROFILE_STEP_END="${PROFILE_STEP_END:-8}"
-USE_PYTORCH_PROFILER="${USE_PYTORCH_PROFILER:-false}"
 
 MODEL_ID="${MODEL}"
 RESULT_MODEL_NAME="${MODEL}"
@@ -236,7 +241,11 @@ if [[ -n "${NUM_LAYERS}" ]] && ! [[ "${NUM_LAYERS}" =~ ^[1-9][0-9]*$ ]]; then
     echo "num-layers must be a positive integer" >&2
     exit 2
 fi
-if [[ "${PROFILE}" == true ]]; then
+case "${PROFILE}" in
+    none|nsys|torch) ;;
+    *) echo "--profile must be one of none|nsys|torch: ${PROFILE}" >&2; exit 2 ;;
+esac
+if [[ "${PROFILE}" != none ]]; then
     if ! [[ "${PROFILE_STEP_START}" =~ ^[0-9]+$ && "${PROFILE_STEP_END}" =~ ^[0-9]+$ ]] || (( PROFILE_STEP_END <= PROFILE_STEP_START || PROFILE_STEP_END > TRAIN_ITERS )); then
         echo "Require PROFILE_STEP_START < PROFILE_STEP_END <= TRAIN_ITERS when --profile is enabled" >&2
         exit 2
@@ -264,22 +273,35 @@ export NCCL_GRAPH_REGISTER="0"
 export TOKENIZERS_PARALLELISM="false"
 export RESULT_DIR MODEL MODEL_ID RESULT_MODEL_NAME PRECISION RUN_NAME RUN_TIME RECIPE
 
-# --disable-nsys only disables the nsys wrapper while retaining NVTX and memory
-# history when --profile is enabled. The run_qwen wrappers explicitly pass
-# --disable-profile unless the user requests --profile.
-if [[ "${PROFILE}" == true ]]; then
-    RECORD_MEMORY_HISTORY="true"
-    NVTX_RANGES="true"
-else
-    RECORD_MEMORY_HISTORY="false"
-    NVTX_RANGES="false"
-fi
-if [[ "${PROFILE}" == true && "${ENABLE_NSYS}" == true ]]; then
-    USE_NSYS_PROFILER="true"
-    USE_PYTORCH_PROFILER="true"
-else
-    USE_NSYS_PROFILER="false"
-fi
+# Derive profiling settings from the selected backend. Bridge's
+# ProfilingConfig.finalize() forbids enabling the nsys and PyTorch profilers at
+# the same time, so exactly one of USE_NSYS_PROFILER/USE_PYTORCH_PROFILER may
+# be true. In torch mode, logger.tensorboard_dir is pointed into the result dir
+# so the profiler's trace_handler (which writes "{tensorboard_dir}/../torch_profile")
+# exports chrome traces to ${RESULT_DIR}/profile/torch_profile.
+case "${PROFILE}" in
+    nsys)
+        USE_NSYS_PROFILER="true"
+        USE_PYTORCH_PROFILER="false"
+        RECORD_MEMORY_HISTORY="true"
+        NVTX_RANGES="true"
+        TENSORBOARD_DIR="null"
+        ;;
+    torch)
+        USE_NSYS_PROFILER="false"
+        USE_PYTORCH_PROFILER="true"
+        RECORD_MEMORY_HISTORY="true"
+        NVTX_RANGES="true"
+        TENSORBOARD_DIR="${RESULT_DIR}/profile/tensorboard"
+        ;;
+    *)
+        USE_NSYS_PROFILER="false"
+        USE_PYTORCH_PROFILER="false"
+        RECORD_MEMORY_HISTORY="false"
+        NVTX_RANGES="false"
+        TENSORBOARD_DIR="null"
+        ;;
+esac
 
 OVERRIDES=(
     "model.seq_length=4096"
@@ -304,7 +326,7 @@ OVERRIDES=(
     "checkpoint.save=null"
     "checkpoint.load=null"
     "logger.log_interval=1"
-    "logger.tensorboard_dir=null"
+    "logger.tensorboard_dir=${TENSORBOARD_DIR}"
     "logger.save_config_filepath=${RESULT_DIR}/config.yaml"
     "profiling.use_pytorch_profiler=${USE_PYTORCH_PROFILER}"
     "profiling.use_nsys_profiler=${USE_NSYS_PROFILER}"
@@ -342,8 +364,8 @@ uv run --no-sync python -c 'import json, os, re; pattern = re.compile(r"(^|_)(TO
 
 printf 'model=%s precision=%s run_name=%s run_time=%s\n' "${MODEL}" "${PRECISION}" "${RUN_NAME}" "${RUN_TIME}" | tee "${RESULT_DIR}/run_info.txt"
 printf 'train_iters=%s global_batch_size=%s micro_batch_size=%s\n' "${TRAIN_ITERS}" "${GLOBAL_BATCH_SIZE}" "${MICRO_BATCH_SIZE}" | tee -a "${RESULT_DIR}/run_info.txt"
-printf 'profile=%s profile_step_start=%s profile_step_end=%s enable_nsys=%s use_pytorch_profiler=%s record_memory_history=%s nvtx_ranges=%s gpu_memory_trace_interval=%s\n' \
-    "${PROFILE}" "${PROFILE_STEP_START}" "${PROFILE_STEP_END}" "${ENABLE_NSYS}" \
+printf 'profile=%s profile_step_start=%s profile_step_end=%s use_nsys_profiler=%s use_pytorch_profiler=%s record_memory_history=%s nvtx_ranges=%s gpu_memory_trace_interval=%s\n' \
+    "${PROFILE}" "${PROFILE_STEP_START}" "${PROFILE_STEP_END}" "${USE_NSYS_PROFILER}" \
     "${USE_PYTORCH_PROFILER}" "${RECORD_MEMORY_HISTORY}" "${NVTX_RANGES}" \
     "${GPU_MEMORY_TRACE_INTERVAL}" | tee -a "${RESULT_DIR}/run_info.txt"
 printf 'result_dir=%s\nprofile_ranks=0,1,2,3\ncommand=%s\n' "${RESULT_DIR}" "${COMMAND_TEXT}" | tee -a "${RESULT_DIR}/run_info.txt"
@@ -389,7 +411,7 @@ cleanup_gpu_memory_monitor() {
 
 trap cleanup_gpu_memory_monitor EXIT
 
-if [[ "${PROFILE}" == true ]]; then
+if [[ "${PROFILE}" == torch ]]; then
     printf 'Starting nvidia-smi memory monitor...\n' | tee -a "${RESULT_DIR}/run_info.txt"
     start_gpu_memory_monitor
 fi
@@ -420,7 +442,7 @@ else
     set -e
 fi
 
-if [[ "${PROFILE}" == true ]]; then
+if [[ "${PROFILE}" == torch ]]; then
     stop_gpu_memory_monitor || {
         MONITOR_STATUS=$?
         printf 'GPU memory monitor failed with status %s.\n' "${MONITOR_STATUS}" \
@@ -432,9 +454,11 @@ if [[ "${PROFILE}" == true ]]; then
     printf 'GPU memory traces: %s\n' "${RESULT_DIR}/gpu_memory" \
         | tee -a "${RESULT_DIR}/run_info.txt"
 
-    # Replay each per-rank memory snapshot into a sibling JSON report
+    # Replay each per-rank memory snapshot into a sibling JSON phase report
     # (snapshot_N.pickle -> snapshot_N.json) using the scale-down replay_step
-    # analysis. Failures are logged but do not fail the training run: a
+    # analysis. The PyTorch profiler provides the ProfilerStep#N boundaries and
+    # phase annotations this replay requires, which is why it runs only in
+    # torch mode. Failures are logged but do not fail the training run: a
     # snapshot without ProfilerStep markers is an analysis gap, not a training
     # failure.
     printf 'Replaying memory snapshots to JSON...\n' | tee -a "${RESULT_DIR}/run_info.txt"

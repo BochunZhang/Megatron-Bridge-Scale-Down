@@ -23,7 +23,7 @@ MODEL="qwen35_text_27b"
 RECIPE_BF16="qwen35_text_27b_pretrain_4gpu_gb200_bf16_fsdp1_config"
 RECIPE_FP8MX="qwen35_text_27b_pretrain_4gpu_gb200_fp8mx_fsdp1_config"
 TEST_ONLY=false
-PROFILE=false
+PROFILE="${PROFILE:-none}"
 
 # Training parameters with defaults (can be overridden via environment variables)
 TRAIN_ITERS="${TRAIN_ITERS:-10}"
@@ -40,7 +40,12 @@ Usage: run_qwen35_27b.sh [OPTIONS]
 
 Options:
     --test                Run one short baseline to validate the environment
-    --profile             Enable nsys, NVTX, and memory-history recording
+    --profile <nsys|torch>
+                          Profiling backend passed to run_pretrain_fsdp1.sh:
+                            nsys   wrap training in nsys profile (NVTX + memory history)
+                            torch  PyTorch profiler + nvidia-smi memory tracing
+                                   + replay_step.py per-phase memory analysis
+                          Omit to disable profiling entirely
     --precision <bf16|fp8mx>  Precision mode (default: bf16)
     --train-iters <n>     Number of training iterations (default: 10)
     --global-batch-size <n>   Global batch size (default: 32)
@@ -63,8 +68,9 @@ while [[ $# -gt 0 ]]; do
             shift
             ;;
         --profile)
-            PROFILE=true
-            shift
+            [[ $# -ge 2 ]] || { usage >&2; exit 2; }
+            PROFILE="$2"
+            shift 2
             ;;
         --precision)
             [[ $# -ge 2 ]] || { usage >&2; exit 2; }
@@ -118,9 +124,14 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
+case "${PROFILE}" in
+    none|nsys|torch) ;;
+    *) echo "--profile must be one of none|nsys|torch: ${PROFILE}" >&2; exit 2 ;;
+esac
+
 PROFILE_ARGS=()
-if [[ "${PROFILE}" == true ]]; then
-    PROFILE_ARGS=(--profile)
+if [[ "${PROFILE}" != none ]]; then
+    PROFILE_ARGS=(--profile "${PROFILE}")
 fi
 
 MODEL_OVERRIDE_ARGS=()
