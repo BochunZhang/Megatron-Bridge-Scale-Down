@@ -240,8 +240,9 @@ def replay_one_step(
             "phase": entry["phase"],
             "mbs": entry["mbs"],
             "phase.stt-step.stt[ms]": us_to_ms(p_start - start),
-            "phase.end-step.end[ms]": us_to_ms(p_end - start) if p_end is not None else None,
+            "phase.end-step.stt[ms]": us_to_ms(p_end - start) if p_end is not None else None,
             "phase.duration[ms]": (p_end - p_start) / 1000 if p_end is not None else None,
+
             "alloc_count": p_result.alloc_count,
             "free_count": p_result.free_count,
             "unmatched_frees": p_result.unmatched_free_count,
@@ -250,9 +251,14 @@ def replay_one_step(
 
             "total_throughput": bytes_to_gigabtyes(p_result.total_alloc_bytes),
             "phase.memory.stt-step.memory.stt[GiB]": bytes_to_gigabtyes(p_delta_at_start),
+            "phase.memory.end-step.memory.stt[GiB]": bytes_to_gigabtyes(p_delta_at_start + p_result.end_delta),
+            "phase.memory.peak-step.memory.stt[GiB]": bytes_to_gigabtyes(p_delta_at_start + p_result.peak_delta),
             "phase.memory.end-phase.memory.stt[GiB]": bytes_to_gigabtyes(p_result.end_delta),
             "phase.memory.peak-phase.memory.stt[GiB]": bytes_to_gigabtyes(p_result.peak_delta),
+            "pahse.memory.stt[GiB]": bytes_to_gigabtyes(baseline_at_start + step_start_delta + p_delta_at_start),
+            "pahse.memory.end[GiB]": bytes_to_gigabtyes(baseline_at_start + step_start_delta + p_delta_at_start + p_result.end_delta),
             "phase.memory.peak[GiB]": bytes_to_gigabtyes(baseline_at_start + step_start_delta + p_delta_at_start + p_result.peak_delta),
+
             "overlaps": p_overlaps,
             "top_sources_at_peak": p_sources[:top_n],
         }
