@@ -29,6 +29,8 @@ PROFILE=false
 TRAIN_ITERS="${TRAIN_ITERS:-10}"
 GLOBAL_BATCH_SIZE="${GLOBAL_BATCH_SIZE:-32}"
 MICRO_BATCH_SIZE="${MICRO_BATCH_SIZE:-1}"
+NUM_LAYERS=""
+LINEAR_ATTENTION_FREQ=""
 PROFILE_STEP_START="${PROFILE_STEP_START:-7}"
 PROFILE_STEP_END="${PROFILE_STEP_END:-8}"
 
@@ -43,6 +45,8 @@ Options:
     --train-iters <n>     Number of training iterations (default: 10)
     --global-batch-size <n>   Global batch size (default: 32)
     --micro-batch-size <n>  Micro batch size (default: 1)
+    --num-layers <n>       Override the number of model layers
+    --linear-attention-freq <value>  Override the linear-attention interval or pattern
     --profile-step-start <n>  Profile start step (default: 7)
     --profile-step-end <n>    Profile end step (default: 8)
     -h, --help            Show this help message
@@ -82,6 +86,16 @@ while [[ $# -gt 0 ]]; do
             MICRO_BATCH_SIZE="$2"
             shift 2
             ;;
+        --num-layers)
+            [[ $# -ge 2 ]] || { usage >&2; exit 2; }
+            NUM_LAYERS="$2"
+            shift 2
+            ;;
+        --linear-attention-freq)
+            [[ $# -ge 2 ]] || { usage >&2; exit 2; }
+            LINEAR_ATTENTION_FREQ="$2"
+            shift 2
+            ;;
         --profile-step-start)
             [[ $# -ge 2 ]] || { usage >&2; exit 2; }
             PROFILE_STEP_START="$2"
@@ -109,6 +123,14 @@ if [[ "${PROFILE}" == true ]]; then
     PROFILE_ARGS=(--profile)
 fi
 
+MODEL_OVERRIDE_ARGS=()
+if [[ -n "${NUM_LAYERS}" ]]; then
+    MODEL_OVERRIDE_ARGS+=(--num-layers "${NUM_LAYERS}")
+fi
+if [[ -n "${LINEAR_ATTENTION_FREQ}" ]]; then
+    MODEL_OVERRIDE_ARGS+=(--linear-attention-freq "${LINEAR_ATTENTION_FREQ}")
+fi
+
 if [[ "${PRECISION}" == bf16 ]]; then
     RECIPE="${RECIPE_BF16}"
 elif [[ "${PRECISION}" == fp8mx ]]; then
@@ -127,6 +149,7 @@ run_config() {
 
     "${RUN_ONE}" \
         "${PROFILE_ARGS[@]}" \
+        "${MODEL_OVERRIDE_ARGS[@]}" \
         --model "${MODEL}" \
         --recipe "${RECIPE}" \
         --precision "${PRECISION}" \
@@ -145,6 +168,7 @@ run_config() {
 if [[ "${TEST_ONLY}" == true ]]; then
     "${RUN_ONE}" \
         "${PROFILE_ARGS[@]}" \
+        "${MODEL_OVERRIDE_ARGS[@]}" \
         --model "${MODEL}" \
         --recipe "${RECIPE}" \
         --precision "${PRECISION}" \

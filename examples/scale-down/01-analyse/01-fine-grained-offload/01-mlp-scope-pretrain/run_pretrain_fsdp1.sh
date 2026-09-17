@@ -21,6 +21,7 @@
 #       --recompute-modules <value> --fine-grained-offload <true|false> \
 #       --offload-modules <value> \
 #       [--train-iters <iters>] [--global-batch-size <gbs>] [--micro-batch-size <mbs>] \
+#       [--num-layers <layers>] [--linear-attention-freq <value>] \
 #       [--profile-step-start <start>] [--profile-step-end <end>] \
 #       [--profile]
 
@@ -45,6 +46,8 @@ Usage: run_pretrain_fsdp1.sh \
     [--train-iters <iters>] \
     [--global-batch-size <gbs>] \
     [--micro-batch-size <mbs>] \
+    [--num-layers <layers>] \
+    [--linear-attention-freq <value>] \
     [--profile-step-start <start>] \
     [--profile-step-end <end>] \
     [--profile] [--disable-profile]
@@ -57,6 +60,8 @@ Optional training parameters (with defaults):
     --train-iters         Number of training iterations (default: 10)
     --global-batch-size   Global batch size (default: 8)
     --micro-batch-size    Micro batch size (default: 1)
+    --num-layers          Override model.num_layers
+    --linear-attention-freq  Override model.linear_attention_freq
     --profile-step-start  Profile start step (default: 7)
     --profile-step-end    Profile end step (default: 8)
     --profile             Enable nsys, NVTX, memory history, and nvidia-smi tracing
@@ -76,6 +81,8 @@ OFFLOAD_MODULES=""
 TRAIN_ITERS=""
 GLOBAL_BATCH_SIZE=""
 MICRO_BATCH_SIZE=""
+NUM_LAYERS=""
+LINEAR_ATTENTION_FREQ=""
 PROFILE_STEP_START=""
 PROFILE_STEP_END=""
 PROFILE="${PROFILE:-false}"
@@ -136,6 +143,16 @@ while [[ $# -gt 0 ]]; do
         --micro-batch-size)
             [[ $# -ge 2 ]] || { usage >&2; exit 2; }
             MICRO_BATCH_SIZE="$2"
+            shift 2
+            ;;
+        --num-layers)
+            [[ $# -ge 2 ]] || { usage >&2; exit 2; }
+            NUM_LAYERS="$2"
+            shift 2
+            ;;
+        --linear-attention-freq)
+            [[ $# -ge 2 ]] || { usage >&2; exit 2; }
+            LINEAR_ATTENTION_FREQ="$2"
             shift 2
             ;;
         --profile-step-start)
@@ -211,6 +228,10 @@ if ! [[ "${TRAIN_ITERS}" =~ ^[0-9]+$ && "${GLOBAL_BATCH_SIZE}" =~ ^[0-9]+$ && "$
 fi
 if (( TRAIN_ITERS < 1 || GLOBAL_BATCH_SIZE < 1 || MICRO_BATCH_SIZE < 1 )); then
     echo "Training sizes must be positive" >&2
+    exit 2
+fi
+if [[ -n "${NUM_LAYERS}" ]] && ! [[ "${NUM_LAYERS}" =~ ^[1-9][0-9]*$ ]]; then
+    echo "num-layers must be a positive integer" >&2
     exit 2
 fi
 if [[ "${PROFILE}" == true ]]; then
@@ -292,6 +313,12 @@ OVERRIDES=(
     "profiling.memory_snapshot_path=${RESULT_DIR}/memory/snapshot.pickle"
     "profiling.nvtx_ranges=${NVTX_RANGES}"
 )
+if [[ -n "${NUM_LAYERS}" ]]; then
+    OVERRIDES+=("model.num_layers=${NUM_LAYERS}")
+fi
+if [[ -n "${LINEAR_ATTENTION_FREQ}" ]]; then
+    OVERRIDES+=("model.linear_attention_freq=${LINEAR_ATTENTION_FREQ}")
+fi
 
 COMMAND=(
     uv run --no-sync python -m torch.distributed.run
