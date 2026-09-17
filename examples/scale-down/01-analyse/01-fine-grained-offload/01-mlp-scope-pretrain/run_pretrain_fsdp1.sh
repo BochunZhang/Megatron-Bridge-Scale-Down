@@ -351,7 +351,7 @@ GPU_MONITOR_READY_FILE="${RESULT_DIR}/.gpu-monitor-ready"
 
 start_gpu_memory_monitor() {
     rm -f "${GPU_MONITOR_READY_FILE}"
-    uv run --no-sync python "${REPO_ROOT}/scripts/nvidia-smi/check_gpu.py" \
+    uv run --no-sync python "${REPO_ROOT}/scripts/scale-down/nvidia-smi/check_gpu.py" \
         --interval "${GPU_MEMORY_TRACE_INTERVAL}" \
         --ready-file "${GPU_MONITOR_READY_FILE}" \
         --output-dir "${RESULT_DIR}/gpu_memory" &
@@ -430,6 +430,13 @@ if [[ "${PROFILE}" == true ]]; then
     printf 'GPU memory traces: %s\n' "${RESULT_DIR}/gpu_memory" \
         | tee -a "${RESULT_DIR}/run_info.txt"
 fi
+
+GPU_UTILIZATION_PATH="${RESULT_DIR}/gpu_utilization.json"
+uv run --no-sync python "${REPO_ROOT}/scripts/scale-down/analyse/export_gpu_utilization.py" \
+    --log-file "${RESULT_DIR}/train.log" \
+    --output "${GPU_UTILIZATION_PATH}"
+printf 'GPU utilization metrics: %s\n' "${GPU_UTILIZATION_PATH}" \
+    | tee -a "${RESULT_DIR}/run_info.txt"
 
 export RUN_STATUS
 uv run --no-sync python -c 'import json, os; root = os.environ["RESULT_DIR"]; result = {"status": int(os.environ["RUN_STATUS"]), "model": os.environ["MODEL"], "precision": os.environ["PRECISION"], "run_name": os.environ["RUN_NAME"], "run_time": os.environ["RUN_TIME"], "recipe": os.environ["RECIPE"], "result_dir": root, "profile_ranks": [0, 1, 2, 3]}; json.dump(result, open(os.path.join(root, "summary.json"), "w"), indent=2, sort_keys=True); raise SystemExit(result["status"])'
