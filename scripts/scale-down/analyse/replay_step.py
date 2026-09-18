@@ -31,6 +31,9 @@ import json
 import logging
 import os
 import sys
+import zipfile
+from pathlib import Path
+from xml.sax.saxutils import escape
 
 
 # Repo root is three levels up from scripts/scale-down/analyse/.
@@ -41,7 +44,6 @@ _SKILL_SCRIPTS = os.path.join(_REPO_ROOT, "skills", "nemo-mbridge-memory-snapsho
 sys.path.insert(0, _SKILL_SCRIPTS)
 from common import (
     TRUST_EPILOG,
-    ReplayResult,
     compute_baseline,
     compute_step_start_deltas,
     find_active_device,
@@ -60,6 +62,21 @@ logger = logging.getLogger(__name__)
 
 
 _PHASE_PREFIXES = ("forward_step", "backward_step", "optimizer_step")
+_MEMORY_ACTIONS = frozenset(("alloc", "free_requested", "free_completed"))
+_XLSX_HEADERS = (
+    "phase",
+    "start time (ms)",
+    "end time (ms)",
+    "duration (ms)",
+    "start memory (GiB)",
+    "end memory (GiB)",
+    "peak memory (GiB)",
+    "end - start memory (GiB)",
+    "peak - start memory (GiB)",
+    "alloc cnt",
+    "free cnt",
+    "overlap",
+)
 
 
 def _parse_mbs(name: str, phase: str) -> int | None:
@@ -167,6 +184,227 @@ def get_phase_intervals(
     return phases, overlaps, start_times
 
 
+def add_anonymous_memory_phases(
+    phases: dict[str, dict],
+    traces: list,
+    start_us: int,
+    end_us: int | None,
+) -> tuple[dict, list[int]]:
+    """Add anonymous intervals for memory events outside annotated phases.
+
+    The intervals cover the gap before the first phase, gaps between adjacent
+    non-overlapping phases, and the gap after the last phase. An interval is
+    added only when it contains an allocator event (``alloc`` or either free
+    event), so annotation-only gaps do not create noise in the report.
+
+    Args:
+        phases: Parsed phase intervals keyed by annotation name.
+        traces: Chronological device allocator events.
+        start_us: Step start timestamp in microseconds.
+        end_us: Step end timestamp in microseconds, or None for an open step.
+
+    Returns:
+        The phase mapping with anonymous entries added and the sorted phase
+        start timestamps.
+    """
+    items = sorted(phases.items(), key=lambda item: item[1]["start"])
+    effective_end_us = end_us
+    if effective_end_us is None:
+        event_times = [
+            event.get("time_us", 0)
+            for event in traces
+            if event.get("time_us", 0) >= start_us
+        ]
+        effective_end_us = max(event_times, default=None)
+    gaps: list[tuple[int, int]] = []
+
+    if not items:
+        if effective_end_us is not None and start_us < effective_end_us:
+            gaps.append((start_us, effective_end_us))
+    else:
+        first_start = items[0][1]["start"]
+        if start_us < first_start:
+            gaps.append((start_us, first_start))
+
+        for (_, previous), (_, current) in zip(items, items[1:]):
+            previous_end = previous["end"]
+            current_start = current["start"]
+            if previous_end is not None and previous_end < current_start:
+                gaps.append((previous_end, current_start))
+
+        last_end = items[-1][1]["end"]
+        if last_end is not None and effective_end_us is not None and last_end < effective_end_us:
+            gaps.append((last_end, effective_end_us))
+
+    anonymous_index = 0
+    for gap_start, gap_end in gaps:
+        has_memory_event = any(
+            gap_start <= event.get("time_us", 0) <= gap_end
+            and event.get("action") in _MEMORY_ACTIONS
+            for event in traces
+        )
+        if not has_memory_event:
+            continue
+
+        name = f"anonymous_phase[{anonymous_index}]"
+        while name in phases:
+            anonymous_index += 1
+            name = f"anonymous_phase[{anonymous_index}]"
+        phases[name] = {
+            "phase": "anonymous",
+            "mbs": None,
+            "start": gap_start,
+            "end": gap_end,
+        }
+        anonymous_index += 1
+
+    return phases, sorted(entry["start"] for entry in phases.values())
+
+
+def _memory_event_count(record: dict) -> int:
+    """Return the number of allocator alloc/free events represented by a result."""
+    return int(record.get("alloc_count", 0)) + int(record.get("free_count", 0))
+
+
+def mark_complete_data(results: list[dict]) -> None:
+    """Mark steps after the first event-bearing step as complete.
+
+    Memory traces can start partway through a profiler run. A step before the
+    first retained allocator event is incomplete. The event-bearing step is the
+    boundary, so all later steps are considered to have complete trace coverage.
+    The final step's phases receive the same propagation treatment so a partial
+    final step can be exported only from its first event-bearing phase onward.
+    """
+    step_flag = False
+    for step in results:
+        step["has_complete_data"] = step_flag
+        for phase in step.get("phases", {}).values():
+            phase["has_complete_data"] = step_flag
+        if not step_flag and _memory_event_count(step) != 0:
+            step_flag = True
+
+    if not results:
+        return
+
+    last_step = results[-1]
+    phase_flag = False
+    for phase in sorted(last_step.get("phases", {}).values(), key=lambda item: item["phase.stt-step.stt[ms]"]):
+        phase["has_complete_data"] = phase_flag
+        if not phase_flag and _memory_event_count(phase) != 0:
+            phase_flag = True
+
+
+def _xlsx_cell(value: object, row: int, column: int) -> str:
+    """Render one worksheet cell as inline text or a numeric value."""
+    column_name = ""
+    number = column
+    while number:
+        number, remainder = divmod(number - 1, 26)
+        column_name = chr(65 + remainder) + column_name
+    cell_ref = f"{column_name}{row}"
+    if value is None or value == "":
+        return f'<c r="{cell_ref}"/>'
+    if isinstance(value, bool):
+        return f'<c r="{cell_ref}" t="b"><v>{int(value)}</v></c>'
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return f'<c r="{cell_ref}"><v>{value}</v></c>'
+    return f'<c r="{cell_ref}" t="inlineStr"><is><t>{escape(str(value))}</t></is></c>'
+
+
+def _xlsx_sheet_xml(rows: list[list[object]]) -> str:
+    """Build a minimal worksheet XML document."""
+    row_xml = []
+    for row_number, values in enumerate(rows, 1):
+        cells = "".join(_xlsx_cell(value, row_number, column) for column, value in enumerate(values, 1))
+        row_xml.append(f'<row r="{row_number}">{cells}</row>')
+    return (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        '<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">'
+        f"<sheetData>{''.join(row_xml)}</sheetData>"
+        "</worksheet>"
+    )
+
+
+def _phase_xlsx_row(phase: dict) -> list[object]:
+    """Map one phase result to the requested workbook columns."""
+    overlaps = ", ".join(item["name"] for item in phase.get("overlaps", []))
+    phase_name = "anonymous" if phase.get("phase") == "anonymous" else phase.get("name", phase.get("phase"))
+    return [
+        phase_name,
+        phase.get("phase.stt-step.stt[ms]"),
+        phase.get("phase.end-step.stt[ms]"),
+        phase.get("phase.duration[ms]"),
+        phase.get("pahse.memory.stt[GiB]"),
+        phase.get("pahse.memory.end[GiB]"),
+        phase.get("phase.memory.peak[GiB]"),
+        phase.get("phase.memory.end-phase.memory.stt[GiB]"),
+        phase.get("phase.memory.peak-phase.memory.stt[GiB]"),
+        phase.get("alloc_count", 0),
+        phase.get("free_count", 0),
+        overlaps,
+    ]
+
+
+def write_xlsx(results: list[dict], output_path: Path) -> None:
+    """Write one worksheet per complete step with phase memory metrics."""
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    complete_steps = [step for step in results if step.get("has_complete_data", False)]
+    workbook_sheets = []
+    sheet_xml = {}
+    for sheet_index, step in enumerate(complete_steps, 1):
+        sheet_name = f"step_{step['step']}"
+        workbook_sheets.append((sheet_name, sheet_index))
+        phases = step.get("phases", {})
+        rows = [_XLSX_HEADERS]
+        rows.extend(
+            _phase_xlsx_row(phase)
+            for _, phase in sorted(phases.items(), key=lambda item: item[1]["phase.stt-step.stt[ms]"])
+        )
+        sheet_xml[sheet_index] = _xlsx_sheet_xml(rows)
+
+    workbook = (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        '<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" '
+        'xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">'
+        f"<sheets>{''.join(f'<sheet name=\"{escape(name)}\" sheetId=\"{index}\" r:id=\"rId{index}\"/>' for name, index in workbook_sheets)}</sheets>"
+        "</workbook>"
+    )
+    workbook_rels = (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+        + "".join(
+            f'<Relationship Id="rId{index}" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet{index}.xml"/>'
+            for _, index in workbook_sheets
+        )
+        + '</Relationships>'
+    )
+    content_types = (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        '<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">'
+        '<Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>'
+        '<Default Extension="xml" ContentType="application/xml"/>'
+        '<Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/>'
+        + "".join(
+            f'<Override PartName="/xl/worksheets/sheet{index}.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>'
+            for _, index in workbook_sheets
+        )
+        + '</Types>'
+    )
+    root_rels = (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+        '<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/>'
+        '</Relationships>'
+    )
+    with zipfile.ZipFile(output_path, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        archive.writestr("[Content_Types].xml", content_types)
+        archive.writestr("_rels/.rels", root_rels)
+        archive.writestr("xl/workbook.xml", workbook)
+        archive.writestr("xl/_rels/workbook.xml.rels", workbook_rels)
+        for index, xml in sheet_xml.items():
+            archive.writestr(f"xl/worksheets/sheet{index}.xml", xml)
+
+
 
 GIB = 1024**3
 
@@ -206,6 +444,7 @@ def replay_one_step(
     # Phase-level breakdown: parse forward/backward/optimizer annotations
     # inside this step window, then replay each phase interval separately.
     phases, overlaps, phase_start_times = get_phase_intervals(annotations, start, end)
+    phases, phase_start_times = add_anonymous_memory_phases(phases, traces, start, end)
 
     # Net delta at each phase start, measured relative to the step start:
     # replay only the step-window events. The phases dict mirrors the
@@ -237,6 +476,7 @@ def replay_one_step(
             for o in overlaps.get(name, [])
         ]
         phase_results[name] = {
+            "name": name,
             "phase": entry["phase"],
             "mbs": entry["mbs"],
             "phase.stt-step.stt[ms]": us_to_ms(p_start - start),
@@ -361,6 +601,11 @@ def main() -> None:
     )
     parser.add_argument("--device", type=int, help="Device index (default: auto-detect)")
     parser.add_argument("--json", action="store_true", help="Output as JSON")
+    parser.add_argument(
+        "--output",
+        type=Path,
+        help="JSON output path when --json is enabled; an adjacent .xlsx is generated too",
+    )
     args = parser.parse_args()
 
     if args.step is None and not args.all_steps:
@@ -414,8 +659,19 @@ def main() -> None:
         )
         all_results.append(r)
 
+    mark_complete_data(all_results)
+
     if args.json:
-        print(json.dumps(all_results, indent=2, default=str))
+        json_text = json.dumps(all_results, indent=2, default=str)
+        print(json_text)
+        json_path = args.output or Path(args.pickle_path).with_suffix(".json")
+        if json_path.suffix.lower() != ".json":
+            json_path = json_path.with_suffix(".json")
+        json_path.parent.mkdir(parents=True, exist_ok=True)
+        json_path.write_text(json_text + "\n", encoding="utf-8")
+        xlsx_path = json_path.with_suffix(".xlsx")
+        write_xlsx(all_results, xlsx_path)
+        logger.info("Wrote JSON to %s and XLSX to %s", json_path, xlsx_path)
     else:
         print()
 
