@@ -33,6 +33,28 @@ ZeRO Stage 3 将 param、grad、optimizer states 全部按 world_size 切分。�
 
 两种配置共享完全相同的 prefetch 逻辑。
 
+当 `offload_param.device=nvme` 时，参数分区还可能以 NVMe 为最终驻留位置。此时不能把 NVMe read 与 all-gather 看成同一个操作：NVMe swapper 先恢复本 rank 的 partition，随后 all-gather 才能使用这个 partition。
+
+| 参数分区状态 | `swap_in` 的目标 buffer | 后续 all-gather |
+|------|------|------|
+| `final_location=nvme`、默认 `aio.use_gds=false` | CPU locked/pinned swap buffer | CPU buffer → GPU local partition，再参与 NCCL all-gather |
+| `final_location=nvme`、`aio.use_gds=true` | GPU device swap buffer（GDS/cuFile） | GPU swap buffer 作为本 rank 输入，直接参与 NCCL all-gather |
+| NVMe read 已完成 | `param.ds_tensor.data` 指向可用 swap buffer，状态为 `AVAILABLE` | 不再重复读 NVMe，只执行 GPU all-gather |
+
+普通 libaio 的路径是：
+
+```text
+NVMe 文件 → CPU pinned swap buffer → GPU local partition → data-parallel all-gather → GPU 完整参数
+```
+
+GDS 路径是：
+
+```text
+NVMe 文件 → GPU swap buffer → data-parallel all-gather → GPU 完整参数
+```
+
+GDS 只消除 CPU staging buffer，不消除 ZeRO-3 的跨 rank all-gather。`swap_in` 恢复的是本 rank 的分区，all-gather 才负责把所有 rank 的分区拼成当前 module 使用的完整参数。
+
 ### 时序（Forward 和 Backward 对称）
 
 ```
@@ -86,6 +108,18 @@ pre_hook(Module N):
 ```
 
 post_hook 只负责 release，不触发 prefetch。
+
+### NVMe 参数的 Prefetch 顺序
+
+开启 NVMe 参数 offload 后，`fetch_sub_module` 仍由每个 module 的 pre-hook 驱动，但会把普通参数预取和 NVMe 分区预取分开处理：
+
+1. 先为当前 module 处理缺失参数。若参数分区在 NVMe 且状态是 `NOT_AVAILABLE`，底层 `_all_gather` 会先同步 `swap_in`；若状态是 `INFLIGHT`，则等待已有的 NVMe read。只有分区变成 `AVAILABLE` 后，才会提交 GPU all-gather。
+2. 当前 module 的参数 wait 完成后，coordinator 从 trace queue 扫描后续参数。
+3. CPU/GPU resident 参数计入 `prefetch_bucket_size`，提交后续 GPU all-gather。
+4. 扫描遇到 NVMe resident 参数时，普通 all-gather 预取会在该位置停下，并调用 `__prefetch_nvme_param_partitions` 提交异步 `swap_in(async_op=True)`。这一步只把参数分区读入 swap buffer，不生成完整参数。
+5. 后续 module 到达时，如果 NVMe read 已完成，直接使用 `AVAILABLE` 的分区执行 all-gather；如果仍为 `INFLIGHT`，先 `synchronize_reads()`，再执行 all-gather。
+
+NVMe 预取本身也受限制：最多使用可用 swap-in buffer，并且 `numel_considered` 不能领先当前 in-flight 参数工作集过多（源码条件为 `numel_considered > 2 * numel_in_flight` 时停止）。因此 NVMe read 是滑动窗口中的前置 I/O 阶段，而不是绕过 all-gather 的替代路径。
 
 ### Prefetch Bucket 的本质：动态 numel 预算，非固定容器
 
@@ -155,9 +189,9 @@ param W (numel=16M, world_size=8):
   rank 7: ds_tensor = W.view(-1)[14M:16M]
 ```
 
-#### 发送阶段：cat + all-gather
+#### 发送阶段：CPU/GPU local partition + all-gather
 
-CPU→GPU 和 NCCL 通信是**一个原子操作**，不存在"先加载到 GPU 再 all-gather"的分离：
+对于 CPU resident 参数，CPU→GPU copy 和 NCCL 通信会在 all-gather 代码路径中连续完成，但语义上仍是两个阶段：必须先得到 GPU 上的本 rank local partition，才能把它作为 NCCL all-gather 的输入。对于 NVMe resident 参数，还必须在此之前完成 NVMe `swap_in`。
 
 ```python
 # partition_parameters.py: _all_gather_dtype
@@ -165,7 +199,7 @@ CPU→GPU 和 NCCL 通信是**一个原子操作**，不存在"先加载到 GPU 
 flat_tensor = torch.empty(partition_sz * world_size, dtype=dtype, device=GPU)
 partitions = [flat_tensor.narrow(0, partition_sz * i, partition_sz) for i in range(world_size)]
 
-# 2. 所有 param 的 CPU partition cat 到当前 rank 的位置
+# 2. 所有 param 的 CPU partition 搬到当前 rank 的 GPU 位置
 torch.cat(
     [p.ds_tensor.to(GPU) for p in params],
     out=partitions[rank_in_group])
