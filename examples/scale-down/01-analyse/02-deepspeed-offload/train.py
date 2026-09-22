@@ -17,12 +17,12 @@ Launch with DeepSpeed:
     deepspeed --num_gpus 8 train.py --deepspeed_config ds_config.json \
         --mode zero3_leaf
     deepspeed --num_gpus 1 train.py --deepspeed_config ds_config.json \
-        --model qwen3_5 --mode zero3_leaf
+        --model Qwen/Qwen3.5-9B --mode zero3_leaf
 
 Launch with profiling / memory snapshots:
 
     deepspeed --num_gpus 1 train.py --deepspeed_config ds_config.json \
-        --model qwen3_5 --mode zero3_leaf \
+        --model Qwen/Qwen3.5-9B --mode zero3_leaf \
         --use_pytorch_profiler --record_memory_history \
         --profile_step_start 5 --profile_step_end 10 \
         --profile_ranks 0 --memory_snapshot_path snapshot.pickle
@@ -31,13 +31,13 @@ Launch with recompute (act) and recompute + CPU activation offload (act+cpu):
 
     # act: HF layerwise gradient checkpointing (use_reentrant=False)
     deepspeed --num_gpus 4 train.py --deepspeed_config ds_config.json \
-        --model qwen3_5_moe --mode zero3_leaf --activation_checkpointing
+        --model Qwen/Qwen3.5-35B-A3B --mode zero3_leaf --activation_checkpointing
 
     # act+cpu: additionally offload checkpointed layer inputs to CPU via
     # DeepSpeed CheckpointHiddenStatesOffload (keep the default
     # DS_PIN_MEMORY_BACKEND=torch)
     deepspeed --num_gpus 4 train.py --deepspeed_config ds_config.json \
-        --model qwen3_5_moe --mode zero3_leaf \
+        --model Qwen/Qwen3.5-35B-A3B --mode zero3_leaf \
         --activation_checkpointing --cpu_checkpointing
 """
 
@@ -59,13 +59,6 @@ import numpy as np
 import torch
 from transformers import (
     AutoModelForCausalLM,
-    Llama4ForCausalLM,
-    Llama4TextConfig,
-    MixtralConfig,
-    Qwen3_5ForCausalLM,
-    Qwen3_5MoeForCausalLM,
-    Qwen3_5MoeTextConfig,
-    Qwen3_5TextConfig,
     enable_full_determinism,
 )
 
@@ -89,48 +82,6 @@ from profiling import (
 from train_utils import start_memory_history_recording
 
 logger = logging.getLogger(__name__)
-
-
-MODEL_PRESETS: dict[str, dict[str, Any]] = {
-    "mixtral": {
-        "architecture": "mixtral",
-        "config_cls": MixtralConfig,
-        "display_name": "Mixtral 8x7B",
-        "default_tokenizer_name": "mistralai/Mixtral-8x7B-v0.1",
-    },
-    "qwen3_5_moe": {
-        "architecture": "qwen3_5_moe",
-        "config_cls": Qwen3_5MoeTextConfig,
-        "display_name": "Qwen3.5 MoE",
-        "default_tokenizer_name": "Qwen/Qwen3-0.6B",
-    },
-    "qwen3_5": {
-        "architecture": "qwen3_5",
-        "config_cls": Qwen3_5TextConfig,
-        "display_name": "Qwen3.5 Text (Dense)",
-        "default_tokenizer_name": "Qwen/Qwen3.5-0.8B",
-    },
-    "llama4": {
-        "architecture": "llama4",
-        "config_cls": Llama4TextConfig,
-        "display_name": "Llama4 Scout",
-        "default_tokenizer_name": "meta-llama/Llama-4-Scout-17B-16E",
-    },
-}
-
-DEEPSPEED_LEAF_MOE_BLOCK_CLASS = {
-    "llama4": "transformers.models.llama4.modeling_llama4.Llama4TextMoe",
-    "mixtral": "transformers.models.mixtral.modeling_mixtral.MixtralSparseMoeBlock",
-    "qwen3_5_moe": (
-        "transformers.models.qwen3_5_moe.modeling_qwen3_5_moe."
-        "Qwen3_5MoeSparseMoeBlock"
-    ),
-}
-
-class ModelPreset(NamedTuple):
-    architecture: str
-    config_cls: type[Any]
-    display_name: str
 
 
 class TrainingState(NamedTuple):
@@ -161,7 +112,16 @@ def parse_args() -> argparse.Namespace:
     # Adds --deepspeed_config (same convention as finetune_zero3.py).
     parser = deepspeed.add_config_arguments(parser)
     parser.add_argument("--mode", choices=["autoep", "zero3_leaf", "dense"], default="autoep")
-    parser.add_argument("--model", choices=sorted(MODEL_PRESETS), default="qwen3_5_moe")
+    parser.add_argument(
+        "--model",
+        default="Qwen/Qwen3.5-9B",
+        help=(
+            "Hugging Face model name or local path, e.g. Qwen/Qwen3.5-9B (dense) or "
+            "Qwen/Qwen3.5-35B-A3B (MoE). The config is loaded via "
+            "AutoConfig.from_pretrained(...).text_config; MoE is detected by an "
+            "int num_experts field in the config."
+        ),
+    )
     parser.add_argument(
         "--override",
         action="append",
@@ -285,39 +245,59 @@ def parse_args() -> argparse.Namespace:
     return args
 
 
-def resolve_model_preset(args: argparse.Namespace) -> ModelPreset:
-    preset = MODEL_PRESETS[args.model]
-    architecture = preset["architecture"]
-    config_cls = preset["config_cls"]
-    if args.tokenizer_name is None:
-        args.tokenizer_name = preset["default_tokenizer_name"]
-    return ModelPreset(
-        architecture,
-        config_cls,
-        preset["display_name"],
+def is_expert_config(model_config: Any) -> bool:
+    """Return True when the HF config describes an expert (MoE) model.
+
+    Detection rule: an ``int``-typed ``num_experts`` field on the (text)
+    config, e.g. ``Qwen3_5MoeTextConfig.num_experts``. Dense configs such as
+    ``Qwen3_5TextConfig`` do not define the field.
+    """
+    num_experts = getattr(model_config, "num_experts", None)
+    return isinstance(num_experts, int) and not isinstance(num_experts, bool)
+
+
+def build_model(model_config: Any) -> torch.nn.Module:
+    """Instantiate a randomly initialized causal LM from the (overridden) config.
+
+    The text-backbone model types (e.g. ``qwen3_5_text`` / ``qwen3_5_moe_text``)
+    are registered in the Auto causal-LM mapping, so no per-family model
+    presets are needed.
+    """
+    return AutoModelForCausalLM.from_config(model_config)
+
+
+def resolve_autoep_preset_name(model_type: str) -> str:
+    """Map an HF ``model_type`` to the DeepSpeed AutoEP preset name.
+
+    AutoEP presets declare the HF model types they support via
+    ``MoEModelPreset.hf_model_types`` (e.g. preset ``qwen3_5_moe`` matches
+    ``qwen3_5_moe_text``), so the preset is resolved from the loaded config
+    instead of a hardcoded architecture table.
+    """
+    from deepspeed.module_inject.auto_ep_config import PRESET_MODELS
+
+    for preset_name, preset in PRESET_MODELS.items():
+        if model_type in tuple(getattr(preset, "hf_model_types", ()) or ()):
+            return preset_name
+    raise ValueError(
+        f"No DeepSpeed AutoEP preset supports model_type={model_type!r}; "
+        f"available presets={sorted(PRESET_MODELS)}"
     )
 
 
-def build_model(architecture: str, model_config: Any) -> torch.nn.Module:
-    if architecture == "mixtral":
-        return AutoModelForCausalLM.from_config(model_config)
-    if architecture == "qwen3_5_moe":
-        return Qwen3_5MoeForCausalLM(model_config)
-    if architecture == "qwen3_5":
-        return Qwen3_5ForCausalLM(model_config)
-    if architecture == "llama4":
-        return Llama4ForCausalLM(model_config)
-    raise ValueError(f"Unsupported architecture: {architecture!r}")
+def find_moe_leaf_module_class(model: torch.nn.Module) -> str | None:
+    """Locate the MoE block class path for ZeRO-3 leaf-module injection.
 
-
-def num_experts_for_config(architecture: str, model_config: Any) -> int | None:
-    if architecture in {"mixtral", "llama4"}:
-        return int(model_config.num_local_experts)
-    if architecture == "qwen3_5_moe":
-        return int(model_config.num_experts)
-    if architecture == "qwen3_5":
-        return None
-    raise ValueError(f"Unsupported architecture: {architecture!r}")
+    Replaces the old static ``DEEPSPEED_LEAF_MOE_BLOCK_CLASS`` table: scans
+    the instantiated model for the HF MoE block module (class names like
+    ``*MoeBlock`` / ``*SparseMoeBlock`` / ``*TextMoe``) and returns its
+    fully-qualified ``module.Class`` path, or None when not found.
+    """
+    for module in model.modules():
+        class_name = type(module).__name__
+        if "MoeBlock" in class_name or class_name.endswith("TextMoe"):
+            return f"{type(module).__module__}.{class_name}"
+    return None
 
 def optimizer_offload_enabled(ds_config: dict[str, Any]) -> bool:
     """Return True when zero-offload (cpu/nvme) or super-offload is enabled.
@@ -375,10 +355,12 @@ def create_offload_ctx_manager() -> Any:
 def build_deepspeed_config(
     config_path: str,
     mode: str,
-    architecture: str,
     micro_batch_size: int,
     grad_accum: int,
-    autoep_size: int | None,
+    *,
+    autoep_size: int | None = None,
+    autoep_preset: str | None = None,
+    leaf_module_class: str | None = None,
 ) -> dict[str, Any]:
     """Load the DeepSpeed JSON config from ``config_path`` and adjust it per model/mode.
 
@@ -390,11 +372,12 @@ def build_deepspeed_config(
       ``gradient_accumulation_steps`` are set from the CLI (and any file-level
       ``train_batch_size`` is dropped), so the DeepSpeed engine, the batch
       generator, and the accumulation loop stay consistent.
-    - ``autoep`` mode: forces ZeRO stage 3 — AutoEP must run on ZeRO-3, never
-      downgraded to stage 1/2 — and injects the ``expert_parallel`` preset
-      block for the model architecture.
-    - ``zero3_leaf`` mode with a MoE architecture: injects the ZeRO-3
-      ``leaf_module`` class list.
+    - ``autoep`` mode: injects the ``expert_parallel`` block with the preset
+      resolved from the HF config ``model_type`` (see
+      ``resolve_autoep_preset_name``).
+    - ``zero3_leaf`` mode with an MoE model: injects the ZeRO-3
+      ``leaf_module`` class list detected from the instantiated model (see
+      ``find_moe_leaf_module_class``).
     """
     with open(config_path, encoding="utf-8") as f:
         config: dict[str, Any] = json.load(f)
@@ -404,24 +387,24 @@ def build_deepspeed_config(
     config["gradient_accumulation_steps"] = grad_accum
 
     if mode == "autoep":
-        if architecture not in DEEPSPEED_LEAF_MOE_BLOCK_CLASS:
-            raise ValueError("AutoEP is only supported for MoE model presets.")
+        if autoep_preset is None:
+            raise ValueError("autoep mode requires a resolved AutoEP preset (MoE model).")
         config["expert_parallel"] = {
             "enabled": True,
             "autoep_size": autoep_size,
-            "preset_model": architecture,
+            "preset_model": autoep_preset,
         }
     elif mode == "zero3_leaf":
-        if architecture in DEEPSPEED_LEAF_MOE_BLOCK_CLASS:
+        if leaf_module_class is not None:
             config["zero_optimization"]["leaf_module"] = {
-                "classes": [DEEPSPEED_LEAF_MOE_BLOCK_CLASS[architecture]]
+                "classes": [leaf_module_class]
             }
 
     return config
 
 
 def validate_autoep_args(
-    architecture: str,
+    preset_name: str,
     autoep_size: int,
     num_experts: int,
     world_size: int,
@@ -433,18 +416,9 @@ def validate_autoep_args(
     ]
     if autoep_size not in valid_sizes:
         raise ValueError(
-            f"Invalid autoep_size={autoep_size} for architecture={architecture!r}; "
+            f"Invalid autoep_size={autoep_size} for AutoEP preset={preset_name!r}; "
             f"num_experts={num_experts}, world_size={world_size}, "
             f"valid sizes={valid_sizes}"
-        )
-
-    from deepspeed.module_inject.auto_ep_config import PRESET_MODELS
-
-    preset_id = architecture
-    if preset_id not in PRESET_MODELS:
-        raise ValueError(
-            f"DeepSpeed does not provide AutoEP preset_model={preset_id!r}; "
-            f"available presets={sorted(PRESET_MODELS)}"
         )
 
 
@@ -516,30 +490,30 @@ def prepare_training(args: argparse.Namespace) -> TrainingState:
     # are captured in the memory history trace.
     start_memory_history_recording(prof_config)
 
-    preset = resolve_model_preset(args)
-    model_config = build_model_config(preset.config_cls, args.override)
-    num_experts = num_experts_for_config(preset.architecture, model_config)
+    if args.tokenizer_name is None:
+        args.tokenizer_name = args.model
+
+    model_config = build_model_config(args.model, args.override)
+    expert_model = is_expert_config(model_config)
+    num_experts = int(model_config.num_experts) if expert_model else None
     autoep_size = args.autoep_size if args.mode == "autoep" else None
 
+    autoep_preset = None
     if args.mode == "autoep":
-        if num_experts is None:
-            logger.error("AutoEP requires an MoE model; use --mode zero3_leaf for %s.", args.model)
+        if not expert_model:
+            logger.error(
+                "AutoEP requires an MoE model (no int num_experts in the config); "
+                "use --mode dense or zero3_leaf for %s.",
+                args.model,
+            )
             sys.exit(2)
         try:
-            assert autoep_size is not None
-            validate_autoep_args(preset.architecture, autoep_size, num_experts, world_size)
+            assert autoep_size is not None and num_experts is not None
+            autoep_preset = resolve_autoep_preset_name(model_config.model_type)
+            validate_autoep_args(autoep_preset, autoep_size, num_experts, world_size)
         except ValueError as exc:
             logger.error("AutoEP preflight failed: %s", exc)
             sys.exit(2)
-
-    ds_config = build_deepspeed_config(
-        args.deepspeed_config,
-        args.mode,
-        preset.architecture,
-        args.micro_batch_size,
-        args.grad_accum,
-        autoep_size,
-    )
 
     try:
         tokenizer = get_tokenizer(args.tokenizer_name, trust_remote_code=True)
@@ -555,10 +529,12 @@ def prepare_training(args: argparse.Namespace) -> TrainingState:
     if rank == 0:
         logger.info("Mode: %s", args.mode)
         logger.info("DeepSpeed config: %s", args.deepspeed_config)
+        logger.info("Model Config: \n%s", model_config)
         logger.info(
-            "Model: %s (%s), layers=%s, hidden=%s, experts=%s, overrides=%s",
+            "Model: %s (model_type=%s, expert_model=%s), layers=%s, hidden=%s, experts=%s, overrides=%s",
             args.model,
-            preset.display_name,
+            model_config.model_type,
+            expert_model,
             model_config.num_hidden_layers,
             model_config.hidden_size,
             num_experts,
@@ -579,8 +555,21 @@ def prepare_training(args: argparse.Namespace) -> TrainingState:
             args.steps,
         )
 
-    model = build_model(preset.architecture, model_config)
+    model = build_model(model_config)
+    leaf_module_class = find_moe_leaf_module_class(model) if expert_model else None
     load_initial_weights(args.load_init_weights, model, args, model_config, rank)
+
+    # ds_config is built after the model: zero3_leaf injection needs the MoE
+    # block class detected from the instantiated module graph.
+    ds_config = build_deepspeed_config(
+        args.deepspeed_config,
+        args.mode,
+        args.micro_batch_size,
+        args.grad_accum,
+        autoep_size=autoep_size,
+        autoep_preset=autoep_preset,
+        leaf_module_class=leaf_module_class,
+    )
 
     # act: HF layerwise gradient checkpointing; must be enabled before
     # deepspeed.initialize so ZeRO-3 partitions the checkpointed module graph.

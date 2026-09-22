@@ -2,7 +2,8 @@
 # Experiment driver for the DeepSpeed offload + recompute matrix.
 #
 # Loop structure (outer -> inner):
-#   outermost: model preset               {qwen3_5 (dense), qwen3_5_moe (MoE)}
+#   outermost: HF model                   {Qwen/Qwen3.5-9B (dense),
+#                                          Qwen/Qwen3.5-35B-A3B (MoE, 64 experts)}
 #   outer : micro-batch size sweep        {1, 2, 4, 8}
 #   middle: recompute x cpu_checkpoint    {recompute_none, recompute_act,
 #                                          recompute_act_cpu}
@@ -32,8 +33,8 @@
 #
 # Usage:
 #   ./pretrain_experiment.sh                          # full matrix, dense + MoE
-#   MODELS="qwen3_5" ./pretrain_experiment.sh         # dense only
-#   MODELS="qwen3_5_moe" ./pretrain_experiment.sh     # MoE only
+#   MODELS="Qwen/Qwen3.5-9B" ./pretrain_experiment.sh         # dense only
+#   MODELS="Qwen/Qwen3.5-35B-A3B" ./pretrain_experiment.sh    # MoE only
 #   OFFLOAD_STRATEGIES="zero_3 zero_offload_nvme super_offload_1.0" ./pretrain_experiment.sh
 #   RECOMPUTE_COMBOS="recompute_act" MICRO_BATCH_SIZES="1 8" ./pretrain_experiment.sh
 set -euo pipefail
@@ -45,9 +46,13 @@ REPO_ROOT=${REPO_ROOT:-"$(cd "$SCRIPT_DIR/../../../.." && pwd)"}
 # ---------------------------------------------------------------------------
 # Experiment matrix knobs
 # ---------------------------------------------------------------------------
-# Outermost loop: train.py model presets — Qwen3.5 dense + Qwen3.5 MoE.
-# (Other available presets: mixtral | llama4.)
-MODELS=${MODELS:-"qwen3_5 qwen3_5_moe"}
+# Outermost loop: HF model names — Qwen3.5 dense + Qwen3.5 MoE. MoE is
+# detected by train.py/pretrain.sh via the config's int num_experts field.
+MODELS=${MODELS:-"Qwen/Qwen3.5-9B Qwen/Qwen3.5-35B-A3B"}
+# The 35B-A3B MoE model is resized to 64 experts for the sweep (must be
+# divisible by AUTOEP_SIZE in pretrain.sh). Applied as an extra
+# --override num_experts=$MOE_NUM_EXPERTS for model names matching *A3B*.
+MOE_NUM_EXPERTS=${MOE_NUM_EXPERTS:-64}
 
 # Outer loop: micro-batch size sweep axis.
 MICRO_BATCH_SIZES=${MICRO_BATCH_SIZES:-"1 2 4 8"}
@@ -111,9 +116,11 @@ OPTIMIZER_WEIGHT_DECAY=${OPTIMIZER_WEIGHT_DECAY:-0.0}
 #   One explicit heredoc block per offload strategy (finetune_qwen35_7b.sh
 #   style) so every generated JSON can be diffed/verified by hand.
 #
-#   NOTE: no "optimizer"/"scheduler" section is emitted on purpose —
-#   train.py passes a client optimizer to deepspeed.initialize(), and
-#   DeepSpeed rejects configs that specify an optimizer twice.
+#   NOTE: the "optimizer" section IS emitted (AdamW by default) and no
+#   "scheduler" section is: train.py passes optimizer=None to
+#   deepspeed.initialize(), so DeepSpeed builds the optimizer from this
+#   section — DeepSpeedCPUAdam when offload is enabled, GPU FusedAdam
+#   otherwise.
 # ---------------------------------------------------------------------------
 build_ds_config() {
     local strategy=$1
@@ -332,7 +339,16 @@ SUMMARY_FILE="${RESULTS_ROOT}/experiment_summary_${INVOKE_TS}.txt"
 
 set +e  # keep sweeping after a failing/OOM run; status is recorded per run
 for MODEL in $MODELS; do
-    MODEL_DIR="${MODEL}_${NUM_LAYERS}layer"
+    # Strip the HF org prefix for filesystem use: Qwen/Qwen3.5-9B -> Qwen3.5-9B
+    MODEL_DIR="${MODEL##*/}_${NUM_LAYERS}layer"
+
+    # Per-model extra HF config overrides consumed by pretrain.sh: the
+    # 35B-A3B MoE model is resized to $MOE_NUM_EXPERTS experts.
+    case "$MODEL" in
+        *A3B*) EXTRA_OVERRIDES="num_experts=$MOE_NUM_EXPERTS" ;;
+        *)     EXTRA_OVERRIDES="" ;;
+    esac
+    export EXTRA_OVERRIDES
 
     for MBS in $MICRO_BATCH_SIZES; do
         if [ $((PER_GPU_BATCH_SIZE % MBS)) -ne 0 ]; then

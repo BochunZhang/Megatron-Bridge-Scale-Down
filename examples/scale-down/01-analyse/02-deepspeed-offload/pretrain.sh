@@ -10,7 +10,9 @@
 #
 #   test_name        self-describing test ID (<strategy>__<recompute>__mbs<N>,
 #                    e.g. super_offload_0.9__recompute_act__mbs4), used for logging
-#   model            train.py --model preset: qwen3_5 (dense) | qwen3_5_moe | mixtral | llama4
+#   model            HF model name or path, e.g. Qwen/Qwen3.5-9B (dense) or
+#                    Qwen/Qwen3.5-35B-A3B (MoE); MoE is detected via the
+#                    config's int num_experts field
 #   micro_batch_size train.py --micro_batch_size (sweep axis: 1/2/4/8)
 #   ds_config        path to the generated DeepSpeed JSON (working copy under
 #                    <repo_root>/.tmp; archived into dirname(metrics_out) before launch)
@@ -125,32 +127,49 @@ NUM_LAYERS=${NUM_LAYERS:-8}
 LINEAR_ATTENTION_FREQ=${LINEAR_ATTENTION_FREQ:-4}
 
 # ---------------------------------------------------------------------------
-# Parallelism: MoE presets run AutoEP with autoep_size=4; dense presets run
+# Parallelism: MoE models run AutoEP with autoep_size=4; dense models run
 # plain ZeRO-3 (--mode dense). Switch MOE_TRAIN_MODE=zero3_leaf to use the
 # ZeRO-3 leaf-module path instead of AutoEP (required if a DeepSpeed version
 # rejects expert_parallel + offload combinations, see README §6.4).
+#
+# MoE detection mirrors train.py: load the HF config (text_config backbone)
+# and check for an int num_experts field. MODEL is an HF name/path, e.g.
+# "Qwen/Qwen3.5-9B" (dense) or "Qwen/Qwen3.5-35B-A3B" (MoE).
 # ---------------------------------------------------------------------------
 AUTOEP_SIZE=${AUTOEP_SIZE:-4}
 MOE_TRAIN_MODE=${MOE_TRAIN_MODE:-autoep}         # autoep | zero3_leaf
 DENSE_TRAIN_MODE=${DENSE_TRAIN_MODE:-dense}      # dense | zero3_leaf
+PYTHON_BIN=${PYTHON_BIN:-python}
 
-case "$MODEL" in
-    qwen3_5_moe|mixtral|llama4)
-        TRAIN_MODE=$MOE_TRAIN_MODE
-        MODE_ARGS="--autoep_size $AUTOEP_SIZE"
-        ;;
-    qwen3_5)
-        TRAIN_MODE=$DENSE_TRAIN_MODE
-        MODE_ARGS=""
-        ;;
-    *)
-        echo "Unknown model preset: $MODEL (expected one of: qwen3_5 qwen3_5_moe mixtral llama4)" >&2
-        exit 2
-        ;;
-esac
+IS_MOE=$("$PYTHON_BIN" -c "
+from transformers import AutoConfig
+config = AutoConfig.from_pretrained('$MODEL', trust_remote_code=True)
+config = getattr(config, 'text_config', config)
+num_experts = getattr(config, 'num_experts', None)
+print('1' if isinstance(num_experts, int) and not isinstance(num_experts, bool) else '0')
+")
+
+if [ "$IS_MOE" = "1" ]; then
+    TRAIN_MODE=$MOE_TRAIN_MODE
+    MODE_ARGS="--autoep_size $AUTOEP_SIZE"
+else
+    TRAIN_MODE=$DENSE_TRAIN_MODE
+    MODE_ARGS=""
+fi
 if [ "$TRAIN_MODE" != "autoep" ]; then
     MODE_ARGS=""
 fi
+
+# ---------------------------------------------------------------------------
+# Extra HF config overrides (space-separated KEY=VALUE pairs), appended to the
+# fixed num_hidden_layers / linear_attention_freq overrides; e.g. the
+# experiment driver sets EXTRA_OVERRIDES="num_experts=64" for Qwen3.5-35B-A3B.
+# ---------------------------------------------------------------------------
+EXTRA_OVERRIDES=${EXTRA_OVERRIDES:-}
+EXTRA_OVERRIDE_ARGS=""
+for kv in $EXTRA_OVERRIDES; do
+    EXTRA_OVERRIDE_ARGS="$EXTRA_OVERRIDE_ARGS --override $kv"
+done
 
 # ---------------------------------------------------------------------------
 # Recompute axis (README §3.1): none | act | act+cpu
@@ -230,6 +249,7 @@ CMD="deepspeed --num_gpus=$NUM_GPUS $DS_LAUNCHER_ARGS train.py \
     $MODE_ARGS \
     --override num_hidden_layers=$NUM_LAYERS \
     --override linear_attention_freq=$LINEAR_ATTENTION_FREQ \
+    $EXTRA_OVERRIDE_ARGS \
     --dataset_name $DATASET_NAME \
     --dataset_percentage $DATASET_PERCENTAGE \
     --seq_len $SEQ_LEN \

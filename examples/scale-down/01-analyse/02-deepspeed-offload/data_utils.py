@@ -10,14 +10,29 @@ from datasets import DownloadConfig, load_dataset
 from datasets.utils.logging import disable_progress_bar
 from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
-from transformers import AutoTokenizer
+from transformers import AutoConfig, AutoTokenizer
 
 
 def build_model_config(
-    config_cls: type[Any],
+    model: str,
     overrides: list[str] | None = None,
 ) -> Any:
-    """Build a Hugging Face config with typed ``KEY=VALUE`` overrides."""
+    """Load the HF text config for ``model`` and apply typed ``KEY=VALUE`` overrides.
+
+    ``model`` is a Hugging Face model name or local path (e.g.
+    ``"Qwen/Qwen3.5-9B"``). The config is loaded via
+    ``AutoConfig.from_pretrained``; composite (multimodal-style) configs are
+    narrowed to their ``text_config`` backbone, then every override is applied
+    on top with ``setattr``.
+
+    ``linear_attention_freq=N`` is a virtual override: it is expanded into an
+    explicit ``layer_types`` list (every Nth layer full attention, the rest
+    linear attention) using the final ``num_hidden_layers`` — so overriding
+    both in one call is order-independent.
+    """
+    config = AutoConfig.from_pretrained(model, trust_remote_code=True)
+    config = getattr(config, "text_config", config)
+
     kwargs: dict[str, Any] = {}
     for override in overrides or []:
         key, separator, raw_value = override.partition("=")
@@ -45,22 +60,22 @@ def build_model_config(
                     value = raw_value
         kwargs[key] = value
 
-    if "linear_attention_freq" in kwargs:
-        assert "num_hidden_layers" in kwargs, (
-            "num_hidden_layers must be provided when linear_attention_freq is set"
-        )
-        num_hidden_layers = int(kwargs["num_hidden_layers"])
-        linear_attention_freq = int(kwargs["linear_attention_freq"])
+    linear_attention_freq = kwargs.pop("linear_attention_freq", None)
+    for key, value in kwargs.items():
+        setattr(config, key, value)
+
+    if linear_attention_freq is not None:
+        num_hidden_layers = int(config.num_hidden_layers)
+        linear_attention_freq = int(linear_attention_freq)
         assert linear_attention_freq > 0, "linear_attention_freq must be positive"
-        kwargs["layer_types"] = [
+        config.layer_types = [
             "full_attention"
             if (layer_index + 1) % linear_attention_freq == 0
             else "linear_attention"
             for layer_index in range(num_hidden_layers)
         ]
-        del kwargs["linear_attention_freq"]
 
-    return config_cls(**kwargs)
+    return config
 
 
 @dataclass
