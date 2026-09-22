@@ -12,11 +12,25 @@ Launch with profiling / memory snapshots:
         --use_pytorch_profiler --record_memory_history \
         --profile_step_start 5 --profile_step_end 10 \
         --profile_ranks 0 --memory_snapshot_path snapshot.pickle
+
+Launch with recompute (act) and recompute + CPU activation offload (act+cpu):
+
+    # act: HF layerwise gradient checkpointing (use_reentrant=False)
+    deepspeed --num_gpus 4 train.py --model qwen3_5_moe --mode zero3_leaf \
+        --activation_checkpointing
+
+    # act+cpu: additionally offload checkpointed layer inputs to CPU via
+    # DeepSpeed CheckpointHiddenStatesOffload (set
+    # PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True; keep the default
+    # DS_PIN_MEMORY_BACKEND=torch)
+    deepspeed --num_gpus 4 train.py --model qwen3_5_moe --mode zero3_leaf \
+        --activation_checkpointing --cpu_checkpointing
 """
 
 from __future__ import annotations
 
 import argparse
+import contextlib
 import logging
 import math
 import os
@@ -113,6 +127,7 @@ class TrainingState(NamedTuple):
     engine: Any
     batch_gen: Any
     profiling: ProfilingConfig
+    offload_ctx: Any = None
 
 
 def parse_args() -> argparse.Namespace:
@@ -143,6 +158,22 @@ def parse_args() -> argparse.Namespace:
         type=str,
         default=None,
         help="Load a shared initialization artifact created by utils/prepare_init_weights.py.",
+    )
+    parser.add_argument(
+        "--activation_checkpointing",
+        action="store_true",
+        help=(
+            "Enable HF layerwise gradient checkpointing (act) with use_reentrant=False; "
+            "also disables model.config.use_cache."
+        ),
+    )
+    parser.add_argument(
+        "--cpu_checkpointing",
+        action="store_true",
+        help=(
+            "Offload checkpointed layer input hidden_states to CPU (act+cpu) via DeepSpeed "
+            "CheckpointHiddenStatesOffload; requires --activation_checkpointing."
+        ),
     )
     parser.add_argument("--metrics_out", default=None)
     parser.add_argument("--local_rank", type=int, default=-1)
@@ -200,6 +231,17 @@ def parse_args() -> argparse.Namespace:
             parser.error("--load_init_weights path must end with '.safetensors'.")
         if not os.path.isfile(args.load_init_weights):
             parser.error(f"--load_init_weights file does not exist: {args.load_init_weights}")
+    if args.cpu_checkpointing and not args.activation_checkpointing:
+        parser.error(
+            "--cpu_checkpointing requires --activation_checkpointing: the offload ctx only "
+            "marks inputs of HF GradientCheckpointingLayer checkpointed layers."
+        )
+    if args.cpu_checkpointing and os.environ.get("DS_PIN_MEMORY_BACKEND", "torch").lower() == "native":
+        parser.error(
+            "DS_PIN_MEMORY_BACKEND=native is incompatible with --cpu_checkpointing: the native "
+            "backend uses mlock without cudaHostRegister, which stalls side-stream DMA. "
+            "Keep the default 'torch' backend."
+        )
 
     return args
 
@@ -241,11 +283,47 @@ def num_experts_for_config(architecture: str, model_config: Any) -> int | None:
 def create_optimizer(model: AutoModelForCausalLM) -> Any:
     from deepspeed.ops.adam import DeepSpeedCPUAdam
     optimizer = DeepSpeedCPUAdam(
-        model.parameters(), 
-        lr=DEFAULT_OPTIMIZER_LR, 
+        model.parameters(),
+        lr=DEFAULT_OPTIMIZER_LR,
         betas=DEFAULT_OPTIMIZER_BETAS
     )
     return optimizer
+
+
+def setup_activation_checkpointing(model: torch.nn.Module) -> None:
+    """Enable HF layerwise gradient checkpointing (act), mirroring finetune_zero3.py.
+
+    HF gradient checkpointing wraps each decoder layer in a checkpoint. The
+    non-reentrant mode is required: reentrant checkpointing is incompatible
+    with ZeRO-3, and the CheckpointHiddenStatesOffload marker patch targets
+    the non-reentrant path. ``use_cache`` conflicts with gradient checkpointing
+    and must be disabled.
+    """
+    if hasattr(model.config, "use_cache"):
+        model.config.use_cache = False
+    model.gradient_checkpointing_enable(
+        gradient_checkpointing_kwargs={"use_reentrant": False}
+    )
+
+
+def create_offload_ctx_manager() -> Any:
+    """Create the DeepSpeed CheckpointHiddenStatesOffload ctx manager (act+cpu).
+
+    Create once and reuse the same manager for every training step. Entering
+    the ctx patches HF ``GradientCheckpointingLayer.__call__`` so each
+    checkpointed layer's input hidden_states are marked; pack hooks then
+    asynchronously D2H the marked activations into pinned CPU buffers (side
+    stream, overlapped with compute) and H2D them back when backward needs
+    them. Forward and backward of a step must run inside the same ctx.
+    """
+    from deepspeed.runtime.activation_checkpointing.offload_activations import (
+        get_checkpoint_hidden_states_offloading_ctx_manager,
+    )
+
+    return get_checkpoint_hidden_states_offloading_ctx_manager(
+        use_pin_memory=True,
+        use_streams=True,
+    )
 
 
 def build_deepspeed_config(
@@ -452,6 +530,21 @@ def prepare_training(args: argparse.Namespace) -> TrainingState:
     model = build_model(preset.architecture, model_config)
     load_initial_weights(args.load_init_weights, model, args, model_config, rank)
 
+    # act: HF layerwise gradient checkpointing; must be enabled before
+    # deepspeed.initialize so ZeRO-3 partitions the checkpointed module graph.
+    offload_ctx = None
+    if args.activation_checkpointing:
+        setup_activation_checkpointing(model)
+        # act+cpu: DeepSpeed CheckpointHiddenStatesOffload ctx, created once and
+        # reused by every training step (forward + backward inside the same ctx).
+        if args.cpu_checkpointing:
+            offload_ctx = create_offload_ctx_manager()
+        if rank == 0:
+            logger.info(
+                "Activation checkpointing enabled (use_reentrant=False); cpu_checkpointing=%s",
+                args.cpu_checkpointing,
+            )
+
     # 支持 super-offload, 创建一个 CPU Adam
     # deepspeed 会根据 offload 比例额外创建 GPU Adam
     optimizer = create_optimizer(model)
@@ -493,6 +586,7 @@ def prepare_training(args: argparse.Namespace) -> TrainingState:
         engine=engine,
         batch_gen=batch_gen,
         profiling=prof_config,
+        offload_ctx=offload_ctx,
     )
 
 
@@ -534,24 +628,31 @@ def train(args: argparse.Namespace, state: TrainingState) -> None:
         last_loss = None
 
         for accum_idx in range(args.grad_accum):
-            msg = f"forward_step[{accum_idx}]"
-            profiler_handle = torch.autograd.profiler.record_function(msg)
-            profiler_handle.__enter__()
-            batch = state.batch_gen.get_batch(step, accum_idx)
-            outputs = state.engine(
-                input_ids=batch.input_ids.to(state.engine.device),
-                attention_mask=batch.attention_mask.to(state.engine.device),
-                labels=batch.labels.to(state.engine.device),
+            # act+cpu: forward and backward of a step must run inside the same
+            # offload ctx so marked hidden_states can be restored on backward.
+            # engine.step() stays outside the ctx.
+            fwd_bwd_ctx = (
+                state.offload_ctx if state.offload_ctx is not None else contextlib.nullcontext()
             )
-            loss = outputs.loss
-            last_loss = loss.detach().clone()
-            profiler_handle.__exit__(None, None, None)
+            with fwd_bwd_ctx:
+                msg = f"forward_step[{accum_idx}]"
+                profiler_handle = torch.autograd.profiler.record_function(msg)
+                profiler_handle.__enter__()
+                batch = state.batch_gen.get_batch(step, accum_idx)
+                outputs = state.engine(
+                    input_ids=batch.input_ids.to(state.engine.device),
+                    attention_mask=batch.attention_mask.to(state.engine.device),
+                    labels=batch.labels.to(state.engine.device),
+                )
+                loss = outputs.loss
+                last_loss = loss.detach().clone()
+                profiler_handle.__exit__(None, None, None)
 
-            msg = f"backward_step[{accum_idx}]"
-            profiler_handle = torch.autograd.profiler.record_function(msg)
-            profiler_handle.__enter__()
-            state.engine.backward(loss)
-            profiler_handle.__exit__(None, None, None)
+                msg = f"backward_step[{accum_idx}]"
+                profiler_handle = torch.autograd.profiler.record_function(msg)
+                profiler_handle.__enter__()
+                state.engine.backward(loss)
+                profiler_handle.__exit__(None, None, None)
 
             msg = f"optimizer_step"
             profiler_handle = torch.autograd.profiler.record_function(msg)
