@@ -214,7 +214,8 @@ def start_memory_history_recording(profiling: ProfilingConfig | None) -> None:
         trace_alloc_max_entries=1_000_000,
         # Record the Python stack at each event — lets memory_viz show call sites.
         trace_alloc_record_context=True,
-        record_pinned_host_memory=True,
+        # only torch>=2.14.0 supports this argument, so we disable it for now to avoid errors on torch<2.14.0
+        # record_pinned_host_memory=True,
     )
 
     def _oom_observer(device: int, alloc: int, device_alloc: int, device_free: int) -> None:
@@ -267,6 +268,13 @@ MEMORY_KEYS: dict[str, str] = {
     "reserved_bytes.all.peak": "mem-max-reserved-bytes",
     "num_alloc_retries": "mem-alloc-retires",
     "allocation.all.current": "mem-allocated-count",
+}
+
+HOST_MEMORY_KEYS: dict[str, str] = {
+    "allocated_bytes.current": "host-mem-allocated-bytes",
+    "allocated_bytes.peak": "host-mem-max-allocated-bytes",
+    "active_bytes.current": "host-mem-active-bytes",
+    "active_bytes.peak": "host-mem-max-active-bytes",
 }
 
 
@@ -1232,6 +1240,8 @@ def training_log(
             memory_string = f"(after {iteration} iterations) memory (GB)"
             for metric, value in report_memory(logger_config.memory_keys).items():
                 memory_string += f" | {metric}: {value}"
+            for metric, value in report_host_memory().items():
+                memory_string += f" | {metric}: {value}"
             if torch.distributed.get_rank(group=pg_collection.dp) == 0:
                 print("[Rank {}] {}".format(torch.distributed.get_rank(), memory_string), flush=True)
             if iteration > (loaded_iteration + 1):
@@ -1280,6 +1290,40 @@ def report_memory(memory_keys: Optional[dict[str, str]]) -> dict:
 
     memory_stats = torch.cuda.memory_stats()
     memory_keys = memory_keys if memory_keys else MEMORY_KEYS
+
+    # simplify and reformat the memory_stats
+    memory_report = {}
+    for torch_name, name in memory_keys.items():
+        if torch_name in memory_stats:
+            # Convert to gigabytes
+            if "bytes" in torch_name:
+                gigabytes = memory_stats[torch_name] / 1.0e9
+                # Round to preserve 5 significant digits
+                if gigabytes != 0:
+                    order_of_magnitude = int(math.floor(math.log10(abs(gigabytes))))
+                    gigabytes = round(gigabytes, -order_of_magnitude + 4)
+                memory_report[name.replace("bytes", "gigabytes")] = gigabytes
+            else:
+                memory_report[name] = memory_stats[torch_name]
+
+    return memory_report
+
+
+def report_host_memory() -> dict:
+    """
+    Logs the memory usage of the model.
+    This metric calls the torch memory stats API for CUDA and reports different memory statistics.
+    Args:
+        memory_keys (dict[str, str], optional): A dict specifying memory statistics to log. Keys
+            are the names of memory statistics to log from `torch.cuda.memory_stats()`, and values
+            are the names they will be logged under. If not provided, the above statistics are
+            logged. Defaults to None.
+    Returns:
+        Memory metrics dictionary.
+    """
+
+    memory_stats = torch.cuda.host_memory_stats()
+    memory_keys = HOST_MEMORY_KEYS
 
     # simplify and reformat the memory_stats
     memory_report = {}
