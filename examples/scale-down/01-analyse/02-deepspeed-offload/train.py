@@ -1,14 +1,28 @@
 """Compact causal LM training example for AutoEP, ZeRO-3 leaf, and Qwen3.5 text.
 
+The DeepSpeed runtime config is loaded from a JSON file via --deepspeed_config
+(same convention as finetune_zero3.py); see ds_config.json for an example.
+Only model-dependent keys (AutoEP expert_parallel, ZeRO-3 leaf module classes)
+and the CLI batch settings are applied on top of the loaded file.
+
+Every run requires PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True (checked
+at startup): ZeRO-3 and the act+cpu offload/restore cycle fragment the
+default allocator.
+
 Launch with DeepSpeed:
 
-    deepspeed --num_gpus 8 train.py --mode autoep --autoep_size 8
-    deepspeed --num_gpus 8 train.py --mode zero3_leaf
-    deepspeed --num_gpus 1 train.py --model qwen3_5 --mode zero3_leaf
+    export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+    deepspeed --num_gpus 8 train.py --deepspeed_config ds_config.json \
+        --mode autoep --autoep_size 8
+    deepspeed --num_gpus 8 train.py --deepspeed_config ds_config.json \
+        --mode zero3_leaf
+    deepspeed --num_gpus 1 train.py --deepspeed_config ds_config.json \
+        --model qwen3_5 --mode zero3_leaf
 
 Launch with profiling / memory snapshots:
 
-    deepspeed --num_gpus 1 train.py --model qwen3_5 --mode zero3_leaf \
+    deepspeed --num_gpus 1 train.py --deepspeed_config ds_config.json \
+        --model qwen3_5 --mode zero3_leaf \
         --use_pytorch_profiler --record_memory_history \
         --profile_step_start 5 --profile_step_end 10 \
         --profile_ranks 0 --memory_snapshot_path snapshot.pickle
@@ -16,14 +30,14 @@ Launch with profiling / memory snapshots:
 Launch with recompute (act) and recompute + CPU activation offload (act+cpu):
 
     # act: HF layerwise gradient checkpointing (use_reentrant=False)
-    deepspeed --num_gpus 4 train.py --model qwen3_5_moe --mode zero3_leaf \
-        --activation_checkpointing
+    deepspeed --num_gpus 4 train.py --deepspeed_config ds_config.json \
+        --model qwen3_5_moe --mode zero3_leaf --activation_checkpointing
 
     # act+cpu: additionally offload checkpointed layer inputs to CPU via
-    # DeepSpeed CheckpointHiddenStatesOffload (set
-    # PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True; keep the default
+    # DeepSpeed CheckpointHiddenStatesOffload (keep the default
     # DS_PIN_MEMORY_BACKEND=torch)
-    deepspeed --num_gpus 4 train.py --model qwen3_5_moe --mode zero3_leaf \
+    deepspeed --num_gpus 4 train.py --deepspeed_config ds_config.json \
+        --model qwen3_5_moe --mode zero3_leaf \
         --activation_checkpointing --cpu_checkpointing
 """
 
@@ -31,6 +45,7 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import json
 import logging
 import math
 import os
@@ -130,9 +145,25 @@ class TrainingState(NamedTuple):
     offload_ctx: Any = None
 
 
+def expandable_segments_enabled() -> bool:
+    """Return True when PYTORCH_CUDA_ALLOC_CONF requests expandable_segments:True.
+
+    Parses the comma-separated ``key:value`` options of the env var so that
+    combined settings (e.g. ``expandable_segments:True,max_split_size_mb:512``)
+    are recognized as well.
+    """
+    for option in os.environ.get("PYTORCH_CUDA_ALLOC_CONF", "").split(","):
+        key, _, value = option.partition(":")
+        if key.strip().lower() == "expandable_segments":
+            return value.strip().lower() == "true"
+    return False
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="AutoEP / ZeRO-3 leaf MoE training")
-    parser.add_argument("--mode", choices=["autoep", "zero3_leaf"], default="autoep")
+    # Adds --deepspeed_config (same convention as finetune_zero3.py).
+    parser = deepspeed.add_config_arguments(parser)
+    parser.add_argument("--mode", choices=["autoep", "zero3_leaf", "dense"], default="autoep")
     parser.add_argument("--model", choices=sorted(MODEL_PRESETS), default="qwen3_5_moe")
     parser.add_argument(
         "--override",
@@ -224,6 +255,17 @@ def parse_args() -> argparse.Namespace:
     )
     args = parser.parse_args()
 
+    if args.deepspeed_config is None:
+        parser.error("--deepspeed_config is required: pass the path to a DeepSpeed JSON config.")
+    if not os.path.isfile(args.deepspeed_config):
+        parser.error(f"--deepspeed_config file does not exist: {args.deepspeed_config}")
+    if not expandable_segments_enabled():
+        parser.error(
+            "PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True is required for every run: "
+            "ZeRO-3 and the act+cpu offload/restore cycle fragment the default allocator "
+            "(see README)."
+        )
+    
     if args.mode == "autoep" and args.autoep_size is None:
         parser.error("--autoep_size is required in AutoEP mode.")
     if args.load_init_weights is not None:
@@ -327,48 +369,50 @@ def create_offload_ctx_manager() -> Any:
 
 
 def build_deepspeed_config(
+    config_path: str,
     mode: str,
     architecture: str,
     micro_batch_size: int,
     grad_accum: int,
     autoep_size: int | None,
 ) -> dict[str, Any]:
-    config: dict[str, Any] = {
-        "bf16": {"enabled": True},
-        "optimizer": {"type": "AdamW", "params": {"lr": 1e-4}},
-        "scheduler": {
-            "type": "WarmupCosineLR",
-            "params": {
-                "total_num_steps": 1000,
-                "warmup_min_ratio": 0,
-                "warmup_num_steps": 100,
-                "cos_min_ratio": 0.001,
-                "warmup_type": "linear",
-            },
-        },
-        "train_micro_batch_size_per_gpu": micro_batch_size,
-        "gradient_accumulation_steps": grad_accum,
-        "steps_per_print": 10,
-    }
+    """Load the DeepSpeed JSON config from ``config_path`` and adjust it per model/mode.
+
+    Mirrors finetune_zero3.py: the base config (bf16, optimizer, scheduler,
+    zero_optimization, offload knobs) comes from the given file instead of
+    being constructed here. Adjustments applied on top of the loaded file:
+
+    - CLI batch settings win: ``train_micro_batch_size_per_gpu`` and
+      ``gradient_accumulation_steps`` are set from the CLI (and any file-level
+      ``train_batch_size`` is dropped), so the DeepSpeed engine, the batch
+      generator, and the accumulation loop stay consistent.
+    - ``autoep`` mode: forces ZeRO stage 3 — AutoEP must run on ZeRO-3, never
+      downgraded to stage 1/2 — and injects the ``expert_parallel`` preset
+      block for the model architecture.
+    - ``zero3_leaf`` mode with a MoE architecture: injects the ZeRO-3
+      ``leaf_module`` class list.
+    """
+    with open(config_path, encoding="utf-8") as f:
+        config: dict[str, Any] = json.load(f)
+
+    config.pop("train_batch_size", None)
+    config["train_micro_batch_size_per_gpu"] = micro_batch_size
+    config["gradient_accumulation_steps"] = grad_accum
+
     if mode == "autoep":
         if architecture not in DEEPSPEED_LEAF_MOE_BLOCK_CLASS:
             raise ValueError("AutoEP is only supported for MoE model presets.")
-        config["zero_optimization"] = {"stage": 1}
         config["expert_parallel"] = {
             "enabled": True,
             "autoep_size": autoep_size,
             "preset_model": architecture,
         }
-    else:
-        zero_config: dict[str, Any] = {
-            "stage": 3,
-            "stage3_param_persistence_threshold": 1e5,
-        }
+    elif mode == "zero3_leaf":
         if architecture in DEEPSPEED_LEAF_MOE_BLOCK_CLASS:
-            zero_config["leaf_module"] = {
+            config["zero_optimization"]["leaf_module"] = {
                 "classes": [DEEPSPEED_LEAF_MOE_BLOCK_CLASS[architecture]]
             }
-        config["zero_optimization"] = zero_config
+
     return config
 
 
@@ -483,6 +527,7 @@ def prepare_training(args: argparse.Namespace) -> TrainingState:
             sys.exit(2)
 
     ds_config = build_deepspeed_config(
+        args.deepspeed_config,
         args.mode,
         preset.architecture,
         args.micro_batch_size,
@@ -503,6 +548,7 @@ def prepare_training(args: argparse.Namespace) -> TrainingState:
 
     if rank == 0:
         logger.info("Mode: %s", args.mode)
+        logger.info("DeepSpeed config: %s", args.deepspeed_config)
         logger.info(
             "Model: %s (%s), layers=%s, hidden=%s, experts=%s, overrides=%s",
             args.model,
