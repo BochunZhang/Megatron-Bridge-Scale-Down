@@ -14,6 +14,8 @@ METRICS_COLUMNS: list[str] = [
     "loss",
     "iter_time_sec",
     "global_tokens_per_sec",
+    "gpu_peak_gigabytes",
+    "cpu_peak_gigabytes",
     "cuda_memory_allocated_bytes",
     "cuda_peak_memory_allocated_bytes",
     "cuda_peak_memory_reserved_bytes",
