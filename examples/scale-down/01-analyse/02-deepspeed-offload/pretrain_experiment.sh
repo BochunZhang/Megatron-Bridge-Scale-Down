@@ -65,7 +65,7 @@ MICRO_BATCH_SIZES=${MICRO_BATCH_SIZES:-"1 2 4 8"}
 RECOMPUTE_COMBOS=${RECOMPUTE_COMBOS:-"recompute_none recompute_act recompute_act_cpu"}
 
 # Inner loop: offload strategies (each maps to one ds_config heredoc below).
-OFFLOAD_STRATEGIES=${OFFLOAD_STRATEGIES:-"zero_3 zero_offload_cpu zero_offload_nvme super_offload_1.0 super_offload_0.9 super_offload_0.75"}
+OFFLOAD_STRATEGIES=${OFFLOAD_STRATEGIES:-"zero_3 zero_offload_cpu super_offload_1.0 super_offload_0.9 super_offload_0.75"}
 
 # Per-GPU samples per optimizer step; grad_accum = PER_GPU_BATCH_SIZE / mbs so
 # the global batch stays constant across the micro-batch sweep (must match
