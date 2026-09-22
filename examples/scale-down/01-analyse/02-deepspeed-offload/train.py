@@ -577,12 +577,17 @@ def train(args: argparse.Namespace, state: TrainingState) -> None:
 
         if step == args.warmup_steps - 1 and torch.cuda.is_available():
             torch.cuda.reset_peak_memory_stats()
+            torch.cuda.reset_peak_host_memory_stats()
 
         if step >= args.warmup_steps and step % args.log_interval == 0:
             max_iter_time = reduce_max(iter_time)
             mem_allocated = torch.cuda.memory_allocated()
             mem_peak_allocated = torch.cuda.max_memory_allocated()
             mem_peak_reserved = torch.cuda.max_memory_reserved()
+
+            gpu_allocated = torch.cuda.memory_stats()
+            cpu_allocated = torch.cuda.host_memory_stats()
+
             global_tokens_per_sec = (
                 args.seq_len
                 * args.micro_batch_size
@@ -606,12 +611,14 @@ def train(args: argparse.Namespace, state: TrainingState) -> None:
             )
             if state.rank == 0:
                 logger.info(
-                    "Step %s: loss=%.6f, time=%.3fs, global_tps=%.0f, peak_mem=%.2f GiB",
+                    "Step %s: loss=%.6f, time=%.3fs, global_tps=%.0f, peak_mem=%.2f GiB, gpu.peak=%.3f GiB, cpu.peak=%.3f MiB",
                     step,
                     reduced_loss,
                     max_iter_time,
                     global_tokens_per_sec,
                     mem_peak_allocated / (1024**3),
+                    gpu_allocated['allocated_bytes.all.peak'] / (1024**3),
+                    cpu_allocated['allocated_bytes.peak'] / (1024**3),
                 )
 
 
