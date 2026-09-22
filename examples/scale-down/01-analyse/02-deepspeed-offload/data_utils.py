@@ -15,12 +15,51 @@ from transformers import AutoTokenizer
 
 def build_model_config(
     config_cls: type[Any],
-    num_hidden_layers: int | None = None,
+    overrides: list[str] | None = None,
 ) -> Any:
-    """Build a Hugging Face config with an optional layer-count override."""
+    """Build a Hugging Face config with typed ``KEY=VALUE`` overrides."""
     kwargs: dict[str, Any] = {}
-    if num_hidden_layers is not None:
-        kwargs["num_hidden_layers"] = num_hidden_layers
+    for override in overrides or []:
+        key, separator, raw_value = override.partition("=")
+        key = key.strip()
+        if not separator or not key:
+            raise ValueError(
+                f"Invalid config override {override!r}; expected KEY=VALUE."
+            )
+
+        raw_value = raw_value.strip()
+        if key == "linear_attention_freq":
+            try:
+                value: Any = int(raw_value)
+            except ValueError as exc:
+                raise AssertionError(
+                    "linear_attention_freq must be convertible to int"
+                ) from exc
+        else:
+            try:
+                value = int(raw_value)
+            except ValueError:
+                try:
+                    value = float(raw_value)
+                except ValueError:
+                    value = raw_value
+        kwargs[key] = value
+
+    if "linear_attention_freq" in kwargs:
+        assert "num_hidden_layers" in kwargs, (
+            "num_hidden_layers must be provided when linear_attention_freq is set"
+        )
+        num_hidden_layers = int(kwargs["num_hidden_layers"])
+        linear_attention_freq = int(kwargs["linear_attention_freq"])
+        assert linear_attention_freq > 0, "linear_attention_freq must be positive"
+        kwargs["layer_types"] = [
+            "full_attention"
+            if (layer_index + 1) % linear_attention_freq == 0
+            else "linear_attention"
+            for layer_index in range(num_hidden_layers)
+        ]
+        del kwargs["linear_attention_freq"]
+
     return config_cls(**kwargs)
 
 

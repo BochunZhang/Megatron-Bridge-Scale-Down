@@ -1,9 +1,10 @@
-"""Compact MoE causal LM training example for AutoEP and ZeRO-3 leaf.
+"""Compact causal LM training example for AutoEP, ZeRO-3 leaf, and Qwen3.5 text.
 
 Launch with DeepSpeed:
 
     deepspeed --num_gpus 8 train.py --mode autoep --autoep_size 8
     deepspeed --num_gpus 8 train.py --mode zero3_leaf
+    deepspeed --num_gpus 1 train.py --model qwen3_5 --mode zero3_leaf
 """
 
 from __future__ import annotations
@@ -24,8 +25,10 @@ from transformers import (
     Llama4ForCausalLM,
     Llama4TextConfig,
     MixtralConfig,
+    Qwen3_5ForCausalLM,
     Qwen3_5MoeForCausalLM,
     Qwen3_5MoeTextConfig,
+    Qwen3_5TextConfig,
 )
 
 import deepspeed
@@ -55,6 +58,12 @@ MODEL_PRESETS: dict[str, dict[str, Any]] = {
         "display_name": "Qwen3.5 MoE",
         "default_tokenizer_name": "Qwen/Qwen3-0.6B",
     },
+    "qwen3_5": {
+        "architecture": "qwen3_5",
+        "config_cls": Qwen3_5TextConfig,
+        "display_name": "Qwen3.5 Text (Dense)",
+        "default_tokenizer_name": "Qwen/Qwen3.5-0.8B",
+    },
     "llama4": {
         "architecture": "llama4",
         "config_cls": Llama4TextConfig,
@@ -72,12 +81,14 @@ DEEPSPEED_LEAF_MOE_BLOCK_CLASS = {
     ),
 }
 
+DEFAULT_OPTIMIZER_LR = 0.001
+DEFAULT_OPTIMIZER_BETAS = (0.9, 0.999)
+
 
 class ModelPreset(NamedTuple):
     architecture: str
     config_cls: type[Any]
     display_name: str
-    num_layers_overridden: bool
 
 
 class TrainingState(NamedTuple):
@@ -91,7 +102,13 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="AutoEP / ZeRO-3 leaf MoE training")
     parser.add_argument("--mode", choices=["autoep", "zero3_leaf"], default="autoep")
     parser.add_argument("--model", choices=sorted(MODEL_PRESETS), default="qwen3_5_moe")
-    parser.add_argument("--num_layers", type=int, default=None)
+    parser.add_argument(
+        "--override",
+        action="append",
+        default=[],
+        metavar="KEY=VALUE",
+        help="Override a Hugging Face config field; may be repeated.",
+    )
     parser.add_argument("--autoep_size", type=int, default=None)
     parser.add_argument("--steps", type=int, default=50)
     parser.add_argument("--warmup_steps", type=int, default=5)
@@ -129,17 +146,12 @@ def resolve_model_preset(args: argparse.Namespace) -> ModelPreset:
     preset = MODEL_PRESETS[args.model]
     architecture = preset["architecture"]
     config_cls = preset["config_cls"]
-    num_layers_overridden = args.num_layers is not None
-    if args.num_layers is None:
-        original_config = build_model_config(config_cls, None)
-        args.num_layers = int(original_config.num_hidden_layers)
     if args.tokenizer_name is None:
         args.tokenizer_name = preset["default_tokenizer_name"]
     return ModelPreset(
         architecture,
         config_cls,
         preset["display_name"],
-        num_layers_overridden,
     )
 
 
@@ -148,17 +160,30 @@ def build_model(architecture: str, model_config: Any) -> torch.nn.Module:
         return AutoModelForCausalLM.from_config(model_config)
     if architecture == "qwen3_5_moe":
         return Qwen3_5MoeForCausalLM(model_config)
+    if architecture == "qwen3_5":
+        return Qwen3_5ForCausalLM(model_config)
     if architecture == "llama4":
         return Llama4ForCausalLM(model_config)
     raise ValueError(f"Unsupported architecture: {architecture!r}")
 
 
-def num_experts_for_config(architecture: str, model_config: Any) -> int:
+def num_experts_for_config(architecture: str, model_config: Any) -> int | None:
     if architecture in {"mixtral", "llama4"}:
         return int(model_config.num_local_experts)
     if architecture == "qwen3_5_moe":
         return int(model_config.num_experts)
+    if architecture == "qwen3_5":
+        return None
     raise ValueError(f"Unsupported architecture: {architecture!r}")
+
+def create_optimizer(model: AutoModelForCausalLM) -> Any:
+    from deepspeed.ops.adam import DeepSpeedCPUAdam
+    optimizer = DeepSpeedCPUAdam(
+        model.parameters(), 
+        lr=DEFAULT_OPTIMIZER_LR, 
+        betas=DEFAULT_OPTIMIZER_BETAS
+    )
+    return optimizer
 
 
 def build_deepspeed_config(
@@ -186,6 +211,8 @@ def build_deepspeed_config(
         "steps_per_print": 10,
     }
     if mode == "autoep":
+        if architecture not in DEEPSPEED_LEAF_MOE_BLOCK_CLASS:
+            raise ValueError("AutoEP is only supported for MoE model presets.")
         config["zero_optimization"] = {"stage": 1}
         config["expert_parallel"] = {
             "enabled": True,
@@ -193,11 +220,15 @@ def build_deepspeed_config(
             "preset_model": architecture,
         }
     else:
-        config["zero_optimization"] = {
+        zero_config: dict[str, Any] = {
             "stage": 3,
             "stage3_param_persistence_threshold": 1e5,
-            "leaf_module": {"classes": [DEEPSPEED_LEAF_MOE_BLOCK_CLASS[architecture]]},
         }
+        if architecture in DEEPSPEED_LEAF_MOE_BLOCK_CLASS:
+            zero_config["leaf_module"] = {
+                "classes": [DEEPSPEED_LEAF_MOE_BLOCK_CLASS[architecture]]
+            }
+        config["zero_optimization"] = zero_config
     return config
 
 
@@ -289,12 +320,16 @@ def prepare_training(args: argparse.Namespace) -> TrainingState:
     seed_everything(args.seed)
 
     preset = resolve_model_preset(args)
-    model_config = build_model_config(preset.config_cls, args.num_layers)
+    model_config = build_model_config(preset.config_cls, args.override)
     num_experts = num_experts_for_config(preset.architecture, model_config)
     autoep_size = args.autoep_size if args.mode == "autoep" else None
 
     if args.mode == "autoep":
+        if num_experts is None:
+            logger.error("AutoEP requires an MoE model; use --mode zero3_leaf for %s.", args.model)
+            sys.exit(2)
         try:
+            assert autoep_size is not None
             validate_autoep_args(preset.architecture, autoep_size, num_experts, world_size)
         except ValueError as exc:
             logger.error("AutoEP preflight failed: %s", exc)
@@ -322,13 +357,13 @@ def prepare_training(args: argparse.Namespace) -> TrainingState:
     if rank == 0:
         logger.info("Mode: %s", args.mode)
         logger.info(
-            "Model: %s (%s), layers=%s%s, hidden=%s, experts=%s",
+            "Model: %s (%s), layers=%s, hidden=%s, experts=%s, overrides=%s",
             args.model,
             preset.display_name,
-            args.num_layers,
-            " from --num_layers" if preset.num_layers_overridden else " original default",
+            model_config.num_hidden_layers,
             model_config.hidden_size,
             num_experts,
+            args.override,
         )
         logger.info(
             "Tokenizer %s: len=%s, vocab_size=%s, model_vocab_size=%s",
@@ -348,10 +383,15 @@ def prepare_training(args: argparse.Namespace) -> TrainingState:
     model = build_model(preset.architecture, model_config)
     load_initial_weights(args.load_init_weights, model, args, model_config, rank)
 
+    # 支持 super-offload, 创建一个 CPU Adam
+    # deepspeed 会根据 offload 比例额外创建 GPU Adam
+    optimizer = create_optimizer(model)
+
     try:
         engine, _, _, _ = deepspeed.initialize(
             model=model,
             config=ds_config,
+            optimizer=optimizer,
             model_parameters=model.parameters(),
         )
     except Exception as exc:

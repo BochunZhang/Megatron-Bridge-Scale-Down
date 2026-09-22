@@ -44,7 +44,7 @@ Use the same randomly initialized weights for AutoEP and ZeRO-3 leaf when compar
 ```bash
 python utils/prepare_init_weights.py \
   --model qwen3_5_moe \
-  --num_layers 8 \
+  --override num_hidden_layers=8 \
   --seed 42 \
   --output runs/qwen35/init/qwen35_l8_seed42.safetensors
 ```
@@ -56,7 +56,7 @@ deepspeed --num_gpus 8 --master_port 29104 train.py \
   --mode autoep \
   --model qwen3_5_moe \
   --autoep_size 8 \
-  --num_layers 8 \
+  --override num_hidden_layers=8 \
   --steps 100 \
   --warmup_steps 50 \
   --log_interval 1 \
@@ -77,7 +77,7 @@ deepspeed --num_gpus 8 --master_port 29104 train.py \
 deepspeed --num_gpus 8 --master_port 29105 train.py \
   --mode zero3_leaf \
   --model qwen3_5_moe \
-  --num_layers 8 \
+  --override num_hidden_layers=8 \
   --steps 100 \
   --warmup_steps 50 \
   --log_interval 1 \

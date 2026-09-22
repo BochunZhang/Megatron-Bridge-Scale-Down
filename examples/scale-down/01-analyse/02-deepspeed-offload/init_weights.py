@@ -40,7 +40,7 @@ def build_config_fingerprint(model_config: object) -> str:
         "num_attention_heads": getattr(model_config, "num_attention_heads"),
         "num_key_value_heads": getattr(model_config, "num_key_value_heads"),
         "num_experts": num_experts,
-        "num_experts_per_tok": getattr(model_config, "num_experts_per_tok"),
+        "num_experts_per_tok": getattr(model_config, "num_experts_per_tok", None),
         "vocab_size": getattr(model_config, "vocab_size"),
         "max_position_embeddings": getattr(model_config, "max_position_embeddings"),
     }
@@ -124,7 +124,7 @@ def save_init_weights_artifact(
     metadata = {
         "schema_version": CURRENT_INIT_SCHEMA_VERSION,
         "seed": int(getattr(args, "seed")),
-        "num_layers": int(getattr(args, "num_layers")),
+        "num_layers": int(getattr(model_config, "num_hidden_layers")),
         "model_class": model.__class__.__name__,
         "config_fingerprint": config_fingerprint,
         "torch_version": torch.__version__,
@@ -171,7 +171,7 @@ def load_init_weights_artifact(
             f"{schema_version} is not supported. Please upgrade your tools."
         )
 
-    expected_layers = int(getattr(args, "num_layers"))
+    expected_layers = int(getattr(model_config, "num_hidden_layers"))
     artifact_layers = int(metadata.get("num_layers", -1))
     if artifact_layers != expected_layers:
         raise ValueError(

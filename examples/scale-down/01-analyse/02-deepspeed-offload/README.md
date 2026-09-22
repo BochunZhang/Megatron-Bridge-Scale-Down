@@ -18,14 +18,14 @@ This example offers a quick start for AutoEP in DeepSpeed.
 ### Run
 
 The following launches causal LM training with **AutoEP + ZeRO-1** on a randomly initialized model built from the original **Qwen3.5-MoE** Hugging Face text config.
-`--num_layers` overrides only the layer count in the original model config, which is useful when testing with limited GPU resources. `--dataset_name` and `--dataset_percentage` choose the Hugging Face training dataset and the percentage of the train split to use.
+`--override` applies one or more `KEY=VALUE` overrides to the original model config, which is useful when testing with limited GPU resources. `--dataset_name` and `--dataset_percentage` choose the Hugging Face training dataset and the percentage of the train split to use.
 
 ```bash
 deepspeed --num_gpus 8 train.py \
     --mode autoep \
     --model qwen3_5_moe \
     --autoep_size 8 \
-    --num_layers 8 \
+    --override num_hidden_layers=8 \
     --dataset_name wikitext \
     --dataset_percentage 10.0 \
     --steps 1000
@@ -47,7 +47,7 @@ Here are the key options in the DeepSpeed config for AutoEP:
 - **`autoep_size`** — Expert-parallel size. It must be specified with `--autoep_size` in AutoEP mode and must divide both the GPU count and the model's expert count. The benchmark commands use `8` for Qwen3.5 and `4` for Llama4 and Mixtral.
 - **`preset_model`** — DeepSpeed's structural AutoEP preset id. The example's public `--model` choices intentionally use the same ids when an AutoEP preset exists.
 
-This example exposes three public `--model` choices: `qwen3_5_moe`, `llama4`, and `mixtral`. These match the DeepSpeed `preset_model` ids used by AutoEP for the same structures. The underlying AutoEP PR also defines additional structural preset ids: `qwen3_moe`, `deepseek_v2`, and `deepseek_v3`; those are not exposed as `--model` choices in this example.
+This example exposes four public `--model` choices: `qwen3_5_moe`, `qwen3_5`, `llama4`, and `mixtral`. The `qwen3_5` choice uses the dense Qwen3.5 text model and must run with `--mode zero3_leaf`; the other choices match the DeepSpeed `preset_model` ids used by AutoEP for the same MoE structures. The underlying AutoEP PR also defines additional structural preset ids: `qwen3_moe`, `deepseek_v2`, and `deepseek_v3`; those are not exposed as `--model` choices in this example.
 
 ## Performance Benchmark
 
