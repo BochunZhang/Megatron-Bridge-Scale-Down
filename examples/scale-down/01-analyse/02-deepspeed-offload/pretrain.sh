@@ -119,12 +119,25 @@ fi
 GRAD_ACCUM=$((PER_GPU_BATCH_SIZE / MICRO_BATCH_SIZE))
 
 # ---------------------------------------------------------------------------
-# Model shape: shrink every model to 8 layers, linear attention every 4th
-# layer (data_utils.build_model_config expands linear_attention_freq into
-# layer_types; num_hidden_layers is mandatory when it is set).
+# Model shape: optionally shrink every model to $NUM_LAYERS layers with linear
+# attention every $LINEAR_ATTENTION_FREQ-th layer (data_utils.build_model_config
+# expands linear_attention_freq into layer_types; num_hidden_layers is mandatory
+# when it is set).
+# DISABLED by default: run with the model's native layer count / attention
+# pattern. Set APPLY_MODEL_SHAPE_OVERRIDES=true to re-enable shrinking;
+# pretrain_experiment.sh tags result dirs with _<N>layer only when the flag
+# is true, so folder names always follow the actual overrides.
 # ---------------------------------------------------------------------------
 NUM_LAYERS=${NUM_LAYERS:-8}
 LINEAR_ATTENTION_FREQ=${LINEAR_ATTENTION_FREQ:-4}
+APPLY_MODEL_SHAPE_OVERRIDES=${APPLY_MODEL_SHAPE_OVERRIDES:-false}
+if [ "$APPLY_MODEL_SHAPE_OVERRIDES" = "true" ]; then
+    MODEL_SHAPE_OVERRIDE_ARGS="--override num_hidden_layers=$NUM_LAYERS --override linear_attention_freq=$LINEAR_ATTENTION_FREQ"
+    MODEL_SHAPE_DESC="${NUM_LAYERS} layers (linear_attention_freq=$LINEAR_ATTENTION_FREQ)"
+else
+    MODEL_SHAPE_OVERRIDE_ARGS=""
+    MODEL_SHAPE_DESC="native (no num_hidden_layers/linear_attention_freq overrides)"
+fi
 
 # ---------------------------------------------------------------------------
 # Parallelism: MoE models run AutoEP with autoep_size=4; dense models run
@@ -161,9 +174,10 @@ if [ "$TRAIN_MODE" != "autoep" ]; then
 fi
 
 # ---------------------------------------------------------------------------
-# Extra HF config overrides (space-separated KEY=VALUE pairs), appended to the
-# fixed num_hidden_layers / linear_attention_freq overrides; e.g. the
-# experiment driver sets EXTRA_OVERRIDES="num_experts=64" for Qwen3.5-35B-A3B.
+# Extra HF config overrides (space-separated KEY=VALUE pairs), appended as
+# --override arguments; e.g. the experiment driver sets
+# EXTRA_OVERRIDES="num_experts=64" for Qwen3.5-35B-A3B. (The fixed
+# num_hidden_layers / linear_attention_freq overrides are commented out above.)
 # ---------------------------------------------------------------------------
 EXTRA_OVERRIDES=${EXTRA_OVERRIDES:-}
 EXTRA_OVERRIDE_ARGS=""
@@ -234,7 +248,7 @@ echo "GPUs:            $NUM_GPUS"
 echo "Seq len:         $SEQ_LEN"
 echo "Micro batch:     $MICRO_BATCH_SIZE  grad_accum: $GRAD_ACCUM  global batch: $GLOBAL_BATCH_SIZE"
 echo "Steps:           $STEPS (warmup=$WARMUP_STEPS)"
-echo "Layers:          $NUM_LAYERS (linear_attention_freq=$LINEAR_ATTENTION_FREQ)"
+echo "Model shape:     $MODEL_SHAPE_DESC"
 echo "Metrics out:     $METRICS_OUT"
 echo "================================================"
 
@@ -247,8 +261,7 @@ CMD="deepspeed --num_gpus=$NUM_GPUS $DS_LAUNCHER_ARGS train.py \
     --model $MODEL \
     --mode $TRAIN_MODE \
     $MODE_ARGS \
-    --override num_hidden_layers=$NUM_LAYERS \
-    --override linear_attention_freq=$LINEAR_ATTENTION_FREQ \
+    $MODEL_SHAPE_OVERRIDE_ARGS \
     $EXTRA_OVERRIDE_ARGS \
     --dataset_name $DATASET_NAME \
     --dataset_percentage $DATASET_PERCENTAGE \

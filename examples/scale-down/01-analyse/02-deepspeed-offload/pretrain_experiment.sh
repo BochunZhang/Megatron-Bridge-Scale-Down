@@ -21,7 +21,7 @@
 # (NVMe offload shows up in the name via the zero_offload_nvme strategy.)
 #
 # Output layout — one independent folder per test, timestamped per run:
-#   <repo_root>/results/01-analyse/02-deepspeed/<model>_<N>layer/<TEST_NAME>/<timestamp>/
+#   <repo_root>/results/01-analyse/02-deepspeed/<model>[_<N>layer]/<TEST_NAME>/<timestamp>/
 #       ├── run.log        full stdout/stderr
 #       ├── metrics.csv    per-step metrics (train.py MetricsLogger)
 #       └── ds_config.json exact config used (copied by pretrain.sh)
@@ -71,16 +71,18 @@ OFFLOAD_STRATEGIES=${OFFLOAD_STRATEGIES:-"zero_3 zero_offload_cpu super_offload_
 # the global batch stays constant across the micro-batch sweep (must match
 # PER_GPU_BATCH_SIZE in pretrain.sh).
 PER_GPU_BATCH_SIZE=${PER_GPU_BATCH_SIZE:-16}
-# Shrunk layer count; part of the model result folder name and exported so
-# pretrain.sh applies the same --override num_hidden_layers.
+# Shrunk layer count; only applied — and only tagged onto result folder names
+# as _<N>layer — when APPLY_MODEL_SHAPE_OVERRIDES=true (see pretrain.sh model
+# shape section). Exported so pretrain.sh sees the same values.
 NUM_LAYERS=${NUM_LAYERS:-8}
-export NUM_LAYERS PER_GPU_BATCH_SIZE
+APPLY_MODEL_SHAPE_OVERRIDES=${APPLY_MODEL_SHAPE_OVERRIDES:-false}
+export NUM_LAYERS PER_GPU_BATCH_SIZE APPLY_MODEL_SHAPE_OVERRIDES
 
 # ---------------------------------------------------------------------------
 # Output layout
 #   working ds_configs : <repo_root>/.tmp/
 #   results            : <repo_root>/results/01-analyse/02-deepspeed/
-#                        └── <model>_<N>layer/<TEST_NAME>/<timestamp>/{run.log,
+#                        └── <model>[_<N>layer]/<TEST_NAME>/<timestamp>/{run.log,
 #                            metrics.csv, ds_config.json}
 # ---------------------------------------------------------------------------
 TMP_CONFIG_DIR=${TMP_CONFIG_DIR:-"${REPO_ROOT}/.tmp"}
@@ -339,8 +341,15 @@ SUMMARY_FILE="${RESULTS_ROOT}/experiment_summary_${INVOKE_TS}.txt"
 
 set +e  # keep sweeping after a failing/OOM run; status is recorded per run
 for MODEL in $MODELS; do
-    # Strip the HF org prefix for filesystem use: Qwen/Qwen3.5-9B -> Qwen3.5-9B
-    MODEL_DIR="${MODEL##*/}_${NUM_LAYERS}layer"
+    # Strip the HF org prefix for filesystem use: Qwen/Qwen3.5-9B -> Qwen3.5-9B.
+    # The _<N>layer tag follows the override configuration: it is only present
+    # when the layer-shrink overrides are actually applied to the model.
+    if [ "$APPLY_MODEL_SHAPE_OVERRIDES" = "true" ]; then
+        MODEL_SHAPE_TAG="_${NUM_LAYERS}layer"
+    else
+        MODEL_SHAPE_TAG=""
+    fi
+    MODEL_DIR="${MODEL##*/}${MODEL_SHAPE_TAG}"
 
     # Per-model extra HF config overrides consumed by pretrain.sh: the
     # 35B-A3B MoE model is resized to $MOE_NUM_EXPERTS experts.
