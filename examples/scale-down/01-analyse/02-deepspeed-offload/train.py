@@ -5,6 +5,13 @@ Launch with DeepSpeed:
     deepspeed --num_gpus 8 train.py --mode autoep --autoep_size 8
     deepspeed --num_gpus 8 train.py --mode zero3_leaf
     deepspeed --num_gpus 1 train.py --model qwen3_5 --mode zero3_leaf
+
+Launch with profiling / memory snapshots:
+
+    deepspeed --num_gpus 1 train.py --model qwen3_5 --mode zero3_leaf \
+        --use_pytorch_profiler --record_memory_history \
+        --profile_step_start 5 --profile_step_end 10 \
+        --profile_ranks 0 --memory_snapshot_path snapshot.pickle
 """
 
 from __future__ import annotations
@@ -34,6 +41,7 @@ from transformers import (
 
 import deepspeed
 
+from config import ProfilingConfig
 from data_utils import (
     build_hf_batch_generator,
     build_model_config,
@@ -42,6 +50,12 @@ from data_utils import (
 )
 from init_weights import load_init_weights_artifact
 from metrics import MetricsLogger, reduce_loss, reduce_max
+from profiling import (
+    handle_profiling_step,
+    handle_profiling_stop,
+    initialize_pytorch_profiler,
+    should_profile_rank,
+)
 from train_utils import start_memory_history_recording
 
 logger = logging.getLogger(__name__)
@@ -98,6 +112,7 @@ class TrainingState(NamedTuple):
     dp_world_size: int
     engine: Any
     batch_gen: Any
+    profiling: ProfilingConfig
 
 
 def parse_args() -> argparse.Namespace:
@@ -131,6 +146,51 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--metrics_out", default=None)
     parser.add_argument("--local_rank", type=int, default=-1)
+    # Profiling arguments. All default to None so ProfilingConfig owns the
+    # actual defaults; ProfilingConfig.from_args(args) parses them generically.
+    parser.add_argument(
+        "--profile_step_start",
+        type=int,
+        default=None,
+        help="Global step to start profiling.",
+    )
+    parser.add_argument(
+        "--profile_step_end",
+        type=int,
+        default=None,
+        help="Global step to stop profiling; memory snapshot is dumped at this step.",
+    )
+    parser.add_argument(
+        "--profile_ranks",
+        type=int,
+        nargs="+",
+        default=None,
+        help="Global ranks to profile.",
+    )
+    parser.add_argument(
+        "--record_memory_history",
+        action="store_true",
+        default=None,
+        help="Record CUDA memory history and dump a snapshot pickle at profile_step_end.",
+    )
+    parser.add_argument(
+        "--memory_snapshot_path",
+        type=str,
+        default=None,
+        help="Memory history pickle path; the rank is inserted before the extension.",
+    )
+    parser.add_argument(
+        "--use_pytorch_profiler",
+        action="store_true",
+        default=None,
+        help="Enable the built-in PyTorch profiler (chrome traces under ./torch_profile).",
+    )
+    parser.add_argument(
+        "--tensorboard_dir",
+        type=str,
+        default=None,
+        help="Directory for PyTorch profiler TensorBoard output.",
+    )
     args = parser.parse_args()
 
     if args.mode == "autoep" and args.autoep_size is None:
@@ -321,6 +381,13 @@ def prepare_training(args: argparse.Namespace) -> TrainingState:
     )
     seed_everything(args.seed)
 
+    # ProfilingConfig parses the matching CLI arguments from the namespace
+    # generically (see ProfilingConfig.from_args); unknown args are ignored.
+    prof_config = ProfilingConfig.from_args(args)
+    # Must start before model construction so weight/optimizer allocations
+    # are captured in the memory history trace.
+    start_memory_history_recording(prof_config)
+
     preset = resolve_model_preset(args)
     model_config = build_model_config(preset.config_cls, args.override)
     num_experts = num_experts_for_config(preset.architecture, model_config)
@@ -425,24 +492,51 @@ def prepare_training(args: argparse.Namespace) -> TrainingState:
         dp_world_size=dp_world_size,
         engine=engine,
         batch_gen=batch_gen,
+        profiling=prof_config,
     )
 
 
 def train(args: argparse.Namespace, state: TrainingState) -> None:
     metrics_logger = MetricsLogger(args.metrics_out, state.rank)
+    profiling = state.profiling
+    nsys_nvtx_context = None  # NVTX context for nsys profiling, set at profile_step_start
     if state.rank == 0:
         logger.info(
             "Starting training for %s optimizer steps (warmup=%s).",
             args.steps,
             args.warmup_steps,
         )
+        if profiling.use_pytorch_profiler or profiling.use_nsys_profiler or profiling.record_memory_history:
+            logger.info("Profiling config: %s", profiling)
+
+    prof = None
+    prof_config = profiling
+    if prof_config and should_profile_rank(prof_config, torch.distributed.get_rank()):
+        if prof_config.use_pytorch_profiler:
+            prof = initialize_pytorch_profiler(prof_config, prof_config.tensorboard_dir)
+            prof.start()
+
 
     for step in range(args.steps):
         sync_cuda()
+
+        # Handle profiling for this step
+        nvtx_ctx = handle_profiling_step(
+            prof_config,
+            step,
+            torch.distributed.get_rank(),
+            prof,
+        )
+        if nvtx_ctx is not None:
+            nsys_nvtx_context = nvtx_ctx
+
         step_start = time.time()
         last_loss = None
 
         for accum_idx in range(args.grad_accum):
+            msg = f"forward_step[{accum_idx}]"
+            profiler_handle = torch.autograd.profiler.record_function(msg)
+            profiler_handle.__enter__()
             batch = state.batch_gen.get_batch(step, accum_idx)
             outputs = state.engine(
                 input_ids=batch.input_ids.to(state.engine.device),
@@ -451,8 +545,23 @@ def train(args: argparse.Namespace, state: TrainingState) -> None:
             )
             loss = outputs.loss
             last_loss = loss.detach().clone()
+            profiler_handle.__exit__(None, None, None)
+
+            msg = f"backward_step[{accum_idx}]"
+            profiler_handle = torch.autograd.profiler.record_function(msg)
+            profiler_handle.__enter__()
             state.engine.backward(loss)
-            state.engine.step()
+            profiler_handle.__exit__(None, None, None)
+
+            msg = f"optimizer_step"
+            profiler_handle = torch.autograd.profiler.record_function(msg)
+
+            if accum_idx == args.grad_accum - 1:
+                profiler_handle.__enter__()
+                state.engine.step()
+                profiler_handle.__exit__(None, None, None)
+            else:
+                state.engine.step()
 
         sync_cuda()
         iter_time = time.time() - step_start
@@ -504,6 +613,26 @@ def train(args: argparse.Namespace, state: TrainingState) -> None:
                     global_tokens_per_sec,
                     mem_peak_allocated / (1024**3),
                 )
+
+
+        if profiling and profiling.record_memory_history and step == profiling.profile_step_end:
+            rank = state.rank
+            if rank in profiling.profile_ranks:
+                snapshot = torch.cuda.memory._snapshot()
+                from pickle import dump
+
+                filename, ext = os.path.splitext(profiling.memory_snapshot_path)
+                filename = f"{filename}_{rank}{ext}"
+                with open(filename, "wb") as f:
+                    dump(snapshot, f)
+
+        handle_profiling_stop(
+            profiling,
+            step,
+            state.rank,
+            prof,
+            nsys_nvtx_context,
+        )
 
     metrics_logger.close()
     if state.rank == 0:

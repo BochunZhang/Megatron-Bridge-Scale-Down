@@ -1,4 +1,5 @@
-from dataclasses import dataclass, field
+import argparse
+from dataclasses import dataclass, field, fields
 
 
 @dataclass(kw_only=True)
@@ -30,8 +31,10 @@ class ProfilingConfig:
     pytorch_profiler_collect_chakra: bool = False
     """Collect chakra trace in pytorch profiler."""
 
-    profile_ranks: list[int] = field(default_factory=lambda: [])
-    """Global ranks to profile."""
+    profile_ranks: list[int] = field(default_factory=lambda: [0])
+    """Global ranks to profile. Memory-snapshot and recording-start guards use a
+    strict membership check, so an empty list disables capture; the default
+    ``[0]`` gives rank-0 capture with no further override required."""
 
     record_memory_history: bool = False
     """Record memory history in last rank."""
@@ -45,3 +48,42 @@ class ProfilingConfig:
     nvtx_ranges: bool = False
     """Enable NVTX range annotations for profiling. When enabled, inserts NVTX markers
     to categorize execution in profiler output."""
+
+    tensorboard_dir: str | None = None
+
+    def finalize(self) -> None:
+        """Validate profiling configuration."""
+        assert not (self.use_pytorch_profiler and self.use_nsys_profiler), (
+            "Exactly one of pytorch or nsys profiler should be enabled, not both."
+        )
+        assert self.profile_step_start >= 0, f"profile_step_start must be >= 0, got {self.profile_step_start}"
+        assert self.profile_step_end >= 0, f"profile_step_end must be >= 0, got {self.profile_step_end}"
+        assert self.profile_step_end >= self.profile_step_start, (
+            f"profile_step_end ({self.profile_step_end}) must be >= profile_step_start ({self.profile_step_start})"
+        )
+
+    @classmethod
+    def from_args(cls, args: argparse.Namespace) -> "ProfilingConfig":
+        """Build a ProfilingConfig from an argparse namespace, parsing it generically.
+
+        Every dataclass field is looked up on the namespace by its argparse dest
+        (``metadata["argparse_meta"]["dest"]`` when present, otherwise the field
+        name). Attributes that are missing or ``None`` fall back to the dataclass
+        default, and unknown attributes are ignored — so callers can pass their
+        full namespace through without per-field mapping.
+
+        Args:
+            args: Parsed argparse namespace (may contain unrelated arguments).
+
+        Returns:
+            A validated ProfilingConfig instance.
+        """
+        kwargs = {}
+        for f in fields(cls):
+            dest = f.metadata.get("argparse_meta", {}).get("dest", f.name)
+            value = getattr(args, dest, None)
+            if value is not None:
+                kwargs[f.name] = value
+        config = cls(**kwargs)
+        config.finalize()
+        return config
