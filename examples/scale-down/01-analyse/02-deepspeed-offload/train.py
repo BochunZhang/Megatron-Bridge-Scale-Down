@@ -13,6 +13,7 @@ import argparse
 import logging
 import math
 import os
+import pickle
 import random
 import sys
 import time
@@ -41,6 +42,7 @@ from data_utils import (
 )
 from init_weights import load_init_weights_artifact
 from metrics import MetricsLogger, reduce_loss, reduce_max
+from train_utils import start_memory_history_recording
 
 logger = logging.getLogger(__name__)
 

@@ -3,6 +3,8 @@ import torch
 import logging
 from typing import Optional
 
+from config import ProfilingConfig
+
 logger = logging.getLogger(__name__)
 
 def get_rank_safe() -> int:
@@ -33,11 +35,21 @@ def print_rank_0(message: str) -> None:
         print(message, flush=True)
 
 
-def start_memory_history_recording(record_memory_history: bool, memory_snapshot_path: str, profile_ranks: Optional[list] = None) -> None:
-    if not record_memory_history:
-        return
+def start_memory_history_recording(profiling: ProfilingConfig | None) -> None:
+    """Enable the CUDA caching allocator trace so memory snapshots contain history.
 
-    if (profile_ranks is not None) and (get_rank_safe() not in profile_ranks):
+    ``torch.cuda.memory._snapshot()`` only includes allocation/free events and
+    Python stack context after ``_record_memory_history()`` has been enabled.
+    Without this call, dumped snapshots contain only the current live
+    allocations — no timeline, no call sites.
+
+    Must be invoked before model construction so every tensor allocation is
+    captured. Guarded by ``profile_ranks`` so only ranks that will dump a
+    snapshot pay the recording overhead.
+    """
+    if profiling is None or not profiling.record_memory_history:
+        return
+    if get_rank_safe() not in profiling.profile_ranks:
         return
 
     torch.cuda.memory._record_memory_history(
@@ -46,7 +58,6 @@ def start_memory_history_recording(record_memory_history: bool, memory_snapshot_
         trace_alloc_max_entries=100_000,
         # Record the Python stack at each event — lets memory_viz show call sites.
         trace_alloc_record_context=True,
-
     )
 
     def _oom_observer(device: int, alloc: int, device_alloc: int, device_free: int) -> None:
@@ -54,7 +65,7 @@ def start_memory_history_recording(record_memory_history: bool, memory_snapshot_
         import pickle
 
         rank = get_rank_safe()
-        base, ext = os.path.splitext(memory_snapshot_path)
+        base, ext = os.path.splitext(profiling.memory_snapshot_path)
         filename = f"{base}_oom_rank-{rank}{ext}"
         snapshot = torch.cuda.memory._snapshot()
         with open(filename, "wb") as f:
@@ -65,5 +76,5 @@ def start_memory_history_recording(record_memory_history: bool, memory_snapshot_
     torch._C._cuda_attach_out_of_memory_observer(_oom_observer)
     print_rank_0(
         f"Memory history recording enabled (rank {get_rank_safe()}); "
-        f"snapshots will be written to '{memory_snapshot_path}'."
+        f"snapshots will be written to '{profiling.memory_snapshot_path}'."
     )
