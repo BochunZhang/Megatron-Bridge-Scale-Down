@@ -58,6 +58,9 @@ export PYTORCH_CUDA_ALLOC_CONF=${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:Tr
 # no cudaHostRegister) stalls side-stream DMA in act+cpu.
 export DS_PIN_MEMORY_BACKEND=${DS_PIN_MEMORY_BACKEND:-torch}
 
+# Repo-local HuggingFace cache. REPO_ROOT defaults to the megatron-bridge
+# checkout root (4 levels up from this script); override via env if needed.
+REPO_ROOT=${REPO_ROOT:-"$(cd "$SCRIPT_DIR/../../../.." && pwd)"}
 HF_CACHE="${REPO_ROOT}/.cache/huggingface"
 mkdir -p "$HF_CACHE"
 export HF_HOME="${HF_CACHE}"
