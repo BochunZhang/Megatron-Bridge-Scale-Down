@@ -1247,7 +1247,9 @@ def training_log(
             if iteration > (loaded_iteration + 1):
                 # Make sure the memory after the second iteration is reported
                 # to include optimizer state memory.
-                report_memory_flag = False
+                # report_memory_flag = False
+                # allocate every iteration
+                report_memory_flag = True
         timers.log(timers_to_log, normalizer=logger_config.log_interval)
 
     return report_memory_flag
