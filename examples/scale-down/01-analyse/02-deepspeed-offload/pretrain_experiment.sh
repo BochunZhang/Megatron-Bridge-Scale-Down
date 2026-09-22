@@ -2,6 +2,7 @@
 # Experiment driver for the DeepSpeed offload + recompute matrix.
 #
 # Loop structure (outer -> inner):
+#   outermost: model preset               {qwen3_5 (dense), qwen3_5_moe (MoE)}
 #   outer : micro-batch size sweep        {1, 2, 4, 8}
 #   middle: recompute x cpu_checkpoint    {recompute_none, recompute_act,
 #                                          recompute_act_cpu}
@@ -30,8 +31,9 @@
 # be verified by hand); pretrain.sh copies the one it used into the run dir.
 #
 # Usage:
-#   ./pretrain_experiment.sh                          # full matrix, dense model
-#   MODEL=qwen3_5_moe ./pretrain_experiment.sh        # MoE model
+#   ./pretrain_experiment.sh                          # full matrix, dense + MoE
+#   MODELS="qwen3_5" ./pretrain_experiment.sh         # dense only
+#   MODELS="qwen3_5_moe" ./pretrain_experiment.sh     # MoE only
 #   OFFLOAD_STRATEGIES="zero_3 zero_offload_nvme super_offload_1.0" ./pretrain_experiment.sh
 #   RECOMPUTE_COMBOS="recompute_act" MICRO_BATCH_SIZES="1 8" ./pretrain_experiment.sh
 set -euo pipefail
@@ -43,8 +45,9 @@ REPO_ROOT=${REPO_ROOT:-"$(cd "$SCRIPT_DIR/../../../.." && pwd)"}
 # ---------------------------------------------------------------------------
 # Experiment matrix knobs
 # ---------------------------------------------------------------------------
-# train.py model preset: qwen3_5 (dense) | qwen3_5_moe | mixtral | llama4
-MODEL=${MODEL:-qwen3_5}
+# Outermost loop: train.py model presets — Qwen3.5 dense + Qwen3.5 MoE.
+# (Other available presets: mixtral | llama4.)
+MODELS=${MODELS:-"qwen3_5 qwen3_5_moe"}
 
 # Outer loop: micro-batch size sweep axis.
 MICRO_BATCH_SIZES=${MICRO_BATCH_SIZES:-"1 2 4 8"}
@@ -77,7 +80,6 @@ export NUM_LAYERS PER_GPU_BATCH_SIZE
 # ---------------------------------------------------------------------------
 TMP_CONFIG_DIR=${TMP_CONFIG_DIR:-"${REPO_ROOT}/.tmp"}
 RESULTS_ROOT=${RESULTS_ROOT:-"${REPO_ROOT}/results/01-analyse/02-deepspeed"}
-MODEL_DIR="${MODEL}_${NUM_LAYERS}layer"
 mkdir -p "$TMP_CONFIG_DIR" "$RESULTS_ROOT"
 
 # ---------------------------------------------------------------------------
@@ -259,53 +261,59 @@ recompute_token() {
 }
 
 # ---------------------------------------------------------------------------
-# Main sweep: outer batch size -> middle recompute combo -> inner strategy
+# Main sweep: model -> batch size -> recompute combo -> offload strategy
 # ---------------------------------------------------------------------------
 INVOKE_TS=$(date +%Y%m%d_%H%M%S)
 SUMMARY_FILE="${RESULTS_ROOT}/experiment_summary_${INVOKE_TS}.txt"
 : > "$SUMMARY_FILE"
 
 set +e  # keep sweeping after a failing/OOM run; status is recorded per run
-for MBS in $MICRO_BATCH_SIZES; do
-    if [ $((PER_GPU_BATCH_SIZE % MBS)) -ne 0 ]; then
-        echo "PER_GPU_BATCH_SIZE($PER_GPU_BATCH_SIZE) must be divisible by micro_batch_size($MBS)" >&2
-        exit 2
-    fi
-    GRAD_ACCUM=$((PER_GPU_BATCH_SIZE / MBS))
+for MODEL in $MODELS; do
+    MODEL_DIR="${MODEL}_${NUM_LAYERS}layer"
 
-    for RECOMPUTE_COMBO in $RECOMPUTE_COMBOS; do
-        RECOMPUTE=$(recompute_token "$RECOMPUTE_COMBO")
+    for MBS in $MICRO_BATCH_SIZES; do
+        if [ $((PER_GPU_BATCH_SIZE % MBS)) -ne 0 ]; then
+            echo "PER_GPU_BATCH_SIZE($PER_GPU_BATCH_SIZE) must be divisible by micro_batch_size($MBS)" >&2
+            exit 2
+        fi
+        GRAD_ACCUM=$((PER_GPU_BATCH_SIZE / MBS))
 
-        for STRATEGY in $OFFLOAD_STRATEGIES; do
-            TEST_NAME="${STRATEGY}__${RECOMPUTE_COMBO}__mbs${MBS}"
-            RUN_TS=$(date +%Y%m%d_%H%M%S)
-            RUN_DIR="${RESULTS_ROOT}/${MODEL_DIR}/${TEST_NAME}/${RUN_TS}"
-            mkdir -p "$RUN_DIR"
+        for RECOMPUTE_COMBO in $RECOMPUTE_COMBOS; do
+            RECOMPUTE=$(recompute_token "$RECOMPUTE_COMBO")
 
-            # Working copy under <repo_root>/.tmp; pretrain.sh archives it
-            # into $RUN_DIR/ds_config.json before launching.
-            DS_CONFIG="${TMP_CONFIG_DIR}/ds_config_${TEST_NAME}.json"
-            METRICS_OUT="${RUN_DIR}/metrics.csv"
-            LOG_FILE="${RUN_DIR}/run.log"
+            for STRATEGY in $OFFLOAD_STRATEGIES; do
+                TEST_NAME="${STRATEGY}__${RECOMPUTE_COMBO}__mbs${MBS}"
+                RUN_TS=$(date +%Y%m%d_%H%M%S)
+                RUN_DIR="${RESULTS_ROOT}/${MODEL_DIR}/${TEST_NAME}/${RUN_TS}"
+                mkdir -p "$RUN_DIR"
 
-            build_ds_config "$STRATEGY" "$MBS" "$GRAD_ACCUM" "$DS_CONFIG"
+                # Working copy under <repo_root>/.tmp; pretrain.sh archives it
+                # into $RUN_DIR/ds_config.json before launching. The config
+                # content is model-independent, so one file per TEST_NAME is
+                # enough (rebuilt for each model to keep .tmp self-contained).
+                DS_CONFIG="${TMP_CONFIG_DIR}/ds_config_${TEST_NAME}.json"
+                METRICS_OUT="${RUN_DIR}/metrics.csv"
+                LOG_FILE="${RUN_DIR}/run.log"
 
-            echo ""
-            echo "################ RUN ${MODEL_DIR}/${TEST_NAME}/${RUN_TS} ################"
-            bash "${SCRIPT_DIR}/pretrain.sh" \
-                "$TEST_NAME" "$MODEL" "$MBS" "$DS_CONFIG" "$RECOMPUTE" "$METRICS_OUT" \
-                2>&1 | tee "$LOG_FILE"
-            RUN_RC=${PIPESTATUS[0]}
+                build_ds_config "$STRATEGY" "$MBS" "$GRAD_ACCUM" "$DS_CONFIG"
 
-            STATUS="OK"
-            if [ "$RUN_RC" -ne 0 ]; then
-                if grep -qi "out of memory\|CUDA out of memory\|OutOfMemoryError" "$LOG_FILE"; then
-                    STATUS="OOM"
-                else
-                    STATUS="FAILED(rc=$RUN_RC)"
+                echo ""
+                echo "################ RUN ${MODEL_DIR}/${TEST_NAME}/${RUN_TS} ################"
+                bash "${SCRIPT_DIR}/pretrain.sh" \
+                    "$TEST_NAME" "$MODEL" "$MBS" "$DS_CONFIG" "$RECOMPUTE" "$METRICS_OUT" \
+                    2>&1 | tee "$LOG_FILE"
+                RUN_RC=${PIPESTATUS[0]}
+
+                STATUS="OK"
+                if [ "$RUN_RC" -ne 0 ]; then
+                    if grep -qi "out of memory\|CUDA out of memory\|OutOfMemoryError" "$LOG_FILE"; then
+                        STATUS="OOM"
+                    else
+                        STATUS="FAILED(rc=$RUN_RC)"
+                    fi
                 fi
-            fi
-            echo "${MODEL_DIR}/${TEST_NAME}/${RUN_TS} ${STATUS}" | tee -a "$SUMMARY_FILE"
+                echo "${MODEL_DIR}/${TEST_NAME}/${RUN_TS} ${STATUS}" | tee -a "$SUMMARY_FILE"
+            done
         done
     done
 done

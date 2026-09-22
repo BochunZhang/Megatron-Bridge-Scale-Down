@@ -48,14 +48,14 @@ NUM_GPUS=${NUM_GPUS:-4}
 # NUMA binding wrapper prefixed to the deepspeed launcher (set NUMARUN= to
 # disable on machines without numarun; note the dash form so an explicitly
 # empty value is honored instead of falling back to the default).
-NUMARUN=${NUMARUN-numarun}
+# NUMARUN=${NUMARUN-numarun}
 # README §2: SuperOffload runs launch with --bind_cores_to_rank. Applied
 # automatically when the ds_config enables super_offload; force via env var.
 BIND_CORES_TO_RANK=${BIND_CORES_TO_RANK:-auto}   # auto | true | false
 
 # train.py refuses to start without expandable_segments (ZeRO-3 + act+cpu
 # offload/restore cycles fragment the default allocator).
-export PYTORCH_CUDA_ALLOC_CONF=${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}
+
 # README §3.1: keep the default torch pinned-memory backend; native (mlock,
 # no cudaHostRegister) stalls side-stream DMA in act+cpu.
 export DS_PIN_MEMORY_BACKEND=${DS_PIN_MEMORY_BACKEND:-torch}
@@ -68,6 +68,13 @@ mkdir -p "$HF_CACHE"
 export HF_HOME="${HF_CACHE}"
 export HF_HUB_CACHE="${HF_CACHE}"
 export TRANSFORMERS_CACHE="${HF_CACHE}"
+
+export TORCH_NCCL_AVOID_RECORD_STREAMS="1"
+export NVLINK_DOMAIN_SIZE="72"
+export PYTORCH_CUDA_ALLOC_CONF="expandable_segments:True"
+export NCCL_NVLS_ENABLE="0"
+export NCCL_DEBUG="WARN"
+export NCCL_GRAPH_REGISTER="0"
 
 # ---------------------------------------------------------------------------
 # Data knobs
@@ -216,7 +223,7 @@ echo "================================================"
 # --record_memory_history / --profile_* are intentionally omitted).
 # NUMARUN prefixes deepspeed to bind the process to the correct NUMA node;
 # expand to empty (NUMARUN=) to launch deepspeed directly.
-CMD="$NUMARUN deepspeed --num_gpus=$NUM_GPUS $DS_LAUNCHER_ARGS train.py \
+CMD="deepspeed --num_gpus=$NUM_GPUS $DS_LAUNCHER_ARGS train.py \
     --deepspeed_config $DS_CONFIG \
     --model $MODEL \
     --mode $TRAIN_MODE \
