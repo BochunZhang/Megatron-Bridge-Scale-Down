@@ -214,6 +214,7 @@ def start_memory_history_recording(profiling: ProfilingConfig | None) -> None:
         trace_alloc_max_entries=100_000,
         # Record the Python stack at each event — lets memory_viz show call sites.
         trace_alloc_record_context=True,
+        record_pinned_host_memory=True,
     )
 
     def _oom_observer(device: int, alloc: int, device_alloc: int, device_free: int) -> None:
