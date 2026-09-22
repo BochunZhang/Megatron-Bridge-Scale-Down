@@ -95,7 +95,16 @@ WALL_CLOCK_BREAKDOWN=${WALL_CLOCK_BREAKDOWN:-true}
 # SuperOffload knobs (README §2: cpuadam_cores_perc = 0.90 for all runs).
 CPUADAM_CORES_PERC=${CPUADAM_CORES_PERC:-0.90}
 # ZeRO-Infinity NVMe offload path (zero_offload_nvme only).
-NVME_PATH=${NVME_PATH:-/local_nvme}
+NVME_PATH=${NVME_PATH:-/dev/nvme2n1}
+# Optimizer section for every generated ds_config. train.py does NOT create a
+# client optimizer: DeepSpeed builds DeepSpeedCPUAdam from this section when
+# zero-offload / super-offload is enabled, and GPU FusedAdam when it is not.
+OPTIMIZER_TYPE=${OPTIMIZER_TYPE:-AdamW}
+OPTIMIZER_LR=${OPTIMIZER_LR:-0.001}
+OPTIMIZER_BETA1=${OPTIMIZER_BETA1:-0.9}
+OPTIMIZER_BETA2=${OPTIMIZER_BETA2:-0.999}
+OPTIMIZER_EPS=${OPTIMIZER_EPS:-1e-8}
+OPTIMIZER_WEIGHT_DECAY=${OPTIMIZER_WEIGHT_DECAY:-0.0}
 
 # ---------------------------------------------------------------------------
 # build_ds_config <strategy> <micro_batch_size> <grad_accum> <output_path>
@@ -118,6 +127,15 @@ cat > "$ds_config_json" << EOF
     "train_micro_batch_size_per_gpu": $mbs,
     "gradient_accumulation_steps": $grad_accum,
     "bf16": { "enabled": $BF16_ENABLED },
+    "optimizer": {
+        "type": "$OPTIMIZER_TYPE",
+        "params": {
+            "lr": $OPTIMIZER_LR,
+            "betas": [$OPTIMIZER_BETA1, $OPTIMIZER_BETA2],
+            "eps": $OPTIMIZER_EPS,
+            "weight_decay": $OPTIMIZER_WEIGHT_DECAY
+        }
+    },
     "zero_optimization": {
         "stage": $ZERO_STAGE,
         "overlap_comm": $OVERLAP_COMM,
@@ -134,6 +152,15 @@ cat > "$ds_config_json" << EOF
     "train_micro_batch_size_per_gpu": $mbs,
     "gradient_accumulation_steps": $grad_accum,
     "bf16": { "enabled": $BF16_ENABLED },
+    "optimizer": {
+        "type": "$OPTIMIZER_TYPE",
+        "params": {
+            "lr": $OPTIMIZER_LR,
+            "betas": [$OPTIMIZER_BETA1, $OPTIMIZER_BETA2],
+            "eps": $OPTIMIZER_EPS,
+            "weight_decay": $OPTIMIZER_WEIGHT_DECAY
+        }
+    },
     "zero_optimization": {
         "stage": $ZERO_STAGE,
         "overlap_comm": $OVERLAP_COMM,
@@ -154,6 +181,15 @@ cat > "$ds_config_json" << EOF
     "train_micro_batch_size_per_gpu": $mbs,
     "gradient_accumulation_steps": $grad_accum,
     "bf16": { "enabled": $BF16_ENABLED },
+    "optimizer": {
+        "type": "$OPTIMIZER_TYPE",
+        "params": {
+            "lr": $OPTIMIZER_LR,
+            "betas": [$OPTIMIZER_BETA1, $OPTIMIZER_BETA2],
+            "eps": $OPTIMIZER_EPS,
+            "weight_decay": $OPTIMIZER_WEIGHT_DECAY
+        }
+    },
     "zero_optimization": {
         "stage": $ZERO_STAGE,
         "overlap_comm": $OVERLAP_COMM,
@@ -175,6 +211,15 @@ cat > "$ds_config_json" << EOF
     "train_micro_batch_size_per_gpu": $mbs,
     "gradient_accumulation_steps": $grad_accum,
     "bf16": { "enabled": $BF16_ENABLED },
+    "optimizer": {
+        "type": "$OPTIMIZER_TYPE",
+        "params": {
+            "lr": $OPTIMIZER_LR,
+            "betas": [$OPTIMIZER_BETA1, $OPTIMIZER_BETA2],
+            "eps": $OPTIMIZER_EPS,
+            "weight_decay": $OPTIMIZER_WEIGHT_DECAY
+        }
+    },
     "zero_optimization": {
         "stage": $ZERO_STAGE,
         "overlap_comm": $OVERLAP_COMM,
@@ -198,6 +243,15 @@ cat > "$ds_config_json" << EOF
     "train_micro_batch_size_per_gpu": $mbs,
     "gradient_accumulation_steps": $grad_accum,
     "bf16": { "enabled": $BF16_ENABLED },
+    "optimizer": {
+        "type": "$OPTIMIZER_TYPE",
+        "params": {
+            "lr": $OPTIMIZER_LR,
+            "betas": [$OPTIMIZER_BETA1, $OPTIMIZER_BETA2],
+            "eps": $OPTIMIZER_EPS,
+            "weight_decay": $OPTIMIZER_WEIGHT_DECAY
+        }
+    },
     "zero_optimization": {
         "stage": $ZERO_STAGE,
         "overlap_comm": $OVERLAP_COMM,
@@ -221,6 +275,15 @@ cat > "$ds_config_json" << EOF
     "train_micro_batch_size_per_gpu": $mbs,
     "gradient_accumulation_steps": $grad_accum,
     "bf16": { "enabled": $BF16_ENABLED },
+    "optimizer": {
+        "type": "$OPTIMIZER_TYPE",
+        "params": {
+            "lr": $OPTIMIZER_LR,
+            "betas": [$OPTIMIZER_BETA1, $OPTIMIZER_BETA2],
+            "eps": $OPTIMIZER_EPS,
+            "weight_decay": $OPTIMIZER_WEIGHT_DECAY
+        }
+    },
     "zero_optimization": {
         "stage": $ZERO_STAGE,
         "overlap_comm": $OVERLAP_COMM,

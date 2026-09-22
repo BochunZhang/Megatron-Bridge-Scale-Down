@@ -127,10 +127,6 @@ DEEPSPEED_LEAF_MOE_BLOCK_CLASS = {
     ),
 }
 
-DEFAULT_OPTIMIZER_LR = 0.001
-DEFAULT_OPTIMIZER_BETAS = (0.9, 0.999)
-
-
 class ModelPreset(NamedTuple):
     architecture: str
     config_cls: type[Any]
@@ -323,14 +319,21 @@ def num_experts_for_config(architecture: str, model_config: Any) -> int | None:
         return None
     raise ValueError(f"Unsupported architecture: {architecture!r}")
 
-def create_optimizer(model: AutoModelForCausalLM) -> Any:
-    from deepspeed.ops.adam import DeepSpeedCPUAdam
-    optimizer = DeepSpeedCPUAdam(
-        model.parameters(),
-        lr=DEFAULT_OPTIMIZER_LR,
-        betas=DEFAULT_OPTIMIZER_BETAS
-    )
-    return optimizer
+def optimizer_offload_enabled(ds_config: dict[str, Any]) -> bool:
+    """Return True when zero-offload (cpu/nvme) or super-offload is enabled.
+
+    Mirrors DeepSpeed ``engine.zero_use_cpu_optimizer()`` (offload_optimizer
+    device is cpu/nvme) plus the SuperOffload flag. When enabled, the engine
+    builds its own ``DeepSpeedCPUAdam`` from the ds_config ``optimizer``
+    section (``get_optimizer_configuration``), and SuperOffload additionally
+    runs the real CPU Adam inside a spawned worker process
+    (``SuperOffloadCPUOptimizer``) — a client-side CPUAdam would only
+    duplicate that state, so train.py must not create one.
+    """
+    zero_cfg = ds_config.get("zero_optimization") or {}
+    offload_optimizer = zero_cfg.get("offload_optimizer") or {}
+    device = str(offload_optimizer.get("device", "none")).lower()
+    return device in ("cpu", "nvme") or bool(offload_optimizer.get("super_offload", False))
 
 
 def setup_activation_checkpointing(model: torch.nn.Module) -> None:
@@ -594,15 +597,36 @@ def prepare_training(args: argparse.Namespace) -> TrainingState:
                 args.cpu_checkpointing,
             )
 
-    # 支持 super-offload, 创建一个 CPU Adam
-    # deepspeed 会根据 offload 比例额外创建 GPU Adam
-    optimizer = create_optimizer(model)
+    # Offload-aware optimizer setup — no client-side optimizer is created:
+    # - zero-offload / super-offload enabled: do NOT create a DeepSpeedCPUAdam
+    #   here. The engine builds its own CPU Adam from the ds_config "optimizer"
+    #   section; with super_offload the real CPU Adam runs in a spawned
+    #   SuperOffloadCPUOptimizer worker process, and the engine-side CPUAdam
+    #   only serves as hyper-parameter donor / backup-optimizer base (stage3
+    #   asserts its type when ratio < 1).
+    # - no offload: the same config path builds a GPU FusedAdam.
+    offload_enabled = optimizer_offload_enabled(ds_config)
+    if "optimizer" not in ds_config:
+        logger.error(
+            "ds_config must contain an 'optimizer' section: train.py does not create a "
+            "client optimizer (offload_enabled=%s); DeepSpeed builds DeepSpeedCPUAdam "
+            "(offload) or FusedAdam (no offload) from the config.",
+            offload_enabled,
+        )
+        sys.exit(2)
+    if rank == 0:
+        logger.info(
+            "Optimizer offload enabled: %s; the optimizer is built by DeepSpeed from "
+            "the ds_config 'optimizer' section (type=%s).",
+            offload_enabled,
+            ds_config["optimizer"].get("type"),
+        )
 
     try:
         engine, _, _, _ = deepspeed.initialize(
             model=model,
             config=ds_config,
-            optimizer=optimizer,
+            optimizer=None,
             model_parameters=model.parameters(),
         )
     except Exception as exc:
