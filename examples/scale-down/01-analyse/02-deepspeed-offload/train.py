@@ -532,7 +532,7 @@ def prepare_training(args: argparse.Namespace) -> TrainingState:
 
     # act: HF layerwise gradient checkpointing; must be enabled before
     # deepspeed.initialize so ZeRO-3 partitions the checkpointed module graph.
-    offload_ctx = None
+    offload_ctx = contextlib.nullcontext()
     if args.activation_checkpointing:
         setup_activation_checkpointing(model)
         # act+cpu: DeepSpeed CheckpointHiddenStatesOffload ctx, created once and
@@ -631,9 +631,7 @@ def train(args: argparse.Namespace, state: TrainingState) -> None:
             # act+cpu: forward and backward of a step must run inside the same
             # offload ctx so marked hidden_states can be restored on backward.
             # engine.step() stays outside the ctx.
-            fwd_bwd_ctx = (
-                state.offload_ctx if state.offload_ctx is not None else contextlib.nullcontext()
-            )
+            fwd_bwd_ctx = state.offload_ctx
             with fwd_bwd_ctx:
                 msg = f"forward_step[{accum_idx}]"
                 profiler_handle = torch.autograd.profiler.record_function(msg)
