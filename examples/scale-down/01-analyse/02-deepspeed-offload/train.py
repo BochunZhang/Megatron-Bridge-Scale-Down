@@ -479,6 +479,7 @@ def load_initial_weights(
 ) -> None:
     if path is None:
         return
+    assert False, "init weights loading is disabled for now"
     try:
         context = load_init_weights_artifact(path, model, args=args, model_config=model_config)
     except Exception as exc:

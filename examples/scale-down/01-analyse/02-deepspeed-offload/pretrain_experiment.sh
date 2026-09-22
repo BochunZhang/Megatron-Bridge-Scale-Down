@@ -14,19 +14,31 @@
 #                                          super_offload_0.75}
 #
 # Every test carries a long, self-describing name:
-#   <model>__<strategy>__<recompute_combo>__mbs<N>
-#   e.g. qwen3_5__super_offload_0.9__recompute_act__mbs4
-# and gets its own ds_config JSON, built by an explicit per-strategy
-# heredoc block in build_ds_config() so each file can be verified by hand.
+#   <strategy>__<recompute_combo>__mbs<N>
+#   e.g. super_offload_0.9__recompute_act__mbs4
+# (NVMe offload shows up in the name via the zero_offload_nvme strategy.)
+#
+# Output layout — one independent folder per test, timestamped per run:
+#   <repo_root>/results/01-analyse/02-deepspeed/<model>_<N>layer/<TEST_NAME>/<timestamp>/
+#       ├── run.log        full stdout/stderr
+#       ├── metrics.csv    per-step metrics (train.py MetricsLogger)
+#       └── ds_config.json exact config used (copied by pretrain.sh)
+#   <repo_root>/results/01-analyse/02-deepspeed/experiment_summary_<ts>.txt
+#
+# The working ds_config JSONs are generated under <repo_root>/.tmp/ (built by
+# an explicit per-strategy heredoc block in build_ds_config() so each file can
+# be verified by hand); pretrain.sh copies the one it used into the run dir.
 #
 # Usage:
 #   ./pretrain_experiment.sh                          # full matrix, dense model
 #   MODEL=qwen3_5_moe ./pretrain_experiment.sh        # MoE model
-#   OFFLOAD_STRATEGIES="zero_3 super_offload_1.0" ./pretrain_experiment.sh
+#   OFFLOAD_STRATEGIES="zero_3 zero_offload_nvme super_offload_1.0" ./pretrain_experiment.sh
 #   RECOMPUTE_COMBOS="recompute_act" MICRO_BATCH_SIZES="1 8" ./pretrain_experiment.sh
 set -euo pipefail
 
 SCRIPT_DIR=$(cd "$(dirname "$0")" && pwd)
+# Repo root (megatron-bridge): 4 levels up from this script.
+REPO_ROOT=${REPO_ROOT:-"$(cd "$SCRIPT_DIR/../../../.." && pwd)"}
 
 # ---------------------------------------------------------------------------
 # Experiment matrix knobs
@@ -51,13 +63,22 @@ OFFLOAD_STRATEGIES=${OFFLOAD_STRATEGIES:-"zero_3 zero_offload_cpu zero_offload_n
 # the global batch stays constant across the micro-batch sweep (must match
 # PER_GPU_BATCH_SIZE in pretrain.sh).
 PER_GPU_BATCH_SIZE=${PER_GPU_BATCH_SIZE:-16}
+# Shrunk layer count; part of the model result folder name and exported so
+# pretrain.sh applies the same --override num_hidden_layers.
+NUM_LAYERS=${NUM_LAYERS:-8}
+export NUM_LAYERS PER_GPU_BATCH_SIZE
 
 # ---------------------------------------------------------------------------
 # Output layout
+#   working ds_configs : <repo_root>/.tmp/
+#   results            : <repo_root>/results/01-analyse/02-deepspeed/
+#                        └── <model>_<N>layer/<TEST_NAME>/<timestamp>/{run.log,
+#                            metrics.csv, ds_config.json}
 # ---------------------------------------------------------------------------
-CONFIG_DIR=${CONFIG_DIR:-"${SCRIPT_DIR}/configs"}
-RESULTS_DIR=${RESULTS_DIR:-"${SCRIPT_DIR}/results"}
-mkdir -p "$CONFIG_DIR" "$RESULTS_DIR"
+TMP_CONFIG_DIR=${TMP_CONFIG_DIR:-"${REPO_ROOT}/.tmp"}
+RESULTS_ROOT=${RESULTS_ROOT:-"${REPO_ROOT}/results/01-analyse/02-deepspeed"}
+MODEL_DIR="${MODEL}_${NUM_LAYERS}layer"
+mkdir -p "$TMP_CONFIG_DIR" "$RESULTS_ROOT"
 
 # ---------------------------------------------------------------------------
 # Common DeepSpeed knobs, fixed for all runs (README §2)
@@ -240,7 +261,8 @@ recompute_token() {
 # ---------------------------------------------------------------------------
 # Main sweep: outer batch size -> middle recompute combo -> inner strategy
 # ---------------------------------------------------------------------------
-SUMMARY_FILE="${RESULTS_DIR}/experiment_summary.txt"
+INVOKE_TS=$(date +%Y%m%d_%H%M%S)
+SUMMARY_FILE="${RESULTS_ROOT}/experiment_summary_${INVOKE_TS}.txt"
 : > "$SUMMARY_FILE"
 
 set +e  # keep sweeping after a failing/OOM run; status is recorded per run
@@ -255,15 +277,21 @@ for MBS in $MICRO_BATCH_SIZES; do
         RECOMPUTE=$(recompute_token "$RECOMPUTE_COMBO")
 
         for STRATEGY in $OFFLOAD_STRATEGIES; do
-            TEST_NAME="${MODEL}__${STRATEGY}__${RECOMPUTE_COMBO}__mbs${MBS}"
-            DS_CONFIG="${CONFIG_DIR}/ds_config_${TEST_NAME}.json"
-            METRICS_OUT="${RESULTS_DIR}/${TEST_NAME}_metrics.csv"
-            LOG_FILE="${RESULTS_DIR}/${TEST_NAME}.log"
+            TEST_NAME="${STRATEGY}__${RECOMPUTE_COMBO}__mbs${MBS}"
+            RUN_TS=$(date +%Y%m%d_%H%M%S)
+            RUN_DIR="${RESULTS_ROOT}/${MODEL_DIR}/${TEST_NAME}/${RUN_TS}"
+            mkdir -p "$RUN_DIR"
+
+            # Working copy under <repo_root>/.tmp; pretrain.sh archives it
+            # into $RUN_DIR/ds_config.json before launching.
+            DS_CONFIG="${TMP_CONFIG_DIR}/ds_config_${TEST_NAME}.json"
+            METRICS_OUT="${RUN_DIR}/metrics.csv"
+            LOG_FILE="${RUN_DIR}/run.log"
 
             build_ds_config "$STRATEGY" "$MBS" "$GRAD_ACCUM" "$DS_CONFIG"
 
             echo ""
-            echo "################ RUN ${TEST_NAME} ################"
+            echo "################ RUN ${MODEL_DIR}/${TEST_NAME}/${RUN_TS} ################"
             bash "${SCRIPT_DIR}/pretrain.sh" \
                 "$TEST_NAME" "$MODEL" "$MBS" "$DS_CONFIG" "$RECOMPUTE" "$METRICS_OUT" \
                 2>&1 | tee "$LOG_FILE"
@@ -277,7 +305,7 @@ for MBS in $MICRO_BATCH_SIZES; do
                     STATUS="FAILED(rc=$RUN_RC)"
                 fi
             fi
-            echo "${TEST_NAME} ${STATUS}" | tee -a "$SUMMARY_FILE"
+            echo "${MODEL_DIR}/${TEST_NAME}/${RUN_TS} ${STATUS}" | tee -a "$SUMMARY_FILE"
         done
     done
 done
@@ -286,5 +314,5 @@ set -e
 echo ""
 echo "================ SUMMARY ================"
 cat "$SUMMARY_FILE"
-echo "Configs:  $CONFIG_DIR"
-echo "Results:  $RESULTS_DIR"
+echo "Tmp configs: $TMP_CONFIG_DIR"
+echo "Results:     $RESULTS_ROOT"
