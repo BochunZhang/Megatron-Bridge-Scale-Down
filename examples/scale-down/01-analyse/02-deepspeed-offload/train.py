@@ -776,6 +776,8 @@ def train(args: argparse.Namespace, state: TrainingState) -> None:
                     "loss": reduced_loss,
                     "iter_time_sec": max_iter_time,
                     "global_tokens_per_sec": global_tokens_per_sec,
+                    "gpu_allocated_gigabytes": gpu_allocated['allocated_bytes.all.peak'] / (1024**3),
+                    "cpu_allocated_gigabytes": cpu_allocated['allocated_bytes.peak'] / (1024**3),
                     "cuda_memory_allocated_bytes": mem_allocated,
                     "cuda_peak_memory_allocated_bytes": mem_peak_allocated,
                     "cuda_peak_memory_reserved_bytes": mem_peak_reserved,
