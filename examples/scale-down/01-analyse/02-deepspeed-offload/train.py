@@ -66,6 +66,7 @@ from transformers import (
     Qwen3_5MoeForCausalLM,
     Qwen3_5MoeTextConfig,
     Qwen3_5TextConfig,
+    enable_full_determinism,
 )
 
 import deepspeed
@@ -461,6 +462,7 @@ def seed_everything(seed: int) -> None:
     torch.manual_seed(seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
+    enable_full_determinism(seed)
 
 
 def sync_cuda() -> None:

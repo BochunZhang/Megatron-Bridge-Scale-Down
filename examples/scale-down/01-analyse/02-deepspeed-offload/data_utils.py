@@ -135,7 +135,7 @@ def load_hf_text_dataset_rows(
 
     if dataset_name == "wikitext":
         dataset = load_dataset(
-            "wikitext",
+            "Salesforce/wikitext",
             "wikitext-103-raw-v1",
             split=split_str,
             download_config=dl_cfg,
