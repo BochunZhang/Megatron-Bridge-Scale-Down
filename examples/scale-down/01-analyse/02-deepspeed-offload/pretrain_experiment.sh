@@ -9,15 +9,17 @@
 #                                          recompute_act_cpu}
 #           (cpu_checkpoint requires recompute=act, so the (off, on)
 #           combination is invalid and not generated)
-#   inner : offload strategy              {zero_3, zero_offload_cpu,
-#                                          zero_offload_nvme,
-#                                          super_offload_1.0,
-#                                          super_offload_0.9,
-#                                          super_offload_0.75}
+#   inner : offload strategy              <optimizer_strategy>-<param_placement>
+#           optimizer_strategy ∈ {zero_3, zero_offload_cpu,
+#                                 super_offload_1.0, super_offload_0.9,
+#                                 super_offload_0.75, super_offload_0.1}
+#           param_placement    ∈ {param_gpu, param_cpu}
+#                                (param_cpu adds an offload_param cpu block
+#                                 to zero_optimization; orthogonal axis)
 #
 # Every test carries a long, self-describing name:
 #   <strategy>__<recompute_combo>__mbs<N>
-#   e.g. super_offload_0.9__recompute_act__mbs4
+#   e.g. super_offload_0.9-param_cpu__recompute_act__mbs4
 # (NVMe offload shows up in the name via the zero_offload_nvme strategy.)
 #
 # Output layout — one independent folder per test, timestamped per run:
@@ -35,7 +37,7 @@
 #   ./pretrain_experiment.sh                          # full matrix, dense + MoE
 #   MODELS="Qwen/Qwen3.5-9B" ./pretrain_experiment.sh         # dense only
 #   MODELS="Qwen/Qwen3.5-35B-A3B" ./pretrain_experiment.sh    # MoE only
-#   OFFLOAD_STRATEGIES="zero_3 zero_offload_nvme super_offload_1.0" ./pretrain_experiment.sh
+#   OFFLOAD_STRATEGIES="zero_3-param_gpu zero_offload_cpu-param_cpu super_offload_1.0-param_cpu" ./pretrain_experiment.sh
 #   RECOMPUTE_COMBOS="recompute_act" MICRO_BATCH_SIZES="1 8" ./pretrain_experiment.sh
 set -euo pipefail
 
@@ -64,8 +66,19 @@ MICRO_BATCH_SIZES=${MICRO_BATCH_SIZES:-"1 2 4 8"}
 # )
 RECOMPUTE_COMBOS=${RECOMPUTE_COMBOS:-"recompute_none recompute_act recompute_act_cpu"}
 
-# Inner loop: offload strategies (each maps to one ds_config heredoc below).
-OFFLOAD_STRATEGIES=${OFFLOAD_STRATEGIES:-"zero_3 zero_offload_cpu super_offload_1.0 super_offload_0.9 super_offload_0.75"}
+# Inner loop: offload strategies. Each name is <optimizer_strategy>-<param_placement>:
+#   optimizer_strategy: zero_3 | zero_offload_cpu | super_offload_<ratio>
+#                       (each maps to one ds_config heredoc below)
+#   param_placement   : param_gpu (params stay on GPU) |
+#                       param_cpu (adds "offload_param": cpu to zero_optimization)
+# Bare names without a -param_* suffix are also accepted (== param_gpu).
+OFFLOAD_STRATEGIES=${OFFLOAD_STRATEGIES:-"\
+zero_3-param_gpu zero_3-param_cpu \
+zero_offload_cpu-param_gpu zero_offload_cpu-param_cpu \
+super_offload_1.0-param_gpu super_offload_1.0-param_cpu \
+super_offload_0.9-param_gpu super_offload_0.9-param_cpu \
+super_offload_0.75-param_gpu super_offload_0.75-param_cpu \
+super_offload_0.1-param_gpu super_offload_0.1-param_cpu"}
 
 # Per-GPU samples per optimizer step; grad_accum = PER_GPU_BATCH_SIZE / mbs so
 # the global batch stays constant across the micro-batch sweep (must match
@@ -115,8 +128,11 @@ OPTIMIZER_WEIGHT_DECAY=${OPTIMIZER_WEIGHT_DECAY:-0.0}
 
 # ---------------------------------------------------------------------------
 # build_ds_config <strategy> <micro_batch_size> <grad_accum> <output_path>
-#   One explicit heredoc block per offload strategy (finetune_qwen35_7b.sh
-#   style) so every generated JSON can be diffed/verified by hand.
+#   <strategy> is <optimizer_strategy>-<param_placement> (a bare
+#   <optimizer_strategy> is accepted and treated as param_gpu). One explicit
+#   heredoc block per optimizer strategy (finetune_qwen35_7b.sh style) so
+#   every generated JSON can be diffed/verified by hand; the param axis is
+#   injected via $param_block appended to zero_optimization.
 #
 #   NOTE: the "optimizer" section IS emitted (AdamW by default) and no
 #   "scheduler" section is: train.py passes optimizer=None to
@@ -130,7 +146,22 @@ build_ds_config() {
     local grad_accum=$3
     local ds_config_json=$4
 
-    if [ "$strategy" = "zero_3" ]; then
+    # Split off the -param_cpu / -param_gpu suffix; bare names keep params on
+    # GPU (== param_gpu). param_cpu appends an offload_param cpu block to
+    # zero_optimization (ZeRO-Infinity parameter offload; requires stage 3).
+    local base=$strategy
+    local param_block=""
+    case "$strategy" in
+        *-param_cpu)
+            base="${strategy%-param_cpu}"
+            param_block=$(printf ',\n        "offload_param": {\n            "device": "cpu",\n            "pin_memory": %s\n        }' "$PIN_MEMORY")
+            ;;
+        *-param_gpu)
+            base="${strategy%-param_gpu}"
+            ;;
+    esac
+
+    if [ "$base" = "zero_3" ]; then
 cat > "$ds_config_json" << EOF
 {
     "train_micro_batch_size_per_gpu": $mbs,
@@ -149,13 +180,13 @@ cat > "$ds_config_json" << EOF
         "stage": $ZERO_STAGE,
         "overlap_comm": $OVERLAP_COMM,
         "reduce_bucket_size": $REDUCE_BUCKET_SIZE,
-        "sub_group_size": $SUB_GROUP_SIZE
+        "sub_group_size": $SUB_GROUP_SIZE$param_block
     },
     "wall_clock_breakdown": $WALL_CLOCK_BREAKDOWN
 }
 EOF
 
-    elif [ "$strategy" = "zero_offload_cpu" ]; then
+    elif [ "$base" = "zero_offload_cpu" ]; then
 cat > "$ds_config_json" << EOF
 {
     "train_micro_batch_size_per_gpu": $mbs,
@@ -178,43 +209,13 @@ cat > "$ds_config_json" << EOF
         "offload_optimizer": {
             "device": "cpu",
             "pin_memory": $PIN_MEMORY
-        }
+        }$param_block
     },
     "wall_clock_breakdown": $WALL_CLOCK_BREAKDOWN
 }
 EOF
 
-    elif [ "$strategy" = "zero_offload_nvme" ]; then
-cat > "$ds_config_json" << EOF
-{
-    "train_micro_batch_size_per_gpu": $mbs,
-    "gradient_accumulation_steps": $grad_accum,
-    "bf16": { "enabled": $BF16_ENABLED },
-    "optimizer": {
-        "type": "$OPTIMIZER_TYPE",
-        "params": {
-            "lr": $OPTIMIZER_LR,
-            "betas": [$OPTIMIZER_BETA1, $OPTIMIZER_BETA2],
-            "eps": $OPTIMIZER_EPS,
-            "weight_decay": $OPTIMIZER_WEIGHT_DECAY
-        }
-    },
-    "zero_optimization": {
-        "stage": $ZERO_STAGE,
-        "overlap_comm": $OVERLAP_COMM,
-        "reduce_bucket_size": $REDUCE_BUCKET_SIZE,
-        "sub_group_size": $SUB_GROUP_SIZE,
-        "offload_optimizer": {
-            "device": "nvme",
-            "nvme_path": "$NVME_PATH",
-            "pin_memory": $PIN_MEMORY
-        }
-    },
-    "wall_clock_breakdown": $WALL_CLOCK_BREAKDOWN
-}
-EOF
-
-    elif [ "$strategy" = "super_offload_1.0" ]; then
+    elif [ "$base" = "super_offload_1.0" ]; then
 cat > "$ds_config_json" << EOF
 {
     "train_micro_batch_size_per_gpu": $mbs,
@@ -240,13 +241,13 @@ cat > "$ds_config_json" << EOF
             "ratio": 1.0,
             "super_offload": true,
             "cpuadam_cores_perc": $CPUADAM_CORES_PERC
-        }
+        }$param_block
     },
     "wall_clock_breakdown": $WALL_CLOCK_BREAKDOWN
 }
 EOF
 
-    elif [ "$strategy" = "super_offload_0.9" ]; then
+    elif [ "$base" = "super_offload_0.9" ]; then
 cat > "$ds_config_json" << EOF
 {
     "train_micro_batch_size_per_gpu": $mbs,
@@ -272,13 +273,13 @@ cat > "$ds_config_json" << EOF
             "ratio": 0.9,
             "super_offload": true,
             "cpuadam_cores_perc": $CPUADAM_CORES_PERC
-        }
+        }$param_block
     },
     "wall_clock_breakdown": $WALL_CLOCK_BREAKDOWN
 }
 EOF
 
-    elif [ "$strategy" = "super_offload_0.75" ]; then
+    elif [ "$base" = "super_offload_0.75" ]; then
 cat > "$ds_config_json" << EOF
 {
     "train_micro_batch_size_per_gpu": $mbs,
@@ -304,14 +305,46 @@ cat > "$ds_config_json" << EOF
             "ratio": 0.75,
             "super_offload": true,
             "cpuadam_cores_perc": $CPUADAM_CORES_PERC
+        }$param_block
+    },
+    "wall_clock_breakdown": $WALL_CLOCK_BREAKDOWN
+}
+EOF
+
+    elif [ "$base" = "super_offload_0.1" ]; then
+cat > "$ds_config_json" << EOF
+{
+    "train_micro_batch_size_per_gpu": $mbs,
+    "gradient_accumulation_steps": $grad_accum,
+    "bf16": { "enabled": $BF16_ENABLED },
+    "optimizer": {
+        "type": "$OPTIMIZER_TYPE",
+        "params": {
+            "lr": $OPTIMIZER_LR,
+            "betas": [$OPTIMIZER_BETA1, $OPTIMIZER_BETA2],
+            "eps": $OPTIMIZER_EPS,
+            "weight_decay": $OPTIMIZER_WEIGHT_DECAY
         }
+    },
+    "zero_optimization": {
+        "stage": $ZERO_STAGE,
+        "overlap_comm": $OVERLAP_COMM,
+        "reduce_bucket_size": $REDUCE_BUCKET_SIZE,
+        "sub_group_size": $SUB_GROUP_SIZE,
+        "offload_optimizer": {
+            "device": "cpu",
+            "pin_memory": $PIN_MEMORY,
+            "ratio": 0.1,
+            "super_offload": true,
+            "cpuadam_cores_perc": $CPUADAM_CORES_PERC
+        }$param_block
     },
     "wall_clock_breakdown": $WALL_CLOCK_BREAKDOWN
 }
 EOF
 
     else
-        echo "Unknown offload strategy: $strategy" >&2
+        echo "Unknown offload strategy: $strategy (base: $base; expected zero_3|zero_offload_cpu|super_offload_1.0|super_offload_0.9|super_offload_0.75|super_offload_0.1 with optional -param_gpu|-param_cpu suffix)" >&2
         exit 2
     fi
 }
