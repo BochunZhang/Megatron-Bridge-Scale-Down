@@ -179,6 +179,32 @@ HF 构建的模型采用 **HF 原生逐层重计算 + DeepSpeed 激活 CPU 卸�
 3. 显存—吞吐前沿图（Phase 5），标注 Pareto 最优点；
 4. O1 vs O2、P2 vs P3 的 SuperOffload 增益结论（分 Dense / MoE）。
 
+### 5.1 实测发现：Adam 实现差异导致 loss 不完全一致
+
+各配置实际使用的 optimizer 实现与更新路径如下：
+
+| 配置 | `basic_optimizer` | ZeRO-3 外层 | 实际更新路径 |
+|---|---|---|---|
+| `zero_3`（无 offload） | `FusedAdam`（GPU） | `DeepSpeedZeroOptimizer_Stage3` | GPU 上的 FP32 master partition + FusedAdam |
+| `zero_offload_cpu` | `DeepSpeedCPUAdam` | `DeepSpeedZeroOptimizer_Stage3` | CPU 上的 FP32 master partition + CPUAdam |
+| `super_offload_1.0` | `DeepSpeedCPUAdam` | `SuperOffloadOptimizer_Stage3` | CPU worker 中的 DeepSpeedCPUAdam，全部 subgroup 走 CPU |
+| `super_offload_0.9/0.75/0.1` | `DeepSpeedCPUAdam` | `SuperOffloadOptimizer_Stage3` | CPU worker 更新 CPU subgroup；GPU subgroup 通过额外的 `torch.optim.AdamW` backup optimizer 更新 |
+
+实测结论：
+
+- 不同的 Adam 实现，计算结果是不同的，这和 Adam 内部的实现有关系。随机初始化的参数相同，
+  理论上 step 1 计算得到的 loss 是相等的，但是第 2 轮的参数是 Adam 更新后的，
+  Adam 的实现差别会导致从 step 2 开始的 loss 出现差异。
+- 例如 super-offload 0.75 & super-offload 0.5 算出来的 loss 是不同的。
+- 但是 zero-offload / super-offload_0.9 / super-offload_1.0 算出来的结果是相同的，暂时没有找到问题所在。
+- zero-3 使用 deepspeed 的 FusedAdam 训练，会稳定出现 non-finit 报错，改用 torch 的 Adam 后错误消失。
+  这个错误在 dense 和 expert 模型里面都出现了，应该是 FusedAdam 的实现存在问题。
+- 同样使用 torch Adam，super-offload 0.0 和 zero-3 + torch Adam 的结果不同，
+  推测是 Adam 的参数配置存在差异，导致后面的 loss 有差别。
+  因为 super-offload 的 torch Adam 参数是从 DeepSpeed 的 CpuAdam 派生出来的。
+- 测试 zero-3 (FusedAdam) / zero-3 (torch.Adam) / super_offload 0.0 / super_offload 1.0，
+  step 1 的 loss 全部相等，证明这应该是 Adam 的实现差别导致的后续 step loss 不完全一致。
+
 ## 6. 前置改造项（TODO）
 
 当前 harness 不能直接跑完上述矩阵，需要先补齐：

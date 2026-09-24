@@ -3,7 +3,7 @@
 The DeepSpeed runtime config is loaded from a JSON file via --deepspeed_config
 (same convention as finetune_zero3.py); see ds_config.json for an example.
 Only model-dependent keys (AutoEP expert_parallel, ZeRO-3 leaf module classes)
-and the CLI batch settings are applied on top of the loaded file.
+are applied on top of the loaded file. Batch settings remain in the JSON file.
 
 Every run requires PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True (checked
 at startup): ZeRO-3 and the act+cpu offload/restore cycle fragment the
@@ -134,8 +134,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--warmup_steps", type=int, default=5)
     parser.add_argument("--log_interval", type=int, default=1)
     parser.add_argument("--seq_len", type=int, default=128)
-    parser.add_argument("--micro_batch_size", type=int, default=2)
-    parser.add_argument("--grad_accum", type=int, default=1)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--dataset_name", default="wikitext")
     parser.add_argument("--dataset_percentage", type=float, default=10.0)
@@ -216,6 +214,10 @@ def parse_args() -> argparse.Namespace:
         parser.error("--deepspeed_config is required: pass the path to a DeepSpeed JSON config.")
     if not os.path.isfile(args.deepspeed_config):
         parser.error(f"--deepspeed_config file does not exist: {args.deepspeed_config}")
+    try:
+        args.micro_batch_size, args.grad_accum = load_batch_settings(args.deepspeed_config)
+    except (KeyError, TypeError, ValueError) as exc:
+        parser.error(f"invalid batch settings in --deepspeed_config: {exc}")
     if not expandable_segments_enabled():
         parser.error(
             "PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True is required for every run: "
@@ -355,8 +357,6 @@ def create_offload_ctx_manager() -> Any:
 def build_deepspeed_config(
     config_path: str,
     mode: str,
-    micro_batch_size: int,
-    grad_accum: int,
     *,
     autoep_size: int | None = None,
     autoep_preset: str | None = None,
@@ -368,10 +368,9 @@ def build_deepspeed_config(
     zero_optimization, offload knobs) comes from the given file instead of
     being constructed here. Adjustments applied on top of the loaded file:
 
-    - CLI batch settings win: ``train_micro_batch_size_per_gpu`` and
-      ``gradient_accumulation_steps`` are set from the CLI (and any file-level
-      ``train_batch_size`` is dropped), so the DeepSpeed engine, the batch
-      generator, and the accumulation loop stay consistent.
+    - Batch settings remain exclusively in the JSON file, so the DeepSpeed
+      engine, the batch generator, and the accumulation loop share one source
+      of truth.
     - ``autoep`` mode: injects the ``expert_parallel`` block with the preset
       resolved from the HF config ``model_type`` (see
       ``resolve_autoep_preset_name``).
@@ -383,8 +382,7 @@ def build_deepspeed_config(
         config: dict[str, Any] = json.load(f)
 
     config.pop("train_batch_size", None)
-    config["train_micro_batch_size_per_gpu"] = micro_batch_size
-    config["gradient_accumulation_steps"] = grad_accum
+    validate_batch_settings(config)
 
     if mode == "autoep":
         if autoep_preset is None:
@@ -401,6 +399,32 @@ def build_deepspeed_config(
             }
 
     return config
+
+
+def load_batch_settings(config_path: str) -> tuple[int, int]:
+    """Read the per-GPU micro-batch and accumulation settings from JSON."""
+    with open(config_path, encoding="utf-8") as f:
+        config: dict[str, Any] = json.load(f)
+    return validate_batch_settings(config)
+
+
+def validate_batch_settings(config: dict[str, Any]) -> tuple[int, int]:
+    """Validate and return the batch settings from a DeepSpeed config."""
+    micro_batch_size = config["train_micro_batch_size_per_gpu"]
+    grad_accum = config["gradient_accumulation_steps"]
+    if (
+        isinstance(micro_batch_size, bool)
+        or not isinstance(micro_batch_size, int)
+        or micro_batch_size <= 0
+    ):
+        raise ValueError("train_micro_batch_size_per_gpu must be a positive integer")
+    if (
+        isinstance(grad_accum, bool)
+        or not isinstance(grad_accum, int)
+        or grad_accum <= 0
+    ):
+        raise ValueError("gradient_accumulation_steps must be a positive integer")
+    return micro_batch_size, grad_accum
 
 
 def validate_autoep_args(
@@ -564,8 +588,6 @@ def prepare_training(args: argparse.Namespace) -> TrainingState:
     ds_config = build_deepspeed_config(
         args.deepspeed_config,
         args.mode,
-        args.micro_batch_size,
-        args.grad_accum,
         autoep_size=autoep_size,
         autoep_preset=autoep_preset,
         leaf_module_class=leaf_module_class,
@@ -740,6 +762,14 @@ def train(args: argparse.Namespace, state: TrainingState) -> None:
             torch.cuda.reset_peak_memory_stats()
             torch.cuda.reset_peak_host_memory_stats()
 
+        if step < args.warmup_steps:
+            if state.rank == 0:
+                logger.info(
+                    "Warming up for %s steps (step=%s), loss=%.6f",
+                    args.warmup_steps,
+                    step,
+                    reduced_loss,
+                )
         if step >= args.warmup_steps and step % args.log_interval == 0:
             max_iter_time = reduce_max(iter_time)
             mem_allocated = torch.cuda.memory_allocated()

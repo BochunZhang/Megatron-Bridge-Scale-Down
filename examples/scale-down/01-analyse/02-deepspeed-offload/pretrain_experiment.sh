@@ -103,42 +103,10 @@ RESULTS_ROOT=${RESULTS_ROOT:-"${REPO_ROOT}/results/01-analyse/02-deepspeed"}
 mkdir -p "$TMP_CONFIG_DIR" "$RESULTS_ROOT"
 
 # ---------------------------------------------------------------------------
-# Common DeepSpeed knobs, fixed for all runs (README §2)
-# ---------------------------------------------------------------------------
-BF16_ENABLED=${BF16_ENABLED:-true}
-ZERO_STAGE=${ZERO_STAGE:-3}
-OVERLAP_COMM=${OVERLAP_COMM:-false}
-REDUCE_BUCKET_SIZE=${REDUCE_BUCKET_SIZE:-4e8}
-SUB_GROUP_SIZE=${SUB_GROUP_SIZE:-4e8}
-PIN_MEMORY=${PIN_MEMORY:-true}
-WALL_CLOCK_BREAKDOWN=${WALL_CLOCK_BREAKDOWN:-true}
-# SuperOffload knobs (README §2: cpuadam_cores_perc = 0.90 for all runs).
-CPUADAM_CORES_PERC=${CPUADAM_CORES_PERC:-0.90}
-# ZeRO-Infinity NVMe offload path (zero_offload_nvme only).
-NVME_PATH=${NVME_PATH:-/dev/nvme2n1}
-# Optimizer section for every generated ds_config. train.py does NOT create a
-# client optimizer: DeepSpeed builds DeepSpeedCPUAdam from this section when
-# zero-offload / super-offload is enabled, and GPU FusedAdam when it is not.
-OPTIMIZER_TYPE=${OPTIMIZER_TYPE:-AdamW}
-OPTIMIZER_LR=${OPTIMIZER_LR:-0.001}
-OPTIMIZER_BETA1=${OPTIMIZER_BETA1:-0.9}
-OPTIMIZER_BETA2=${OPTIMIZER_BETA2:-0.999}
-OPTIMIZER_EPS=${OPTIMIZER_EPS:-1e-8}
-OPTIMIZER_WEIGHT_DECAY=${OPTIMIZER_WEIGHT_DECAY:-0.0}
-
-# ---------------------------------------------------------------------------
 # build_ds_config <strategy> <micro_batch_size> <grad_accum> <output_path>
 #   <strategy> is <optimizer_strategy>-<param_placement> (a bare
-#   <optimizer_strategy> is accepted and treated as param_gpu). One explicit
-#   heredoc block per optimizer strategy (finetune_qwen35_7b.sh style) so
-#   every generated JSON can be diffed/verified by hand; the param axis is
-#   injected via $param_block appended to zero_optimization.
-#
-#   NOTE: the "optimizer" section IS emitted (AdamW by default) and no
-#   "scheduler" section is: train.py passes optimizer=None to
-#   deepspeed.initialize(), so DeepSpeed builds the optimizer from this
-#   section — DeepSpeedCPUAdam when offload is enabled, GPU FusedAdam
-#   otherwise.
+#   <optimizer_strategy> is accepted and treated as param_gpu. Batch settings
+#   are the only values that vary inside the common JSON template.
 # ---------------------------------------------------------------------------
 build_ds_config() {
     local strategy=$1
@@ -146,207 +114,67 @@ build_ds_config() {
     local grad_accum=$3
     local ds_config_json=$4
 
-    # Split off the -param_cpu / -param_gpu suffix; bare names keep params on
-    # GPU (== param_gpu). param_cpu appends an offload_param cpu block to
-    # zero_optimization (ZeRO-Infinity parameter offload; requires stage 3).
     local base=$strategy
     local param_block=""
+    local optimizer_block=""
     case "$strategy" in
         *-param_cpu)
             base="${strategy%-param_cpu}"
-            param_block=$(printf ',\n        "offload_param": {\n            "device": "cpu",\n            "pin_memory": %s\n        }' "$PIN_MEMORY")
+            param_block=',
+        "offload_param": {
+            "device": "cpu",
+            "pin_memory": true
+        }'
             ;;
         *-param_gpu)
             base="${strategy%-param_gpu}"
             ;;
     esac
 
-    if [ "$base" = "zero_3" ]; then
-cat > "$ds_config_json" << EOF
-{
-    "train_micro_batch_size_per_gpu": $mbs,
-    "gradient_accumulation_steps": $grad_accum,
-    "bf16": { "enabled": $BF16_ENABLED },
-    "optimizer": {
-        "type": "$OPTIMIZER_TYPE",
-        "params": {
-            "lr": $OPTIMIZER_LR,
-            "betas": [$OPTIMIZER_BETA1, $OPTIMIZER_BETA2],
-            "eps": $OPTIMIZER_EPS,
-            "weight_decay": $OPTIMIZER_WEIGHT_DECAY
-        }
-    },
-    "zero_optimization": {
-        "stage": $ZERO_STAGE,
-        "overlap_comm": $OVERLAP_COMM,
-        "reduce_bucket_size": $REDUCE_BUCKET_SIZE,
-        "sub_group_size": $SUB_GROUP_SIZE$param_block
-    },
-    "wall_clock_breakdown": $WALL_CLOCK_BREAKDOWN
-}
-EOF
-
-    elif [ "$base" = "zero_offload_cpu" ]; then
-cat > "$ds_config_json" << EOF
-{
-    "train_micro_batch_size_per_gpu": $mbs,
-    "gradient_accumulation_steps": $grad_accum,
-    "bf16": { "enabled": $BF16_ENABLED },
-    "optimizer": {
-        "type": "$OPTIMIZER_TYPE",
-        "params": {
-            "lr": $OPTIMIZER_LR,
-            "betas": [$OPTIMIZER_BETA1, $OPTIMIZER_BETA2],
-            "eps": $OPTIMIZER_EPS,
-            "weight_decay": $OPTIMIZER_WEIGHT_DECAY
-        }
-    },
-    "zero_optimization": {
-        "stage": $ZERO_STAGE,
-        "overlap_comm": $OVERLAP_COMM,
-        "reduce_bucket_size": $REDUCE_BUCKET_SIZE,
-        "sub_group_size": $SUB_GROUP_SIZE,
+    case "$base" in
+        zero_3) ;;
+        zero_offload_cpu)
+            optimizer_block=',
         "offload_optimizer": {
             "device": "cpu",
-            "pin_memory": $PIN_MEMORY
-        }$param_block
-    },
-    "wall_clock_breakdown": $WALL_CLOCK_BREAKDOWN
-}
-EOF
+            "pin_memory": true
+        }'
+            ;;
+        super_offload_1.0|super_offload_0.9|super_offload_0.75|super_offload_0.1)
+            local ratio="${base#super_offload_}"
+            optimizer_block=$(printf \
+                ',\n        "offload_optimizer": {\n            "device": "cpu",\n            "pin_memory": true,\n            "ratio": %s,\n            "super_offload": true,\n            "cpuadam_cores_perc": 0.90\n        }' \
+                "$ratio")
+            ;;
+        *)
+            echo "Unknown offload strategy: $strategy (base: $base; expected zero_3|zero_offload_cpu|super_offload_1.0|super_offload_0.9|super_offload_0.75|super_offload_0.1 with optional -param_gpu|-param_cpu suffix)" >&2
+            exit 2
+            ;;
+    esac
 
-    elif [ "$base" = "super_offload_1.0" ]; then
-cat > "$ds_config_json" << EOF
+    cat > "$ds_config_json" << EOF
 {
     "train_micro_batch_size_per_gpu": $mbs,
     "gradient_accumulation_steps": $grad_accum,
-    "bf16": { "enabled": $BF16_ENABLED },
+    "bf16": { "enabled": true },
     "optimizer": {
-        "type": "$OPTIMIZER_TYPE",
+        "type": "AdamW",
         "params": {
-            "lr": $OPTIMIZER_LR,
-            "betas": [$OPTIMIZER_BETA1, $OPTIMIZER_BETA2],
-            "eps": $OPTIMIZER_EPS,
-            "weight_decay": $OPTIMIZER_WEIGHT_DECAY
+            "lr": 0.001,
+            "betas": [0.9, 0.999],
+            "eps": 1e-8,
+            "weight_decay": 0.01
         }
     },
     "zero_optimization": {
-        "stage": $ZERO_STAGE,
-        "overlap_comm": $OVERLAP_COMM,
-        "reduce_bucket_size": $REDUCE_BUCKET_SIZE,
-        "sub_group_size": $SUB_GROUP_SIZE,
-        "offload_optimizer": {
-            "device": "cpu",
-            "pin_memory": $PIN_MEMORY,
-            "ratio": 1.0,
-            "super_offload": true,
-            "cpuadam_cores_perc": $CPUADAM_CORES_PERC
-        }$param_block
+        "stage": 3,
+        "overlap_comm": false,
+        "reduce_bucket_size": 4e8,
+        "sub_group_size": 4e8${optimizer_block}${param_block}
     },
-    "wall_clock_breakdown": $WALL_CLOCK_BREAKDOWN
+    "wall_clock_breakdown": true
 }
 EOF
-
-    elif [ "$base" = "super_offload_0.9" ]; then
-cat > "$ds_config_json" << EOF
-{
-    "train_micro_batch_size_per_gpu": $mbs,
-    "gradient_accumulation_steps": $grad_accum,
-    "bf16": { "enabled": $BF16_ENABLED },
-    "optimizer": {
-        "type": "$OPTIMIZER_TYPE",
-        "params": {
-            "lr": $OPTIMIZER_LR,
-            "betas": [$OPTIMIZER_BETA1, $OPTIMIZER_BETA2],
-            "eps": $OPTIMIZER_EPS,
-            "weight_decay": $OPTIMIZER_WEIGHT_DECAY
-        }
-    },
-    "zero_optimization": {
-        "stage": $ZERO_STAGE,
-        "overlap_comm": $OVERLAP_COMM,
-        "reduce_bucket_size": $REDUCE_BUCKET_SIZE,
-        "sub_group_size": $SUB_GROUP_SIZE,
-        "offload_optimizer": {
-            "device": "cpu",
-            "pin_memory": $PIN_MEMORY,
-            "ratio": 0.9,
-            "super_offload": true,
-            "cpuadam_cores_perc": $CPUADAM_CORES_PERC
-        }$param_block
-    },
-    "wall_clock_breakdown": $WALL_CLOCK_BREAKDOWN
-}
-EOF
-
-    elif [ "$base" = "super_offload_0.75" ]; then
-cat > "$ds_config_json" << EOF
-{
-    "train_micro_batch_size_per_gpu": $mbs,
-    "gradient_accumulation_steps": $grad_accum,
-    "bf16": { "enabled": $BF16_ENABLED },
-    "optimizer": {
-        "type": "$OPTIMIZER_TYPE",
-        "params": {
-            "lr": $OPTIMIZER_LR,
-            "betas": [$OPTIMIZER_BETA1, $OPTIMIZER_BETA2],
-            "eps": $OPTIMIZER_EPS,
-            "weight_decay": $OPTIMIZER_WEIGHT_DECAY
-        }
-    },
-    "zero_optimization": {
-        "stage": $ZERO_STAGE,
-        "overlap_comm": $OVERLAP_COMM,
-        "reduce_bucket_size": $REDUCE_BUCKET_SIZE,
-        "sub_group_size": $SUB_GROUP_SIZE,
-        "offload_optimizer": {
-            "device": "cpu",
-            "pin_memory": $PIN_MEMORY,
-            "ratio": 0.75,
-            "super_offload": true,
-            "cpuadam_cores_perc": $CPUADAM_CORES_PERC
-        }$param_block
-    },
-    "wall_clock_breakdown": $WALL_CLOCK_BREAKDOWN
-}
-EOF
-
-    elif [ "$base" = "super_offload_0.1" ]; then
-cat > "$ds_config_json" << EOF
-{
-    "train_micro_batch_size_per_gpu": $mbs,
-    "gradient_accumulation_steps": $grad_accum,
-    "bf16": { "enabled": $BF16_ENABLED },
-    "optimizer": {
-        "type": "$OPTIMIZER_TYPE",
-        "params": {
-            "lr": $OPTIMIZER_LR,
-            "betas": [$OPTIMIZER_BETA1, $OPTIMIZER_BETA2],
-            "eps": $OPTIMIZER_EPS,
-            "weight_decay": $OPTIMIZER_WEIGHT_DECAY
-        }
-    },
-    "zero_optimization": {
-        "stage": $ZERO_STAGE,
-        "overlap_comm": $OVERLAP_COMM,
-        "reduce_bucket_size": $REDUCE_BUCKET_SIZE,
-        "sub_group_size": $SUB_GROUP_SIZE,
-        "offload_optimizer": {
-            "device": "cpu",
-            "pin_memory": $PIN_MEMORY,
-            "ratio": 0.1,
-            "super_offload": true,
-            "cpuadam_cores_perc": $CPUADAM_CORES_PERC
-        }$param_block
-    },
-    "wall_clock_breakdown": $WALL_CLOCK_BREAKDOWN
-}
-EOF
-
-    else
-        echo "Unknown offload strategy: $strategy (base: $base; expected zero_3|zero_offload_cpu|super_offload_1.0|super_offload_0.9|super_offload_0.75|super_offload_0.1 with optional -param_gpu|-param_cpu suffix)" >&2
-        exit 2
-    fi
 }
 
 # ---------------------------------------------------------------------------
@@ -421,7 +249,7 @@ for MODEL in $MODELS; do
                 echo ""
                 echo "################ RUN ${MODEL_DIR}/${TEST_NAME}/${RUN_TS} ################"
                 bash "${SCRIPT_DIR}/pretrain.sh" \
-                    "$TEST_NAME" "$MODEL" "$MBS" "$DS_CONFIG" "$RECOMPUTE" "$METRICS_OUT" \
+                    "$TEST_NAME" "$MODEL" "$DS_CONFIG" "$RECOMPUTE" "$METRICS_OUT" \
                     2>&1 | tee "$LOG_FILE"
                 RUN_RC=${PIPESTATUS[0]}
 

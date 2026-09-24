@@ -53,6 +53,7 @@ python utils/prepare_init_weights.py \
 
 ```bash
 deepspeed --num_gpus 8 --master_port 29104 train.py \
+  --deepspeed_config ds_config.json \
   --mode autoep \
   --model qwen3_5_moe \
   --autoep_size 8 \
@@ -61,8 +62,6 @@ deepspeed --num_gpus 8 --master_port 29104 train.py \
   --warmup_steps 50 \
   --log_interval 1 \
   --seq_len 1024 \
-  --micro_batch_size 1 \
-  --grad_accum 4 \
   --seed 42 \
   --dataset_name wikitext \
   --dataset_percentage 10.0 \
@@ -75,6 +74,7 @@ deepspeed --num_gpus 8 --master_port 29104 train.py \
 
 ```bash
 deepspeed --num_gpus 8 --master_port 29105 train.py \
+  --deepspeed_config ds_config.json \
   --mode zero3_leaf \
   --model qwen3_5_moe \
   --override num_hidden_layers=8 \
@@ -82,8 +82,6 @@ deepspeed --num_gpus 8 --master_port 29105 train.py \
   --warmup_steps 50 \
   --log_interval 1 \
   --seq_len 1024 \
-  --micro_batch_size 1 \
-  --grad_accum 4 \
   --seed 42 \
   --dataset_name wikitext \
   --dataset_percentage 10.0 \

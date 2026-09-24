@@ -2,18 +2,16 @@
 # Launch ONE train.py run for the offload/recompute experiment matrix.
 #
 # Uses train.py arguments ONLY (not finetune_zero3.py arguments).
-# Every tunable is a variable (env-overridable) so the sweep can be extended
-# without editing the command line below.
+# Runtime knobs are grouped below; batch settings come from the DeepSpeed JSON.
 #
 # Usage:
-#   pretrain.sh <test_name> <model> <micro_batch_size> <ds_config> <recompute> <metrics_out>
+#   pretrain.sh <test_name> <model> <ds_config> <recompute> <metrics_out>
 #
 #   test_name        self-describing test ID (<strategy>__<recompute>__mbs<N>,
 #                    e.g. super_offload_0.9__recompute_act__mbs4), used for logging
 #   model            HF model name or path, e.g. Qwen/Qwen3.5-9B (dense) or
 #                    Qwen/Qwen3.5-35B-A3B (MoE); MoE is detected via the
 #                    config's int num_experts field
-#   micro_batch_size train.py --micro_batch_size (sweep axis: 1/2/4/8)
 #   ds_config        path to the generated DeepSpeed JSON (working copy under
 #                    <repo_root>/.tmp; archived into dirname(metrics_out) before launch)
 #   recompute        none | act | act_cpu  -> train.py checkpointing flags
@@ -26,17 +24,16 @@ cd "$SCRIPT_DIR"
 # ---------------------------------------------------------------------------
 # Positional arguments
 # ---------------------------------------------------------------------------
-if [ "$#" -ne 6 ]; then
-    echo "Usage: $0 <test_name> <model> <micro_batch_size> <ds_config> <recompute:none|act|act_cpu> <metrics_out>" >&2
+if [ "$#" -ne 5 ]; then
+    echo "Usage: $0 <test_name> <model> <ds_config> <recompute:none|act|act_cpu> <metrics_out>" >&2
     exit 2
 fi
 
 TEST_NAME=$1
 MODEL=$2
-MICRO_BATCH_SIZE=$3
-DS_CONFIG=$4
-RECOMPUTE=$5
-METRICS_OUT=$6
+DS_CONFIG=$3
+RECOMPUTE=$4
+METRICS_OUT=$5
 
 if [ ! -f "$DS_CONFIG" ]; then
     echo "ds_config not found: $DS_CONFIG" >&2
@@ -82,7 +79,7 @@ export NCCL_GRAPH_REGISTER="0"
 # Data knobs
 # ---------------------------------------------------------------------------
 DATASET_NAME=${DATASET_NAME:-wikitext}
-DATASET_PERCENTAGE=${DATASET_PERCENTAGE:-10.0}
+DATASET_PERCENTAGE=${DATASET_PERCENTAGE:-1.0}
 SEQ_LEN=${SEQ_LEN:-4096}
 HF_NUM_DATALOADER_WORKERS=${HF_NUM_DATALOADER_WORKERS:-0}
 # Empty -> train.py falls back to the preset default tokenizer.
@@ -97,26 +94,6 @@ LOG_INTERVAL=${LOG_INTERVAL:-1}
 SEED=${SEED:-42}
 # Empty -> train.py does not load a shared init artifact.
 LOAD_INIT_WEIGHTS=${LOAD_INIT_WEIGHTS:-}
-
-# ---------------------------------------------------------------------------
-# Batch shape (README §2 + sweep requirement)
-#   global batch per step  = 64 samples
-#   per-GPU batch per step = 16 samples = micro_batch_size * grad_accum
-#   grad_accum is derived so the global batch stays constant across the
-#   micro-batch sweep {1, 2, 4, 8}.
-# ---------------------------------------------------------------------------
-GLOBAL_BATCH_SIZE=${GLOBAL_BATCH_SIZE:-64}
-PER_GPU_BATCH_SIZE=${PER_GPU_BATCH_SIZE:-16}
-
-if [ $((PER_GPU_BATCH_SIZE * NUM_GPUS)) -ne "$GLOBAL_BATCH_SIZE" ]; then
-    echo "Inconsistent batch shape: PER_GPU_BATCH_SIZE($PER_GPU_BATCH_SIZE) * NUM_GPUS($NUM_GPUS) != GLOBAL_BATCH_SIZE($GLOBAL_BATCH_SIZE)" >&2
-    exit 2
-fi
-if [ $((PER_GPU_BATCH_SIZE % MICRO_BATCH_SIZE)) -ne 0 ]; then
-    echo "PER_GPU_BATCH_SIZE($PER_GPU_BATCH_SIZE) must be divisible by MICRO_BATCH_SIZE($MICRO_BATCH_SIZE)" >&2
-    exit 2
-fi
-GRAD_ACCUM=$((PER_GPU_BATCH_SIZE / MICRO_BATCH_SIZE))
 
 # ---------------------------------------------------------------------------
 # Model shape: optionally shrink every model to $NUM_LAYERS layers with linear
@@ -153,6 +130,19 @@ AUTOEP_SIZE=${AUTOEP_SIZE:-4}
 MOE_TRAIN_MODE=${MOE_TRAIN_MODE:-autoep}         # autoep | zero3_leaf
 DENSE_TRAIN_MODE=${DENSE_TRAIN_MODE:-dense}      # dense | zero3_leaf
 PYTHON_BIN=${PYTHON_BIN:-python}
+
+# Batch settings have one source of truth: the archived DeepSpeed JSON.
+read -r MICRO_BATCH_SIZE GRAD_ACCUM < <("$PYTHON_BIN" - "$DS_CONFIG" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as config_file:
+    config = json.load(config_file)
+
+print(config["train_micro_batch_size_per_gpu"], config["gradient_accumulation_steps"])
+PY
+)
+GLOBAL_BATCH_SIZE=$((MICRO_BATCH_SIZE * GRAD_ACCUM * NUM_GPUS))
 
 IS_MOE=$("$PYTHON_BIN" -c "
 from transformers import AutoConfig
@@ -246,7 +236,7 @@ echo "Run dir:         $RUN_DIR"
 echo "Recompute:       $RECOMPUTE"
 echo "GPUs:            $NUM_GPUS"
 echo "Seq len:         $SEQ_LEN"
-echo "Micro batch:     $MICRO_BATCH_SIZE  grad_accum: $GRAD_ACCUM  global batch: $GLOBAL_BATCH_SIZE"
+echo "Global batch:    $GLOBAL_BATCH_SIZE"
 echo "Steps:           $STEPS (warmup=$WARMUP_STEPS)"
 echo "Model shape:     $MODEL_SHAPE_DESC"
 echo "Metrics out:     $METRICS_OUT"
@@ -266,8 +256,6 @@ CMD="deepspeed --num_gpus=$NUM_GPUS $DS_LAUNCHER_ARGS train.py \
     --dataset_name $DATASET_NAME \
     --dataset_percentage $DATASET_PERCENTAGE \
     --seq_len $SEQ_LEN \
-    --micro_batch_size $MICRO_BATCH_SIZE \
-    --grad_accum $GRAD_ACCUM \
     --steps $STEPS \
     --warmup_steps $WARMUP_STEPS \
     --log_interval $LOG_INTERVAL \
