@@ -166,6 +166,7 @@ build_ds_config() {
 
     local param_block=""
     local optimizer_block=""
+    local optimizer_params_block=""
     case "$param_position" in
         param_cpu)
             param_block=',
@@ -182,7 +183,10 @@ build_ds_config() {
     esac
 
     case "$optimizer_strategy" in
-        zero_3) ;;
+        zero_3)
+            optimizer_params_block=',
+            "torch_adam": true'
+            ;;
         zero_offload|zero_offload_cpu)
             optimizer_block=',
         "offload_optimizer": {
@@ -218,7 +222,7 @@ build_ds_config() {
             "lr": 0.001,
             "betas": [0.9, 0.999],
             "eps": 1e-8,
-            "weight_decay": 0.01
+            "weight_decay": 0.01${optimizer_params_block}
         }
     },
     "zero_optimization": {
