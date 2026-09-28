@@ -25,6 +25,7 @@ DENSE_MODEL="9b"
 DTYPE="${DTYPE:-bf16}"
 PROFILE="none"
 CASE_FILTER="all"
+DISPATCHER_FILTER="all"
 TRAIN_ITERS="${TRAIN_ITERS:-10}"
 GLOBAL_BATCH_SIZE="${GLOBAL_BATCH_SIZE:-32}"
 MICRO_BATCH_SIZES="${MICRO_BATCH_SIZES:-1,2,4,8}"
@@ -55,6 +56,8 @@ Options:
     --dtype <bf16|mxfp8>         Training dtype (default: bf16)
     --profile <none|nsys|torch>  Profiling backend (default: none)
     --case <name|all>            Run baseline or offload (default: all)
+    --dispatcher <all|alltoall|hybridep>
+                                 MoE dispatcher filter (default: all)
     --train-iters <n>            Total steps per run (default: 10)
     --global-batch-size <n>      Global batch size (default: 32)
     --micro-batch-sizes <list>   Comma-separated MBS sweep (default: 1,2,4,8)
@@ -85,6 +88,7 @@ while [[ $# -gt 0 ]]; do
             ;;
         --profile) PROFILE="$2"; shift 2 ;;
         --case) CASE_FILTER="$2"; shift 2 ;;
+        --dispatcher) DISPATCHER_FILTER="$2"; shift 2 ;;
         --train-iters) TRAIN_ITERS="$2"; shift 2 ;;
         --global-batch-size) GLOBAL_BATCH_SIZE="$2"; shift 2 ;;
         --micro-batch-sizes) MICRO_BATCH_SIZES="$2"; shift 2 ;;
@@ -113,6 +117,10 @@ case "${PROFILE}" in none|nsys|torch) ;; *) echo "Invalid profile: ${PROFILE}" >
 case "${CASE_FILTER}" in
     all|baseline|offload) ;;
     *) echo "Invalid case: ${CASE_FILTER}" >&2; exit 2 ;;
+esac
+case "${DISPATCHER_FILTER}" in
+    all|alltoall|hybridep) ;;
+    *) echo "Invalid dispatcher: ${DISPATCHER_FILTER}" >&2; exit 2 ;;
 esac
 
 for value_name in TRAIN_ITERS GLOBAL_BATCH_SIZE HYBRIDEP_NUM_SMS; do
@@ -241,14 +249,17 @@ run_expert_matrix() {
     local micro_batch_size="$1"
     local dispatcher
     for dispatcher in alltoall hybridep; do
+        if [[ "${DISPATCHER_FILTER}" != all && "${DISPATCHER_FILTER}" != "${dispatcher}" ]]; then
+            continue
+        fi
         run_case expert "${EXPERT_MODEL_NAME}" "${EXPERT_RECIPE_PREFIX}" "${dispatcher}" baseline null null false null "${micro_batch_size}"
         run_case expert "${EXPERT_MODEL_NAME}" "${EXPERT_RECIPE_PREFIX}" "${dispatcher}" offload null null true '[mlp_norm,expert_fc1,moe_act]' "${micro_batch_size}"
     done
 }
 
 export RESULTS_ROOT RUN_TIME
-printf 'benchmark_id=%s model=%s dtype=%s results_root=%s train_iters=%s runs_per_case=1 micro_batch_sizes=%s\n' \
-    "${RUN_TIME}" "${MODEL_FAMILY}" "${DTYPE}" "${RESULTS_ROOT}" "${TRAIN_ITERS}" "${MICRO_BATCH_SIZES}"
+printf 'benchmark_id=%s model=%s dtype=%s dispatcher=%s results_root=%s train_iters=%s runs_per_case=1 micro_batch_sizes=%s\n' \
+    "${RUN_TIME}" "${MODEL_FAMILY}" "${DTYPE}" "${DISPATCHER_FILTER}" "${RESULTS_ROOT}" "${TRAIN_ITERS}" "${MICRO_BATCH_SIZES}"
 
 for micro_batch_size in "${MICRO_BATCH_SIZE_VALUES[@]}"; do
     case "${SCOPE}" in
