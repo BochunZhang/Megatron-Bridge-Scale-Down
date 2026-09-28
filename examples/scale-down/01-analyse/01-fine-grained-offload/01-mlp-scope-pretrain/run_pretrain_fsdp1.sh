@@ -21,7 +21,12 @@
 #       --recompute-modules <value> --fine-grained-offload <true|false> \
 #       --offload-modules <value> \
 #       [--train-iters <iters>] [--global-batch-size <gbs>] [--micro-batch-size <mbs>] \
+#       [--warmup-steps <steps>] [--optimizer-cpu-offload <true|false>] \
+#       [--optimizer-offload-fraction <0..1>] \
+#       [--overlap-cpu-optimizer-d2h-h2d <true|false>] \
+#       [--seed <integer>] [--num-experts <integer>] \
 #       [--num-layers <layers>] [--linear-attention-freq <value>] \
+#       [--dispatcher <default|alltoall|hybridep>] [--hybridep-num-sms <sms>] \
 #       [--profile-step-start <start>] [--profile-step-end <end>] \
 #       [--profile <nsys|torch>]
 
@@ -46,8 +51,16 @@ Usage: run_pretrain_fsdp1.sh \
     [--train-iters <iters>] \
     [--global-batch-size <gbs>] \
     [--micro-batch-size <mbs>] \
+    [--warmup-steps <steps>] \
+    [--optimizer-cpu-offload <true|false>] \
+    [--optimizer-offload-fraction <0..1>] \
+    [--overlap-cpu-optimizer-d2h-h2d <true|false>] \
+    [--seed <integer>] \
+    [--num-experts <integer>] \
     [--num-layers <layers>] \
     [--linear-attention-freq <value>] \
+    [--dispatcher <default|alltoall|hybridep>] \
+    [--hybridep-num-sms <sms>] \
     [--profile-step-start <start>] \
     [--profile-step-end <end>] \
     [--profile <nsys|torch>]
@@ -60,8 +73,13 @@ Optional training parameters (with defaults):
     --train-iters         Number of training iterations (default: 10)
     --global-batch-size   Global batch size (default: 8)
     --micro-batch-size    Micro batch size (default: 1)
+    --seed                Override rng.seed and dataset.random_seed
+    --num-experts         Override model.num_moe_experts
     --num-layers          Override model.num_layers
     --linear-attention-freq  Override model.linear_attention_freq
+    --dispatcher          Keep the recipe default, or explicitly select the
+                          standard all-to-all or HybridEP dispatcher
+    --hybridep-num-sms    Communication SMs for HybridEP (default: 32)
     --profile-step-start  Profile start step (default: 7)
     --profile-step-end    Profile end step (default: 8)
     --profile <nsys|torch>
@@ -90,8 +108,16 @@ OFFLOAD_MODULES=""
 TRAIN_ITERS=""
 GLOBAL_BATCH_SIZE=""
 MICRO_BATCH_SIZE=""
+WARMUP_STEPS=""
+OPTIMIZER_CPU_OFFLOAD="false"
+OPTIMIZER_OFFLOAD_FRACTION="0.0"
+OVERLAP_CPU_OPTIMIZER_D2H_H2D="false"
+SEED=""
+NUM_EXPERTS=""
 NUM_LAYERS=""
 LINEAR_ATTENTION_FREQ=""
+DISPATCHER="default"
+HYBRIDEP_NUM_SMS="${HYBRIDEP_NUM_SMS:-32}"
 PROFILE_STEP_START=""
 PROFILE_STEP_END=""
 PROFILE="${PROFILE:-none}"
@@ -153,6 +179,36 @@ while [[ $# -gt 0 ]]; do
             MICRO_BATCH_SIZE="$2"
             shift 2
             ;;
+        --warmup-steps)
+            [[ $# -ge 2 ]] || { usage >&2; exit 2; }
+            WARMUP_STEPS="$2"
+            shift 2
+            ;;
+        --optimizer-cpu-offload)
+            [[ $# -ge 2 ]] || { usage >&2; exit 2; }
+            OPTIMIZER_CPU_OFFLOAD="$2"
+            shift 2
+            ;;
+        --optimizer-offload-fraction)
+            [[ $# -ge 2 ]] || { usage >&2; exit 2; }
+            OPTIMIZER_OFFLOAD_FRACTION="$2"
+            shift 2
+            ;;
+        --overlap-cpu-optimizer-d2h-h2d)
+            [[ $# -ge 2 ]] || { usage >&2; exit 2; }
+            OVERLAP_CPU_OPTIMIZER_D2H_H2D="$2"
+            shift 2
+            ;;
+        --seed)
+            [[ $# -ge 2 ]] || { usage >&2; exit 2; }
+            SEED="$2"
+            shift 2
+            ;;
+        --num-experts)
+            [[ $# -ge 2 ]] || { usage >&2; exit 2; }
+            NUM_EXPERTS="$2"
+            shift 2
+            ;;
         --num-layers)
             [[ $# -ge 2 ]] || { usage >&2; exit 2; }
             NUM_LAYERS="$2"
@@ -161,6 +217,16 @@ while [[ $# -gt 0 ]]; do
         --linear-attention-freq)
             [[ $# -ge 2 ]] || { usage >&2; exit 2; }
             LINEAR_ATTENTION_FREQ="$2"
+            shift 2
+            ;;
+        --dispatcher)
+            [[ $# -ge 2 ]] || { usage >&2; exit 2; }
+            DISPATCHER="$2"
+            shift 2
+            ;;
+        --hybridep-num-sms)
+            [[ $# -ge 2 ]] || { usage >&2; exit 2; }
+            HYBRIDEP_NUM_SMS="$2"
             shift 2
             ;;
         --profile-step-start)
@@ -202,6 +268,7 @@ done
 TRAIN_ITERS="${TRAIN_ITERS:-10}"
 GLOBAL_BATCH_SIZE="${GLOBAL_BATCH_SIZE:-8}"
 MICRO_BATCH_SIZE="${MICRO_BATCH_SIZE:-1}"
+WARMUP_STEPS="${WARMUP_STEPS:-0}"
 PROFILE_STEP_START="${PROFILE_STEP_START:-7}"
 PROFILE_STEP_END="${PROFILE_STEP_END:-8}"
 
@@ -220,6 +287,30 @@ case "${FINE_GRAINED_OFFLOAD}" in
     true|false) ;;
     *) echo "fine-grained offload must be true or false: ${FINE_GRAINED_OFFLOAD}" >&2; exit 2 ;;
 esac
+case "${OPTIMIZER_CPU_OFFLOAD}" in
+    true|false) ;;
+    *) echo "optimizer CPU offload must be true or false: ${OPTIMIZER_CPU_OFFLOAD}" >&2; exit 2 ;;
+esac
+case "${OVERLAP_CPU_OPTIMIZER_D2H_H2D}" in
+    true|false) ;;
+    *) echo "optimizer D2H/H2D overlap must be true or false: ${OVERLAP_CPU_OPTIMIZER_D2H_H2D}" >&2; exit 2 ;;
+esac
+if ! [[ "${OPTIMIZER_OFFLOAD_FRACTION}" =~ ^(0([.][0-9]+)?|1([.]0*)?)$ ]]; then
+    echo "optimizer offload fraction must be in [0, 1]: ${OPTIMIZER_OFFLOAD_FRACTION}" >&2
+    exit 2
+fi
+if [[ -n "${SEED}" ]] && ! [[ "${SEED}" =~ ^[0-9]+$ ]]; then
+    echo "seed must be a non-negative integer: ${SEED}" >&2
+    exit 2
+fi
+if [[ -n "${NUM_EXPERTS}" ]] && ! [[ "${NUM_EXPERTS}" =~ ^[1-9][0-9]*$ ]]; then
+    echo "num-experts must be a positive integer: ${NUM_EXPERTS}" >&2
+    exit 2
+fi
+case "${DISPATCHER}" in
+    default|alltoall|hybridep) ;;
+    *) echo "--dispatcher must be one of default|alltoall|hybridep: ${DISPATCHER}" >&2; exit 2 ;;
+esac
 
 RESULTS_ROOT="${RESULTS_ROOT:-${REPO_ROOT}/results/01-analyse/01-fine-grained-offload}"
 RUN_TIME="${RUN_TIME:-$(date +%Y%m%d-%H%M%S)}"
@@ -229,16 +320,20 @@ NEMO_CACHE="${REPO_ROOT}/.cache/nemo"
 UV_CACHE="${REPO_ROOT}/.cache/uv"
 MASTER_PORT="${MASTER_PORT:-29501}"
 
-if ! [[ "${TRAIN_ITERS}" =~ ^[0-9]+$ && "${GLOBAL_BATCH_SIZE}" =~ ^[0-9]+$ && "${MICRO_BATCH_SIZE}" =~ ^[0-9]+$ ]]; then
+if ! [[ "${TRAIN_ITERS}" =~ ^[0-9]+$ && "${GLOBAL_BATCH_SIZE}" =~ ^[0-9]+$ && "${MICRO_BATCH_SIZE}" =~ ^[0-9]+$ && "${WARMUP_STEPS}" =~ ^[0-9]+$ ]]; then
     echo "Training sizes must be non-negative integers" >&2
     exit 2
 fi
-if (( TRAIN_ITERS < 1 || GLOBAL_BATCH_SIZE < 1 || MICRO_BATCH_SIZE < 1 )); then
+if (( TRAIN_ITERS < 1 || GLOBAL_BATCH_SIZE < 1 || MICRO_BATCH_SIZE < 1 || WARMUP_STEPS > TRAIN_ITERS )); then
     echo "Training sizes must be positive" >&2
     exit 2
 fi
 if [[ -n "${NUM_LAYERS}" ]] && ! [[ "${NUM_LAYERS}" =~ ^[1-9][0-9]*$ ]]; then
     echo "num-layers must be a positive integer" >&2
+    exit 2
+fi
+if ! [[ "${HYBRIDEP_NUM_SMS}" =~ ^[1-9][0-9]*$ ]]; then
+    echo "hybridep-num-sms must be a positive integer" >&2
     exit 2
 fi
 case "${PROFILE}" in
@@ -266,12 +361,18 @@ export UV_CACHE_DIR="${UV_CACHE}"
 export NVTE_CPU_OFFLOAD_V1="1"
 export TORCH_NCCL_AVOID_RECORD_STREAMS="1"
 export NVLINK_DOMAIN_SIZE="72"
+if [[ "${DISPATCHER}" == hybridep ]]; then
+    export NUM_OF_HYBRID_EP_RANKS_PER_NVLINK_DOMAIN="${NUM_OF_HYBRID_EP_RANKS_PER_NVLINK_DOMAIN:-4}"
+fi
 export PYTORCH_CUDA_ALLOC_CONF="expandable_segments:True"
 export NCCL_NVLS_ENABLE="0"
 export NCCL_DEBUG="WARN"
 export NCCL_GRAPH_REGISTER="0"
 export TOKENIZERS_PARALLELISM="false"
 export RESULT_DIR MODEL MODEL_ID RESULT_MODEL_NAME PRECISION RUN_NAME RUN_TIME RECIPE
+export RECOMPUTE_GRANULARITY RECOMPUTE_MODULES FINE_GRAINED_OFFLOAD OFFLOAD_MODULES
+export TRAIN_ITERS GLOBAL_BATCH_SIZE MICRO_BATCH_SIZE WARMUP_STEPS DISPATCHER HYBRIDEP_NUM_SMS PROFILE
+export OPTIMIZER_CPU_OFFLOAD OPTIMIZER_OFFLOAD_FRACTION OVERLAP_CPU_OPTIMIZER_D2H_H2D
 
 # Derive profiling settings from the selected backend. Bridge's
 # ProfilingConfig.finalize() forbids enabling the nsys and PyTorch profilers at
@@ -310,9 +411,9 @@ OVERRIDES=(
     "train.train_iters=${TRAIN_ITERS}"
     "train.global_batch_size=${GLOBAL_BATCH_SIZE}"
     "train.micro_batch_size=${MICRO_BATCH_SIZE}"
+    "scheduler.lr_warmup_iters=${WARMUP_STEPS}"
     "validation.eval_iters=0"
     "validation.eval_interval=0"
-    "scheduler.lr_warmup_iters=0"
     "model.recompute_granularity=${RECOMPUTE_GRANULARITY}"
     "model.recompute_method=null"
     "model.recompute_num_layers=null"
@@ -323,6 +424,9 @@ OVERRIDES=(
     "model.cuda_graph_scope=null"
     "model.cuda_graph_modules=[]"
     "model.moe_shared_expert_overlap=false"
+    "optimizer.optimizer_cpu_offload=${OPTIMIZER_CPU_OFFLOAD}"
+    "optimizer.optimizer_offload_fraction=${OPTIMIZER_OFFLOAD_FRACTION}"
+    "optimizer.overlap_cpu_optimizer_d2h_h2d=${OVERLAP_CPU_OPTIMIZER_D2H_H2D}"
     "checkpoint.save=null"
     "checkpoint.load=null"
     "logger.log_interval=1"
@@ -343,6 +447,28 @@ fi
 if [[ -n "${LINEAR_ATTENTION_FREQ}" ]]; then
     OVERRIDES+=("model.linear_attention_freq=${LINEAR_ATTENTION_FREQ}")
 fi
+if [[ -n "${SEED}" ]]; then
+    OVERRIDES+=("rng.seed=${SEED}" "dataset.random_seed=${SEED}")
+fi
+if [[ -n "${NUM_EXPERTS}" ]]; then
+    OVERRIDES+=("model.num_moe_experts=${NUM_EXPERTS}")
+fi
+case "${DISPATCHER}" in
+    alltoall)
+        OVERRIDES+=(
+            "model.moe_token_dispatcher_type=alltoall"
+            "model.moe_flex_dispatcher_backend=null"
+            "model.moe_flex_dispatcher_num_sms=null"
+        )
+        ;;
+    hybridep)
+        OVERRIDES+=(
+            "model.moe_token_dispatcher_type=flex"
+            "model.moe_flex_dispatcher_backend=hybridep"
+            "model.moe_flex_dispatcher_num_sms=${HYBRIDEP_NUM_SMS}"
+        )
+        ;;
+esac
 
 COMMAND=(
     uv run --no-sync python -m torch.distributed.run
@@ -360,10 +486,17 @@ COMMAND=(
 COMMAND_TEXT="${COMMAND[*]}"
 export COMMAND_TEXT
 
-uv run --no-sync python -c 'import json, os, re; pattern = re.compile(r"(^|_)(TOKEN|SECRET|PASSWORD|PASSWD|API_KEY|ACCESS_KEY|SECRET_KEY|PRIVATE_KEY|AUTHORIZATION)(_|$)", re.I); root = os.environ["RESULT_DIR"]; env = {k: ("[REDACTED]" if pattern.search(k) else v) for k, v in sorted(os.environ.items())}; json.dump(env, open(os.path.join(root, "environment.json"), "w"), indent=2, sort_keys=True); open(os.path.join(root, "command.txt"), "w").write(os.environ["COMMAND_TEXT"] + "\n"); config = {"model": os.environ["MODEL"], "model_id": os.environ["MODEL_ID"], "precision": os.environ["PRECISION"], "run_name": os.environ["RUN_NAME"], "run_time": os.environ["RUN_TIME"], "recipe": os.environ["RECIPE"], "result_dir": root, "profile_ranks": [0, 1, 2, 3], "cache_paths": {"hf": env["HF_HOME"], "nemo": env["NEMO_HOME"]}, "cli": os.environ["COMMAND_TEXT"]}; json.dump(config, open(os.path.join(root, "config.json"), "w"), indent=2, sort_keys=True)'
+uv run --no-sync python -c 'import json, os, re; pattern = re.compile(r"(^|_)(TOKEN|SECRET|PASSWORD|PASSWD|API_KEY|ACCESS_KEY|SECRET_KEY|PRIVATE_KEY|AUTHORIZATION)(_|$)", re.I); root = os.environ["RESULT_DIR"]; env = {k: ("[REDACTED]" if pattern.search(k) else v) for k, v in sorted(os.environ.items())}; json.dump(env, open(os.path.join(root, "environment.json"), "w"), indent=2, sort_keys=True); open(os.path.join(root, "command.txt"), "w").write(os.environ["COMMAND_TEXT"] + "\n"); config = {"model": os.environ["MODEL"], "model_id": os.environ["MODEL_ID"], "precision": os.environ["PRECISION"], "profile": os.environ["PROFILE"], "run_name": os.environ["RUN_NAME"], "run_time": os.environ["RUN_TIME"], "recipe": os.environ["RECIPE"], "result_dir": root, "profile_ranks": [0, 1, 2, 3], "cache_paths": {"hf": env["HF_HOME"], "nemo": env["NEMO_HOME"]}, "train_iters": int(os.environ["TRAIN_ITERS"]), "global_batch_size": int(os.environ["GLOBAL_BATCH_SIZE"]), "micro_batch_size": int(os.environ["MICRO_BATCH_SIZE"]), "sequence_length": 4096, "recompute_granularity": os.environ["RECOMPUTE_GRANULARITY"], "recompute_modules": os.environ["RECOMPUTE_MODULES"], "fine_grained_offload": os.environ["FINE_GRAINED_OFFLOAD"] == "true", "offload_modules": os.environ["OFFLOAD_MODULES"], "dispatcher": os.environ["DISPATCHER"], "hybridep_num_sms": int(os.environ["HYBRIDEP_NUM_SMS"]), "cli": os.environ["COMMAND_TEXT"]}; json.dump(config, open(os.path.join(root, "config.json"), "w"), indent=2, sort_keys=True)'
+uv run --no-sync python -c 'import json, os; path = os.path.join(os.environ["RESULT_DIR"], "config.json"); config = json.load(open(path, encoding="utf-8")); config.update({"warmup_steps": int(os.environ["WARMUP_STEPS"]), "optimizer_cpu_offload": os.environ["OPTIMIZER_CPU_OFFLOAD"] == "true", "optimizer_offload_fraction": float(os.environ["OPTIMIZER_OFFLOAD_FRACTION"]), "overlap_cpu_optimizer_d2h_h2d": os.environ["OVERLAP_CPU_OPTIMIZER_D2H_H2D"] == "true"}); json.dump(config, open(path, "w", encoding="utf-8"), indent=2, sort_keys=True)'
 
 printf 'model=%s precision=%s run_name=%s run_time=%s\n' "${MODEL}" "${PRECISION}" "${RUN_NAME}" "${RUN_TIME}" | tee "${RESULT_DIR}/run_info.txt"
 printf 'train_iters=%s global_batch_size=%s micro_batch_size=%s\n' "${TRAIN_ITERS}" "${GLOBAL_BATCH_SIZE}" "${MICRO_BATCH_SIZE}" | tee -a "${RESULT_DIR}/run_info.txt"
+printf 'warmup_steps=%s optimizer_cpu_offload=%s optimizer_offload_fraction=%s overlap_cpu_optimizer_d2h_h2d=%s\n' \
+    "${WARMUP_STEPS}" "${OPTIMIZER_CPU_OFFLOAD}" "${OPTIMIZER_OFFLOAD_FRACTION}" \
+    "${OVERLAP_CPU_OPTIMIZER_D2H_H2D}" | tee -a "${RESULT_DIR}/run_info.txt"
+printf 'dispatcher=%s hybridep_num_sms=%s recompute_modules=%s offload_modules=%s\n' \
+    "${DISPATCHER}" "${HYBRIDEP_NUM_SMS}" "${RECOMPUTE_MODULES}" "${OFFLOAD_MODULES}" \
+    | tee -a "${RESULT_DIR}/run_info.txt"
 printf 'profile=%s profile_step_start=%s profile_step_end=%s use_nsys_profiler=%s use_pytorch_profiler=%s record_memory_history=%s nvtx_ranges=%s gpu_memory_trace_interval=%s\n' \
     "${PROFILE}" "${PROFILE_STEP_START}" "${PROFILE_STEP_END}" "${USE_NSYS_PROFILER}" \
     "${USE_PYTORCH_PROFILER}" "${RECORD_MEMORY_HISTORY}" "${NVTX_RANGES}" \
@@ -411,10 +544,8 @@ cleanup_gpu_memory_monitor() {
 
 trap cleanup_gpu_memory_monitor EXIT
 
-if [[ "${PROFILE}" == torch ]]; then
-    printf 'Starting nvidia-smi memory monitor...\n' | tee -a "${RESULT_DIR}/run_info.txt"
-    start_gpu_memory_monitor
-fi
+printf 'Starting nvidia-smi memory monitor...\n' | tee -a "${RESULT_DIR}/run_info.txt"
+start_gpu_memory_monitor
 
 # Run training with optional nsys profiling.
 if [[ "${USE_NSYS_PROFILER}" == true ]]; then
@@ -442,17 +573,18 @@ else
     set -e
 fi
 
+stop_gpu_memory_monitor || {
+    MONITOR_STATUS=$?
+    printf 'GPU memory monitor failed with status %s.\n' "${MONITOR_STATUS}" \
+        | tee -a "${RESULT_DIR}/run_info.txt" >&2
+    if [[ "${RUN_STATUS}" -eq 0 ]]; then
+        RUN_STATUS="${MONITOR_STATUS}"
+    fi
+}
+printf 'GPU memory traces: %s\n' "${RESULT_DIR}/gpu_memory" \
+    | tee -a "${RESULT_DIR}/run_info.txt"
+
 if [[ "${PROFILE}" == torch ]]; then
-    stop_gpu_memory_monitor || {
-        MONITOR_STATUS=$?
-        printf 'GPU memory monitor failed with status %s.\n' "${MONITOR_STATUS}" \
-            | tee -a "${RESULT_DIR}/run_info.txt" >&2
-        if [[ "${RUN_STATUS}" -eq 0 ]]; then
-            RUN_STATUS="${MONITOR_STATUS}"
-        fi
-    }
-    printf 'GPU memory traces: %s\n' "${RESULT_DIR}/gpu_memory" \
-        | tee -a "${RESULT_DIR}/run_info.txt"
 
     # Replay each per-rank memory snapshot into a sibling JSON phase report
     # (snapshot_N.pickle -> snapshot_N.json) using the scale-down replay_step
@@ -490,4 +622,4 @@ printf 'GPU utilization metrics: %s\n' "${GPU_UTILIZATION_PATH}" \
     | tee -a "${RESULT_DIR}/run_info.txt"
 
 export RUN_STATUS
-uv run --no-sync python -c 'import json, os; root = os.environ["RESULT_DIR"]; result = {"status": int(os.environ["RUN_STATUS"]), "model": os.environ["MODEL"], "precision": os.environ["PRECISION"], "run_name": os.environ["RUN_NAME"], "run_time": os.environ["RUN_TIME"], "recipe": os.environ["RECIPE"], "result_dir": root, "profile_ranks": [0, 1, 2, 3]}; json.dump(result, open(os.path.join(root, "summary.json"), "w"), indent=2, sort_keys=True); raise SystemExit(result["status"])'
+uv run --no-sync python -c 'import json, os; root = os.environ["RESULT_DIR"]; result = {"status": int(os.environ["RUN_STATUS"]), "model": os.environ["MODEL"], "precision": os.environ["PRECISION"], "run_name": os.environ["RUN_NAME"], "run_time": os.environ["RUN_TIME"], "recipe": os.environ["RECIPE"], "result_dir": root, "profile_ranks": [0, 1, 2, 3], "optimizer_cpu_offload": os.environ["OPTIMIZER_CPU_OFFLOAD"] == "true", "optimizer_offload_fraction": float(os.environ["OPTIMIZER_OFFLOAD_FRACTION"]) }; json.dump(result, open(os.path.join(root, "summary.json"), "w"), indent=2, sort_keys=True); raise SystemExit(result["status"])'
