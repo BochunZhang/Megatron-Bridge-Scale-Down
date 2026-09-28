@@ -49,11 +49,11 @@ EXPERIMENT_DIR=examples/scale-down/01-analyse/01-fine-grained-offload/02-offload
 
 ```bash
 # bf16
-bash "$EXPERIMENT_DIR/benchmark_mlp_offload.sh" \
+bash "./examples/scale-down/01-analyse/01-fine-grained-offload/02-offload-on-dense-or-expert-model/benchmark_mlp_offload.sh" \
   --model qwen --dtype bf16 --micro-batch-sizes 1,2,4,8
 
 # mxfp8
-bash "$EXPERIMENT_DIR/benchmark_mlp_offload.sh" \
+bash "./examples/scale-down/01-analyse/01-fine-grained-offload/02-offload-on-dense-or-expert-model/benchmark_mlp_offload.sh" \
   --model qwen --dtype mxfp8 --micro-batch-sizes 1,2,4,8
 ```
 
@@ -61,11 +61,11 @@ bash "$EXPERIMENT_DIR/benchmark_mlp_offload.sh" \
 
 ```bash
 # bf16 + nsys
-bash "$EXPERIMENT_DIR/benchmark_mlp_offload.sh" \
+bash "./examples/scale-down/01-analyse/01-fine-grained-offload/02-offload-on-dense-or-expert-model/benchmark_mlp_offload.sh" \
   --model qwen --dtype bf16 --micro-batch-sizes 1,2,4,8 --profile nsys
 
 # mxfp8 + nsys
-bash "$EXPERIMENT_DIR/benchmark_mlp_offload.sh" \
+bash "./examples/scale-down/01-analyse/01-fine-grained-offload/02-offload-on-dense-or-expert-model/benchmark_mlp_offload.sh" \
   --model qwen --dtype mxfp8 --micro-batch-sizes 1,2,4,8 --profile nsys
 ```
 
@@ -77,22 +77,22 @@ bash "$EXPERIMENT_DIR/benchmark_mlp_offload.sh" \
 
 ```bash
 # 1. bf16 + alltoall
-bash "$EXPERIMENT_DIR/benchmark_mlp_offload.sh" \
+bash "./examples/scale-down/01-analyse/01-fine-grained-offload/02-offload-on-dense-or-expert-model/benchmark_mlp_offload.sh" \
   --model deepseek --dtype bf16 --dispatcher alltoall \
   --micro-batch-sizes 1,2 --profile nsys
 
 # 2. bf16 + hybridep
-bash "$EXPERIMENT_DIR/benchmark_mlp_offload.sh" \
+bash "./examples/scale-down/01-analyse/01-fine-grained-offload/02-offload-on-dense-or-expert-model/benchmark_mlp_offload.sh" \
   --model deepseek --dtype bf16 --dispatcher hybridep \
   --micro-batch-sizes 1,2 --profile nsys
 
 # 3. mxfp8 + alltoall
-bash "$EXPERIMENT_DIR/benchmark_mlp_offload.sh" \
+bash "./examples/scale-down/01-analyse/01-fine-grained-offload/02-offload-on-dense-or-expert-model/benchmark_mlp_offload.sh" \
   --model deepseek --dtype mxfp8 --dispatcher alltoall \
   --micro-batch-sizes 1,2 --profile nsys
 
 # 4. mxfp8 + hybridep
-bash "$EXPERIMENT_DIR/benchmark_mlp_offload.sh" \
+bash "./examples/scale-down/01-analyse/01-fine-grained-offload/02-offload-on-dense-or-expert-model/benchmark_mlp_offload.sh" \
   --model deepseek --dtype mxfp8 --dispatcher hybridep \
   --micro-batch-sizes 1,2 --profile nsys
 ```
@@ -100,7 +100,7 @@ bash "$EXPERIMENT_DIR/benchmark_mlp_offload.sh" \
 ### 测试 3：qwen3.5 expert 单项测试（MBS 1 + bf16 + hybridep + nsys）
 
 ```bash
-bash "$EXPERIMENT_DIR/benchmark_mlp_offload.sh" \
+bash "./examples/scale-down/01-analyse/01-fine-grained-offload/02-offload-on-dense-or-expert-model/benchmark_mlp_offload.sh" \
   --model qwen --scope expert --dtype bf16 --dispatcher hybridep \
   --micro-batch-size 1 --profile nsys
 ```
@@ -110,7 +110,7 @@ bash "$EXPERIMENT_DIR/benchmark_mlp_offload.sh" \
 ### 生成 XLSX 汇总（只收 `--profile none` 的成功运行）
 
 ```bash
-node "$EXPERIMENT_DIR/collect_mlp_offload_results.mjs"
+node "./examples/scale-down/01-analyse/01-fine-grained-offload/02-offload-on-dense-or-expert-model/collect_mlp_offload_results.mjs"
 # 默认收集最新批次；回看旧批次加 --run-time <benchmark_id>
 # 只校验数据不写 XLSX：加 --dry-run
 ```
