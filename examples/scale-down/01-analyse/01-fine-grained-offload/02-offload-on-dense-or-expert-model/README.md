@@ -122,8 +122,8 @@ node "./examples/scale-down/01-analyse/01-fine-grained-offload/02-offload-on-den
 训练结果根目录（可用 `--results-root <path>` 改）：
 
 ```text
-results/01-analyse/01-offload-on-dense-and-expert-model/
-└── <model>/<bf16|mxfp8>/<run-name__参数标签>/<run-time>/
+result/01-analyse/01-fine-grained-offload/02-offload-on-dense-or-expert-model/
+└── <qwen35_text_9b|qwen35_text_35b_a3b|deepseek>/<bf16|mxfp8>/<baseline|offload>/<run-time>/
     ├── config.json / config.yaml   # 最终 recipe 与 override（含 dtype、dispatcher）
     ├── command.txt                 # 实际 distributed 命令
     ├── train.log                   # 训练与 step time 日志
@@ -137,7 +137,7 @@ results/01-analyse/01-offload-on-dense-and-expert-model/
 XLSX 汇总输出：
 
 ```text
-results/01-analyse/01-offload-on-dense-and-expert-model/offload-comparison-<run-time>.xlsx
+result/01-analyse/01-fine-grained-offload/02-offload-on-dense-or-expert-model/offload-comparison-<run-time>.xlsx
 ```
 
 包含 `Summary`（每 run 吞吐均值/中位数/波动、相对 baseline 的比例）和 `Samples`（逐 iteration step time、tokens/s、raw result 目录）两个 sheet。

@@ -23,7 +23,7 @@ const SCRIPT_DIR = path.dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = path.resolve(SCRIPT_DIR, "../../../../..");
 const DEFAULT_RESULTS_ROOT = path.join(
   REPO_ROOT,
-  "results/01-analyse/01-offload-on-dense-and-expert-model",
+  "result/01-analyse/01-fine-grained-offload/02-offload-on-dense-or-expert-model",
 );
 const SAMPLE_ITERATIONS = [5, 6, 7, 8, 9];
 const RUN_NAME_PATTERN =
