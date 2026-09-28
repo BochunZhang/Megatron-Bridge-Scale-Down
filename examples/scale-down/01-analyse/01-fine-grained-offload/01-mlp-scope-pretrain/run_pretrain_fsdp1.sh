@@ -16,7 +16,7 @@
 # Run one FSDP1 experiment on four local GPUs.
 #
 # Usage:
-#   run_pretrain_fsdp1.sh --model <model> --recipe <recipe> --precision <precision> \
+#   run_pretrain_fsdp1.sh --model <model> --recipe <recipe> [--dtype <dtype>] \
 #       --run-name <run-name> --recompute-granularity <value> \
 #       --recompute-modules <value> --fine-grained-offload <true|false> \
 #       --offload-modules <value> \
@@ -42,7 +42,7 @@ usage() {
 Usage: run_pretrain_fsdp1.sh \
     --model <model> \
     --recipe <recipe> \
-    --precision <bf16|fp8mx> \
+    [--dtype <bf16|mxfp8>] \
     --run-name <run-name> \
     --recompute-granularity <null|selective> \
     --recompute-modules <value> \
@@ -65,9 +65,10 @@ Usage: run_pretrain_fsdp1.sh \
     [--profile-step-end <end>] \
     [--profile <nsys|torch>]
 
-The model, recipe, and precision are selected by the caller and are passed
-through without model/precision combination logic. Hydra values such as null,
-selective, [layernorm,mlp], or [expert_fc1,moe_act] are accepted.
+The model and recipe are selected by the caller. Dtype defaults to bf16 and is
+recorded with the run; recipe selection remains the caller's responsibility.
+Hydra values such as null, selective, [layernorm,mlp], or
+[expert_fc1,moe_act] are accepted.
 
 Optional training parameters (with defaults):
     --train-iters         Number of training iterations (default: 10)
@@ -97,7 +98,7 @@ EOF
 
 MODEL=""
 RECIPE=""
-PRECISION=""
+DTYPE="${DTYPE:-bf16}"
 RUN_NAME=""
 RECOMPUTE_GRANULARITY=""
 RECOMPUTE_MODULES=""
@@ -134,9 +135,18 @@ while [[ $# -gt 0 ]]; do
             RECIPE="$2"
             shift 2
             ;;
+        --dtype)
+            [[ $# -ge 2 ]] || { usage >&2; exit 2; }
+            DTYPE="$2"
+            shift 2
+            ;;
         --precision)
             [[ $# -ge 2 ]] || { usage >&2; exit 2; }
-            PRECISION="$2"
+            case "$2" in
+                bf16) DTYPE=bf16 ;;
+                fp8mx|mxfp8) DTYPE=mxfp8 ;;
+                *) DTYPE="$2" ;;
+            esac
             shift 2
             ;;
         --run-name)
@@ -256,7 +266,7 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
-for required in MODEL RECIPE PRECISION RUN_NAME RECOMPUTE_GRANULARITY RECOMPUTE_MODULES FINE_GRAINED_OFFLOAD OFFLOAD_MODULES; do
+for required in MODEL RECIPE RUN_NAME RECOMPUTE_GRANULARITY RECOMPUTE_MODULES FINE_GRAINED_OFFLOAD OFFLOAD_MODULES; do
     if [[ -z "${!required}" ]]; then
         echo "Missing required option for ${required}" >&2
         usage >&2
@@ -275,9 +285,15 @@ PROFILE_STEP_END="${PROFILE_STEP_END:-8}"
 MODEL_ID="${MODEL}"
 RESULT_MODEL_NAME="${MODEL}"
 
-case "${PRECISION}" in
-    bf16|fp8mx) ;;
-    *) echo "Unsupported precision: ${PRECISION}" >&2; exit 2 ;;
+sanitize_path_component() {
+    local value="$1"
+    value="${value//[^[:alnum:]._-]/_}"
+    printf '%s' "${value}"
+}
+
+case "${DTYPE}" in
+    bf16|mxfp8) ;;
+    *) echo "Unsupported dtype: ${DTYPE}; expected bf16 or mxfp8" >&2; exit 2 ;;
 esac
 case "${RECOMPUTE_GRANULARITY}" in
     null|selective) ;;
@@ -312,9 +328,13 @@ case "${DISPATCHER}" in
     *) echo "--dispatcher must be one of default|alltoall|hybridep: ${DISPATCHER}" >&2; exit 2 ;;
 esac
 
-RESULTS_ROOT="${RESULTS_ROOT:-${REPO_ROOT}/results/01-analyse/01-fine-grained-offload}"
+RESULTS_ROOT="${RESULTS_ROOT:-${REPO_ROOT}/results/01-analyse/01-offload-on-dense-and-expert-model}"
 RUN_TIME="${RUN_TIME:-$(date +%Y%m%d-%H%M%S)}"
-RESULT_DIR="${RESULTS_ROOT}/${RESULT_MODEL_NAME}/${PRECISION}/${RUN_NAME}/${RUN_TIME}"
+SAFE_RUN_NAME="$(sanitize_path_component "${RUN_NAME}")"
+SAFE_NUM_LAYERS="$(sanitize_path_component "${NUM_LAYERS:-default}")"
+SAFE_NUM_EXPERTS="$(sanitize_path_component "${NUM_EXPERTS:-default}")"
+RESULT_PATH_NAME="${SAFE_RUN_NAME}__mbs${MICRO_BATCH_SIZE}_gbs${GLOBAL_BATCH_SIZE}_iters${TRAIN_ITERS}_layers${SAFE_NUM_LAYERS}_experts${SAFE_NUM_EXPERTS}_disp${DISPATCHER}_recompute${RECOMPUTE_GRANULARITY}_offload${FINE_GRAINED_OFFLOAD}_profile${PROFILE}"
+RESULT_DIR="${RESULTS_ROOT}/${RESULT_MODEL_NAME}/${DTYPE}/${RESULT_PATH_NAME}/${RUN_TIME}"
 HF_CACHE="${REPO_ROOT}/.cache/huggingface"
 NEMO_CACHE="${REPO_ROOT}/.cache/nemo"
 UV_CACHE="${REPO_ROOT}/.cache/uv"
@@ -369,7 +389,7 @@ export NCCL_NVLS_ENABLE="0"
 export NCCL_DEBUG="WARN"
 export NCCL_GRAPH_REGISTER="0"
 export TOKENIZERS_PARALLELISM="false"
-export RESULT_DIR MODEL MODEL_ID RESULT_MODEL_NAME PRECISION RUN_NAME RUN_TIME RECIPE
+export RESULT_DIR MODEL MODEL_ID RESULT_MODEL_NAME DTYPE RUN_NAME RUN_TIME RECIPE RESULT_PATH_NAME
 export RECOMPUTE_GRANULARITY RECOMPUTE_MODULES FINE_GRAINED_OFFLOAD OFFLOAD_MODULES
 export TRAIN_ITERS GLOBAL_BATCH_SIZE MICRO_BATCH_SIZE WARMUP_STEPS DISPATCHER HYBRIDEP_NUM_SMS PROFILE
 export OPTIMIZER_CPU_OFFLOAD OPTIMIZER_OFFLOAD_FRACTION OVERLAP_CPU_OPTIMIZER_D2H_H2D
@@ -486,10 +506,12 @@ COMMAND=(
 COMMAND_TEXT="${COMMAND[*]}"
 export COMMAND_TEXT
 
-uv run --no-sync python -c 'import json, os, re; pattern = re.compile(r"(^|_)(TOKEN|SECRET|PASSWORD|PASSWD|API_KEY|ACCESS_KEY|SECRET_KEY|PRIVATE_KEY|AUTHORIZATION)(_|$)", re.I); root = os.environ["RESULT_DIR"]; env = {k: ("[REDACTED]" if pattern.search(k) else v) for k, v in sorted(os.environ.items())}; json.dump(env, open(os.path.join(root, "environment.json"), "w"), indent=2, sort_keys=True); open(os.path.join(root, "command.txt"), "w").write(os.environ["COMMAND_TEXT"] + "\n"); config = {"model": os.environ["MODEL"], "model_id": os.environ["MODEL_ID"], "precision": os.environ["PRECISION"], "profile": os.environ["PROFILE"], "run_name": os.environ["RUN_NAME"], "run_time": os.environ["RUN_TIME"], "recipe": os.environ["RECIPE"], "result_dir": root, "profile_ranks": [0, 1, 2, 3], "cache_paths": {"hf": env["HF_HOME"], "nemo": env["NEMO_HOME"]}, "train_iters": int(os.environ["TRAIN_ITERS"]), "global_batch_size": int(os.environ["GLOBAL_BATCH_SIZE"]), "micro_batch_size": int(os.environ["MICRO_BATCH_SIZE"]), "sequence_length": 4096, "recompute_granularity": os.environ["RECOMPUTE_GRANULARITY"], "recompute_modules": os.environ["RECOMPUTE_MODULES"], "fine_grained_offload": os.environ["FINE_GRAINED_OFFLOAD"] == "true", "offload_modules": os.environ["OFFLOAD_MODULES"], "dispatcher": os.environ["DISPATCHER"], "hybridep_num_sms": int(os.environ["HYBRIDEP_NUM_SMS"]), "cli": os.environ["COMMAND_TEXT"]}; json.dump(config, open(os.path.join(root, "config.json"), "w"), indent=2, sort_keys=True)'
+uv run --no-sync python -c 'import json, os, re; pattern = re.compile(r"(^|_)(TOKEN|SECRET|PASSWORD|PASSWD|API_KEY|ACCESS_KEY|SECRET_KEY|PRIVATE_KEY|AUTHORIZATION)(_|$)", re.I); root = os.environ["RESULT_DIR"]; env = {k: ("[REDACTED]" if pattern.search(k) else v) for k, v in sorted(os.environ.items())}; json.dump(env, open(os.path.join(root, "environment.json"), "w"), indent=2, sort_keys=True); open(os.path.join(root, "command.txt"), "w").write(os.environ["COMMAND_TEXT"] + "\n"); config = {"model": os.environ["MODEL"], "model_id": os.environ["MODEL_ID"], "dtype": os.environ["DTYPE"], "precision": os.environ["DTYPE"], "profile": os.environ["PROFILE"], "run_name": os.environ["RUN_NAME"], "result_path_name": os.environ["RESULT_PATH_NAME"], "run_time": os.environ["RUN_TIME"], "recipe": os.environ["RECIPE"], "result_dir": root, "profile_ranks": [0, 1, 2, 3], "cache_paths": {"hf": env["HF_HOME"], "nemo": env["NEMO_HOME"]}, "train_iters": int(os.environ["TRAIN_ITERS"]), "global_batch_size": int(os.environ["GLOBAL_BATCH_SIZE"]), "micro_batch_size": int(os.environ["MICRO_BATCH_SIZE"]), "sequence_length": 4096, "recompute_granularity": os.environ["RECOMPUTE_GRANULARITY"], "recompute_modules": os.environ["RECOMPUTE_MODULES"], "fine_grained_offload": os.environ["FINE_GRAINED_OFFLOAD"] == "true", "offload_modules": os.environ["OFFLOAD_MODULES"], "dispatcher": os.environ["DISPATCHER"], "hybridep_num_sms": int(os.environ["HYBRIDEP_NUM_SMS"]), "cli": os.environ["COMMAND_TEXT"]}; json.dump(config, open(os.path.join(root, "config.json"), "w"), indent=2, sort_keys=True)'
 uv run --no-sync python -c 'import json, os; path = os.path.join(os.environ["RESULT_DIR"], "config.json"); config = json.load(open(path, encoding="utf-8")); config.update({"warmup_steps": int(os.environ["WARMUP_STEPS"]), "optimizer_cpu_offload": os.environ["OPTIMIZER_CPU_OFFLOAD"] == "true", "optimizer_offload_fraction": float(os.environ["OPTIMIZER_OFFLOAD_FRACTION"]), "overlap_cpu_optimizer_d2h_h2d": os.environ["OVERLAP_CPU_OPTIMIZER_D2H_H2D"] == "true"}); json.dump(config, open(path, "w", encoding="utf-8"), indent=2, sort_keys=True)'
 
-printf 'model=%s precision=%s run_name=%s run_time=%s\n' "${MODEL}" "${PRECISION}" "${RUN_NAME}" "${RUN_TIME}" | tee "${RESULT_DIR}/run_info.txt"
+printf 'model=%s dtype=%s run_name=%s result_path_name=%s run_time=%s\n' \
+    "${MODEL}" "${DTYPE}" "${RUN_NAME}" "${RESULT_PATH_NAME}" "${RUN_TIME}" \
+    | tee "${RESULT_DIR}/run_info.txt"
 printf 'train_iters=%s global_batch_size=%s micro_batch_size=%s\n' "${TRAIN_ITERS}" "${GLOBAL_BATCH_SIZE}" "${MICRO_BATCH_SIZE}" | tee -a "${RESULT_DIR}/run_info.txt"
 printf 'warmup_steps=%s optimizer_cpu_offload=%s optimizer_offload_fraction=%s overlap_cpu_optimizer_d2h_h2d=%s\n' \
     "${WARMUP_STEPS}" "${OPTIMIZER_CPU_OFFLOAD}" "${OPTIMIZER_OFFLOAD_FRACTION}" \
@@ -556,7 +578,7 @@ if [[ "${USE_NSYS_PROFILER}" == true ]]; then
         -t cuda,nvtx \
         --capture-range=cudaProfilerApi \
         --capture-range-end=stop \
-        -o "${RESULT_DIR}/profile/profile_%p_%h" \
+        -o "${RESULT_DIR}/profile/nsys-${RESULT_PATH_NAME}-${RUN_TIME}_%p_%h" \
         --force-overwrite=true \
         "${COMMAND[@]}" 2>&1 | tee "${RESULT_DIR}/train.log"
     RUN_STATUS=${PIPESTATUS[0]}
@@ -622,4 +644,4 @@ printf 'GPU utilization metrics: %s\n' "${GPU_UTILIZATION_PATH}" \
     | tee -a "${RESULT_DIR}/run_info.txt"
 
 export RUN_STATUS
-uv run --no-sync python -c 'import json, os; root = os.environ["RESULT_DIR"]; result = {"status": int(os.environ["RUN_STATUS"]), "model": os.environ["MODEL"], "precision": os.environ["PRECISION"], "run_name": os.environ["RUN_NAME"], "run_time": os.environ["RUN_TIME"], "recipe": os.environ["RECIPE"], "result_dir": root, "profile_ranks": [0, 1, 2, 3], "optimizer_cpu_offload": os.environ["OPTIMIZER_CPU_OFFLOAD"] == "true", "optimizer_offload_fraction": float(os.environ["OPTIMIZER_OFFLOAD_FRACTION"]) }; json.dump(result, open(os.path.join(root, "summary.json"), "w"), indent=2, sort_keys=True); raise SystemExit(result["status"])'
+uv run --no-sync python -c 'import json, os; root = os.environ["RESULT_DIR"]; result = {"status": int(os.environ["RUN_STATUS"]), "model": os.environ["MODEL"], "dtype": os.environ["DTYPE"], "precision": os.environ["DTYPE"], "run_name": os.environ["RUN_NAME"], "result_path_name": os.environ["RESULT_PATH_NAME"], "run_time": os.environ["RUN_TIME"], "recipe": os.environ["RECIPE"], "result_dir": root, "profile_ranks": [0, 1, 2, 3], "optimizer_cpu_offload": os.environ["OPTIMIZER_CPU_OFFLOAD"] == "true", "optimizer_offload_fraction": float(os.environ["OPTIMIZER_OFFLOAD_FRACTION"]) }; json.dump(result, open(os.path.join(root, "summary.json"), "w"), indent=2, sort_keys=True); raise SystemExit(result["status"])'

@@ -1,0 +1,1 @@
+../01-mlp-scope-pretrain/run_pretrain_fsdp1.sh

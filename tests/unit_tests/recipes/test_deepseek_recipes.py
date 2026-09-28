@@ -42,6 +42,8 @@ _DEEPSEEK_RECIPE_NAMES = frozenset(
     {
         "deepseek_v3_pretrain_config",
         "deepseek_v3_pretrain_config_32nodes",
+        "deepseek_v3_pretrain_4gpu_gb200_bf16_fsdp1_config",
+        "deepseek_v3_pretrain_4gpu_gb200_fp8mx_fsdp1_config",
         "deepseek_v4_flash_pretrain_config",
         "deepseek_v4_flash_pretrain_mxfp8_config",
         "deepseek_v4_flash_pretrain_muon_config",
@@ -129,6 +131,8 @@ def test_each_deepseek_recipe_builds_config(recipe_func: Callable, monkeypatch: 
     # Always patch AutoBridge in the base deepseek_v3 module (where base configs call it)
     deepseek_v3_mod = importlib.import_module("megatron.bridge.recipes.deepseek.deepseek_v3")
     patch_recipe_module_global(monkeypatch, deepseek_v3_mod, "AutoBridge", _FakeBridge)
+    deepseek_v3_h100_mod = importlib.import_module("megatron.bridge.recipes.deepseek.h100.deepseek_v3")
+    patch_recipe_module_global(monkeypatch, deepseek_v3_h100_mod, "AutoBridge", _FakeBridge)
     # Also patch in the recipe's own module if it directly imports AutoBridge
     module_name = recipe_func.__module__
     mod = importlib.import_module(module_name)
@@ -151,6 +155,29 @@ def test_each_deepseek_recipe_builds_config(recipe_func: Callable, monkeypatch: 
     # Parallelism and shaping
     assert getattr(cfg.model, "tensor_model_parallel_size", 1) >= 1
     assert getattr(cfg.model, "pipeline_model_parallel_size", 1) >= 1
+
+
+def test_deepseek_v3_4gpu_gb200_fsdp1_proxy(monkeypatch: pytest.MonkeyPatch):
+    recipe_module = importlib.import_module("megatron.bridge.recipes.deepseek.gb200.deepseek_v3")
+    deepseek_v3_h100_mod = importlib.import_module("megatron.bridge.recipes.deepseek.h100.deepseek_v3")
+    patch_recipe_module_global(monkeypatch, deepseek_v3_h100_mod, "AutoBridge", _FakeBridge)
+
+    bf16_cfg = recipe_module.deepseek_v3_pretrain_4gpu_gb200_bf16_fsdp1_config()
+    mxfp8_cfg = recipe_module.deepseek_v3_pretrain_4gpu_gb200_fp8mx_fsdp1_config()
+
+    assert bf16_cfg.model.num_layers == 8
+    assert bf16_cfg.model.moe_layer_freq == [1] * 8
+    assert bf16_cfg.model.num_moe_experts == 64
+    assert bf16_cfg.model.expert_model_parallel_size == 4
+    assert bf16_cfg.model.pipeline_model_parallel_size == 1
+    assert bf16_cfg.model.recompute_granularity is None
+    assert bf16_cfg.model.fine_grained_activation_offloading is False
+    assert bf16_cfg.ddp.use_megatron_fsdp is True
+    assert bf16_cfg.ddp.data_parallel_sharding_strategy == "optim_grads_params"
+    assert bf16_cfg.checkpoint.ckpt_format == "fsdp_dtensor"
+    assert mxfp8_cfg.mixed_precision.fp8 == "e4m3"
+    assert mxfp8_cfg.mixed_precision.fp8_recipe == "mxfp8"
+    assert mxfp8_cfg.model.moe_router_padding_for_fp8 is True
 
 
 def test_model_and_perf_deepseek_recipes_bake_environment_defaults(monkeypatch: pytest.MonkeyPatch):

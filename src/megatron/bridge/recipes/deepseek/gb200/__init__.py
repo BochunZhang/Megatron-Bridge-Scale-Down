@@ -11,8 +11,12 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""GB200 recipes for DeepSeek V4 Flash."""
+"""GB200 recipes for DeepSeek models."""
 
+from megatron.bridge.recipes.deepseek.gb200.deepseek_v3 import (
+    deepseek_v3_pretrain_4gpu_gb200_bf16_fsdp1_config,
+    deepseek_v3_pretrain_4gpu_gb200_fp8mx_fsdp1_config,
+)
 from megatron.bridge.recipes.deepseek.gb200.deepseek_v4 import (
     deepseek_v4_flash_pretrain_64gpu_gb200_bf16_config,
     deepseek_v4_flash_pretrain_64gpu_gb200_bf16_muon_config,
@@ -21,6 +25,8 @@ from megatron.bridge.recipes.deepseek.gb200.deepseek_v4 import (
 
 
 __all__ = [
+    "deepseek_v3_pretrain_4gpu_gb200_bf16_fsdp1_config",
+    "deepseek_v3_pretrain_4gpu_gb200_fp8mx_fsdp1_config",
     "deepseek_v4_flash_pretrain_64gpu_gb200_bf16_config",
     "deepseek_v4_flash_pretrain_64gpu_gb200_bf16_muon_config",
     "deepseek_v4_flash_pretrain_64gpu_gb200_fp8mx_config",

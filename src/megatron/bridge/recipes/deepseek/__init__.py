@@ -46,6 +46,10 @@ from .deepseek_v4 import (
     deepseek_v4_pro_pretrain_mxfp8_config,
     set_deepseek_v4_pipeline_model_parallel_layout,
 )
+from .gb200.deepseek_v3 import (
+    deepseek_v3_pretrain_4gpu_gb200_bf16_fsdp1_config,
+    deepseek_v3_pretrain_4gpu_gb200_fp8mx_fsdp1_config,
+)
 from .gb200.deepseek_v4 import (
     deepseek_v4_flash_pretrain_64gpu_gb200_bf16_config,
     deepseek_v4_flash_pretrain_64gpu_gb200_bf16_muon_config,
@@ -64,6 +68,8 @@ __all__ = [
     # DeepSeek V3
     "deepseek_v3_pretrain_config",
     "deepseek_v3_pretrain_config_32nodes",
+    "deepseek_v3_pretrain_4gpu_gb200_bf16_fsdp1_config",
+    "deepseek_v3_pretrain_4gpu_gb200_fp8mx_fsdp1_config",
     "set_deepseek_v3_pipeline_model_parallel_layout",
     # DeepSeek V4
     "deepseek_v4_flash_pretrain_config",

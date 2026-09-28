@@ -18,21 +18,22 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/../../../../.." && pwd)"
 RUN_ONE="${SCRIPT_DIR}/run_pretrain_fsdp1.sh"
-SUMMARIZER="${SCRIPT_DIR}/summarize_mlp_offload.py"
 
 SCOPE="all"
+MODEL_FAMILY="qwen"
 DENSE_MODEL="9b"
-PRECISION="bf16"
+DTYPE="${DTYPE:-bf16}"
 PROFILE="none"
 CASE_FILTER="all"
 TRAIN_ITERS="${TRAIN_ITERS:-10}"
 GLOBAL_BATCH_SIZE="${GLOBAL_BATCH_SIZE:-32}"
-MICRO_BATCH_SIZE="${MICRO_BATCH_SIZE:-1}"
+MICRO_BATCH_SIZES="${MICRO_BATCH_SIZES:-1,2,4,8}"
 HYBRIDEP_NUM_SMS="${HYBRIDEP_NUM_SMS:-32}"
-EXPERT_NUM_LAYERS=20
+QWEN_EXPERT_NUM_LAYERS=16
+DEEPSEEK_EXPERT_NUM_LAYERS=8
 EXPERT_NUM_EXPERTS=64
 EXPERT_LINEAR_ATTENTION_FREQ=4
-RESULTS_ROOT="${RESULTS_ROOT:-${REPO_ROOT}/results/01-analyse/01-fine-grained-offload}"
+RESULTS_ROOT="${RESULTS_ROOT:-${REPO_ROOT}/results/01-analyse/01-offload-on-dense-and-expert-model}"
 RUN_TIME="${RUN_TIME:-$(date +%Y%m%d-%H%M%S)}"
 DRY_RUN=false
 FAILURES=0
@@ -42,20 +43,22 @@ usage() {
 Usage: benchmark_mlp_offload.sh [OPTIONS]
 
 Run a controlled MLP activation-memory benchmark on four local GB200 GPUs.
-Dense models run baseline and MLP activation offload. The expert model runs
-baseline and expert activation offload with both all-to-all and HybridEP
-dispatchers. The expert model is reduced to 20 layers and 64 experts to lower
-peak memory. Activation recompute is disabled in every case.
+Qwen runs dense and expert cases. DeepSeek-V3 is MoE-only and therefore runs
+only expert cases. The Qwen expert uses 16 layers; DeepSeek-V3 uses eight MoE
+layers with no dense layer. Both use 64 experts. Activation recompute is
+disabled in every case.
 
 Options:
     --scope <all|dense|expert>    Matrix subset (default: all)
+    --model <qwen|deepseek>       Model family (default: qwen)
     --dense-model <9b|27b>       Dense model size (default: 9b)
-    --precision <bf16|fp8mx>     Precision (default: bf16)
+    --dtype <bf16|mxfp8>         Training dtype (default: bf16)
     --profile <none|nsys|torch>  Profiling backend (default: none)
     --case <name|all>            Run baseline or offload (default: all)
     --train-iters <n>            Total steps per run (default: 10)
     --global-batch-size <n>      Global batch size (default: 32)
-    --micro-batch-size <n>       Micro batch size (default: 1)
+    --micro-batch-sizes <list>   Comma-separated MBS sweep (default: 1,2,4,8)
+    --micro-batch-size <n>       Run a single MBS value
     --hybridep-num-sms <n>       HybridEP communication SMs (default: 32)
     --results-root <path>        Result tree root
     --run-time <id>              Stable batch id used to group/resume results
@@ -70,13 +73,23 @@ EOF
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --scope) SCOPE="$2"; shift 2 ;;
+        --model) MODEL_FAMILY="$2"; shift 2 ;;
         --dense-model) DENSE_MODEL="$2"; shift 2 ;;
-        --precision) PRECISION="$2"; shift 2 ;;
+        --dtype) DTYPE="$2"; shift 2 ;;
+        --precision)
+            case "$2" in
+                bf16) DTYPE=bf16 ;;
+                fp8mx|mxfp8) DTYPE=mxfp8 ;;
+                *) DTYPE="$2" ;;
+            esac
+            shift 2
+            ;;
         --profile) PROFILE="$2"; shift 2 ;;
         --case) CASE_FILTER="$2"; shift 2 ;;
         --train-iters) TRAIN_ITERS="$2"; shift 2 ;;
         --global-batch-size) GLOBAL_BATCH_SIZE="$2"; shift 2 ;;
-        --micro-batch-size) MICRO_BATCH_SIZE="$2"; shift 2 ;;
+        --micro-batch-sizes) MICRO_BATCH_SIZES="$2"; shift 2 ;;
+        --micro-batch-size) MICRO_BATCH_SIZES="$2"; shift 2 ;;
         --hybridep-num-sms) HYBRIDEP_NUM_SMS="$2"; shift 2 ;;
         --results-root) RESULTS_ROOT="$2"; shift 2 ;;
         --run-time) RUN_TIME="$2"; shift 2 ;;
@@ -87,30 +100,62 @@ while [[ $# -gt 0 ]]; do
 done
 
 case "${SCOPE}" in all|dense|expert) ;; *) echo "Invalid scope: ${SCOPE}" >&2; exit 2 ;; esac
+case "${MODEL_FAMILY}" in qwen|deepseek) ;; *) echo "Invalid model: ${MODEL_FAMILY}; expected qwen or deepseek" >&2; exit 2 ;; esac
+if [[ "${MODEL_FAMILY}" == deepseek && "${SCOPE}" == dense ]]; then
+    echo "DeepSeek-V3 is an expert model; --scope dense is not supported with --model deepseek" >&2
+    exit 2
+fi
 case "${DENSE_MODEL}" in 9b|27b) ;; *) echo "Invalid dense model: ${DENSE_MODEL}" >&2; exit 2 ;; esac
-case "${PRECISION}" in bf16|fp8mx) ;; *) echo "Invalid precision: ${PRECISION}" >&2; exit 2 ;; esac
+case "${DTYPE}" in
+    bf16) RECIPE_DTYPE=bf16 ;;
+    mxfp8) RECIPE_DTYPE=fp8mx ;;
+    *) echo "Invalid dtype: ${DTYPE}; expected bf16 or mxfp8" >&2; exit 2 ;;
+esac
 case "${PROFILE}" in none|nsys|torch) ;; *) echo "Invalid profile: ${PROFILE}" >&2; exit 2 ;; esac
 case "${CASE_FILTER}" in
     all|baseline|offload) ;;
     *) echo "Invalid case: ${CASE_FILTER}" >&2; exit 2 ;;
 esac
 
-for value_name in TRAIN_ITERS GLOBAL_BATCH_SIZE MICRO_BATCH_SIZE HYBRIDEP_NUM_SMS; do
+for value_name in TRAIN_ITERS GLOBAL_BATCH_SIZE HYBRIDEP_NUM_SMS; do
     if ! [[ "${!value_name}" =~ ^[1-9][0-9]*$ ]]; then
         echo "${value_name} must be a positive integer" >&2
         exit 2
     fi
 done
 
-if [[ "${DENSE_MODEL}" == 9b ]]; then
-    DENSE_MODEL_NAME="qwen35_text_9b"
-    DENSE_RECIPE_PREFIX="qwen35_text_9b_pretrain_4gpu_gb200"
-else
-    DENSE_MODEL_NAME="qwen35_text_27b"
-    DENSE_RECIPE_PREFIX="qwen35_text_27b_pretrain_4gpu_gb200"
+IFS=',' read -r -a MICRO_BATCH_SIZE_VALUES <<< "${MICRO_BATCH_SIZES}"
+if (( ${#MICRO_BATCH_SIZE_VALUES[@]} == 0 )); then
+    echo "MICRO_BATCH_SIZES must contain at least one value" >&2
+    exit 2
 fi
-EXPERT_MODEL_NAME="qwen35_text_35b_a3b"
-EXPERT_RECIPE_PREFIX="qwen35_text_35b_a3b_pretrain_4gpu_gb200"
+for micro_batch_size in "${MICRO_BATCH_SIZE_VALUES[@]}"; do
+    if ! [[ "${micro_batch_size}" =~ ^[1-9][0-9]*$ ]]; then
+        echo "Each micro batch size must be a positive integer: ${micro_batch_size}" >&2
+        exit 2
+    fi
+    if (( GLOBAL_BATCH_SIZE % micro_batch_size != 0 )); then
+        echo "GLOBAL_BATCH_SIZE must be divisible by every micro batch size: ${micro_batch_size}" >&2
+        exit 2
+    fi
+done
+
+if [[ "${MODEL_FAMILY}" == deepseek ]]; then
+    EXPERT_NUM_LAYERS="${DEEPSEEK_EXPERT_NUM_LAYERS}"
+    EXPERT_MODEL_NAME="deepseek_v3"
+    EXPERT_RECIPE_PREFIX="deepseek_v3_pretrain_4gpu_gb200"
+else
+    EXPERT_NUM_LAYERS="${QWEN_EXPERT_NUM_LAYERS}"
+    if [[ "${DENSE_MODEL}" == 9b ]]; then
+        DENSE_MODEL_NAME="qwen35_text_9b"
+        DENSE_RECIPE_PREFIX="qwen35_text_9b_pretrain_4gpu_gb200"
+    else
+        DENSE_MODEL_NAME="qwen35_text_27b"
+        DENSE_RECIPE_PREFIX="qwen35_text_27b_pretrain_4gpu_gb200"
+    fi
+    EXPERT_MODEL_NAME="qwen35_text_35b_a3b"
+    EXPERT_RECIPE_PREFIX="qwen35_text_35b_a3b_pretrain_4gpu_gb200"
+fi
 PROFILE_STEP_START=7
 PROFILE_STEP_END=8
 
@@ -124,8 +169,9 @@ run_case() {
     local recompute_modules="$7"
     local fine_grained_offload="$8"
     local offload_modules="$9"
+    local micro_batch_size="${10}"
     local run_name
-    local recipe="${recipe_prefix}_${PRECISION}_fsdp1_config"
+    local recipe="${recipe_prefix}_${RECIPE_DTYPE}_fsdp1_config"
     local num_layers="default"
     local num_experts="default"
     local -a profile_args=()
@@ -135,7 +181,8 @@ run_case() {
         return
     fi
 
-    printf -v run_name '%s-%s-%s-r01' "${model_kind}" "${dispatcher}" "${case_name}"
+    printf -v run_name '%s-%s-%s-mbs%s-r01' \
+        "${model_kind}" "${dispatcher}" "${case_name}" "${micro_batch_size}"
     if [[ "${PROFILE}" != none ]]; then
         profile_args=(--profile "${PROFILE}")
     fi
@@ -145,13 +192,16 @@ run_case() {
         model_override_args=(
             --num-layers "${EXPERT_NUM_LAYERS}"
             --num-experts "${EXPERT_NUM_EXPERTS}"
-            --linear-attention-freq "${EXPERT_LINEAR_ATTENTION_FREQ}"
         )
+        if [[ "${MODEL_FAMILY}" == qwen ]]; then
+            model_override_args+=(--linear-attention-freq "${EXPERT_LINEAR_ATTENTION_FREQ}")
+        fi
     fi
 
-    printf 'matrix model=%s case=%s dispatcher=%s repeat=1 layers=%s experts=%s offload=%s recompute=%s\n' \
-        "${model}" "${case_name}" "${dispatcher}" \
-        "${num_layers}" "${num_experts}" "${offload_modules}" "${recompute_modules}"
+    printf 'matrix model=%s dtype=%s recipe=%s case=%s dispatcher=%s mbs=%s repeat=1 layers=%s experts=%s offload=%s recompute=%s\n' \
+        "${model}" "${DTYPE}" "${recipe}" "${case_name}" "${dispatcher}" \
+        "${micro_batch_size}" "${num_layers}" "${num_experts}" \
+        "${offload_modules}" "${recompute_modules}"
     if [[ "${DRY_RUN}" == true ]]; then
         return
     fi
@@ -162,7 +212,7 @@ run_case() {
         "${model_override_args[@]}" \
         --model "${model}" \
         --recipe "${recipe}" \
-        --precision "${PRECISION}" \
+        --dtype "${DTYPE}" \
         --run-name "${run_name}" \
         --dispatcher "${dispatcher}" \
         --hybridep-num-sms "${HYBRIDEP_NUM_SMS}" \
@@ -172,7 +222,7 @@ run_case() {
         --offload-modules "${offload_modules}" \
         --train-iters "${TRAIN_ITERS}" \
         --global-batch-size "${GLOBAL_BATCH_SIZE}" \
-        --micro-batch-size "${MICRO_BATCH_SIZE}" \
+        --micro-batch-size "${micro_batch_size}" \
         --profile-step-start "${PROFILE_STEP_START}" \
         --profile-step-end "${PROFILE_STEP_END}"
     local status=$?
@@ -184,40 +234,46 @@ run_case() {
 }
 
 run_dense_matrix() {
-    run_case dense "${DENSE_MODEL_NAME}" "${DENSE_RECIPE_PREFIX}" default baseline null null false null
-    run_case dense "${DENSE_MODEL_NAME}" "${DENSE_RECIPE_PREFIX}" default offload null null true '[mlp_norm,mlp_act]'
+    local micro_batch_size="$1"
+    run_case dense "${DENSE_MODEL_NAME}" "${DENSE_RECIPE_PREFIX}" default baseline null null false null "${micro_batch_size}"
+    run_case dense "${DENSE_MODEL_NAME}" "${DENSE_RECIPE_PREFIX}" default offload null null true '[mlp_norm,mlp_act]' "${micro_batch_size}"
 }
 
 run_expert_matrix() {
+    local micro_batch_size="$1"
     local dispatcher
     for dispatcher in alltoall hybridep; do
-        run_case expert "${EXPERT_MODEL_NAME}" "${EXPERT_RECIPE_PREFIX}" "${dispatcher}" baseline null null false null
-        run_case expert "${EXPERT_MODEL_NAME}" "${EXPERT_RECIPE_PREFIX}" "${dispatcher}" offload null null true '[mlp_norm,expert_fc1,moe_act]'
+        run_case expert "${EXPERT_MODEL_NAME}" "${EXPERT_RECIPE_PREFIX}" "${dispatcher}" baseline null null false null "${micro_batch_size}"
+        run_case expert "${EXPERT_MODEL_NAME}" "${EXPERT_RECIPE_PREFIX}" "${dispatcher}" offload null null true '[mlp_norm,expert_fc1,moe_act]' "${micro_batch_size}"
     done
 }
 
 export RESULTS_ROOT RUN_TIME
-printf 'benchmark_id=%s results_root=%s train_iters=%s runs_per_case=1\n' \
-    "${RUN_TIME}" "${RESULTS_ROOT}" "${TRAIN_ITERS}"
+printf 'benchmark_id=%s model=%s dtype=%s results_root=%s train_iters=%s runs_per_case=1 micro_batch_sizes=%s\n' \
+    "${RUN_TIME}" "${MODEL_FAMILY}" "${DTYPE}" "${RESULTS_ROOT}" "${TRAIN_ITERS}" "${MICRO_BATCH_SIZES}"
 
-case "${SCOPE}" in
-    all) run_dense_matrix; run_expert_matrix ;;
-    dense) run_dense_matrix ;;
-    expert) run_expert_matrix ;;
-esac
+for micro_batch_size in "${MICRO_BATCH_SIZE_VALUES[@]}"; do
+    case "${SCOPE}" in
+        all)
+            if [[ "${MODEL_FAMILY}" == qwen ]]; then
+                run_dense_matrix "${micro_batch_size}"
+            fi
+            run_expert_matrix "${micro_batch_size}"
+            ;;
+        dense) run_dense_matrix "${micro_batch_size}" ;;
+        expert) run_expert_matrix "${micro_batch_size}" ;;
+    esac
+done
 
 if [[ "${DRY_RUN}" == true ]]; then
     exit 0
 fi
 
-REPORT_DIR="${RESULTS_ROOT}/benchmarks/${RUN_TIME}"
-uv run --no-sync python "${SUMMARIZER}" \
-    --results-root "${RESULTS_ROOT}" \
-    --run-time "${RUN_TIME}" \
-    --output-dir "${REPORT_DIR}"
-
-printf 'Benchmark report: %s/summary.md\n' "${REPORT_DIR}"
 if (( FAILURES > 0 )); then
-    printf '%d benchmark run(s) failed; see runs.csv for status.\n' "${FAILURES}" >&2
+    printf '%d training run(s) failed; inspect the raw result directories above.\n' "${FAILURES}" >&2
     exit 1
 fi
+
+printf 'Raw results: %s (run_time=%s)\n' "${RESULTS_ROOT}" "${RUN_TIME}"
+printf 'Collect XLSX: %s/collect_mlp_offload_results.mjs --run-time %s\n' \
+    "${SCRIPT_DIR}" "${RUN_TIME}"
