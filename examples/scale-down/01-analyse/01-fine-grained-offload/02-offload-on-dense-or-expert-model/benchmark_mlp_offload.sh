@@ -61,7 +61,6 @@ Options:
     --micro-batch-size <n>       Run a single MBS value
     --hybridep-num-sms <n>       HybridEP communication SMs (default: 32)
     --results-root <path>        Result tree root
-    --run-time <id>              Stable batch id used to group/resume results
     --dry-run                    Print the matrix without launching training
     -h, --help                   Show this help
 
@@ -92,7 +91,6 @@ while [[ $# -gt 0 ]]; do
         --micro-batch-size) MICRO_BATCH_SIZES="$2"; shift 2 ;;
         --hybridep-num-sms) HYBRIDEP_NUM_SMS="$2"; shift 2 ;;
         --results-root) RESULTS_ROOT="$2"; shift 2 ;;
-        --run-time) RUN_TIME="$2"; shift 2 ;;
         --dry-run) DRY_RUN=true; shift ;;
         -h|--help) usage; exit 0 ;;
         *) echo "Unknown argument: $1" >&2; usage >&2; exit 2 ;;
@@ -275,5 +273,4 @@ if (( FAILURES > 0 )); then
 fi
 
 printf 'Raw results: %s (run_time=%s)\n' "${RESULTS_ROOT}" "${RUN_TIME}"
-printf 'Collect XLSX: %s/collect_mlp_offload_results.mjs --run-time %s\n' \
-    "${SCRIPT_DIR}" "${RUN_TIME}"
+printf 'Collect XLSX: %s/collect_mlp_offload_results.mjs\n' "${SCRIPT_DIR}"

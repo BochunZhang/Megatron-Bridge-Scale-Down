@@ -45,20 +45,17 @@ bash "$EXPERIMENT_DIR/benchmark_mlp_offload.sh" --dry-run --micro-batch-sizes 1,
 # Qwen Dense 9B：每 MBS 2 个运行（baseline/offload），共 8 个
 bash "$EXPERIMENT_DIR/benchmark_mlp_offload.sh" \
   --model qwen --scope dense --dense-model 9b \
-  --dtype bf16 --micro-batch-sizes 1,2,4,8 \
-  --run-time 20260928-qwen9b-dense-bf16
+  --dtype bf16 --micro-batch-sizes 1,2,4,8
 
 # Qwen MoE：每 MBS 4 个运行（2 dispatcher × 2 case），共 16 个
 bash "$EXPERIMENT_DIR/benchmark_mlp_offload.sh" \
   --model qwen --scope expert \
-  --dtype bf16 --micro-batch-sizes 1,2,4,8 \
-  --run-time 20260928-qwenmoe-bf16
+  --dtype bf16 --micro-batch-sizes 1,2,4,8
 
 # DeepSeek-V3：每 MBS 4 个运行，共 16 个
 bash "$EXPERIMENT_DIR/benchmark_mlp_offload.sh" \
   --model deepseek \
-  --dtype bf16 --micro-batch-sizes 1,2,4,8 \
-  --run-time 20260928-deepseek-bf16
+  --dtype bf16 --micro-batch-sizes 1,2,4,8
 ```
 
 ### 3. 三个模型 × mxfp8 × MBS 1,2,4,8
@@ -68,28 +65,27 @@ bash "$EXPERIMENT_DIR/benchmark_mlp_offload.sh" \
 ```bash
 bash "$EXPERIMENT_DIR/benchmark_mlp_offload.sh" \
   --model qwen --scope dense --dense-model 9b \
-  --dtype mxfp8 --micro-batch-sizes 1,2,4,8 \
-  --run-time 20260928-qwen9b-dense-mxfp8
+  --dtype mxfp8 --micro-batch-sizes 1,2,4,8
 
 bash "$EXPERIMENT_DIR/benchmark_mlp_offload.sh" \
   --model qwen --scope expert \
-  --dtype mxfp8 --micro-batch-sizes 1,2,4,8 \
-  --run-time 20260928-qwenmoe-mxfp8
+  --dtype mxfp8 --micro-batch-sizes 1,2,4,8
 
 bash "$EXPERIMENT_DIR/benchmark_mlp_offload.sh" \
   --model deepseek \
-  --dtype mxfp8 --micro-batch-sizes 1,2,4,8 \
-  --run-time 20260928-deepseek-mxfp8
+  --dtype mxfp8 --micro-batch-sizes 1,2,4,8
 ```
 
-> 不带 `--scope` 时 `--model qwen` 会同时跑 dense + expert。`--scope dense` 只对 Qwen 有效（DeepSeek 是 MoE-only）。`--run-time` 是批次标识，同一批次内 run name 必须唯一。
+> 不带 `--scope` 时 `--model qwen` 会同时跑 dense + expert。`--scope dense` 只对 Qwen 有效（DeepSeek 是 MoE-only）。每次 benchmark 启动时会自动生成批次标识，不需要额外传参。
 
-### 4. 生成 XLSX 汇总（每个 run-time 各跑一次）
+### 4. 生成 XLSX 汇总（默认读取最新批次）
 
 ```bash
-node "$EXPERIMENT_DIR/collect_mlp_offload_results.mjs" --run-time 20260928-qwen9b-dense-bf16
+node "$EXPERIMENT_DIR/collect_mlp_offload_results.mjs"
 # 只校验数据不写 XLSX：加 --dry-run
 ```
+
+benchmark 完成后会打印自动生成的批次标识和上述收集命令。只有在需要回看旧批次时，才使用 collector 自身的可选 `--run-time <id>` 参数。
 
 收集器只接受 `profile=none` 且 `summary.json` 成功的运行，固定读取 iteration 5–9 的 step time（所以 `--train-iters` 不能小于 10）。
 

@@ -1,0 +1,15 @@
+{
+  "experiment": "baseline",
+  "model": "dense",
+  "precision": "bf16",
+  "profile_ranks": [
+    0,
+    1,
+    2,
+    3
+  ],
+  "recipe": "qwen38_text_27b_pretrain_4gpu_gb200_bf16_fsdp1_config",
+  "repeat": "0",
+  "result_dir": "/Users/zhangbochun/Desktop/AI-Infra/Megatron/Megatron-Scale-Down/megatron-bridge/results/qwen38_text_27b/bf16/baseline/repeat-0",
+  "status": 1
+}
