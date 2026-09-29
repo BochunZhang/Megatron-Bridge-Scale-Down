@@ -1,10 +1,30 @@
-# Offload ON/OFF 性能对比：Qwen Dense / Qwen MoE / DeepSeek-V3
+# Offload ON/OFF 性能对比
 
-## 测试目的
+## 测试目标
 
-1. **量化 dense / MoE 开启 offload 后的性能下降幅度。** 此前测试发现 dense 模型开启 fine-grained activation offload 后性能下降很大，本测试要复现该现象，并通过 nsys 找到性能瓶颈的来源——例如哪里的 D2H/H2D copy 或通信无法被计算 overlap。
-2. **分析 qwen3.5 训练效率偏低的原因。** 测试发现 qwen3.5 dense / expert 的训练效率仅约 500 TFlops / 100 TFlops，而此前测试 deepseek 架构时能跑到 1000 TFlops / 700 TFlops。因此增加 deepseek 架构的对照测试，用于分析 qwen3.5 效率低在哪里。
-3. **定位 allreduce 通信的来源。** profiling 时观察到很多 allreduce 通信；`--profile nsys` 会自动开启 NVTX 标记（`profiling.nvtx_ranges=true`，nsys 以 `-t cuda,nvtx` 采集），通过时间轴上 NVTX range 与 NCCL kernel 的对应关系，确认每个 allreduce 是由哪个操作产生的（FSDP grad reduce / param gather / MoE dispatch-combine 等）。
+### 1. 量化 dense / MoE 开启 offload 后的性能下降幅度
+
+此前测试发现 dense 模型开启 fine-grained activation offload 后性能下降约 5%，expert 模型下降接近 20%。
+本测试需要复现该现象，并通过 nsys 找到性能瓶颈的来源 —— 分析是否需要为 moe 的流量模式设计新的 offload 策略。
+
+## 测试日志
+
+### 1. qwen3.5 训练效率偏低
+
+测试 qwen3.5 dense / expert 的训练吞吐为 500 TFlops / 100 TFlops。
+此前测试 deepseek (mla) 架构时, 能跑到 1000 TFlops / 700 TFlops，增加 mbs 能够跑到 1100 / 800+ TFlops。
+增加 deepseek 模型作为对照
+
+问题定位:
+- deepseek 的训练也只有 500TFlops，这是没有安装 flash-attn 导致
+- 安装 flash-attn-4[cu13]==4.0.0b11 后训练吞吐恢复到 1000TFlops
+
+### 2. allreduce 通信
+
+通过 nsys 观察到大量 allreduce 通信，增加 nvtx 标记，检查通信来源。
+
+问题定位:
+- codex 生成的测试里面，错误的开启了 zero-3 (optim-grads-params)，改成 zero-1 (optim) 即可。
 
 ## 测试内容
 
