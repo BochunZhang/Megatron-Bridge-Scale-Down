@@ -30,9 +30,9 @@ def deepseek_v3_pretrain_4gpu_gb200_bf16_fsdp1_config() -> ConfigContainer:
     """
     cfg = deepseek_v3_pretrain_1024gpu_h100_bf16_config()
 
-    cfg.model.num_layers = 8
-    cfg.model.moe_layer_freq = [1] * 8
-    cfg.model.num_moe_experts = 64
+    # cfg.model.num_layers = 8
+    # cfg.model.moe_layer_freq = [1] * 8
+    # cfg.model.num_moe_experts = 64
     cfg.model.tensor_model_parallel_size = 1
     cfg.model.pipeline_model_parallel_size = 1
     cfg.model.pipeline_model_parallel_layout = None
@@ -45,7 +45,7 @@ def deepseek_v3_pretrain_4gpu_gb200_bf16_fsdp1_config() -> ConfigContainer:
 
     cfg.model.moe_token_dispatcher_type = "flex"
     cfg.model.moe_flex_dispatcher_backend = "hybridep"
-    cfg.model.moe_flex_dispatcher_num_sms = 32
+    cfg.model.moe_flex_dispatcher_num_sms = 16
     cfg.model.moe_hybridep_num_sms = None
     cfg.model.moe_shared_expert_overlap = False
     cfg.model.moe_router_force_load_balancing = False
@@ -69,7 +69,7 @@ def deepseek_v3_pretrain_4gpu_gb200_bf16_fsdp1_config() -> ConfigContainer:
     cfg.dist.enable_megatron_core_experimental = True
     cfg.ddp.use_megatron_fsdp = True
     cfg.ddp.use_distributed_optimizer = True
-    cfg.ddp.data_parallel_sharding_strategy = "optim_grads_params"
+    cfg.ddp.data_parallel_sharding_strategy = "optim"
     cfg.ddp.num_distributed_optimizer_instances = 1
     cfg.ddp.outer_dp_sharding_strategy = "no_shard"
     cfg.ddp.average_in_collective = False
