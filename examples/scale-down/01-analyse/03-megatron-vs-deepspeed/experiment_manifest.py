@@ -45,12 +45,38 @@ def _rope_value(config: Any, field: str) -> Any:
     return rope_parameters.get(field) if isinstance(rope_parameters, dict) else None
 
 
-def _layer_types(num_layers: int, full_attention_interval: int) -> list[str]:
-    """Expand Megatron's attention interval into the equivalent HF layer list."""
-    return [
-        "full_attention" if (layer_index + 1) % full_attention_interval == 0 else "linear_attention"
-        for layer_index in range(num_layers)
-    ]
+def _layer_types(num_layers: int, linear_attention_freq: int | list[int]) -> list[str]:
+    """Expand Megatron's interval or per-layer pattern into HF layer types."""
+    if isinstance(linear_attention_freq, int) and not isinstance(linear_attention_freq, bool):
+        if linear_attention_freq <= 0:
+            raise ValueError(f"linear_attention_freq must be positive, got {linear_attention_freq}")
+        pattern = [
+            0 if (layer_index + 1) % linear_attention_freq == 0 else 1 for layer_index in range(num_layers)
+        ]
+    elif isinstance(linear_attention_freq, list):
+        if len(linear_attention_freq) != num_layers:
+            raise ValueError(
+                "linear_attention_freq pattern length must match num_layers: "
+                f"got {len(linear_attention_freq)}, expected {num_layers}"
+            )
+        pattern = linear_attention_freq
+    else:
+        raise TypeError(
+            "linear_attention_freq must be an int or list[int], "
+            f"got {type(linear_attention_freq).__name__}"
+        )
+
+    unsupported = sorted(
+        {
+            repr(value)
+            for value in pattern
+            if not isinstance(value, int) or isinstance(value, bool) or value not in {0, 1}
+        }
+    )
+    if unsupported:
+        raise ValueError(f"linear_attention_freq pattern must contain only 0 or 1, got {unsupported}")
+    layer_type_by_pattern = {0: "full_attention", 1: "linear_attention"}
+    return [layer_type_by_pattern[value] for value in pattern]
 
 
 def _hf_contract(config: Any, *, expert: bool) -> dict[str, Any]:
@@ -95,7 +121,6 @@ def _hf_contract(config: Any, *, expert: bool) -> dict[str, Any]:
 def _megatron_contract(provider: Any, *, expert: bool) -> dict[str, Any]:
     """Normalize a post-override Megatron provider into common model fields."""
     num_layers = int(provider.num_layers)
-    full_attention_interval = int(provider.linear_attention_freq)
     contract = {
         "num_layers": num_layers,
         "hidden_size": provider.hidden_size,
@@ -103,7 +128,7 @@ def _megatron_contract(provider: Any, *, expert: bool) -> dict[str, Any]:
         "num_query_groups": provider.num_query_groups,
         "head_dim": provider.kv_channels,
         "vocab_size": provider.vocab_size,
-        "layer_types": _layer_types(num_layers, full_attention_interval),
+        "layer_types": _layer_types(num_layers, provider.linear_attention_freq),
         "linear_conv_kernel_dim": provider.linear_conv_kernel_dim,
         "linear_key_head_dim": provider.linear_key_head_dim,
         "linear_value_head_dim": provider.linear_value_head_dim,
