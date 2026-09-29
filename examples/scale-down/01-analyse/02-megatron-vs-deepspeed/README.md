@@ -57,3 +57,18 @@ Results are written below
 `results/01-analyse/02-megatron-vs-deepspeed/`, with one `config.yaml`,
 `config.json`, `summary.json`, log, memory trace, and profiler output per run.
 Run `summarize.py` to regenerate `summary.csv`.
+
+The matrix enables `profiling.record_memory_usage=true` and resets the memory
+peak counters after the configured warmup steps. The training log records the
+following raw byte fields at each logging interval:
+
+```text
+cuda_memory_allocated_bytes
+cuda_peak_memory_allocated_bytes
+host_memory_allocated_bytes
+host_peak_memory_allocated_bytes
+```
+
+The host fields are CUDA pinned-host allocator statistics, matching the
+DeepSpeed measurement; they are not process RSS. The same values are also
+sent to configured experiment loggers under the `memory_usage/` namespace.

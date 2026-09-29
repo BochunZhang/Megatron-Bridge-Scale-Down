@@ -22,6 +22,7 @@
 #       --offload-modules <value> \
 #       [--train-iters <iters>] [--global-batch-size <gbs>] [--micro-batch-size <mbs>] \
 #       [--num-layers <layers>] [--linear-attention-freq <value>] \
+#       [--record-memory-usage <true|false>] [--memory-usage-start-step <step>] \
 #       [--profile-step-start <start>] [--profile-step-end <end>] \
 #       [--profile <nsys|torch>]
 
@@ -48,6 +49,8 @@ Usage: run_pretrain_fsdp1.sh \
     [--micro-batch-size <mbs>] \
     [--num-layers <layers>] \
     [--linear-attention-freq <value>] \
+    [--record-memory-usage <true|false>] \
+    [--memory-usage-start-step <step>] \
     [--profile-step-start <start>] \
     [--profile-step-end <end>] \
     [--profile <nsys|torch>]
@@ -62,6 +65,11 @@ Optional training parameters (with defaults):
     --micro-batch-size    Micro batch size (default: 1)
     --num-layers          Override model.num_layers
     --linear-attention-freq  Override model.linear_attention_freq
+    --record-memory-usage    Record CUDA and pinned-host memory byte metrics
+                            (default: false)
+    --memory-usage-start-step
+                            First iteration included after resetting memory peaks
+                            (default: 0)
     --profile-step-start  Profile start step (default: 7)
     --profile-step-end    Profile end step (default: 8)
     --profile <nsys|torch>
@@ -94,6 +102,8 @@ NUM_LAYERS=""
 LINEAR_ATTENTION_FREQ=""
 PROFILE_STEP_START=""
 PROFILE_STEP_END=""
+RECORD_MEMORY_USAGE="${RECORD_MEMORY_USAGE:-false}"
+MEMORY_USAGE_START_STEP="${MEMORY_USAGE_START_STEP:-0}"
 PROFILE="${PROFILE:-none}"
 GPU_MEMORY_TRACE_INTERVAL="${GPU_MEMORY_TRACE_INTERVAL:-1.0}"
 while [[ $# -gt 0 ]]; do
@@ -163,6 +173,16 @@ while [[ $# -gt 0 ]]; do
             LINEAR_ATTENTION_FREQ="$2"
             shift 2
             ;;
+        --record-memory-usage)
+            [[ $# -ge 2 ]] || { usage >&2; exit 2; }
+            RECORD_MEMORY_USAGE="$2"
+            shift 2
+            ;;
+        --memory-usage-start-step)
+            [[ $# -ge 2 ]] || { usage >&2; exit 2; }
+            MEMORY_USAGE_START_STEP="$2"
+            shift 2
+            ;;
         --profile-step-start)
             [[ $# -ge 2 ]] || { usage >&2; exit 2; }
             PROFILE_STEP_START="$2"
@@ -220,6 +240,14 @@ case "${FINE_GRAINED_OFFLOAD}" in
     true|false) ;;
     *) echo "fine-grained offload must be true or false: ${FINE_GRAINED_OFFLOAD}" >&2; exit 2 ;;
 esac
+case "${RECORD_MEMORY_USAGE}" in
+    true|false) ;;
+    *) echo "record-memory-usage must be true or false: ${RECORD_MEMORY_USAGE}" >&2; exit 2 ;;
+esac
+if ! [[ "${MEMORY_USAGE_START_STEP}" =~ ^[0-9]+$ ]]; then
+    echo "memory-usage-start-step must be a non-negative integer" >&2
+    exit 2
+fi
 
 RESULTS_ROOT="${RESULTS_ROOT:-${REPO_ROOT}/results/01-analyse/01-fine-grained-offload}"
 RUN_TIME="${RUN_TIME:-$(date +%Y%m%d-%H%M%S)}"
@@ -335,6 +363,8 @@ OVERRIDES=(
     "profiling.profile_ranks=[0,1,2,3]"
     "profiling.record_memory_history=${RECORD_MEMORY_HISTORY}"
     "profiling.memory_snapshot_path=${RESULT_DIR}/memory/snapshot.pickle"
+    "profiling.record_memory_usage=${RECORD_MEMORY_USAGE}"
+    "profiling.memory_usage_start_step=${MEMORY_USAGE_START_STEP}"
     "profiling.nvtx_ranges=${NVTX_RANGES}"
 )
 if [[ -n "${NUM_LAYERS}" ]]; then
@@ -368,6 +398,8 @@ printf 'profile=%s profile_step_start=%s profile_step_end=%s use_nsys_profiler=%
     "${PROFILE}" "${PROFILE_STEP_START}" "${PROFILE_STEP_END}" "${USE_NSYS_PROFILER}" \
     "${USE_PYTORCH_PROFILER}" "${RECORD_MEMORY_HISTORY}" "${NVTX_RANGES}" \
     "${GPU_MEMORY_TRACE_INTERVAL}" | tee -a "${RESULT_DIR}/run_info.txt"
+printf 'record_memory_usage=%s memory_usage_start_step=%s\n' \
+    "${RECORD_MEMORY_USAGE}" "${MEMORY_USAGE_START_STEP}" | tee -a "${RESULT_DIR}/run_info.txt"
 printf 'result_dir=%s\nprofile_ranks=0,1,2,3\ncommand=%s\n' "${RESULT_DIR}" "${COMMAND_TEXT}" | tee -a "${RESULT_DIR}/run_info.txt"
 
 GPU_MONITOR_PID=""

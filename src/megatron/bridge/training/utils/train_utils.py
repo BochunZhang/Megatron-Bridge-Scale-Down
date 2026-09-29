@@ -277,6 +277,13 @@ HOST_MEMORY_KEYS: dict[str, str] = {
     "active_bytes.peak": "host-mem-max-active-bytes",
 }
 
+MEMORY_USAGE_FIELDS: tuple[str, ...] = (
+    "cuda_memory_allocated_bytes",
+    "cuda_peak_memory_allocated_bytes",
+    "host_memory_allocated_bytes",
+    "host_peak_memory_allocated_bytes",
+)
+
 
 def param_is_not_shared(param: nn.Parameter) -> bool:
     """Check if a parameter is marked as not shared.
@@ -617,6 +624,36 @@ def reduce_max_memory_across_pp_group(
     return reduced
 
 
+def reset_memory_usage_stats() -> None:
+    """Reset CUDA and pinned-host peak counters used by memory usage metrics."""
+    if not torch.cuda.is_available():
+        return
+
+    torch.cuda.reset_peak_memory_stats()
+    reset_host_peak = getattr(torch.cuda, "reset_peak_host_memory_stats", None)
+    if reset_host_peak is not None:
+        reset_host_peak()
+
+
+def report_memory_usage() -> dict[str, int]:
+    """Return DeepSpeed-compatible current and peak memory counters in bytes.
+
+    The host values are CUDA pinned-host allocator statistics, matching
+    ``torch.cuda.host_memory_stats()`` used by the DeepSpeed comparison.
+    They are not process RSS measurements.
+    """
+    if not torch.cuda.is_available():
+        return dict.fromkeys(MEMORY_USAGE_FIELDS, 0)
+
+    host_stats = torch.cuda.host_memory_stats()
+    return {
+        "cuda_memory_allocated_bytes": int(torch.cuda.memory_allocated()),
+        "cuda_peak_memory_allocated_bytes": int(torch.cuda.max_memory_allocated()),
+        "host_memory_allocated_bytes": int(host_stats.get("allocated_bytes.current", 0)),
+        "host_peak_memory_allocated_bytes": int(host_stats.get("allocated_bytes.peak", 0)),
+    }
+
+
 class _MoeMetricFanoutWriter:
     """SummaryWriter-shaped adapter that fans add_scalar to MLFlow / Comet.
 
@@ -862,6 +899,22 @@ def training_log(
         memory_report = reduce_max_memory_across_pp_group(memory_report, pg_collection.pp)
         memory_report = {f"memory/{mem_stat}": val for (mem_stat, val) in memory_report.items()}
 
+    memory_usage_report: Optional[dict[str, int]] = None
+    profiling_config = config.profiling
+    if (
+        profiling_config is not None
+        and getattr(profiling_config, "record_memory_usage", False) is True
+        and iteration % logger_config.log_interval == 0
+    ):
+        memory_usage_start_step = profiling_config.memory_usage_start_step
+        memory_usage_reset_step = max(memory_usage_start_step - 1, 0)
+        if iteration >= memory_usage_reset_step and not getattr(global_state, "_memory_usage_started", False):
+            reset_memory_usage_stats()
+            global_state._memory_usage_started = True
+        if iteration >= memory_usage_start_step:
+            memory_usage_report = report_memory_usage()
+            memory_usage_report = reduce_max_memory_across_pp_group(memory_usage_report, pg_collection.pp)
+
     if loggers_exist and iteration % logger_config.tensorboard_log_interval == 0:
         if logger_config.log_throughput_to_tensorboard:
             throughput_report = report_throughput(
@@ -890,6 +943,17 @@ def training_log(
                 mlflow_logger.log_metrics(_sanitize_mlflow_metrics(memory_report), step=iteration)
             if comet_logger:
                 comet_logger.log_metrics(memory_report, step=iteration)
+        if memory_usage_report is not None:
+            memory_usage_scalars = {f"memory_usage/{key}": value for key, value in memory_usage_report.items()}
+            if writer:
+                for metric, value in memory_usage_scalars.items():
+                    writer.add_scalar(metric, value, iteration)
+            if wandb_writer:
+                wandb_writer.log(memory_usage_scalars, iteration)
+            if mlflow_logger:
+                mlflow_logger.log_metrics(_sanitize_mlflow_metrics(memory_usage_scalars), step=iteration)
+            if comet_logger:
+                comet_logger.log_metrics(memory_usage_scalars, step=iteration)
         if logger_config.log_runtime_to_tensorboard:
             runtime_report = report_runtime(
                 train_state=train_state,
@@ -1188,6 +1252,10 @@ def training_log(
 
         if num_flops is not None and logger_config.log_throughput:
             log_string += f" throughput per GPU (TFLOP/s/GPU): {per_gpu_tf:.1f} |"
+
+        if memory_usage_report is not None:
+            for metric in MEMORY_USAGE_FIELDS:
+                log_string += f" {metric}: {memory_usage_report[metric]} |"
 
         if energy_monitor is not None:
             energy = (energy_monitor.lap() / total_iterations) / get_world_size_safe()

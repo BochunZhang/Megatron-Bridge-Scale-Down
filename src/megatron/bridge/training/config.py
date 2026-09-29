@@ -751,6 +751,16 @@ class ProfilingConfig(MTrainProfilingConfig):
     inside the container). Override for non-NeMo-Run setups.
     """
 
+    record_memory_usage: bool = False
+    """Record DeepSpeed-compatible CUDA and pinned-host memory byte metrics."""
+
+    memory_usage_start_step: int = 0
+    """First iteration included in memory usage metrics.
+
+    Peak counters are reset after the preceding iteration. Set this to the
+    number of warmup iterations when comparing benchmark runs.
+    """
+
     def finalize(self) -> None:
         """Validate profiling configuration."""
         assert not (self.use_pytorch_profiler and self.use_nsys_profiler), (
@@ -760,6 +770,9 @@ class ProfilingConfig(MTrainProfilingConfig):
         assert self.profile_step_end >= 0, f"profile_step_end must be >= 0, got {self.profile_step_end}"
         assert self.profile_step_end >= self.profile_step_start, (
             f"profile_step_end ({self.profile_step_end}) must be >= profile_step_start ({self.profile_step_start})"
+        )
+        assert self.memory_usage_start_step >= 0, (
+            f"memory_usage_start_step must be >= 0, got {self.memory_usage_start_step}"
         )
 
 
