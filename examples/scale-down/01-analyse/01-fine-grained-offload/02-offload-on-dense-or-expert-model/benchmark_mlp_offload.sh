@@ -56,7 +56,7 @@ Options:
     --dense-model <9b|27b>       Dense model size (default: 9b)
     --dtype <bf16|mxfp8>         Training dtype (default: bf16)
     --profile <none|nsys|torch>  Profiling backend (default: none)
-    --case <name|all>            Run baseline or offload (default: all)
+    --case <name|all>            Run baseline, offload-mlp, or offload-attn-mlp (default: all)
     --dispatcher <all|alltoall|hybridep>
                                  MoE dispatcher filter (default: all)
     --train-iters <n>            Total steps per run (default: 10)
@@ -112,7 +112,7 @@ case "${DTYPE}" in
 esac
 case "${PROFILE}" in none|nsys|torch) ;; *) echo "Invalid profile: ${PROFILE}" >&2; exit 2 ;; esac
 case "${CASE_FILTER}" in
-    all|baseline|offload) ;;
+    all|baseline|offload-mlp|offload-attn-mlp) ;;
     *) echo "Invalid case: ${CASE_FILTER}" >&2; exit 2 ;;
 esac
 case "${DISPATCHER_FILTER}" in
@@ -258,7 +258,13 @@ run_case() {
 run_dense_matrix() {
     local micro_batch_size="$1"
     run_case dense "${DENSE_MODEL_NAME}" "${DENSE_RECIPE_PREFIX}" default baseline null null false null "${micro_batch_size}"
-    run_case dense "${DENSE_MODEL_NAME}" "${DENSE_RECIPE_PREFIX}" default offload null null true '[mlp_norm,mlp_act]' "${micro_batch_size}"
+    run_case dense "${DENSE_MODEL_NAME}" "${DENSE_RECIPE_PREFIX}" default offload-mlp null null true '[mlp_norm,mlp_act]' "${micro_batch_size}"
+    if [[ "${MODEL_FAMILY}" == qwen ]]; then
+        local attention_offload_modules='[attn_norm,attn_proj]'
+    else
+        local attention_offload_modules='[attn_norm,qkv_linear,core_attn,attn_proj]'
+    fi
+    run_case dense "${DENSE_MODEL_NAME}" "${DENSE_RECIPE_PREFIX}" default offload-attn-mlp null null true "[mlp_norm,mlp_act,${attention_offload_modules#[}" "${micro_batch_size}"
 }
 
 run_expert_matrix() {
@@ -269,7 +275,13 @@ run_expert_matrix() {
             continue
         fi
         run_case expert "${EXPERT_MODEL_NAME}" "${EXPERT_RECIPE_PREFIX}" "${dispatcher}" baseline null null false null "${micro_batch_size}"
-        run_case expert "${EXPERT_MODEL_NAME}" "${EXPERT_RECIPE_PREFIX}" "${dispatcher}" offload null null true '[mlp_norm,expert_fc1,moe_act]' "${micro_batch_size}"
+        run_case expert "${EXPERT_MODEL_NAME}" "${EXPERT_RECIPE_PREFIX}" "${dispatcher}" offload-mlp null null true '[mlp_norm,expert_fc1,moe_act]' "${micro_batch_size}"
+        if [[ "${MODEL_FAMILY}" == qwen ]]; then
+            local attention_offload_modules='[attn_norm,attn_proj]'
+        else
+            local attention_offload_modules='[attn_norm,qkv_linear,core_attn,attn_proj]'
+        fi
+        run_case expert "${EXPERT_MODEL_NAME}" "${EXPERT_RECIPE_PREFIX}" "${dispatcher}" offload-attn-mlp null null true "[mlp_norm,expert_fc1,moe_act,${attention_offload_modules#[}" "${micro_batch_size}"
     done
 }
 

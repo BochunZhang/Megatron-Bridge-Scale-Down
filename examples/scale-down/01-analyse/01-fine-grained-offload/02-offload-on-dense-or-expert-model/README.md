@@ -28,14 +28,14 @@
 
 ## 测试内容
 
-对比 Qwen Dense、Qwen MoE 以及 DeepSeek 的 dense/expert proxy 在 **开启 / 关闭 fine-grained activation offload** 时的性能差异（step time、tokens/s、显存峰值）：
+对比 Qwen Dense、Qwen MoE 以及 DeepSeek 的 dense/expert proxy 在 **baseline / offload-mlp / offload-attn-mlp** 三种配置下的性能差异（step time、tokens/s、显存峰值）：
 
 | 模型 | 选择参数 | scope | offload 模块 |
 | --- | --- | --- | --- |
-| Qwen Dense (9B/27B) | `--model qwen --scope dense` | dense MLP | `[mlp_norm,mlp_act]` |
-| Qwen MoE (35B-A3B, 16 层, 64 experts) | `--model qwen --scope expert` | expert MLP | `[mlp_norm,expert_fc1,moe_act]` |
-| DeepSeek-V3 dense proxy (4 层, 32 experts) | `--model deepseek --scope dense` | dense MLP | `[mlp_norm,mlp_act]` |
-| DeepSeek-V3 expert proxy (4 层, 32 experts) | `--model deepseek --scope expert` | expert MLP | `[mlp_norm,expert_fc1,moe_act]` |
+| Qwen Dense (9B/27B) | `--model qwen --scope dense` | dense MLP + attention | `offload-mlp: [mlp_norm,mlp_act]`; `offload-attn-mlp: [mlp_norm,mlp_act,attn_norm,attn_proj]` |
+| Qwen MoE (35B-A3B, 16 层, 64 experts) | `--model qwen --scope expert` | expert MLP + attention | `offload-mlp: [mlp_norm,expert_fc1,moe_act]`; `offload-attn-mlp` 追加 `[attn_norm,attn_proj]` |
+| DeepSeek-V3 dense proxy (4 层, 32 experts) | `--model deepseek --scope dense` | dense MLP + attention | `offload-mlp: [mlp_norm,mlp_act]`; `offload-attn-mlp` 追加 `[attn_norm,qkv_linear,core_attn,attn_proj]` |
+| DeepSeek-V3 expert proxy (4 层, 32 experts) | `--model deepseek --scope expert` | expert MLP + attention | `offload-mlp: [mlp_norm,expert_fc1,moe_act]`; `offload-attn-mlp` 追加 `[attn_norm,qkv_linear,core_attn,attn_proj]` |
 
 DeepSeek-V3 的两种 proxy 由脚本 override 构造（不再限制 `--scope dense`）：统一设置 `num_layers=4`、`num_moe_experts=32`；dense proxy 令 `moe_layer_freq=[0,0,0,0]`（4 个主 layer 全部走 dense MLP），expert proxy 令 `moe_layer_freq=[1,1,1,1]`（4 个主 layer 全部走 MoE）。脚本不 override MTP 数量，DeepSeek 默认的 1 个 MTP layer 会复用最后一个主 layer 的 dense/expert 类型，因此最终分别得到 5 个 dense layer 或 5 个 expert layer。这些列表值通过 Hydra override 直接传入，而不是按字符串逐层拼接。
 
@@ -44,7 +44,7 @@ DeepSeek-V3 的两种 proxy 由脚本 override 构造（不再限制 `--scope de
 - **MBS**：`1,2,4,8`（默认，必须整除 GBS）
 - **精度**：`--dtype bf16`（默认）或 `--dtype mxfp8`
 - **dispatcher**（仅 MoE）：`alltoall` / `hybridep`；默认两个都跑，可用 `--dispatcher <alltoall|hybridep>` 只跑其一
-- **case**：`baseline`（offload 关）与 `offload`（offload 开）
+- **case**：`baseline`、`offload-mlp`、`offload-attn-mlp`
 
 固定条件：4 GPU FSDP1、seq len 4096、GBS 32、train-iters 10、关闭 recompute / CUDA graph / optimizer offload / checkpoint。
 
@@ -61,6 +61,8 @@ DeepSeek-V3 的两种 proxy 由脚本 override 构造（不再限制 `--scope de
 
 前置：仓库根目录 `uv sync`；4 张 GPU 可用（GB200 recipe）；`--profile nsys` 需要 `nsys`。两个 Python XLSX 脚本只使用标准库，不需要 Node.js 或 `@oai/artifact-tool`。
 
+Python 生成的 XLSX 使用简单数据表格式：第一行是字段名，后续行是数据，不额外添加颜色、边框、合并单元格或数字格式。
+
 ```bash
 EXPERIMENT_DIR=examples/scale-down/01-analyse/01-fine-grained-offload/02-offload-on-dense-or-expert-model
 ```
@@ -69,9 +71,9 @@ EXPERIMENT_DIR=examples/scale-down/01-analyse/01-fine-grained-offload/02-offload
 
 ### 测试 1：qwen3.5 dense + expert 综合矩阵（MBS 1,2,4,8）
 
-不带 `--scope` 时 dense 和 expert 都跑；expert 自动覆盖 alltoall 和 hybridep 两个 dispatcher。每个 dtype 分别给出关闭 / 开启 nsys 的指令。
+不带 `--scope` 时 dense 和 expert 都跑；expert 自动覆盖 alltoall 和 hybridep 两个 dispatcher。每个 dtype 分别给出三组 case 的关闭 / 开启 nsys 指令。
 
-**关闭 nsys（吞吐矩阵，结果进 XLSX）**，每个 dtype 24 个运行（dense 8 + expert 16）：
+**关闭 nsys（吞吐矩阵，结果进 XLSX）**，每个 dtype 36 个运行（dense 12 + expert 24）：
 
 ```bash
 # bf16
@@ -83,7 +85,7 @@ bash "./examples/scale-down/01-analyse/01-fine-grained-offload/02-offload-on-den
   --model qwen --dtype mxfp8 --micro-batch-sizes 1,2,4
 ```
 
-**开启 nsys（定位瓶颈 / allreduce 来源，不进 XLSX）**，每个 dtype 同样 24 个运行：
+**开启 nsys（定位瓶颈 / allreduce 来源，不进 XLSX）**，每个 dtype 同样 36 个运行：
 
 ```bash
 # bf16 + nsys
@@ -112,9 +114,9 @@ uv run python examples/scale-down/01-analyse/01-fine-grained-offload/02-offload-
 
 ### 测试 2：deepseek-v3 dense + expert 综合矩阵（MBS 1,2,4,8）
 
-不带 `--scope` 时 dense proxy 和 expert proxy 都跑；expert 自动覆盖 alltoall 和 hybridep 两个 dispatcher，dense 走 recipe 默认 dispatcher。每个 dtype 分别给出关闭 / 开启 nsys 的指令。
+不带 `--scope` 时 dense proxy 和 expert proxy 都跑；expert 自动覆盖 alltoall 和 hybridep 两个 dispatcher，dense 走 recipe 默认 dispatcher。每个 dtype 分别给出三组 case 的关闭 / 开启 nsys 指令。
 
-**关闭 nsys（吞吐矩阵，结果进 XLSX）**，每个 dtype 24 个运行（dense 8 + expert 16）：
+**关闭 nsys（吞吐矩阵，结果进 XLSX）**，每个 dtype 36 个运行（dense 12 + expert 24）：
 
 ```bash
 # bf16
@@ -126,7 +128,7 @@ bash "./examples/scale-down/01-analyse/01-fine-grained-offload/02-offload-on-den
   --model deepseek --dtype mxfp8 --micro-batch-sizes 1,2,4
 ```
 
-**开启 nsys（定位瓶颈 / allreduce 来源，不进 XLSX）**，每个 dtype 同样 24 个运行：
+**开启 nsys（定位瓶颈 / allreduce 来源，不进 XLSX）**，每个 dtype 同样 36 个运行：
 
 ```bash
 # bf16 + nsys
@@ -161,7 +163,7 @@ bash "./examples/scale-down/01-analyse/01-fine-grained-offload/02-offload-on-den
   --micro-batch-size 1 --profile nsys
 ```
 
-运行 2 个 case（baseline / offload）。
+运行 3 个 case（baseline / offload-mlp / offload-attn-mlp）。
 
 ### 生成 XLSX 汇总（只收 `--profile none` 的成功运行）
 
@@ -193,13 +195,13 @@ result/01-analyse/01-fine-grained-offload/02-offload-on-dense-or-expert-model/
 其中 `<test-name>` 按以下规则构建：
 
 ```text
-dtype_<bf16|mxfp8>-mbs_<mbs>-gbs_<gbs>-<baseline|offload>
+dtype_<bf16|mxfp8>-mbs_<mbs>-gbs_<gbs>-<baseline|offload-mlp|offload-attn-mlp>
 ```
 
 expert 模型会在 case 前补充 dispatcher：
 
 ```text
-dtype_<bf16|mxfp8>-mbs_<mbs>-gbs_<gbs>-dispatcher_<alltoall|hybridep>-<baseline|offload>
+dtype_<bf16|mxfp8>-mbs_<mbs>-gbs_<gbs>-dispatcher_<alltoall|hybridep>-<baseline|offload-mlp|offload-attn-mlp>
 ```
 
 XLSX 汇总输出：
@@ -221,28 +223,28 @@ uv run python "./examples/scale-down/01-analyse/01-fine-grained-offload/02-offlo
 ```
 
 分析脚本只读取成功且 `profile=none` 的运行。它按 model、dispatcher、MBS、dtype、dense/expert
-配对 baseline 和 offload，分别选择各组最新的 baseline 与 offload。每个运行必须提供至少 10 组
+配对 baseline、offload-mlp 和 offload-attn-mlp，分别选择各组最新的 case。每个运行必须提供至少 10 组
 GPU utilization 数据，分析时读取全部数据并对最后 4 组 `MODEL_TFLOP/s/GPU` 取平均。结果默认写入：
 
 ```text
 result/01-analyse/01-fine-grained-offload/02-offload-on-dense-or-expert-model/offload-throughput-<qwen|deepseek>.xlsx
 ```
 
-表格按 dispatcher、MBS、dtype、dense/expert 排序。性能下降幅度按
-`(baseline - offload) / baseline` 计算。
+表格按 dispatcher、MBS、dtype、dense/expert 排序。两个 offload case 的性能下降幅度分别按
+`(baseline - offload_case) / baseline` 计算。
 
 ## nsys / NVTX 分析
 
 - `--profile nsys` 会自动设置 `profiling.use_nsys_profiler=true`、`profiling.nvtx_ranges=true`、`profiling.record_memory_history=true`，并用 `nsys profile -s none -t cuda,nvtx --capture-range=cudaProfilerApi` 启动训练，只采集 step 7–8，4 个 rank 都记录。nsys 文件名使用 `<model>/<test-name>/<run-time>` 的组件并将 `/` 替换为 `-`，例如 `nsys-qwen35_text_9b-dtype_bf16-mbs_1-gbs_32-baseline-<run-time>_%p_%h.nsys-rep`。
 - 用 Nsight Systems GUI 打开 `<run-dir>/profile/*.nsys-rep`：
   - 在时间轴上把 NCCL allreduce / reduce-scatter / all-gather kernel 与 NVTX range（forward、backward、optimizer、offload D2H/H2D 等）对齐，即可回答"allreduce 是哪个操作产生的"（目的 3）；
-  - 对比 baseline 与 offload 的时间轴，找出无法被计算 overlap 的 copy / 通信段（目的 1）；
+- 对比 baseline、offload-mlp 与 offload-attn-mlp 的时间轴，找出无法被计算 overlap 的 copy / 通信段（目的 1）；
   - 对比 qwen3.5 与 deepseek 的 kernel 间隙和通信占比，定位效率差距来源（目的 2）。
 - profiling 运行不会被 XLSX 收集器纳入吞吐比较；显存细节看 `memory/snapshot.pickle` 和 `gpu_memory/`。
 
 ## 如何解读
 
-- baseline 与 offload 必须在相同模型、dtype、MBS、GBS、dispatcher 下对比；不要把不同架构的绝对 tokens/s 当成 dense/MoE 的普遍排名。
+- baseline、offload-mlp 与 offload-attn-mlp 必须在相同模型、dtype、MBS、GBS、dispatcher 下对比；不要把不同架构的绝对 tokens/s 当成 dense/MoE 的普遍排名。
 - 先看 `summary.json` 和日志有无 NaN/Inf，再比 step time、tokens/s、显存。
 - 显存峰值看各 run 目录的 `gpu_memory/`；XLSX 只汇总吞吐。
-- 本矩阵只覆盖 MLP/MoE activation offload；attention offload 是 `plan.md` 中的后续 TODO。
+- `offload-attn-mlp` 在 MLP/MoE activation offload 基础上增加 attention activation offload；Qwen 的 GatedDeltaNet case 只追加 `attn_norm` 和 `attn_proj`。

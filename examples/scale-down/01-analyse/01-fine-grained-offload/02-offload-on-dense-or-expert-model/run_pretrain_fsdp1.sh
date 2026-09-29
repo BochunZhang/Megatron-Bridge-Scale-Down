@@ -364,10 +364,19 @@ SAFE_RUN_NAME="$(sanitize_path_component "${RUN_NAME}")"
 SAFE_NUM_LAYERS="$(sanitize_path_component "${NUM_LAYERS:-default}")"
 SAFE_NUM_EXPERTS="$(sanitize_path_component "${NUM_EXPERTS:-default}")"
 MODEL_KIND="${RUN_NAME%%-*}"
-case "${FINE_GRAINED_OFFLOAD}" in
-    true) TEST_NAME=offload ;;
-    false) TEST_NAME=baseline ;;
-esac
+if [[ "${IS_DENSE_OR_EXPERT_EXPERIMENT}" == true ]]; then
+    case "${RUN_NAME}" in
+        *-baseline-mbs*-r[0-9]*) TEST_NAME=baseline ;;
+        *-offload-mlp-mbs*-r[0-9]*) TEST_NAME=offload-mlp ;;
+        *-offload-attn-mlp-mbs*-r[0-9]*) TEST_NAME=offload-attn-mlp ;;
+        *) echo "Run name has an unsupported experiment case: ${RUN_NAME}" >&2; exit 2 ;;
+    esac
+else
+    case "${FINE_GRAINED_OFFLOAD}" in
+        true) TEST_NAME=offload ;;
+        false) TEST_NAME=baseline ;;
+    esac
+fi
 if [[ "${IS_DENSE_OR_EXPERT_EXPERIMENT}" == true ]]; then
     case "${MODEL_KIND}" in
         dense|expert) ;;

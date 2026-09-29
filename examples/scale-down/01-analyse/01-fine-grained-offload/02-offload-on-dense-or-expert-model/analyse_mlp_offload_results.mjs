@@ -28,7 +28,7 @@ const DEFAULT_RESULTS_ROOT = path.join(
 const MIN_GPU_UTILIZATION_SAMPLES = 10;
 const GPU_UTILIZATION_SAMPLES_TO_AVERAGE = 4;
 const RUN_NAME_PATTERN =
-  /^(dense|expert)-(default|alltoall|hybridep)-(baseline|offload)(?:-mbs(\d+))?-r\d+$/;
+  /^(dense|expert)-(default|alltoall|hybridep)-(baseline|offload-mlp|offload-attn-mlp)(?:-mbs(\d+))?-r\d+$/;
 const HEADERS = [
   "model",
   "dispatcher",
@@ -36,17 +36,19 @@ const HEADERS = [
   "dtype",
   "type",
   "baseline (TFlops)",
-  "offload (TFlops)",
-  "offload 相对于 baseline 的性能下降幅度",
+  "offload-mlp (TFlops)",
+  "offload-attn-mlp (TFlops)",
+  "offload-mlp 相对于 baseline 的性能下降幅度",
+  "offload-attn-mlp 相对于 baseline 的性能下降幅度",
 ];
 
 function usage() {
   process.stdout.write(`Usage: analyse_mlp_offload_results.mjs --model <qwen|deepseek> [OPTIONS]
 
-Read successful non-profiled runs, select the latest baseline and offload for
-each model/dispatcher/MBS/dtype/type combination, and write an XLSX throughput
-comparison using the final 4 GPU utilization values. Each run must contain at
-least 10 GPU utilization values.
+Read successful non-profiled runs, select the latest baseline, offload-mlp, and
+offload-attn-mlp for each model/dispatcher/MBS/dtype/type combination, and write
+an XLSX throughput comparison using the final 4 GPU utilization values. Each
+run must contain at least 10 GPU utilization values.
 
 Options:
   --model <qwen|deepseek>  Model family to analyse (required)
@@ -257,7 +259,11 @@ async function discoverRows(resultsRoot, modelFamily) {
     const identity = parseIdentity(config, configPath);
     const key = groupKey(identity);
     if (!groups.has(key)) {
-      groups.set(key, { baseline: new Map(), offload: new Map() });
+      groups.set(key, {
+        baseline: new Map(),
+        "offload-mlp": new Map(),
+        "offload-attn-mlp": new Map(),
+      });
     }
     const caseRuns = groups.get(key)[identity.caseName];
     if (caseRuns.has(identity.runTime)) {
@@ -268,16 +274,23 @@ async function discoverRows(resultsRoot, modelFamily) {
 
   const rows = [];
   for (const [key, caseRuns] of groups) {
-    if (caseRuns.baseline.size === 0 || caseRuns.offload.size === 0) {
-      throw new Error(`Missing baseline or offload run for ${key}`);
+    if (
+      caseRuns.baseline.size === 0
+      || caseRuns["offload-mlp"].size === 0
+      || caseRuns["offload-attn-mlp"].size === 0
+    ) {
+      throw new Error(`Missing baseline or offload case run for ${key}`);
     }
 
     const baselineRunTime = [...caseRuns.baseline.keys()].sort().at(-1);
-    const offloadRunTime = [...caseRuns.offload.keys()].sort().at(-1);
+    const offloadMlpRunTime = [...caseRuns["offload-mlp"].keys()].sort().at(-1);
+    const offloadAttnMlpRunTime = [...caseRuns["offload-attn-mlp"].keys()].sort().at(-1);
     const baselineRun = caseRuns.baseline.get(baselineRunTime);
-    const offloadRun = caseRuns.offload.get(offloadRunTime);
+    const offloadMlpRun = caseRuns["offload-mlp"].get(offloadMlpRunTime);
+    const offloadAttnMlpRun = caseRuns["offload-attn-mlp"].get(offloadAttnMlpRunTime);
     const baseline = await readMeanTflops(baselineRun.resultDir);
-    const offload = await readMeanTflops(offloadRun.resultDir);
+    const offloadMlp = await readMeanTflops(offloadMlpRun.resultDir);
+    const offloadAttnMlp = await readMeanTflops(offloadAttnMlpRun.resultDir);
     if (baseline.mean <= 0) {
       throw new Error(`Baseline mean TFlops must be positive for ${key} at ${baselineRunTime}`);
     }
@@ -288,12 +301,16 @@ async function discoverRows(resultsRoot, modelFamily) {
       dtype: baselineRun.identity.dtype,
       type: baselineRun.identity.type,
       baselineTflops: baseline.mean,
-      offloadTflops: offload.mean,
-      performanceDrop: (baseline.mean - offload.mean) / baseline.mean,
+      offloadMlpTflops: offloadMlp.mean,
+      offloadAttnMlpTflops: offloadAttnMlp.mean,
+      offloadMlpPerformanceDrop: (baseline.mean - offloadMlp.mean) / baseline.mean,
+      offloadAttnMlpPerformanceDrop: (baseline.mean - offloadAttnMlp.mean) / baseline.mean,
       baselineRunTime,
-      offloadRunTime,
+      offloadMlpRunTime,
+      offloadAttnMlpRunTime,
       baselineSamples: baseline.samples,
-      offloadSamples: offload.samples,
+      offloadMlpSamples: offloadMlp.samples,
+      offloadAttnMlpSamples: offloadAttnMlp.samples,
     });
   }
 
@@ -327,24 +344,26 @@ async function writeWorkbook(rows, outputPath, artifactToolSpecifier) {
   const workbook = Workbook.create();
   const sheet = workbook.worksheets.add("Throughput");
   const lastRow = rows.length + 1;
-  const tableRange = `A1:H${lastRow}`;
+  const tableRange = `A1:J${lastRow}`;
 
   sheet.showGridLines = false;
   sheet.tabColor = "#1F4E78";
-  sheet.getRange("A1:H1").values = [HEADERS];
-  sheet.getRange(`A2:H${lastRow}`).values = rows.map((row) => [
+  sheet.getRange("A1:J1").values = [HEADERS];
+  sheet.getRange(`A2:J${lastRow}`).values = rows.map((row) => [
     row.model,
     row.dispatcher,
     row.mbs,
     row.dtype,
     row.type,
     row.baselineTflops,
-    row.offloadTflops,
-    row.performanceDrop,
+    row.offloadMlpTflops,
+    row.offloadAttnMlpTflops,
+    row.offloadMlpPerformanceDrop,
+    row.offloadAttnMlpPerformanceDrop,
   ]);
 
   sheet.getRange(tableRange).format.font = { name: "Arial", size: 10, color: "#1F1F1F" };
-  sheet.getRange("A1:H1").format = {
+  sheet.getRange("A1:J1").format = {
     fill: "#1F4E78",
     font: { name: "Arial", size: 10, bold: true, color: "#FFFFFF" },
     horizontalAlignment: "center",
@@ -353,22 +372,22 @@ async function writeWorkbook(rows, outputPath, artifactToolSpecifier) {
     rowHeight: 30,
     borders: { preset: "all", style: "thin", color: "#FFFFFF" },
   };
-  sheet.getRange(`A2:H${lastRow}`).format.verticalAlignment = "center";
+  sheet.getRange(`A2:J${lastRow}`).format.verticalAlignment = "center";
   sheet.getRange(`B2:E${lastRow}`).format.horizontalAlignment = "center";
   sheet.getRange(`C2:C${lastRow}`).format.numberFormat = "0";
   sheet.getRange(`F2:G${lastRow}`).format.numberFormat = "0.00";
-  sheet.getRange(`H2:H${lastRow}`).format.numberFormat = "0.00%";
-  sheet.getRange(`A2:H${lastRow}`).format.borders = {
+  sheet.getRange(`H2:J${lastRow}`).format.numberFormat = "0.00%";
+  sheet.getRange(`A2:J${lastRow}`).format.borders = {
     insideHorizontal: { style: "thin", color: "#D9E1F2" },
     insideVertical: { style: "thin", color: "#E5E7EB" },
     bottom: { style: "thin", color: "#A6A6A6" },
   };
-  sheet.getRange(`H2:H${lastRow}`).conditionalFormats.add("cellIs", {
+  sheet.getRange(`H2:J${lastRow}`).conditionalFormats.add("cellIs", {
     operator: "greaterThan",
     formula: 0,
     format: { fill: "#FCE8E6", font: { color: "#B91C1C" } },
   });
-  sheet.getRange(`H2:H${lastRow}`).conditionalFormats.add("cellIs", {
+  sheet.getRange(`H2:J${lastRow}`).conditionalFormats.add("cellIs", {
     operator: "lessThan",
     formula: 0,
     format: { fill: "#E6F4EA", font: { color: "#166534" } },
@@ -376,7 +395,7 @@ async function writeWorkbook(rows, outputPath, artifactToolSpecifier) {
   sheet.freezePanes.freezeRows(1);
 
   for (const [column, width] of [
-    ["A", 26], ["B", 14], ["C", 8], ["D", 10], ["E", 10], ["F", 20], ["G", 20], ["H", 38],
+    ["A", 26], ["B", 14], ["C", 8], ["D", 10], ["E", 10], ["F", 20], ["G", 20], ["H", 20], ["I", 38], ["J", 38],
   ]) {
     sheet.getRange(`${column}:${column}`).format.columnWidth = width;
   }

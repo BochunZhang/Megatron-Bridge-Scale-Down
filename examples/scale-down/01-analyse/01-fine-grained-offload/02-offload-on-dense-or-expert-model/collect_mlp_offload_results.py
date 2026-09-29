@@ -36,7 +36,7 @@ DEFAULT_RESULTS_ROOT = (
 )
 SAMPLE_ITERATIONS = (5, 6, 7, 8, 9)
 RUN_NAME_PATTERN = re.compile(
-    r"^(dense|expert)-(default|alltoall|hybridep)-(baseline|offload)(?:-mbs(\d+))?-r(\d+)$"
+    r"^(dense|expert)-(default|alltoall|hybridep)-(baseline|offload-mlp|offload-attn-mlp)(?:-mbs(\d+))?-r(\d+)$"
 )
 ITERATION_PATTERN = re.compile(
     r"iteration\s+(\d+)\s*/\s*\d+\s*\|.*?elapsed time per iteration \(ms\):\s*([\d.]+)",
@@ -187,7 +187,7 @@ def sort_key(run: Run) -> tuple[object, ...]:
         {"dense": 0, "expert": 1}[run.model_kind],
         {"default": 0, "alltoall": 1, "hybridep": 2}[run.dispatcher],
         run.micro_batch_size,
-        {"baseline": 0, "offload": 1}[run.case_name],
+        {"baseline": 0, "offload-mlp": 1, "offload-attn-mlp": 2}[run.case_name],
         run.repeat,
     )
 
@@ -254,19 +254,22 @@ def xml_text(value: object) -> str:
 def inline_string_cell(reference: str, value: object, style: int = 0) -> str:
     """Build an inline-string worksheet cell."""
 
-    return f'<c r="{reference}" s="{style}" t="inlineStr"><is><t>{xml_text(value)}</t></is></c>'
+    style_attribute = f' s="{style}"' if style else ""
+    return f'<c r="{reference}"{style_attribute} t="inlineStr"><is><t>{xml_text(value)}</t></is></c>'
 
 
 def number_cell(reference: str, value: object, style: int = 0) -> str:
     """Build a numeric worksheet cell."""
 
-    return f'<c r="{reference}" s="{style}"><v>{xml_text(value)}</v></c>'
+    style_attribute = f' s="{style}"' if style else ""
+    return f'<c r="{reference}"{style_attribute}><v>{xml_text(value)}</v></c>'
 
 
 def formula_cell(reference: str, formula: str, style: int = 0) -> str:
     """Build a worksheet formula cell."""
 
-    return f'<c r="{reference}" s="{style}"><f>{xml_text(formula)}</f><v></v></c>'
+    style_attribute = f' s="{style}"' if style else ""
+    return f'<c r="{reference}"{style_attribute}><f>{xml_text(formula)}</f><v></v></c>'
 
 
 def make_sheet_xml(
@@ -285,6 +288,7 @@ def make_sheet_xml(
         f'<col min="{index + 1}" max="{index + 1}" width="{width}" customWidth="1"/>'
         for index, width in widths
     )
+    columns_xml = f"<cols>{columns}</cols>" if columns else ""
     sheet_rows = []
     heights = dict(row_heights)
     for row_number, cells in enumerate(rows, start=1):
@@ -305,23 +309,22 @@ def make_sheet_xml(
         '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
         '<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">'
         f'<dimension ref="A1:{column_name(max_column - 1)}{max_row}"/>'
-        f'{pane}<sheetFormatPr defaultRowHeight="15"/><cols>{columns}</cols>'
+        f'{pane}<sheetFormatPr defaultRowHeight="15"/>{columns_xml}'
         f'<sheetData>{"".join(sheet_rows)}</sheetData>{merge_xml}'
         "</worksheet>"
     )
 
 
 def styles_xml() -> str:
-    """Return the workbook's compact style table."""
+    """Return the workbook's default, unformatted style table."""
 
     return '''<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <styleSheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">
-  <numFmts count="2"><numFmt numFmtId="164" formatCode="#,##0.00"/><numFmt numFmtId="165" formatCode="0.00%"/></numFmts>
-  <fonts count="4"><font><sz val="11"/><color theme="1"/><name val="Calibri"/></font><font><b/><sz val="16"/><color rgb="FFFFFFFF"/><name val="Calibri"/></font><font><i/><sz val="11"/><color rgb="FF1F1F1F"/><name val="Calibri"/></font><font><b/><sz val="11"/><color rgb="FFFFFFFF"/><name val="Calibri"/></font></fonts>
-  <fills count="4"><fill><patternFill patternType="none"/></fill><fill><patternFill patternType="gray125"/></fill><fill><patternFill patternType="solid"><fgColor rgb="FF1F4E78"/></patternFill></fill><fill><patternFill patternType="solid"><fgColor rgb="FFD9EAF7"/></patternFill></fill></fills>
-  <borders count="2"><border/><border><top style="thin"><color rgb="FFD9E1F2"/></top><bottom style="thin"><color rgb="FFD9E1F2"/></bottom></border></borders>
+  <fonts count="1"><font><sz val="11"/><name val="Calibri"/></font></fonts>
+  <fills count="2"><fill><patternFill patternType="none"/></fill><fill><patternFill patternType="gray125"/></fill></fills>
+  <borders count="1"><border/></borders>
   <cellStyleXfs count="1"><xf numFmtId="0" fontId="0" fillId="0" borderId="0"/></cellStyleXfs>
-  <cellXfs count="8"><xf numFmtId="0" fontId="0" fillId="0" borderId="0"/><xf numFmtId="0" fontId="1" fillId="2" borderId="0" applyAlignment="1"><alignment horizontal="left"/></xf><xf numFmtId="0" fontId="2" fillId="3" borderId="0"/><xf numFmtId="0" fontId="3" fillId="2" borderId="0" applyAlignment="1"><alignment wrapText="1"/></xf><xf numFmtId="164" fontId="0" fillId="0" borderId="1"/><xf numFmtId="165" fontId="0" fillId="0" borderId="1"/><xf numFmtId="0" fontId="0" fillId="0" borderId="1"/><xf numFmtId="164" fontId="0" fillId="0" borderId="0"/></cellXfs>
+  <cellXfs count="1"><xf numFmtId="0" fontId="0" fillId="0" borderId="0"/></cellXfs>
   <cellStyles count="1"><cellStyle name="Normal" xfId="0" builtinId="0"/></cellStyles>
 </styleSheet>'''
 
@@ -362,17 +365,13 @@ def write_workbook(runs: list[Run], run_time: str, output_path: Path) -> None:
         "Iter 5", "Iter 6", "Iter 7", "Iter 8", "Iter 9", "Mean", "Median", "Min",
         "Max", "Std Dev", "CV", "vs Baseline", "vs All-to-All",
     ]
-    summary_rows: list[list[str]] = []
-    summary_rows.append([inline_string_cell("A1", "MLP Offload Throughput Comparison", 1)])
-    summary_rows.append([inline_string_cell("A2", f"run_time={run_time}; successful profile=none runs only; throughput uses iterations 5-9", 2)])
-    summary_rows.append([])
-    summary_rows.append([
-        inline_string_cell(f"{column_name(index)}4", header, 3) for index, header in enumerate(summary_headers)
-    ])
+    summary_rows: list[list[str]] = [[
+        inline_string_cell(f"{column_name(index)}1", header) for index, header in enumerate(summary_headers)
+    ]]
 
     baseline_rows: dict[tuple[object, ...], int] = {}
     alltoall_rows: dict[tuple[object, ...], int] = {}
-    for index, run in enumerate(runs, start=5):
+    for index, run in enumerate(runs, start=2):
         baseline_key = (run.model_kind, run.model, run.dtype, run.dispatcher, run.micro_batch_size, run.repeat)
         alltoall_key = (run.model_kind, run.model, run.dtype, run.case_name, run.micro_batch_size, run.repeat)
         if run.case_name == "baseline":
@@ -380,7 +379,7 @@ def write_workbook(runs: list[Run], run_time: str, output_path: Path) -> None:
         if run.dispatcher == "alltoall":
             alltoall_rows[alltoall_key] = index
 
-    for index, run in enumerate(runs, start=5):
+    for index, run in enumerate(runs, start=2):
         cells = [
             inline_string_cell(f"A{index}", run.model_kind),
             inline_string_cell(f"B{index}", run.model),
@@ -390,26 +389,26 @@ def write_workbook(runs: list[Run], run_time: str, output_path: Path) -> None:
             number_cell(f"F{index}", run.repeat),
             number_cell(f"G{index}", run.micro_batch_size),
         ]
-        cells.extend(number_cell(f"{column_name(column)}{index}", sample.tokens_per_second, 4) for column, sample in enumerate(run.samples, start=7))
+        cells.extend(number_cell(f"{column_name(column)}{index}", sample.tokens_per_second) for column, sample in enumerate(run.samples, start=7))
         cells.extend([
-            formula_cell(f"M{index}", f"AVERAGE(H{index}:L{index})", 4),
-            formula_cell(f"N{index}", f"MEDIAN(H{index}:L{index})", 4),
-            formula_cell(f"O{index}", f"MIN(H{index}:L{index})", 4),
-            formula_cell(f"P{index}", f"MAX(H{index}:L{index})", 4),
-            formula_cell(f"Q{index}", f"STDEV.S(H{index}:L{index})", 4),
-            formula_cell(f"R{index}", f'IFERROR(Q{index}/M{index},"")', 5),
+            formula_cell(f"M{index}", f"AVERAGE(H{index}:L{index})"),
+            formula_cell(f"N{index}", f"MEDIAN(H{index}:L{index})"),
+            formula_cell(f"O{index}", f"MIN(H{index}:L{index})"),
+            formula_cell(f"P{index}", f"MAX(H{index}:L{index})"),
+            formula_cell(f"Q{index}", f"STDEV.S(H{index}:L{index})"),
+            formula_cell(f"R{index}", f'IFERROR(Q{index}/M{index},"")'),
         ])
         baseline_row = baseline_rows.get((run.model_kind, run.model, run.dtype, run.dispatcher, run.micro_batch_size, run.repeat))
-        cells.append(formula_cell(f"S{index}", f'IFERROR(M{index}/M{baseline_row}-1,"")' if baseline_row else '""', 5))
+        cells.append(formula_cell(f"S{index}", f'IFERROR(M{index}/M{baseline_row}-1,"")' if baseline_row else '""'))
         alltoall_row = alltoall_rows.get((run.model_kind, run.model, run.dtype, run.case_name, run.micro_batch_size, run.repeat))
-        cells.append(formula_cell(f"T{index}", f'IFERROR(M{index}/M{alltoall_row}-1,"")' if run.model_kind == "expert" and alltoall_row else '""', 5))
+        cells.append(formula_cell(f"T{index}", f'IFERROR(M{index}/M{alltoall_row}-1,"")' if run.model_kind == "expert" and alltoall_row else '""'))
         summary_rows.append(cells)
 
     sample_headers = [
         "Run Time", "Model Type", "Model", "DType", "Dispatcher", "Case", "Repeat", "MBS",
         "Iteration", "Step Time (ms)", "Global Batch Size", "Sequence Length", "Throughput (tokens/s)", "Result Directory",
     ]
-    sample_rows = [[inline_string_cell(f"{column_name(index)}1", header, 3) for index, header in enumerate(sample_headers)]]
+    sample_rows = [[inline_string_cell(f"{column_name(index)}1", header) for index, header in enumerate(sample_headers)]]
     for run in runs:
         for sample in run.samples:
             row = len(sample_rows) + 1
@@ -418,28 +417,21 @@ def write_workbook(runs: list[Run], run_time: str, output_path: Path) -> None:
                 inline_string_cell(f"C{row}", run.model), inline_string_cell(f"D{row}", run.dtype),
                 inline_string_cell(f"E{row}", run.dispatcher), inline_string_cell(f"F{row}", run.case_name),
                 number_cell(f"G{row}", run.repeat), number_cell(f"H{row}", run.micro_batch_size),
-                number_cell(f"I{row}", sample.iteration), number_cell(f"J{row}", sample.step_time_ms, 4),
+                number_cell(f"I{row}", sample.iteration), number_cell(f"J{row}", sample.step_time_ms),
                 number_cell(f"K{row}", run.global_batch_size), number_cell(f"L{row}", run.sequence_length),
-                number_cell(f"M{row}", sample.tokens_per_second, 4), inline_string_cell(f"N{row}", run.result_dir),
+                number_cell(f"M{row}", sample.tokens_per_second), inline_string_cell(f"N{row}", run.result_dir),
             ]
             sample_rows.append(values)
 
     summary_xml = make_sheet_xml(
         summary_rows,
         max_column=20,
-        max_row=max(4, len(summary_rows)),
-        merges=("A1:T1", "A2:T2"),
-        widths=tuple((index, width) for index, width in enumerate((12, 24, 10, 13, 11, 8, 8, 13, 13, 13, 13, 13, 14, 14, 14, 14, 14, 11, 14, 15))),
-        frozen_rows=4,
-        row_heights=((1, 28), (4, 30)),
+        max_row=max(1, len(summary_rows)),
     )
     samples_xml = make_sheet_xml(
         sample_rows,
         max_column=14,
         max_row=max(1, len(sample_rows)),
-        widths=tuple((index, width) for index, width in enumerate((20, 12, 24, 10, 13, 11, 8, 8, 10, 16, 17, 16, 22, 72))),
-        frozen_rows=1,
-        row_heights=((1, 30),),
     )
     output_path.parent.mkdir(parents=True, exist_ok=True)
     with zipfile.ZipFile(output_path, "w", compression=zipfile.ZIP_DEFLATED) as archive:

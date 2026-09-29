@@ -27,7 +27,7 @@ const DEFAULT_RESULTS_ROOT = path.join(
 );
 const SAMPLE_ITERATIONS = [5, 6, 7, 8, 9];
 const RUN_NAME_PATTERN =
-  /^(dense|expert)-(default|alltoall|hybridep)-(baseline|offload)(?:-mbs(\d+))?-r(\d+)$/;
+  /^(dense|expert)-(default|alltoall|hybridep)-(baseline|offload-mlp|offload-attn-mlp)(?:-mbs(\d+))?-r(\d+)$/;
 const ITERATION_PATTERN =
   /iteration\s+(\d+)\s*\/\s*\d+\s*\|.*?elapsed time per iteration \(ms\):\s*([\d.]+)/i;
 
@@ -212,7 +212,7 @@ async function parseRun(configPath) {
 function sortRuns(left, right) {
   const modelOrder = { dense: 0, expert: 1 };
   const dispatcherOrder = { default: 0, alltoall: 1, hybridep: 2 };
-  const caseOrder = { baseline: 0, offload: 1 };
+  const caseOrder = { baseline: 0, "offload-mlp": 1, "offload-attn-mlp": 2 };
   return (
     modelOrder[left.modelKind] - modelOrder[right.modelKind] ||
     dispatcherOrder[left.dispatcher] - dispatcherOrder[right.dispatcher] ||

@@ -41,7 +41,7 @@ from collect_mlp_offload_results import (
 MIN_GPU_UTILIZATION_SAMPLES = 10
 GPU_UTILIZATION_SAMPLES_TO_AVERAGE = 4
 RUN_NAME_PATTERN = re.compile(
-    r"^(dense|expert)-(default|alltoall|hybridep)-(baseline|offload)(?:-mbs(\d+))?-r\d+$"
+    r"^(dense|expert)-(default|alltoall|hybridep)-(baseline|offload-mlp|offload-attn-mlp)(?:-mbs(\d+))?-r\d+$"
 )
 HEADERS = (
     "model",
@@ -50,8 +50,10 @@ HEADERS = (
     "dtype",
     "type",
     "baseline (TFlops)",
-    "offload (TFlops)",
-    "offload 相对于 baseline 的性能下降幅度",
+    "offload-mlp (TFlops)",
+    "offload-attn-mlp (TFlops)",
+    "offload-mlp 相对于 baseline 的性能下降幅度",
+    "offload-attn-mlp 相对于 baseline 的性能下降幅度",
 )
 
 
@@ -78,7 +80,7 @@ class Candidate:
 
 @dataclass(frozen=True)
 class ThroughputRow:
-    """Comparison of the latest baseline and offload runs."""
+    """Comparison of the latest baseline and both offload runs."""
 
     model: str
     dispatcher: str
@@ -86,12 +88,16 @@ class ThroughputRow:
     dtype: str
     model_type: str
     baseline_tflops: float
-    offload_tflops: float
-    performance_drop: float
+    offload_mlp_tflops: float
+    offload_attn_mlp_tflops: float
+    offload_mlp_performance_drop: float
+    offload_attn_mlp_performance_drop: float
     baseline_run_time: str
-    offload_run_time: str
+    offload_mlp_run_time: str
+    offload_attn_mlp_run_time: str
     baseline_samples: tuple[float, ...]
-    offload_samples: tuple[float, ...]
+    offload_mlp_samples: tuple[float, ...]
+    offload_attn_mlp_samples: tuple[float, ...]
 
 
 def read_json(path: Path) -> dict[str, object]:
@@ -183,7 +189,10 @@ def discover_rows(results_root: Path, model_family: str) -> list[ThroughputRow]:
             continue
         identity = parse_identity(config, config_path)
         key = (identity.model, identity.dispatcher, identity.mbs, identity.dtype, identity.model_type)
-        case_runs = groups.setdefault(key, {"baseline": {}, "offload": {}})
+        case_runs = groups.setdefault(
+            key,
+            {"baseline": {}, "offload-mlp": {}, "offload-attn-mlp": {}},
+        )
         target = case_runs[identity.case_name]
         if identity.run_time in target:
             raise ValueError(f"Duplicate {identity.case_name} run for {key} at {identity.run_time}")
@@ -191,14 +200,21 @@ def discover_rows(results_root: Path, model_family: str) -> list[ThroughputRow]:
 
     rows: list[ThroughputRow] = []
     for key, case_runs in groups.items():
-        if not case_runs["baseline"] or not case_runs["offload"]:
-            raise ValueError(f"Missing baseline or offload run for {key}")
+        if (
+            not case_runs["baseline"]
+            or not case_runs["offload-mlp"]
+            or not case_runs["offload-attn-mlp"]
+        ):
+            raise ValueError(f"Missing baseline or offload case run for {key}")
         baseline_time = sorted(case_runs["baseline"])[-1]
-        offload_time = sorted(case_runs["offload"])[-1]
+        offload_mlp_time = sorted(case_runs["offload-mlp"])[-1]
+        offload_attn_mlp_time = sorted(case_runs["offload-attn-mlp"])[-1]
         baseline = case_runs["baseline"][baseline_time]
-        offload = case_runs["offload"][offload_time]
+        offload_mlp = case_runs["offload-mlp"][offload_mlp_time]
+        offload_attn_mlp = case_runs["offload-attn-mlp"][offload_attn_mlp_time]
         baseline_mean, baseline_samples = read_mean_tflops(baseline.result_dir)
-        offload_mean, offload_samples = read_mean_tflops(offload.result_dir)
+        offload_mlp_mean, offload_mlp_samples = read_mean_tflops(offload_mlp.result_dir)
+        offload_attn_mlp_mean, offload_attn_mlp_samples = read_mean_tflops(offload_attn_mlp.result_dir)
         if baseline_mean <= 0:
             raise ValueError(f"Baseline mean TFlops must be positive for {key} at {baseline_time}")
         rows.append(
@@ -209,12 +225,16 @@ def discover_rows(results_root: Path, model_family: str) -> list[ThroughputRow]:
                 dtype=baseline.identity.dtype,
                 model_type=baseline.identity.model_type,
                 baseline_tflops=baseline_mean,
-                offload_tflops=offload_mean,
-                performance_drop=(baseline_mean - offload_mean) / baseline_mean,
+                offload_mlp_tflops=offload_mlp_mean,
+                offload_attn_mlp_tflops=offload_attn_mlp_mean,
+                offload_mlp_performance_drop=(baseline_mean - offload_mlp_mean) / baseline_mean,
+                offload_attn_mlp_performance_drop=(baseline_mean - offload_attn_mlp_mean) / baseline_mean,
                 baseline_run_time=baseline_time,
-                offload_run_time=offload_time,
+                offload_mlp_run_time=offload_mlp_time,
+                offload_attn_mlp_run_time=offload_attn_mlp_time,
                 baseline_samples=baseline_samples,
-                offload_samples=offload_samples,
+                offload_mlp_samples=offload_mlp_samples,
+                offload_attn_mlp_samples=offload_attn_mlp_samples,
             )
         )
     if not rows:
@@ -246,7 +266,7 @@ def workbook_rels_xml() -> str:
 def write_workbook(rows: list[ThroughputRow], output_path: Path) -> None:
     """Write throughput rows to a formatted XLSX workbook."""
 
-    sheet_rows = [[inline_string_cell(f"{column_name(index)}1", header, 3) for index, header in enumerate(HEADERS)]]
+    sheet_rows = [[inline_string_cell(f"{column_name(index)}1", header) for index, header in enumerate(HEADERS)]]
     for row_number, row in enumerate(rows, start=2):
         sheet_rows.append([
             inline_string_cell(f"A{row_number}", row.model),
@@ -254,17 +274,16 @@ def write_workbook(rows: list[ThroughputRow], output_path: Path) -> None:
             number_cell(f"C{row_number}", row.mbs),
             inline_string_cell(f"D{row_number}", row.dtype),
             inline_string_cell(f"E{row_number}", row.model_type),
-            number_cell(f"F{row_number}", row.baseline_tflops, 4),
-            number_cell(f"G{row_number}", row.offload_tflops, 4),
-            number_cell(f"H{row_number}", row.performance_drop, 5),
+            number_cell(f"F{row_number}", row.baseline_tflops),
+            number_cell(f"G{row_number}", row.offload_mlp_tflops),
+            number_cell(f"H{row_number}", row.offload_attn_mlp_tflops),
+            number_cell(f"I{row_number}", row.offload_mlp_performance_drop),
+            number_cell(f"J{row_number}", row.offload_attn_mlp_performance_drop),
         ])
     sheet = make_sheet_xml(
         sheet_rows,
-        max_column=8,
+        max_column=10,
         max_row=max(1, len(sheet_rows)),
-        widths=tuple((index, width) for index, width in enumerate((26, 14, 8, 10, 10, 20, 20, 38))),
-        frozen_rows=1,
-        row_heights=((1, 30),),
     )
     content_types = content_types_xml().replace(
         '<Override PartName="/xl/worksheets/sheet2.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>',
@@ -305,12 +324,16 @@ def run_cli(argv: list[str]) -> int:
                     "dtype": row.dtype,
                     "type": row.model_type,
                     "baselineTflops": row.baseline_tflops,
-                    "offloadTflops": row.offload_tflops,
-                    "performanceDrop": row.performance_drop,
+                    "offloadMlpTflops": row.offload_mlp_tflops,
+                    "offloadAttnMlpTflops": row.offload_attn_mlp_tflops,
+                    "offloadMlpPerformanceDrop": row.offload_mlp_performance_drop,
+                    "offloadAttnMlpPerformanceDrop": row.offload_attn_mlp_performance_drop,
                     "baselineRunTime": row.baseline_run_time,
-                    "offloadRunTime": row.offload_run_time,
+                    "offloadMlpRunTime": row.offload_mlp_run_time,
+                    "offloadAttnMlpRunTime": row.offload_attn_mlp_run_time,
                     "baselineSamples": row.baseline_samples,
-                    "offloadSamples": row.offload_samples,
+                    "offloadMlpSamples": row.offload_mlp_samples,
+                    "offloadAttnMlpSamples": row.offload_attn_mlp_samples,
                 }
                 for row in rows
             ],
