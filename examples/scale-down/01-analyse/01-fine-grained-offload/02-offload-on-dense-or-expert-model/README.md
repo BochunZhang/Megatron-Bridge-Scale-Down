@@ -30,14 +30,25 @@
 
 对比 Qwen Dense、Qwen MoE 以及 DeepSeek 的 dense/expert proxy 在 **baseline / offload-mlp / offload-attn-mlp** 三种配置下的性能差异（step time、tokens/s、显存峰值）：
 
-| 模型 | 选择参数 | scope | offload 模块 |
-| --- | --- | --- | --- |
-| Qwen Dense (9B/27B) | `--model qwen --scope dense` | dense MLP + attention | `offload-mlp: [mlp_norm,mlp_act]`; `offload-attn-mlp: [mlp_norm,mlp_act,attn_norm,core_attn,attn_proj]` |
-| Qwen MoE (35B-A3B, 16 层, 64 experts) | `--model qwen --scope expert` | expert MLP + attention | `offload-mlp: [mlp_norm,expert_fc1,moe_act]`; `offload-attn-mlp` 追加 `[attn_norm,core_attn,attn_proj]` |
-| DeepSeek-V3 dense proxy (4 层, 32 experts) | `--model deepseek --scope dense` | dense MLP + attention | `offload-mlp: [mlp_norm,mlp_act]`; `offload-attn-mlp` 追加 `[attn_norm,qkv_linear,core_attn,attn_proj]` |
-| DeepSeek-V3 expert proxy (4 层, 32 experts) | `--model deepseek --scope expert` | expert MLP + attention | `offload-mlp: [mlp_norm,expert_fc1,moe_act]`; `offload-attn-mlp` 追加 `[attn_norm,qkv_linear,core_attn,attn_proj]` |
+| 模型 | 选择参数 | scope | `baseline` | `offload-mlp` | `offload-attn-mlp` |
+| --- | --- | --- | --- | --- | --- |
+| Qwen Dense (9B/27B) | `--model qwen --scope dense` | dense MLP + attention | 不启用 activation offload | `[mlp_norm,mlp_act]` | `[mlp_norm,mlp_act,attn_norm,core_attn,attn_proj]` |
+| Qwen MoE (35B-A3B, 16 层, 64 experts) | `--model qwen --scope expert` | expert MLP + attention | 不启用 activation offload | `[mlp_norm,expert_fc1,moe_act]` | `[mlp_norm,expert_fc1,moe_act,attn_norm,core_attn,attn_proj]` |
+| DeepSeek-V3 dense proxy (4 层, 32 experts) | `--model deepseek --scope dense` | dense MLP + attention | 不启用 activation offload | `[mlp_norm,mlp_act]` | `[mlp_norm,mlp_act,attn_norm,qkv_linear,core_attn,attn_proj]` |
+| DeepSeek-V3 expert proxy (4 层, 32 experts) | `--model deepseek --scope expert` | expert MLP + attention | 不启用 activation offload | `[mlp_norm,expert_fc1,moe_act]` | `[mlp_norm,expert_fc1,moe_act,attn_norm,qkv_linear,core_attn,attn_proj]` |
 
-MCore 的 `TransformerLayer` 支持 `attn_norm`、`qkv_linear`、`core_attn` 和 `attn_proj`；其中 `attn_proj` 的配置校验要求同时启用 `core_attn`，所以 Qwen 的实际列表包含这个必要依赖。Qwen 的 GatedDeltaNet 路径本身使用独立的 `in_proj`/`out_proj`，不经过标准 SelfAttention 的 qkv/core/attn-proj offload manager，因此 Qwen case 中的 attention offload 只对实际存在的标准 attention 层生效。
+表格中的列表就是传给 MCore `model.offload_modules` 的模块名：
+
+- `mlp_norm`：卸载进入 dense MLP/MoE MLP 前归一化的输入。
+- `mlp_act`：卸载 dense MLP 激活函数的输入/输出 activation。
+- `expert_fc1`：卸载 MoE expert 第一层线性变换的输入。
+- `moe_act`：卸载 MoE expert 激活函数的输入/输出 activation。
+- `attn_norm`：卸载进入 attention 部分归一化的输入。
+- `qkv_linear`：卸载进入标准 attention QKV projection 的输入。
+- `core_attn`：卸载进入标准 attention 核心计算的输入。
+- `attn_proj`：卸载进入标准 attention 输出 projection 的输入。
+
+`baseline` 不设置 `model.fine_grained_activation_offloading`；另外两个 case 开启该选项并使用对应列表。Qwen 的 GatedDeltaNet 使用独立的 `in_proj`/`out_proj`，因此 `qkv_linear` 不加入 Qwen 列表；Qwen 列表中的 `core_attn` 是 MCore 启用 `attn_proj` 所需的依赖，实际 attention offload 只作用于存在的标准 attention 层。
 
 DeepSeek-V3 的两种 proxy 由脚本 override 构造（不再限制 `--scope dense`）：统一设置 `num_layers=4`、`num_moe_experts=32`；dense proxy 令 `moe_layer_freq=[0,0,0,0]`（4 个主 layer 全部走 dense MLP），expert proxy 令 `moe_layer_freq=[1,1,1,1]`（4 个主 layer 全部走 MoE）。脚本不 override MTP 数量，DeepSeek 默认的 1 个 MTP layer 会复用最后一个主 layer 的 dense/expert 类型，因此最终分别得到 5 个 dense layer 或 5 个 expert layer。这些列表值通过 Hydra override 直接传入，而不是按字符串逐层拼接。
 

@@ -1,0 +1,697 @@
+#!/usr/bin/env bash
+# Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# Run one FSDP1 experiment on four local GPUs.
+#
+# Usage:
+#   run_pretrain_fsdp1.sh --model <model> --recipe <recipe> --precision <precision> \
+#       --run-name <run-name> --recompute-granularity <value> \
+#       --recompute-modules <value> --fine-grained-offload <true|false> \
+#       --offload-modules <value> \
+#       [--train-iters <iters>] [--global-batch-size <gbs>] [--micro-batch-size <mbs>] \
+#       [--num-layers <layers>] [--linear-attention-freq <value>] \
+#       [--record-memory-usage <true|false>] [--memory-usage-start-step <step>] \
+#       [--profile-step-start <start>] [--profile-step-end <end>] \
+#       [--profile <nsys|torch>]
+
+set -euo pipefail
+
+export GLOO_SOCKET_IFNAME=eth0
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "${SCRIPT_DIR}/../../../.." && pwd)"
+
+usage() {
+    cat <<'EOF'
+Usage: run_pretrain_fsdp1.sh \
+    --model <model> \
+    --recipe <recipe> \
+    --precision <bf16|fp8mx> \
+    --run-name <run-name> \
+    --recompute-granularity <null|selective|full> \
+    --recompute-method <null|uniform|block> \
+    --recompute-num-layers <null|positive-integer> \
+    --recompute-modules <value> \
+    --fine-grained-offload <true|false> \
+    --offload-modules <value> \
+    [--train-iters <iters>] \
+    [--warmup-steps <iters>] \
+    [--global-batch-size <gbs>] \
+    [--micro-batch-size <mbs>] \
+    [--num-layers <layers>] \
+    [--linear-attention-freq <value>] \
+    [--optimizer-cpu-offload <true|false>] \
+    [--optimizer-offload-fraction <0.0-1.0>] \
+    [--use-torch-optimizer-for-cpu-offload <true|false>] \
+    [--overlap-cpu-optimizer-d2h-h2d <true|false>] \
+    [--seed <seed>] [--num-experts <count>] \
+    [--dispatcher <default|alltoall|hybridep>] \
+    [--record-memory-usage <true|false>] \
+    [--memory-usage-start-step <step>] \
+    [--profile-step-start <start>] \
+    [--profile-step-end <end>] \
+    [--profile <none|nsys|torch>]
+
+The model, recipe, and precision are selected by the caller and are passed
+through without model/precision combination logic. Hydra values such as null,
+selective, [layernorm,mlp], or [expert_fc1,moe_act] are accepted.
+
+Optional training parameters (with defaults):
+    --train-iters         Number of training iterations (default: 10)
+    --warmup-steps        Number of LR warmup iterations (default: 0)
+    --global-batch-size   Global batch size (default: 8)
+    --micro-batch-size    Micro batch size (default: 1)
+    --num-layers          Override model.num_layers
+    --linear-attention-freq  Override model.linear_attention_freq
+    --record-memory-usage    Record CUDA and pinned-host memory byte metrics
+                            (default: false)
+    --memory-usage-start-step
+                            First iteration included after resetting memory peaks
+                            (default: 0)
+    --profile-step-start  Profile start step (default: 7)
+    --profile-step-end    Profile end step (default: 8)
+    --profile <nsys|torch>
+                          Select the profiling backend (omit to disable
+                          profiling entirely):
+                            nsys   Wrap the training command in nsys profile;
+                                   enables NVTX ranges and memory history.
+                            torch  Enable the PyTorch profiler plus NVTX ranges
+                                   and memory history; trace GPU memory with
+                                   nvidia-smi during the run, then replay each
+                                   memory snapshot pickle into a sibling
+                                   per-rank JSON phase report via replay_step.py
+EOF
+}
+
+MODEL=""
+RECIPE=""
+PRECISION=""
+RUN_NAME=""
+RECOMPUTE_GRANULARITY=""
+RECOMPUTE_METHOD="null"
+RECOMPUTE_NUM_LAYERS="null"
+RECOMPUTE_MODULES=""
+FINE_GRAINED_OFFLOAD=""
+OFFLOAD_MODULES=""
+
+# Training parameters with defaults
+TRAIN_ITERS=""
+WARMUP_STEPS=""
+GLOBAL_BATCH_SIZE=""
+MICRO_BATCH_SIZE=""
+NUM_LAYERS=""
+LINEAR_ATTENTION_FREQ=""
+ACTIVATION_STRATEGY=""
+OPTIMIZER_STRATEGY=""
+OPTIMIZER_CPU_OFFLOAD="false"
+OPTIMIZER_OFFLOAD_FRACTION="0.0"
+USE_TORCH_OPTIMIZER_FOR_CPU_OFFLOAD="false"
+OVERLAP_CPU_OPTIMIZER_D2H_H2D="false"
+SEED=""
+NUM_EXPERTS=""
+DISPATCHER="default"
+HYBRIDEP_NUM_SMS="32"
+PROFILE_STEP_START=""
+PROFILE_STEP_END=""
+RECORD_MEMORY_USAGE="${RECORD_MEMORY_USAGE:-false}"
+MEMORY_USAGE_START_STEP="${MEMORY_USAGE_START_STEP:-0}"
+PROFILE="${PROFILE:-none}"
+GPU_MEMORY_TRACE_INTERVAL="${GPU_MEMORY_TRACE_INTERVAL:-1.0}"
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --model)
+            [[ $# -ge 2 ]] || { usage >&2; exit 2; }
+            MODEL="$2"
+            shift 2
+            ;;
+        --recipe)
+            [[ $# -ge 2 ]] || { usage >&2; exit 2; }
+            RECIPE="$2"
+            shift 2
+            ;;
+        --precision)
+            [[ $# -ge 2 ]] || { usage >&2; exit 2; }
+            PRECISION="$2"
+            shift 2
+            ;;
+        --run-name)
+            [[ $# -ge 2 ]] || { usage >&2; exit 2; }
+            RUN_NAME="$2"
+            shift 2
+            ;;
+        --activation-strategy)
+            [[ $# -ge 2 ]] || { usage >&2; exit 2; }
+            ACTIVATION_STRATEGY="$2"
+            shift 2
+            ;;
+        --optimizer-strategy)
+            [[ $# -ge 2 ]] || { usage >&2; exit 2; }
+            OPTIMIZER_STRATEGY="$2"
+            shift 2
+            ;;
+        --recompute-granularity)
+            [[ $# -ge 2 ]] || { usage >&2; exit 2; }
+            RECOMPUTE_GRANULARITY="$2"
+            shift 2
+            ;;
+        --recompute-method)
+            [[ $# -ge 2 ]] || { usage >&2; exit 2; }
+            RECOMPUTE_METHOD="$2"
+            shift 2
+            ;;
+        --recompute-num-layers)
+            [[ $# -ge 2 ]] || { usage >&2; exit 2; }
+            RECOMPUTE_NUM_LAYERS="$2"
+            shift 2
+            ;;
+        --recompute-modules)
+            [[ $# -ge 2 ]] || { usage >&2; exit 2; }
+            RECOMPUTE_MODULES="$2"
+            shift 2
+            ;;
+        --fine-grained-offload)
+            [[ $# -ge 2 ]] || { usage >&2; exit 2; }
+            FINE_GRAINED_OFFLOAD="$2"
+            shift 2
+            ;;
+        --offload-modules)
+            [[ $# -ge 2 ]] || { usage >&2; exit 2; }
+            OFFLOAD_MODULES="$2"
+            shift 2
+            ;;
+        --train-iters)
+            [[ $# -ge 2 ]] || { usage >&2; exit 2; }
+            TRAIN_ITERS="$2"
+            shift 2
+            ;;
+        --warmup-steps)
+            [[ $# -ge 2 ]] || { usage >&2; exit 2; }
+            WARMUP_STEPS="$2"
+            shift 2
+            ;;
+        --global-batch-size)
+            [[ $# -ge 2 ]] || { usage >&2; exit 2; }
+            GLOBAL_BATCH_SIZE="$2"
+            shift 2
+            ;;
+        --micro-batch-size)
+            [[ $# -ge 2 ]] || { usage >&2; exit 2; }
+            MICRO_BATCH_SIZE="$2"
+            shift 2
+            ;;
+        --num-layers)
+            [[ $# -ge 2 ]] || { usage >&2; exit 2; }
+            NUM_LAYERS="$2"
+            shift 2
+            ;;
+        --linear-attention-freq)
+            [[ $# -ge 2 ]] || { usage >&2; exit 2; }
+            LINEAR_ATTENTION_FREQ="$2"
+            shift 2
+            ;;
+        --optimizer-cpu-offload)
+            [[ $# -ge 2 ]] || { usage >&2; exit 2; }
+            OPTIMIZER_CPU_OFFLOAD="$2"
+            shift 2
+            ;;
+        --optimizer-offload-fraction)
+            [[ $# -ge 2 ]] || { usage >&2; exit 2; }
+            OPTIMIZER_OFFLOAD_FRACTION="$2"
+            shift 2
+            ;;
+        --use-torch-optimizer-for-cpu-offload)
+            [[ $# -ge 2 ]] || { usage >&2; exit 2; }
+            USE_TORCH_OPTIMIZER_FOR_CPU_OFFLOAD="$2"
+            shift 2
+            ;;
+        --overlap-cpu-optimizer-d2h-h2d)
+            [[ $# -ge 2 ]] || { usage >&2; exit 2; }
+            OVERLAP_CPU_OPTIMIZER_D2H_H2D="$2"
+            shift 2
+            ;;
+        --seed)
+            [[ $# -ge 2 ]] || { usage >&2; exit 2; }
+            SEED="$2"
+            shift 2
+            ;;
+        --num-experts)
+            [[ $# -ge 2 ]] || { usage >&2; exit 2; }
+            NUM_EXPERTS="$2"
+            shift 2
+            ;;
+        --dispatcher)
+            [[ $# -ge 2 ]] || { usage >&2; exit 2; }
+            DISPATCHER="$2"
+            shift 2
+            ;;
+        --hybridep-num-sms)
+            [[ $# -ge 2 ]] || { usage >&2; exit 2; }
+            HYBRIDEP_NUM_SMS="$2"
+            shift 2
+            ;;
+        --record-memory-usage)
+            [[ $# -ge 2 ]] || { usage >&2; exit 2; }
+            RECORD_MEMORY_USAGE="$2"
+            shift 2
+            ;;
+        --memory-usage-start-step)
+            [[ $# -ge 2 ]] || { usage >&2; exit 2; }
+            MEMORY_USAGE_START_STEP="$2"
+            shift 2
+            ;;
+        --profile-step-start)
+            [[ $# -ge 2 ]] || { usage >&2; exit 2; }
+            PROFILE_STEP_START="$2"
+            shift 2
+            ;;
+        --profile-step-end)
+            [[ $# -ge 2 ]] || { usage >&2; exit 2; }
+            PROFILE_STEP_END="$2"
+            shift 2
+            ;;
+        --profile)
+            [[ $# -ge 2 ]] || { usage >&2; exit 2; }
+            PROFILE="$2"
+            shift 2
+            ;;
+        -h|--help)
+            usage
+            exit 0
+            ;;
+        *)
+            echo "Unknown argument: $1" >&2
+            usage >&2
+            exit 2
+            ;;
+    esac
+done
+
+for required in MODEL RECIPE PRECISION RUN_NAME RECOMPUTE_GRANULARITY RECOMPUTE_MODULES FINE_GRAINED_OFFLOAD OFFLOAD_MODULES; do
+    if [[ -z "${!required}" ]]; then
+        echo "Missing required option for ${required}" >&2
+        usage >&2
+        exit 2
+    fi
+done
+
+# Apply defaults for optional training parameters
+TRAIN_ITERS="${TRAIN_ITERS:-10}"
+WARMUP_STEPS="${WARMUP_STEPS:-0}"
+GLOBAL_BATCH_SIZE="${GLOBAL_BATCH_SIZE:-8}"
+MICRO_BATCH_SIZE="${MICRO_BATCH_SIZE:-1}"
+PROFILE_STEP_START="${PROFILE_STEP_START:-7}"
+PROFILE_STEP_END="${PROFILE_STEP_END:-8}"
+
+MODEL_ID="${MODEL}"
+RESULT_MODEL_NAME="${MODEL}"
+
+case "${PRECISION}" in
+    bf16|fp8mx) ;;
+    *) echo "Unsupported precision: ${PRECISION}" >&2; exit 2 ;;
+esac
+case "${RECOMPUTE_GRANULARITY}" in
+    null|selective|full) ;;
+    *) echo "Unsupported recompute granularity: ${RECOMPUTE_GRANULARITY}" >&2; exit 2 ;;
+esac
+case "${RECOMPUTE_METHOD}" in
+    null|uniform|block) ;;
+    *) echo "Unsupported recompute method: ${RECOMPUTE_METHOD}" >&2; exit 2 ;;
+esac
+if [[ "${RECOMPUTE_GRANULARITY}" == full ]]; then
+    if [[ "${RECOMPUTE_METHOD}" == null || ! "${RECOMPUTE_NUM_LAYERS}" =~ ^[1-9][0-9]*$ ]]; then
+        echo "Full recompute requires a method and a positive recompute-num-layers" >&2
+        exit 2
+    fi
+fi
+case "${FINE_GRAINED_OFFLOAD}" in
+    true|false) ;;
+    *) echo "fine-grained offload must be true or false: ${FINE_GRAINED_OFFLOAD}" >&2; exit 2 ;;
+esac
+case "${RECORD_MEMORY_USAGE}" in
+    true|false) ;;
+    *) echo "record-memory-usage must be true or false: ${RECORD_MEMORY_USAGE}" >&2; exit 2 ;;
+esac
+for boolean_name in OPTIMIZER_CPU_OFFLOAD USE_TORCH_OPTIMIZER_FOR_CPU_OFFLOAD OVERLAP_CPU_OPTIMIZER_D2H_H2D; do
+    case "${!boolean_name}" in
+        true|false) ;;
+        *) echo "${boolean_name} must be true or false" >&2; exit 2 ;;
+    esac
+done
+case "${DISPATCHER}" in
+    default|alltoall|hybridep) ;;
+    *) echo "dispatcher must be default, alltoall, or hybridep" >&2; exit 2 ;;
+esac
+if ! [[ "${OPTIMIZER_OFFLOAD_FRACTION}" =~ ^(0(\.[0-9]+)?|1(\.0+)?)$ ]]; then
+    echo "optimizer-offload-fraction must be between 0.0 and 1.0" >&2
+    exit 2
+fi
+if ! [[ "${MEMORY_USAGE_START_STEP}" =~ ^[0-9]+$ ]]; then
+    echo "memory-usage-start-step must be a non-negative integer" >&2
+    exit 2
+fi
+
+RESULTS_ROOT="${RESULTS_ROOT:-${REPO_ROOT}/results/01-analyse/03-megatron-vs-deepspeed}"
+RUN_TIME="${RUN_TIME:-$(date +%Y%m%d-%H%M%S)}"
+RESULT_DIR="${RESULTS_ROOT}/${RESULT_MODEL_NAME}/${PRECISION}/${RUN_NAME}/${RUN_TIME}"
+HF_CACHE="${REPO_ROOT}/.cache/huggingface"
+NEMO_CACHE="${REPO_ROOT}/.cache/nemo"
+UV_CACHE="${REPO_ROOT}/.cache/uv"
+MASTER_PORT="${MASTER_PORT:-29501}"
+
+if ! [[ "${TRAIN_ITERS}" =~ ^[0-9]+$ && "${WARMUP_STEPS}" =~ ^[0-9]+$ && "${GLOBAL_BATCH_SIZE}" =~ ^[0-9]+$ && "${MICRO_BATCH_SIZE}" =~ ^[0-9]+$ ]]; then
+    echo "Training sizes must be non-negative integers" >&2
+    exit 2
+fi
+if (( WARMUP_STEPS > TRAIN_ITERS )); then
+    echo "warmup-steps must not exceed train-iters" >&2
+    exit 2
+fi
+if (( TRAIN_ITERS < 1 || GLOBAL_BATCH_SIZE < 1 || MICRO_BATCH_SIZE < 1 )); then
+    echo "Training sizes must be positive" >&2
+    exit 2
+fi
+if [[ -n "${NUM_LAYERS}" ]] && ! [[ "${NUM_LAYERS}" =~ ^[1-9][0-9]*$ ]]; then
+    echo "num-layers must be a positive integer" >&2
+    exit 2
+fi
+if [[ -n "${SEED}" ]] && ! [[ "${SEED}" =~ ^[0-9]+$ ]]; then
+    echo "seed must be a non-negative integer" >&2
+    exit 2
+fi
+if [[ -n "${NUM_EXPERTS}" ]] && ! [[ "${NUM_EXPERTS}" =~ ^[1-9][0-9]*$ ]]; then
+    echo "num-experts must be a positive integer" >&2
+    exit 2
+fi
+case "${PROFILE}" in
+    none|nsys|torch) ;;
+    *) echo "--profile must be one of none|nsys|torch: ${PROFILE}" >&2; exit 2 ;;
+esac
+if [[ "${PROFILE}" != none ]]; then
+    if ! [[ "${PROFILE_STEP_START}" =~ ^[0-9]+$ && "${PROFILE_STEP_END}" =~ ^[0-9]+$ ]] || (( PROFILE_STEP_END <= PROFILE_STEP_START || PROFILE_STEP_END > TRAIN_ITERS )); then
+        echo "Require PROFILE_STEP_START < PROFILE_STEP_END <= TRAIN_ITERS when --profile is enabled" >&2
+        exit 2
+    fi
+fi
+
+mkdir -p "${RESULT_DIR}/memory" "${RESULT_DIR}/rank_logs" "${RESULT_DIR}/profile" \
+    "${RESULT_DIR}/gpu_memory" \
+    "${HF_CACHE}" "${NEMO_CACHE}/datasets" "${NEMO_CACHE}/models" "${UV_CACHE}"
+
+export HF_HOME="${HF_CACHE}"
+export HF_HUB_CACHE="${HF_CACHE}"
+export TRANSFORMERS_CACHE="${HF_CACHE}"
+export NEMO_HOME="${NEMO_CACHE}"
+export NEMO_DATASETS_CACHE="${NEMO_CACHE}/datasets"
+export NEMO_MODELS_CACHE="${NEMO_CACHE}/models"
+export UV_CACHE_DIR="${UV_CACHE}"
+export NVTE_CPU_OFFLOAD_V1="1"
+export TORCH_NCCL_AVOID_RECORD_STREAMS="1"
+export NVLINK_DOMAIN_SIZE="72"
+export PYTORCH_CUDA_ALLOC_CONF="expandable_segments:True"
+export NCCL_NVLS_ENABLE="0"
+export NCCL_DEBUG="WARN"
+export NCCL_GRAPH_REGISTER="0"
+export TOKENIZERS_PARALLELISM="false"
+export RESULT_DIR MODEL MODEL_ID RESULT_MODEL_NAME PRECISION RUN_NAME RUN_TIME RECIPE
+export ACTIVATION_STRATEGY OPTIMIZER_STRATEGY TRAIN_ITERS WARMUP_STEPS GLOBAL_BATCH_SIZE MICRO_BATCH_SIZE
+export RECOMPUTE_GRANULARITY RECOMPUTE_METHOD RECOMPUTE_NUM_LAYERS RECOMPUTE_MODULES
+export FINE_GRAINED_OFFLOAD OFFLOAD_MODULES OPTIMIZER_CPU_OFFLOAD OPTIMIZER_OFFLOAD_FRACTION
+export USE_TORCH_OPTIMIZER_FOR_CPU_OFFLOAD OVERLAP_CPU_OPTIMIZER_D2H_H2D DISPATCHER HYBRIDEP_NUM_SMS
+export PROFILE RECORD_MEMORY_USAGE MEMORY_USAGE_START_STEP
+
+# Derive profiling settings from the selected backend. Bridge's
+# ProfilingConfig.finalize() forbids enabling the nsys and PyTorch profilers at
+# the same time, so exactly one of USE_NSYS_PROFILER/USE_PYTORCH_PROFILER may
+# be true. In torch mode, logger.tensorboard_dir is pointed into the result dir
+# so the profiler's trace_handler (which writes "{tensorboard_dir}/../torch_profile")
+# exports chrome traces to ${RESULT_DIR}/profile/torch_profile.
+case "${PROFILE}" in
+    nsys)
+        USE_NSYS_PROFILER="true"
+        USE_PYTORCH_PROFILER="false"
+        RECORD_MEMORY_HISTORY="true"
+        NVTX_RANGES="true"
+        TENSORBOARD_DIR="null"
+        ;;
+    torch)
+        USE_NSYS_PROFILER="false"
+        USE_PYTORCH_PROFILER="true"
+        RECORD_MEMORY_HISTORY="true"
+        NVTX_RANGES="true"
+        TENSORBOARD_DIR="${RESULT_DIR}/profile/tensorboard"
+        ;;
+    *)
+        USE_NSYS_PROFILER="false"
+        USE_PYTORCH_PROFILER="false"
+        RECORD_MEMORY_HISTORY="false"
+        NVTX_RANGES="false"
+        TENSORBOARD_DIR="null"
+        ;;
+esac
+
+OVERRIDES=(
+    "model.seq_length=4096"
+    "dataset.seq_length=4096"
+    "dataset.blend=null"
+    "train.train_iters=${TRAIN_ITERS}"
+    "train.global_batch_size=${GLOBAL_BATCH_SIZE}"
+    "train.micro_batch_size=${MICRO_BATCH_SIZE}"
+    "validation.eval_iters=0"
+    "validation.eval_interval=0"
+    "scheduler.lr_warmup_iters=${WARMUP_STEPS}"
+    "dist.use_megatron_fsdp=true"
+    "ddp.use_megatron_fsdp=true"
+    "ddp.use_distributed_optimizer=true"
+    "optimizer.use_distributed_optimizer=true"
+    "ddp.data_parallel_sharding_strategy=optim_grads_params"
+    "ddp.average_in_collective=false"
+    "checkpoint.ckpt_format=fsdp_dtensor"
+    "model.recompute_granularity=${RECOMPUTE_GRANULARITY}"
+    "model.recompute_method=${RECOMPUTE_METHOD}"
+    "model.recompute_num_layers=${RECOMPUTE_NUM_LAYERS}"
+    "model.recompute_modules=${RECOMPUTE_MODULES}"
+    "model.fine_grained_activation_offloading=${FINE_GRAINED_OFFLOAD}"
+    "model.offload_modules=${OFFLOAD_MODULES}"
+    "model.cuda_graph_impl=none"
+    "model.cuda_graph_scope=null"
+    "model.cuda_graph_modules=[]"
+    "model.moe_shared_expert_overlap=false"
+    "optimizer.optimizer_cpu_offload=${OPTIMIZER_CPU_OFFLOAD}"
+    "optimizer.optimizer_offload_fraction=${OPTIMIZER_OFFLOAD_FRACTION}"
+    "optimizer.use_torch_optimizer_for_cpu_offload=${USE_TORCH_OPTIMIZER_FOR_CPU_OFFLOAD}"
+    "optimizer.overlap_cpu_optimizer_d2h_h2d=${OVERLAP_CPU_OPTIMIZER_D2H_H2D}"
+    "checkpoint.save=null"
+    "checkpoint.load=null"
+    "logger.log_interval=1"
+    "logger.log_throughput=true"
+    "logger.tensorboard_dir=${TENSORBOARD_DIR}"
+    "logger.save_config_filepath=${RESULT_DIR}/config.yaml"
+    "profiling.use_pytorch_profiler=${USE_PYTORCH_PROFILER}"
+    "profiling.use_nsys_profiler=${USE_NSYS_PROFILER}"
+    "profiling.profile_step_start=${PROFILE_STEP_START}"
+    "profiling.profile_step_end=${PROFILE_STEP_END}"
+    "profiling.profile_ranks=[0,1,2,3]"
+    "profiling.record_memory_history=${RECORD_MEMORY_HISTORY}"
+    "profiling.memory_snapshot_path=${RESULT_DIR}/memory/snapshot.pickle"
+    "profiling.record_memory_usage=${RECORD_MEMORY_USAGE}"
+    "profiling.memory_usage_start_step=${MEMORY_USAGE_START_STEP}"
+    "profiling.nvtx_ranges=${NVTX_RANGES}"
+)
+if [[ -n "${NUM_LAYERS}" ]]; then
+    OVERRIDES+=("model.num_layers=${NUM_LAYERS}")
+fi
+if [[ -n "${LINEAR_ATTENTION_FREQ}" ]]; then
+    OVERRIDES+=("model.linear_attention_freq=${LINEAR_ATTENTION_FREQ}")
+fi
+if [[ -n "${SEED}" ]]; then
+    OVERRIDES+=("rng.seed=${SEED}" "dataset.random_seed=${SEED}")
+fi
+if [[ -n "${NUM_EXPERTS}" ]]; then
+    OVERRIDES+=("model.num_moe_experts=${NUM_EXPERTS}")
+fi
+case "${DISPATCHER}" in
+    alltoall)
+        OVERRIDES+=(
+            "model.moe_token_dispatcher_type=alltoall"
+            "model.moe_flex_dispatcher_backend=null"
+            "model.moe_flex_dispatcher_num_sms=null"
+        )
+        ;;
+    hybridep)
+        OVERRIDES+=(
+            "model.moe_token_dispatcher_type=flex"
+            "model.moe_flex_dispatcher_backend=hybridep"
+            "model.moe_flex_dispatcher_num_sms=${HYBRIDEP_NUM_SMS}"
+        )
+        ;;
+esac
+
+COMMAND=(
+    uv run --no-sync python -m torch.distributed.run
+    --standalone
+    --nproc_per_node=4
+    --master_port="${MASTER_PORT}"
+    --log_dir="${RESULT_DIR}/rank_logs"
+    --redirects=3
+    --tee=3
+    scripts/training/run_recipe.py
+    --recipe "${RECIPE}"
+    --step-func llm_step
+    "${OVERRIDES[@]}"
+)
+COMMAND_TEXT="${COMMAND[*]}"
+export COMMAND_TEXT
+
+uv run --no-sync python -c 'import json, os, re; pattern = re.compile(r"(^|_)(TOKEN|SECRET|PASSWORD|PASSWD|API_KEY|ACCESS_KEY|SECRET_KEY|PRIVATE_KEY|AUTHORIZATION)(_|$)", re.I); root = os.environ["RESULT_DIR"]; env = {k: ("[REDACTED]" if pattern.search(k) else v) for k, v in sorted(os.environ.items())}; json.dump(env, open(os.path.join(root, "environment.json"), "w"), indent=2, sort_keys=True); open(os.path.join(root, "command.txt"), "w").write(os.environ["COMMAND_TEXT"] + "\n"); config = {"model": os.environ["MODEL"], "model_id": os.environ["MODEL_ID"], "precision": os.environ["PRECISION"], "profile": os.environ["PROFILE"], "run_name": os.environ["RUN_NAME"], "run_time": os.environ["RUN_TIME"], "recipe": os.environ["RECIPE"], "result_dir": root, "profile_ranks": [0, 1, 2, 3], "cache_paths": {"hf": env["HF_HOME"], "nemo": env["NEMO_HOME"]}, "activation_strategy": os.environ["ACTIVATION_STRATEGY"], "optimizer_strategy": os.environ["OPTIMIZER_STRATEGY"], "train_iters": int(os.environ["TRAIN_ITERS"]), "warmup_steps": int(os.environ["WARMUP_STEPS"]), "global_batch_size": int(os.environ["GLOBAL_BATCH_SIZE"]), "micro_batch_size": int(os.environ["MICRO_BATCH_SIZE"]), "sequence_length": 4096, "data_parallel_sharding_strategy": "optim_grads_params", "recompute_granularity": os.environ["RECOMPUTE_GRANULARITY"], "recompute_method": os.environ["RECOMPUTE_METHOD"], "recompute_num_layers": os.environ["RECOMPUTE_NUM_LAYERS"], "recompute_modules": os.environ["RECOMPUTE_MODULES"], "fine_grained_offload": os.environ["FINE_GRAINED_OFFLOAD"] == "true", "offload_modules": os.environ["OFFLOAD_MODULES"], "optimizer_cpu_offload": os.environ["OPTIMIZER_CPU_OFFLOAD"] == "true", "optimizer_offload_fraction": float(os.environ["OPTIMIZER_OFFLOAD_FRACTION"]), "use_torch_optimizer_for_cpu_offload": os.environ["USE_TORCH_OPTIMIZER_FOR_CPU_OFFLOAD"] == "true", "overlap_cpu_optimizer_d2h_h2d": os.environ["OVERLAP_CPU_OPTIMIZER_D2H_H2D"] == "true", "dispatcher": os.environ["DISPATCHER"], "record_memory_usage": os.environ["RECORD_MEMORY_USAGE"] == "true", "memory_usage_start_step": int(os.environ["MEMORY_USAGE_START_STEP"]), "cli": os.environ["COMMAND_TEXT"]}; json.dump(config, open(os.path.join(root, "config.json"), "w"), indent=2, sort_keys=True)'
+
+printf 'model=%s precision=%s run_name=%s run_time=%s\n' "${MODEL}" "${PRECISION}" "${RUN_NAME}" "${RUN_TIME}" | tee "${RESULT_DIR}/run_info.txt"
+printf 'train_iters=%s global_batch_size=%s micro_batch_size=%s\n' "${TRAIN_ITERS}" "${GLOBAL_BATCH_SIZE}" "${MICRO_BATCH_SIZE}" | tee -a "${RESULT_DIR}/run_info.txt"
+printf 'activation_strategy=%s optimizer_strategy=%s sharding=optim_grads_params warmup_steps=%s\n' \
+    "${ACTIVATION_STRATEGY}" "${OPTIMIZER_STRATEGY}" "${WARMUP_STEPS}" | tee -a "${RESULT_DIR}/run_info.txt"
+printf 'recompute_granularity=%s recompute_method=%s recompute_num_layers=%s recompute_modules=%s fine_grained_offload=%s offload_modules=%s\n' \
+    "${RECOMPUTE_GRANULARITY}" "${RECOMPUTE_METHOD}" "${RECOMPUTE_NUM_LAYERS}" \
+    "${RECOMPUTE_MODULES}" "${FINE_GRAINED_OFFLOAD}" "${OFFLOAD_MODULES}" | tee -a "${RESULT_DIR}/run_info.txt"
+printf 'optimizer_cpu_offload=%s optimizer_offload_fraction=%s use_torch_optimizer_for_cpu_offload=%s overlap_cpu_optimizer_d2h_h2d=%s\n' \
+    "${OPTIMIZER_CPU_OFFLOAD}" "${OPTIMIZER_OFFLOAD_FRACTION}" \
+    "${USE_TORCH_OPTIMIZER_FOR_CPU_OFFLOAD}" "${OVERLAP_CPU_OPTIMIZER_D2H_H2D}" | tee -a "${RESULT_DIR}/run_info.txt"
+printf 'profile=%s profile_step_start=%s profile_step_end=%s use_nsys_profiler=%s use_pytorch_profiler=%s record_memory_history=%s nvtx_ranges=%s gpu_memory_trace_interval=%s\n' \
+    "${PROFILE}" "${PROFILE_STEP_START}" "${PROFILE_STEP_END}" "${USE_NSYS_PROFILER}" \
+    "${USE_PYTORCH_PROFILER}" "${RECORD_MEMORY_HISTORY}" "${NVTX_RANGES}" \
+    "${GPU_MEMORY_TRACE_INTERVAL}" | tee -a "${RESULT_DIR}/run_info.txt"
+printf 'record_memory_usage=%s memory_usage_start_step=%s\n' \
+    "${RECORD_MEMORY_USAGE}" "${MEMORY_USAGE_START_STEP}" | tee -a "${RESULT_DIR}/run_info.txt"
+printf 'result_dir=%s\nprofile_ranks=0,1,2,3\ncommand=%s\n' "${RESULT_DIR}" "${COMMAND_TEXT}" | tee -a "${RESULT_DIR}/run_info.txt"
+
+GPU_MONITOR_PID=""
+GPU_MONITOR_READY_FILE="${RESULT_DIR}/.gpu-monitor-ready"
+
+start_gpu_memory_monitor() {
+    rm -f "${GPU_MONITOR_READY_FILE}"
+    uv run --no-sync python "${REPO_ROOT}/scripts/scale-down/nvidia-smi/check_gpu.py" \
+        --interval "${GPU_MEMORY_TRACE_INTERVAL}" \
+        --ready-file "${GPU_MONITOR_READY_FILE}" \
+        --output-dir "${RESULT_DIR}/gpu_memory" &
+    GPU_MONITOR_PID=$!
+
+    while [[ ! -e "${GPU_MONITOR_READY_FILE}" ]]; do
+        if ! kill -0 "${GPU_MONITOR_PID}" 2>/dev/null; then
+            wait "${GPU_MONITOR_PID}" || true
+            GPU_MONITOR_PID=""
+            echo "GPU memory monitor failed before its first sample." >&2
+            return 1
+        fi
+        sleep 0.05
+    done
+}
+
+stop_gpu_memory_monitor() {
+    local monitor_status=0
+    if [[ -n "${GPU_MONITOR_PID}" ]]; then
+        kill -TERM "${GPU_MONITOR_PID}" 2>/dev/null || true
+        wait "${GPU_MONITOR_PID}" || monitor_status=$?
+        GPU_MONITOR_PID=""
+    fi
+    rm -f "${GPU_MONITOR_READY_FILE}"
+    return "${monitor_status}"
+}
+
+cleanup_gpu_memory_monitor() {
+    local exit_status=$?
+    stop_gpu_memory_monitor || true
+    return "${exit_status}"
+}
+
+trap cleanup_gpu_memory_monitor EXIT
+
+if [[ "${PROFILE}" == torch ]]; then
+    printf 'Starting nvidia-smi memory monitor...\n' | tee -a "${RESULT_DIR}/run_info.txt"
+    start_gpu_memory_monitor
+fi
+
+# Run training with optional nsys profiling.
+if [[ "${USE_NSYS_PROFILER}" == true ]]; then
+    printf 'Running with nsys profiling enabled...\n' | tee -a "${RESULT_DIR}/run_info.txt"
+    set +e
+    nsys profile \
+        -s none \
+        -t cuda,nvtx \
+        --capture-range=cudaProfilerApi \
+        --capture-range-end=stop \
+        -o "${RESULT_DIR}/profile/profile_%p_%h" \
+        --force-overwrite=true \
+        "${COMMAND[@]}" 2>&1 | tee "${RESULT_DIR}/train.log"
+    RUN_STATUS=${PIPESTATUS[0]}
+    set -e
+    if compgen -G "${RESULT_DIR}/profile/*.nsys-rep" > /dev/null; then
+        printf 'nsys profile reports (written after training):\n' | tee -a "${RESULT_DIR}/run_info.txt"
+        find "${RESULT_DIR}/profile" -maxdepth 1 -type f -name '*.nsys-rep' -print | sort | tee -a "${RESULT_DIR}/run_info.txt"
+    fi
+else
+    printf 'Running without nsys profiling...\n' | tee -a "${RESULT_DIR}/run_info.txt"
+    set +e
+    "${COMMAND[@]}" 2>&1 | tee "${RESULT_DIR}/train.log"
+    RUN_STATUS=${PIPESTATUS[0]}
+    set -e
+fi
+
+if [[ "${PROFILE}" == torch ]]; then
+    stop_gpu_memory_monitor || {
+        MONITOR_STATUS=$?
+        printf 'GPU memory monitor failed with status %s.\n' "${MONITOR_STATUS}" \
+            | tee -a "${RESULT_DIR}/run_info.txt" >&2
+        if [[ "${RUN_STATUS}" -eq 0 ]]; then
+            RUN_STATUS="${MONITOR_STATUS}"
+        fi
+    }
+    printf 'GPU memory traces: %s\n' "${RESULT_DIR}/gpu_memory" \
+        | tee -a "${RESULT_DIR}/run_info.txt"
+
+    # Replay each per-rank memory snapshot into a sibling JSON phase report
+    # (snapshot_N.pickle -> snapshot_N.json) using the scale-down replay_step
+    # analysis. The PyTorch profiler provides the ProfilerStep#N boundaries and
+    # phase annotations this replay requires, which is why it runs only in
+    # torch mode. Failures are logged but do not fail the training run: a
+    # snapshot without ProfilerStep markers is an analysis gap, not a training
+    # failure.
+    printf 'Replaying memory snapshots to JSON...\n' | tee -a "${RESULT_DIR}/run_info.txt"
+    shopt -s nullglob
+    MEMORY_PICKLES=("${RESULT_DIR}"/memory/snapshot*.pickle)
+    shopt -u nullglob
+    if (( ${#MEMORY_PICKLES[@]} == 0 )); then
+        printf 'No memory snapshots found under %s/memory.\n' "${RESULT_DIR}" \
+            | tee -a "${RESULT_DIR}/run_info.txt" >&2
+    fi
+    for snapshot_pickle in ${MEMORY_PICKLES[@]+"${MEMORY_PICKLES[@]}"}; do
+        snapshot_json="${snapshot_pickle%.pickle}.json"
+        if uv run --no-sync python "${REPO_ROOT}/scripts/scale-down/analyse/replay_step.py" \
+                "${snapshot_pickle}" --all-steps --json > "${snapshot_json}"; then
+            printf 'Memory replay JSON: %s\n' "${snapshot_json}" | tee -a "${RESULT_DIR}/run_info.txt"
+        else
+            printf 'replay_step.py failed for %s; removed partial JSON.\n' "${snapshot_pickle}" \
+                | tee -a "${RESULT_DIR}/run_info.txt" >&2
+            rm -f "${snapshot_json}"
+        fi
+    done
+fi
+
+GPU_UTILIZATION_PATH="${RESULT_DIR}/gpu_utilization.json"
+uv run --no-sync python "${REPO_ROOT}/scripts/scale-down/analyse/export_gpu_utilization.py" \
+    --log-file "${RESULT_DIR}/train.log" \
+    --output "${GPU_UTILIZATION_PATH}"
+printf 'GPU utilization metrics: %s\n' "${GPU_UTILIZATION_PATH}" \
+    | tee -a "${RESULT_DIR}/run_info.txt"
+
+export RUN_STATUS
+uv run --no-sync python -c 'import json, os; root = os.environ["RESULT_DIR"]; result = {"status": int(os.environ["RUN_STATUS"]), "model": os.environ["MODEL"], "precision": os.environ["PRECISION"], "run_name": os.environ["RUN_NAME"], "run_time": os.environ["RUN_TIME"], "recipe": os.environ["RECIPE"], "result_dir": root, "profile_ranks": [0, 1, 2, 3]}; json.dump(result, open(os.path.join(root, "summary.json"), "w"), indent=2, sort_keys=True); raise SystemExit(result["status"])'

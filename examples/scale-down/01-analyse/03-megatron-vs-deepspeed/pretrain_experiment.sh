@@ -5,7 +5,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/../../../.." && pwd)"
-RUNNER="${REPO_ROOT}/examples/scale-down/01-analyse/01-fine-grained-offload/01-mlp-scope-pretrain/run_pretrain_fsdp1.sh"
+RUNNER="${SCRIPT_DIR}/run_pretrain_fsdp1.sh"
 
 RESULTS_ROOT="${RESULTS_ROOT:-${REPO_ROOT}/results/01-analyse/03-megatron-vs-deepspeed}"
 MODELS="dense expert"
@@ -36,7 +36,6 @@ Options:
   --repeats <n>
   --per-gpu-batch-size <n>
   --results-root <path>
-  --run-time <value>
   --test                    Run only optimizer offload 0.75/1.0 with MBS=1
   --dry-run
   -h, --help
@@ -55,7 +54,6 @@ while [[ $# -gt 0 ]]; do
         --repeats) REPEATS="$2"; shift 2 ;;
         --per-gpu-batch-size) PER_GPU_BATCH_SIZE="$2"; shift 2 ;;
         --results-root) RESULTS_ROOT="$2"; shift 2 ;;
-        --run-time) RUN_TIME="$2"; shift 2 ;;
         --test) TEST_MODE=true; shift ;;
         --dry-run) DRY_RUN=true; shift ;;
         -h|--help) usage; exit 0 ;;
@@ -162,6 +160,7 @@ set_optimizer_strategy() {
 }
 
 mkdir -p "${RESULTS_ROOT}"
+export RESULTS_ROOT RUN_TIME
 MANIFEST="${RESULTS_ROOT}/model_manifest.json"
 if [[ "${DRY_RUN}" == false ]]; then
     uv run --no-sync python "${SCRIPT_DIR}/experiment_manifest.py" \
@@ -221,7 +220,7 @@ for MODEL_KIND in ${MODELS}; do
                     if [[ -n "${NUM_EXPERTS}" ]]; then
                         RUN_ARGS+=(--num-experts "${NUM_EXPERTS}")
                     fi
-                    RESULTS_ROOT="${RESULTS_ROOT}" RUN_TIME="${RUN_TIME}" "${RUNNER}" "${RUN_ARGS[@]}"
+                    "${RUNNER}" "${RUN_ARGS[@]}"
                     RUN_STATUS=$?
                     if [[ ${RUN_STATUS} -eq 0 ]]; then STATUS=OK; else STATUS="FAILED(rc=${RUN_STATUS})"; fi
                     echo "${RUN_NAME} ${STATUS}" | tee -a "${SUMMARY_FILE}"

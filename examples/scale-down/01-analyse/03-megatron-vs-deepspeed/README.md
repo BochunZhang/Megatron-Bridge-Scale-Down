@@ -16,7 +16,7 @@ ddp.data_parallel_sharding_strategy=optim_grads_params
 - `experiment_manifest.py`：读取 Hugging Face config，记录两类模型的结构、训练和并行契约。
 - `summarize.py`：查找结果树中的 `summary.json`，结合相邻的 `config.json` 生成 `summary.csv`。
 - `collect_results.py`：读取每个测试最后 4 个完整 iteration，生成吞吐与 peak memory 的 XLSX 汇总。
-- `../01-fine-grained-offload/01-mlp-scope-pretrain/run_pretrain_fsdp1.sh`：实际启动单个四卡 Megatron 训练任务。
+- `run_pretrain_fsdp1.sh`：本实验目录中的单次四卡 Megatron 训练 runner；它由 fine-grained offload 实验的 runner 复制并在本目录独立维护。
 
 脚本内部使用 `uv run --no-sync`。运行前需要：
 
@@ -103,7 +103,7 @@ Optimizer offload 通过 Megatron 的 fractional optimizer state offload 实现�
 ### 查看完整矩阵，不启动训练
 
 ```bash
-./examples/scale-down/01-analyse/02-megatron-vs-deepspeed/pretrain_experiment.sh \
+./examples/scale-down/01-analyse/03-megatron-vs-deepspeed/pretrain_experiment.sh \
   --dry-run
 ```
 
@@ -112,7 +112,7 @@ Dry-run 会打印每个组合展开后的 recompute、offload、optimizer fracti
 ### 运行默认完整矩阵
 
 ```bash
-./examples/scale-down/01-analyse/02-megatron-vs-deepspeed/pretrain_experiment.sh
+./examples/scale-down/01-analyse/03-megatron-vs-deepspeed/pretrain_experiment.sh
 ```
 
 默认命令运行上述 72 个组合。由于默认每个组合只有 10 个 iteration，这个配置更适合验证组合能否运行和定位 OOM，不足以形成稳定的性能结论。正式性能测试应提高 `--train-iters` 和 `--repeats`，并仅统计 warmup 之后的 iteration。
@@ -120,18 +120,20 @@ Dry-run 会打印每个组合展开后的 recompute、offload、optimizer fracti
 ### 完整实验前运行 test 矩阵
 
 ```bash
-./examples/scale-down/01-analyse/02-megatron-vs-deepspeed/pretrain_experiment.sh \
-  --test \
-  --run-time "20260929-test"
+RUN_TIME="20260929-test" \
+./examples/scale-down/01-analyse/03-megatron-vs-deepspeed/pretrain_experiment.sh \
+  --test
 ```
 
 `--test` 固定使用 `MBS=1`，并只运行 `optimizer_cpu_075` 和 `optimizer_cpu_100`。模型轴仍包含 Dense 和 Expert，activation 轴仍包含 `baseline`、`recompute` 和 `recompute_offload`，因此默认共运行 12 个组合。该模式会覆盖命令行传入的 `--micro-batch-sizes` 和 `--optimizer-strategies`，其余参数（例如 `--train-iters`、`--models` 和 `--activation-strategies`）仍然有效。
 
-test 矩阵结束后会自动生成 XLSX。需要根据已有日志重新生成时，使用同一个 `run-time`：
+`RUN_TIME` 未设置时，入口会使用当前时间自动生成批次名，格式为 `YYYYmmdd-HHMMSS`。需要给批次指定稳定名称时，像上面一样设置环境变量；主脚本不提供 `--run-time` 参数。
+
+test 矩阵结束后会自动生成 XLSX。需要根据已有日志重新生成时，将同一个批次名传给结果收集脚本：
 
 ```bash
 uv run --no-sync python \
-  examples/scale-down/01-analyse/02-megatron-vs-deepspeed/collect_results.py \
+  examples/scale-down/01-analyse/03-megatron-vs-deepspeed/collect_results.py \
   --results-root results/01-analyse/03-megatron-vs-deepspeed \
   --run-time "20260929-test" \
   --output results/01-analyse/03-megatron-vs-deepspeed/megatron-vs-deepspeed-20260929-test.xlsx
@@ -148,7 +150,7 @@ results/01-analyse/03-megatron-vs-deepspeed/megatron-vs-deepspeed-20260929-test.
 下面只运行 Dense、MBS=1、逐层重计算、optimizer fraction=0.75 的一个组合：
 
 ```bash
-./examples/scale-down/01-analyse/02-megatron-vs-deepspeed/pretrain_experiment.sh \
+./examples/scale-down/01-analyse/03-megatron-vs-deepspeed/pretrain_experiment.sh \
   --models "dense" \
   --activation-strategies "recompute" \
   --optimizer-strategies "optimizer_cpu_075" \
@@ -163,7 +165,8 @@ results/01-analyse/03-megatron-vs-deepspeed/megatron-vs-deepspeed-20260929-test.
 下面同时检查 Dense 和 Expert，在 baseline 与 recompute+offload 下比较无 optimizer offload 和 100% optimizer offload：
 
 ```bash
-./examples/scale-down/01-analyse/02-megatron-vs-deepspeed/pretrain_experiment.sh \
+RUN_TIME="20260929-benchmark" \
+./examples/scale-down/01-analyse/03-megatron-vs-deepspeed/pretrain_experiment.sh \
   --models "dense expert" \
   --activation-strategies "baseline recompute_offload" \
   --optimizer-strategies "optimizer_none optimizer_cpu_100" \
@@ -176,15 +179,14 @@ results/01-analyse/03-megatron-vs-deepspeed/megatron-vs-deepspeed-20260929-test.
 ### 指定结果目录
 
 ```bash
-./examples/scale-down/01-analyse/02-megatron-vs-deepspeed/pretrain_experiment.sh \
+./examples/scale-down/01-analyse/03-megatron-vs-deepspeed/pretrain_experiment.sh \
   --models "dense" \
   --activation-strategies "recompute_offload" \
   --optimizer-strategies "optimizer_cpu_090" \
   --micro-batch-sizes "1" \
   --train-iters 10 \
   --warmup-steps 3 \
-  --results-root "$PWD/results/01-analyse/03-megatron-vs-deepspeed" \
-  --run-time "20260929-benchmark"
+  --results-root "$PWD/results/01-analyse/03-megatron-vs-deepspeed"
 ```
 
 当前矩阵入口支持以下选项：
@@ -200,7 +202,6 @@ results/01-analyse/03-megatron-vs-deepspeed/megatron-vs-deepspeed-20260929-test.
 --repeats
 --per-gpu-batch-size
 --results-root
---run-time
 --test
 --dry-run
 ```
@@ -284,11 +285,11 @@ results/01-analyse/03-megatron-vs-deepspeed/
 
 ```bash
 uv run --no-sync python \
-  examples/scale-down/01-analyse/02-megatron-vs-deepspeed/summarize.py \
+  examples/scale-down/01-analyse/03-megatron-vs-deepspeed/summarize.py \
   results/01-analyse/03-megatron-vs-deepspeed
 
 uv run --no-sync python \
-  examples/scale-down/01-analyse/02-megatron-vs-deepspeed/collect_results.py \
+  examples/scale-down/01-analyse/03-megatron-vs-deepspeed/collect_results.py \
   --results-root results/01-analyse/03-megatron-vs-deepspeed \
   --run-time <run-time>
 ```
