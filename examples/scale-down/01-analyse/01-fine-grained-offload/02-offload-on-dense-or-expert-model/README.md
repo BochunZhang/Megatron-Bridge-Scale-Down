@@ -100,8 +100,14 @@ bash "./examples/scale-down/01-analyse/01-fine-grained-offload/02-offload-on-den
 **吞吐矩阵跑完后汇总 TFlops**（只统计 `--profile none` 的成功运行）：
 
 ```bash
+# 生成逐次迭代吞吐对比表（Summary + Samples）
+uv run python examples/scale-down/01-analyse/01-fine-grained-offload/02-offload-on-dense-or-expert-model/collect_mlp_offload_results.py \
+  --run-time <benchmark_id>
+
+# 生成 GPU utilization/TFlops 对比表（最后 4 组数据的平均值）
 uv run python examples/scale-down/01-analyse/01-fine-grained-offload/02-offload-on-dense-or-expert-model/analyse_mlp_offload_results.py \
-  --model qwen
+  --model qwen \
+  --output result/01-analyse/01-fine-grained-offload/02-offload-on-dense-or-expert-model/offload-throughput-qwen.xlsx
 ```
 
 ### 测试 2：deepseek-v3 dense + expert 综合矩阵（MBS 1,2,4,8）
@@ -135,8 +141,14 @@ bash "./examples/scale-down/01-analyse/01-fine-grained-offload/02-offload-on-den
 **吞吐矩阵跑完后汇总 TFlops**（只统计 `--profile none` 的成功运行）：
 
 ```bash
+# 生成逐次迭代吞吐对比表（Summary + Samples）
+uv run python examples/scale-down/01-analyse/01-fine-grained-offload/02-offload-on-dense-or-expert-model/collect_mlp_offload_results.py \
+  --run-time <benchmark_id>
+
+# 生成 GPU utilization/TFlops 对比表（最后 4 组数据的平均值）
 uv run python examples/scale-down/01-analyse/01-fine-grained-offload/02-offload-on-dense-or-expert-model/analyse_mlp_offload_results.py \
-  --model deepseek
+  --model deepseek \
+  --output result/01-analyse/01-fine-grained-offload/02-offload-on-dense-or-expert-model/offload-throughput-deepseek.xlsx
 ```
 
 > 如只想单独跑某一种 proxy，加 `--scope dense` 或 `--scope expert`；expert 还可用 `--dispatcher <alltoall|hybridep>` 只跑其一，并可叠加 `--micro-batch-sizes 1,2` 缩小矩阵（对照 qwen3.5 分析训练效率时的常用组合）。

@@ -40,15 +40,23 @@ Usage: run_pretrain_fsdp1.sh \
     --recipe <recipe> \
     --precision <bf16|fp8mx> \
     --run-name <run-name> \
-    --recompute-granularity <null|selective> \
+    --recompute-granularity <null|selective|full> \
+    --recompute-method <null|uniform|block> \
+    --recompute-num-layers <null|positive-integer> \
     --recompute-modules <value> \
     --fine-grained-offload <true|false> \
     --offload-modules <value> \
     [--train-iters <iters>] \
+    [--warmup-steps <iters>] \
     [--global-batch-size <gbs>] \
     [--micro-batch-size <mbs>] \
     [--num-layers <layers>] \
     [--linear-attention-freq <value>] \
+    [--optimizer-cpu-offload <true|false>] \
+    [--optimizer-offload-fraction <0.0-1.0>] \
+    [--use-torch-optimizer-for-cpu-offload <true|false>] \
+    [--seed <seed>] [--num-experts <count>] \
+    [--dispatcher <default|alltoall|hybridep>] \
     [--record-memory-usage <true|false>] \
     [--memory-usage-start-step <step>] \
     [--profile-step-start <start>] \
@@ -61,6 +69,7 @@ selective, [layernorm,mlp], or [expert_fc1,moe_act] are accepted.
 
 Optional training parameters (with defaults):
     --train-iters         Number of training iterations (default: 10)
+    --warmup-steps        Number of LR warmup iterations (default: 0)
     --global-batch-size   Global batch size (default: 8)
     --micro-batch-size    Micro batch size (default: 1)
     --num-layers          Override model.num_layers
@@ -90,16 +99,29 @@ RECIPE=""
 PRECISION=""
 RUN_NAME=""
 RECOMPUTE_GRANULARITY=""
+RECOMPUTE_METHOD="null"
+RECOMPUTE_NUM_LAYERS="null"
 RECOMPUTE_MODULES=""
 FINE_GRAINED_OFFLOAD=""
 OFFLOAD_MODULES=""
 
 # Training parameters with defaults
 TRAIN_ITERS=""
+WARMUP_STEPS=""
 GLOBAL_BATCH_SIZE=""
 MICRO_BATCH_SIZE=""
 NUM_LAYERS=""
 LINEAR_ATTENTION_FREQ=""
+ACTIVATION_STRATEGY=""
+OPTIMIZER_STRATEGY=""
+OPTIMIZER_CPU_OFFLOAD="false"
+OPTIMIZER_OFFLOAD_FRACTION="0.0"
+USE_TORCH_OPTIMIZER_FOR_CPU_OFFLOAD="false"
+OVERLAP_CPU_OPTIMIZER_D2H_H2D="false"
+SEED=""
+NUM_EXPERTS=""
+DISPATCHER="default"
+HYBRIDEP_NUM_SMS="32"
 PROFILE_STEP_START=""
 PROFILE_STEP_END=""
 RECORD_MEMORY_USAGE="${RECORD_MEMORY_USAGE:-false}"
@@ -128,9 +150,29 @@ while [[ $# -gt 0 ]]; do
             RUN_NAME="$2"
             shift 2
             ;;
+        --activation-strategy)
+            [[ $# -ge 2 ]] || { usage >&2; exit 2; }
+            ACTIVATION_STRATEGY="$2"
+            shift 2
+            ;;
+        --optimizer-strategy)
+            [[ $# -ge 2 ]] || { usage >&2; exit 2; }
+            OPTIMIZER_STRATEGY="$2"
+            shift 2
+            ;;
         --recompute-granularity)
             [[ $# -ge 2 ]] || { usage >&2; exit 2; }
             RECOMPUTE_GRANULARITY="$2"
+            shift 2
+            ;;
+        --recompute-method)
+            [[ $# -ge 2 ]] || { usage >&2; exit 2; }
+            RECOMPUTE_METHOD="$2"
+            shift 2
+            ;;
+        --recompute-num-layers)
+            [[ $# -ge 2 ]] || { usage >&2; exit 2; }
+            RECOMPUTE_NUM_LAYERS="$2"
             shift 2
             ;;
         --recompute-modules)
@@ -153,6 +195,11 @@ while [[ $# -gt 0 ]]; do
             TRAIN_ITERS="$2"
             shift 2
             ;;
+        --warmup-steps)
+            [[ $# -ge 2 ]] || { usage >&2; exit 2; }
+            WARMUP_STEPS="$2"
+            shift 2
+            ;;
         --global-batch-size)
             [[ $# -ge 2 ]] || { usage >&2; exit 2; }
             GLOBAL_BATCH_SIZE="$2"
@@ -171,6 +218,46 @@ while [[ $# -gt 0 ]]; do
         --linear-attention-freq)
             [[ $# -ge 2 ]] || { usage >&2; exit 2; }
             LINEAR_ATTENTION_FREQ="$2"
+            shift 2
+            ;;
+        --optimizer-cpu-offload)
+            [[ $# -ge 2 ]] || { usage >&2; exit 2; }
+            OPTIMIZER_CPU_OFFLOAD="$2"
+            shift 2
+            ;;
+        --optimizer-offload-fraction)
+            [[ $# -ge 2 ]] || { usage >&2; exit 2; }
+            OPTIMIZER_OFFLOAD_FRACTION="$2"
+            shift 2
+            ;;
+        --use-torch-optimizer-for-cpu-offload)
+            [[ $# -ge 2 ]] || { usage >&2; exit 2; }
+            USE_TORCH_OPTIMIZER_FOR_CPU_OFFLOAD="$2"
+            shift 2
+            ;;
+        --overlap-cpu-optimizer-d2h-h2d)
+            [[ $# -ge 2 ]] || { usage >&2; exit 2; }
+            OVERLAP_CPU_OPTIMIZER_D2H_H2D="$2"
+            shift 2
+            ;;
+        --seed)
+            [[ $# -ge 2 ]] || { usage >&2; exit 2; }
+            SEED="$2"
+            shift 2
+            ;;
+        --num-experts)
+            [[ $# -ge 2 ]] || { usage >&2; exit 2; }
+            NUM_EXPERTS="$2"
+            shift 2
+            ;;
+        --dispatcher)
+            [[ $# -ge 2 ]] || { usage >&2; exit 2; }
+            DISPATCHER="$2"
+            shift 2
+            ;;
+        --hybridep-num-sms)
+            [[ $# -ge 2 ]] || { usage >&2; exit 2; }
+            HYBRIDEP_NUM_SMS="$2"
             shift 2
             ;;
         --record-memory-usage)
@@ -220,6 +307,7 @@ done
 
 # Apply defaults for optional training parameters
 TRAIN_ITERS="${TRAIN_ITERS:-10}"
+WARMUP_STEPS="${WARMUP_STEPS:-0}"
 GLOBAL_BATCH_SIZE="${GLOBAL_BATCH_SIZE:-8}"
 MICRO_BATCH_SIZE="${MICRO_BATCH_SIZE:-1}"
 PROFILE_STEP_START="${PROFILE_STEP_START:-7}"
@@ -233,9 +321,19 @@ case "${PRECISION}" in
     *) echo "Unsupported precision: ${PRECISION}" >&2; exit 2 ;;
 esac
 case "${RECOMPUTE_GRANULARITY}" in
-    null|selective) ;;
+    null|selective|full) ;;
     *) echo "Unsupported recompute granularity: ${RECOMPUTE_GRANULARITY}" >&2; exit 2 ;;
 esac
+case "${RECOMPUTE_METHOD}" in
+    null|uniform|block) ;;
+    *) echo "Unsupported recompute method: ${RECOMPUTE_METHOD}" >&2; exit 2 ;;
+esac
+if [[ "${RECOMPUTE_GRANULARITY}" == full ]]; then
+    if [[ "${RECOMPUTE_METHOD}" == null || ! "${RECOMPUTE_NUM_LAYERS}" =~ ^[1-9][0-9]*$ ]]; then
+        echo "Full recompute requires a method and a positive recompute-num-layers" >&2
+        exit 2
+    fi
+fi
 case "${FINE_GRAINED_OFFLOAD}" in
     true|false) ;;
     *) echo "fine-grained offload must be true or false: ${FINE_GRAINED_OFFLOAD}" >&2; exit 2 ;;
@@ -244,6 +342,20 @@ case "${RECORD_MEMORY_USAGE}" in
     true|false) ;;
     *) echo "record-memory-usage must be true or false: ${RECORD_MEMORY_USAGE}" >&2; exit 2 ;;
 esac
+for boolean_name in OPTIMIZER_CPU_OFFLOAD USE_TORCH_OPTIMIZER_FOR_CPU_OFFLOAD OVERLAP_CPU_OPTIMIZER_D2H_H2D; do
+    case "${!boolean_name}" in
+        true|false) ;;
+        *) echo "${boolean_name} must be true or false" >&2; exit 2 ;;
+    esac
+done
+case "${DISPATCHER}" in
+    default|alltoall|hybridep) ;;
+    *) echo "dispatcher must be default, alltoall, or hybridep" >&2; exit 2 ;;
+esac
+if ! [[ "${OPTIMIZER_OFFLOAD_FRACTION}" =~ ^(0(\.[0-9]+)?|1(\.0+)?)$ ]]; then
+    echo "optimizer-offload-fraction must be between 0.0 and 1.0" >&2
+    exit 2
+fi
 if ! [[ "${MEMORY_USAGE_START_STEP}" =~ ^[0-9]+$ ]]; then
     echo "memory-usage-start-step must be a non-negative integer" >&2
     exit 2
@@ -257,8 +369,12 @@ NEMO_CACHE="${REPO_ROOT}/.cache/nemo"
 UV_CACHE="${REPO_ROOT}/.cache/uv"
 MASTER_PORT="${MASTER_PORT:-29501}"
 
-if ! [[ "${TRAIN_ITERS}" =~ ^[0-9]+$ && "${GLOBAL_BATCH_SIZE}" =~ ^[0-9]+$ && "${MICRO_BATCH_SIZE}" =~ ^[0-9]+$ ]]; then
+if ! [[ "${TRAIN_ITERS}" =~ ^[0-9]+$ && "${WARMUP_STEPS}" =~ ^[0-9]+$ && "${GLOBAL_BATCH_SIZE}" =~ ^[0-9]+$ && "${MICRO_BATCH_SIZE}" =~ ^[0-9]+$ ]]; then
     echo "Training sizes must be non-negative integers" >&2
+    exit 2
+fi
+if (( WARMUP_STEPS > TRAIN_ITERS )); then
+    echo "warmup-steps must not exceed train-iters" >&2
     exit 2
 fi
 if (( TRAIN_ITERS < 1 || GLOBAL_BATCH_SIZE < 1 || MICRO_BATCH_SIZE < 1 )); then
@@ -267,6 +383,14 @@ if (( TRAIN_ITERS < 1 || GLOBAL_BATCH_SIZE < 1 || MICRO_BATCH_SIZE < 1 )); then
 fi
 if [[ -n "${NUM_LAYERS}" ]] && ! [[ "${NUM_LAYERS}" =~ ^[1-9][0-9]*$ ]]; then
     echo "num-layers must be a positive integer" >&2
+    exit 2
+fi
+if [[ -n "${SEED}" ]] && ! [[ "${SEED}" =~ ^[0-9]+$ ]]; then
+    echo "seed must be a non-negative integer" >&2
+    exit 2
+fi
+if [[ -n "${NUM_EXPERTS}" ]] && ! [[ "${NUM_EXPERTS}" =~ ^[1-9][0-9]*$ ]]; then
+    echo "num-experts must be a positive integer" >&2
     exit 2
 fi
 case "${PROFILE}" in
@@ -300,6 +424,11 @@ export NCCL_DEBUG="WARN"
 export NCCL_GRAPH_REGISTER="0"
 export TOKENIZERS_PARALLELISM="false"
 export RESULT_DIR MODEL MODEL_ID RESULT_MODEL_NAME PRECISION RUN_NAME RUN_TIME RECIPE
+export ACTIVATION_STRATEGY OPTIMIZER_STRATEGY TRAIN_ITERS WARMUP_STEPS GLOBAL_BATCH_SIZE MICRO_BATCH_SIZE
+export RECOMPUTE_GRANULARITY RECOMPUTE_METHOD RECOMPUTE_NUM_LAYERS RECOMPUTE_MODULES
+export FINE_GRAINED_OFFLOAD OFFLOAD_MODULES OPTIMIZER_CPU_OFFLOAD OPTIMIZER_OFFLOAD_FRACTION
+export USE_TORCH_OPTIMIZER_FOR_CPU_OFFLOAD OVERLAP_CPU_OPTIMIZER_D2H_H2D DISPATCHER HYBRIDEP_NUM_SMS
+export RECORD_MEMORY_USAGE MEMORY_USAGE_START_STEP
 
 # Derive profiling settings from the selected backend. Bridge's
 # ProfilingConfig.finalize() forbids enabling the nsys and PyTorch profilers at
@@ -340,10 +469,17 @@ OVERRIDES=(
     "train.micro_batch_size=${MICRO_BATCH_SIZE}"
     "validation.eval_iters=0"
     "validation.eval_interval=0"
-    "scheduler.lr_warmup_iters=0"
+    "scheduler.lr_warmup_iters=${WARMUP_STEPS}"
+    "dist.use_megatron_fsdp=true"
+    "ddp.use_megatron_fsdp=true"
+    "ddp.use_distributed_optimizer=true"
+    "optimizer.use_distributed_optimizer=true"
+    "ddp.data_parallel_sharding_strategy=optim_grads_params"
+    "ddp.average_in_collective=false"
+    "checkpoint.ckpt_format=fsdp_dtensor"
     "model.recompute_granularity=${RECOMPUTE_GRANULARITY}"
-    "model.recompute_method=null"
-    "model.recompute_num_layers=null"
+    "model.recompute_method=${RECOMPUTE_METHOD}"
+    "model.recompute_num_layers=${RECOMPUTE_NUM_LAYERS}"
     "model.recompute_modules=${RECOMPUTE_MODULES}"
     "model.fine_grained_activation_offloading=${FINE_GRAINED_OFFLOAD}"
     "model.offload_modules=${OFFLOAD_MODULES}"
@@ -351,6 +487,10 @@ OVERRIDES=(
     "model.cuda_graph_scope=null"
     "model.cuda_graph_modules=[]"
     "model.moe_shared_expert_overlap=false"
+    "optimizer.optimizer_cpu_offload=${OPTIMIZER_CPU_OFFLOAD}"
+    "optimizer.optimizer_offload_fraction=${OPTIMIZER_OFFLOAD_FRACTION}"
+    "optimizer.use_torch_optimizer_for_cpu_offload=${USE_TORCH_OPTIMIZER_FOR_CPU_OFFLOAD}"
+    "optimizer.overlap_cpu_optimizer_d2h_h2d=${OVERLAP_CPU_OPTIMIZER_D2H_H2D}"
     "checkpoint.save=null"
     "checkpoint.load=null"
     "logger.log_interval=1"
@@ -373,6 +513,28 @@ fi
 if [[ -n "${LINEAR_ATTENTION_FREQ}" ]]; then
     OVERRIDES+=("model.linear_attention_freq=${LINEAR_ATTENTION_FREQ}")
 fi
+if [[ -n "${SEED}" ]]; then
+    OVERRIDES+=("rng.seed=${SEED}" "dataset.random_seed=${SEED}")
+fi
+if [[ -n "${NUM_EXPERTS}" ]]; then
+    OVERRIDES+=("model.num_moe_experts=${NUM_EXPERTS}")
+fi
+case "${DISPATCHER}" in
+    alltoall)
+        OVERRIDES+=(
+            "model.moe_token_dispatcher_type=alltoall"
+            "model.moe_flex_dispatcher_backend=null"
+            "model.moe_flex_dispatcher_num_sms=null"
+        )
+        ;;
+    hybridep)
+        OVERRIDES+=(
+            "model.moe_token_dispatcher_type=flex"
+            "model.moe_flex_dispatcher_backend=hybridep"
+            "model.moe_flex_dispatcher_num_sms=${HYBRIDEP_NUM_SMS}"
+        )
+        ;;
+esac
 
 COMMAND=(
     uv run --no-sync python -m torch.distributed.run
@@ -390,10 +552,18 @@ COMMAND=(
 COMMAND_TEXT="${COMMAND[*]}"
 export COMMAND_TEXT
 
-uv run --no-sync python -c 'import json, os, re; pattern = re.compile(r"(^|_)(TOKEN|SECRET|PASSWORD|PASSWD|API_KEY|ACCESS_KEY|SECRET_KEY|PRIVATE_KEY|AUTHORIZATION)(_|$)", re.I); root = os.environ["RESULT_DIR"]; env = {k: ("[REDACTED]" if pattern.search(k) else v) for k, v in sorted(os.environ.items())}; json.dump(env, open(os.path.join(root, "environment.json"), "w"), indent=2, sort_keys=True); open(os.path.join(root, "command.txt"), "w").write(os.environ["COMMAND_TEXT"] + "\n"); config = {"model": os.environ["MODEL"], "model_id": os.environ["MODEL_ID"], "precision": os.environ["PRECISION"], "run_name": os.environ["RUN_NAME"], "run_time": os.environ["RUN_TIME"], "recipe": os.environ["RECIPE"], "result_dir": root, "profile_ranks": [0, 1, 2, 3], "cache_paths": {"hf": env["HF_HOME"], "nemo": env["NEMO_HOME"]}, "cli": os.environ["COMMAND_TEXT"]}; json.dump(config, open(os.path.join(root, "config.json"), "w"), indent=2, sort_keys=True)'
+uv run --no-sync python -c 'import json, os, re; pattern = re.compile(r"(^|_)(TOKEN|SECRET|PASSWORD|PASSWD|API_KEY|ACCESS_KEY|SECRET_KEY|PRIVATE_KEY|AUTHORIZATION)(_|$)", re.I); root = os.environ["RESULT_DIR"]; env = {k: ("[REDACTED]" if pattern.search(k) else v) for k, v in sorted(os.environ.items())}; json.dump(env, open(os.path.join(root, "environment.json"), "w"), indent=2, sort_keys=True); open(os.path.join(root, "command.txt"), "w").write(os.environ["COMMAND_TEXT"] + "\n"); config = {"model": os.environ["MODEL"], "model_id": os.environ["MODEL_ID"], "precision": os.environ["PRECISION"], "run_name": os.environ["RUN_NAME"], "run_time": os.environ["RUN_TIME"], "recipe": os.environ["RECIPE"], "result_dir": root, "profile_ranks": [0, 1, 2, 3], "cache_paths": {"hf": env["HF_HOME"], "nemo": env["NEMO_HOME"]}, "activation_strategy": os.environ["ACTIVATION_STRATEGY"], "optimizer_strategy": os.environ["OPTIMIZER_STRATEGY"], "train_iters": int(os.environ["TRAIN_ITERS"]), "warmup_steps": int(os.environ["WARMUP_STEPS"]), "global_batch_size": int(os.environ["GLOBAL_BATCH_SIZE"]), "micro_batch_size": int(os.environ["MICRO_BATCH_SIZE"]), "data_parallel_sharding_strategy": "optim_grads_params", "recompute_granularity": os.environ["RECOMPUTE_GRANULARITY"], "recompute_method": os.environ["RECOMPUTE_METHOD"], "recompute_num_layers": os.environ["RECOMPUTE_NUM_LAYERS"], "recompute_modules": os.environ["RECOMPUTE_MODULES"], "fine_grained_offload": os.environ["FINE_GRAINED_OFFLOAD"] == "true", "offload_modules": os.environ["OFFLOAD_MODULES"], "optimizer_cpu_offload": os.environ["OPTIMIZER_CPU_OFFLOAD"] == "true", "optimizer_offload_fraction": float(os.environ["OPTIMIZER_OFFLOAD_FRACTION"]), "use_torch_optimizer_for_cpu_offload": os.environ["USE_TORCH_OPTIMIZER_FOR_CPU_OFFLOAD"] == "true", "overlap_cpu_optimizer_d2h_h2d": os.environ["OVERLAP_CPU_OPTIMIZER_D2H_H2D"] == "true", "dispatcher": os.environ["DISPATCHER"], "record_memory_usage": os.environ["RECORD_MEMORY_USAGE"] == "true", "memory_usage_start_step": int(os.environ["MEMORY_USAGE_START_STEP"]), "cli": os.environ["COMMAND_TEXT"]}; json.dump(config, open(os.path.join(root, "config.json"), "w"), indent=2, sort_keys=True)'
 
 printf 'model=%s precision=%s run_name=%s run_time=%s\n' "${MODEL}" "${PRECISION}" "${RUN_NAME}" "${RUN_TIME}" | tee "${RESULT_DIR}/run_info.txt"
 printf 'train_iters=%s global_batch_size=%s micro_batch_size=%s\n' "${TRAIN_ITERS}" "${GLOBAL_BATCH_SIZE}" "${MICRO_BATCH_SIZE}" | tee -a "${RESULT_DIR}/run_info.txt"
+printf 'activation_strategy=%s optimizer_strategy=%s sharding=optim_grads_params warmup_steps=%s\n' \
+    "${ACTIVATION_STRATEGY}" "${OPTIMIZER_STRATEGY}" "${WARMUP_STEPS}" | tee -a "${RESULT_DIR}/run_info.txt"
+printf 'recompute_granularity=%s recompute_method=%s recompute_num_layers=%s recompute_modules=%s fine_grained_offload=%s offload_modules=%s\n' \
+    "${RECOMPUTE_GRANULARITY}" "${RECOMPUTE_METHOD}" "${RECOMPUTE_NUM_LAYERS}" \
+    "${RECOMPUTE_MODULES}" "${FINE_GRAINED_OFFLOAD}" "${OFFLOAD_MODULES}" | tee -a "${RESULT_DIR}/run_info.txt"
+printf 'optimizer_cpu_offload=%s optimizer_offload_fraction=%s use_torch_optimizer_for_cpu_offload=%s overlap_cpu_optimizer_d2h_h2d=%s\n' \
+    "${OPTIMIZER_CPU_OFFLOAD}" "${OPTIMIZER_OFFLOAD_FRACTION}" \
+    "${USE_TORCH_OPTIMIZER_FOR_CPU_OFFLOAD}" "${OVERLAP_CPU_OPTIMIZER_D2H_H2D}" | tee -a "${RESULT_DIR}/run_info.txt"
 printf 'profile=%s profile_step_start=%s profile_step_end=%s use_nsys_profiler=%s use_pytorch_profiler=%s record_memory_history=%s nvtx_ranges=%s gpu_memory_trace_interval=%s\n' \
     "${PROFILE}" "${PROFILE_STEP_START}" "${PROFILE_STEP_END}" "${USE_NSYS_PROFILER}" \
     "${USE_PYTORCH_PROFILER}" "${RECORD_MEMORY_HISTORY}" "${NVTX_RANGES}" \
