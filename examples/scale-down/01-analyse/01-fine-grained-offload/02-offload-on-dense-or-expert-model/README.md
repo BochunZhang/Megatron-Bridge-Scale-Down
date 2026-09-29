@@ -32,10 +32,12 @@
 
 | 模型 | 选择参数 | scope | offload 模块 |
 | --- | --- | --- | --- |
-| Qwen Dense (9B/27B) | `--model qwen --scope dense` | dense MLP + attention | `offload-mlp: [mlp_norm,mlp_act]`; `offload-attn-mlp: [mlp_norm,mlp_act,attn_norm,attn_proj]` |
-| Qwen MoE (35B-A3B, 16 层, 64 experts) | `--model qwen --scope expert` | expert MLP + attention | `offload-mlp: [mlp_norm,expert_fc1,moe_act]`; `offload-attn-mlp` 追加 `[attn_norm,attn_proj]` |
+| Qwen Dense (9B/27B) | `--model qwen --scope dense` | dense MLP + attention | `offload-mlp: [mlp_norm,mlp_act]`; `offload-attn-mlp: [mlp_norm,mlp_act,attn_norm,core_attn,attn_proj]` |
+| Qwen MoE (35B-A3B, 16 层, 64 experts) | `--model qwen --scope expert` | expert MLP + attention | `offload-mlp: [mlp_norm,expert_fc1,moe_act]`; `offload-attn-mlp` 追加 `[attn_norm,core_attn,attn_proj]` |
 | DeepSeek-V3 dense proxy (4 层, 32 experts) | `--model deepseek --scope dense` | dense MLP + attention | `offload-mlp: [mlp_norm,mlp_act]`; `offload-attn-mlp` 追加 `[attn_norm,qkv_linear,core_attn,attn_proj]` |
 | DeepSeek-V3 expert proxy (4 层, 32 experts) | `--model deepseek --scope expert` | expert MLP + attention | `offload-mlp: [mlp_norm,expert_fc1,moe_act]`; `offload-attn-mlp` 追加 `[attn_norm,qkv_linear,core_attn,attn_proj]` |
+
+MCore 的 `TransformerLayer` 支持 `attn_norm`、`qkv_linear`、`core_attn` 和 `attn_proj`；其中 `attn_proj` 的配置校验要求同时启用 `core_attn`，所以 Qwen 的实际列表包含这个必要依赖。Qwen 的 GatedDeltaNet 路径本身使用独立的 `in_proj`/`out_proj`，不经过标准 SelfAttention 的 qkv/core/attn-proj offload manager，因此 Qwen case 中的 attention offload 只对实际存在的标准 attention 层生效。
 
 DeepSeek-V3 的两种 proxy 由脚本 override 构造（不再限制 `--scope dense`）：统一设置 `num_layers=4`、`num_moe_experts=32`；dense proxy 令 `moe_layer_freq=[0,0,0,0]`（4 个主 layer 全部走 dense MLP），expert proxy 令 `moe_layer_freq=[1,1,1,1]`（4 个主 layer 全部走 MoE）。脚本不 override MTP 数量，DeepSeek 默认的 1 个 MTP layer 会复用最后一个主 layer 的 dense/expert 类型，因此最终分别得到 5 个 dense layer 或 5 个 expert layer。这些列表值通过 Hydra override 直接传入，而不是按字符串逐层拼接。
 
@@ -247,4 +249,4 @@ result/01-analyse/01-fine-grained-offload/02-offload-on-dense-or-expert-model/of
 - baseline、offload-mlp 与 offload-attn-mlp 必须在相同模型、dtype、MBS、GBS、dispatcher 下对比；不要把不同架构的绝对 tokens/s 当成 dense/MoE 的普遍排名。
 - 先看 `summary.json` 和日志有无 NaN/Inf，再比 step time、tokens/s、显存。
 - 显存峰值看各 run 目录的 `gpu_memory/`；XLSX 只汇总吞吐。
-- `offload-attn-mlp` 在 MLP/MoE activation offload 基础上增加 attention activation offload；Qwen 的 GatedDeltaNet case 只追加 `attn_norm` 和 `attn_proj`。
+- `offload-attn-mlp` 在 MLP/MoE activation offload 基础上增加 attention activation offload；Qwen 按 GatedDeltaNet 架构只选择 `attn_norm` 和 `attn_proj`，并因 MCore 依赖额外包含 `core_attn`。

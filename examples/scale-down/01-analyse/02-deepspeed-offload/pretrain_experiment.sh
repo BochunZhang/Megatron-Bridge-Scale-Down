@@ -2,8 +2,8 @@
 # Experiment driver for the DeepSpeed offload + recompute matrix.
 #
 # Loop structure (outer -> inner):
-#   outermost: HF model                   {Qwen/Qwen3.5-9B (dense),
-#                                          Qwen/Qwen3.5-35B-A3B (MoE, 64 experts)}
+#   outermost: HF model                   {Qwen/Qwen3.5-9B-Base (dense),
+#                                          Qwen/Qwen3.5-35B-A3B-Base (MoE, 64 experts)}
 #   outer : micro-batch size sweep        {1, 2, 4, 8}
 #   middle: recompute x cpu_checkpoint    {recompute_none, recompute_act,
 #                                          recompute_act_cpu}
@@ -35,8 +35,8 @@
 #
 # Usage:
 #   ./pretrain_experiment.sh                          # full matrix, dense + MoE
-#   ./pretrain_experiment.sh --models Qwen/Qwen3.5-9B         # dense only
-#   ./pretrain_experiment.sh --models Qwen/Qwen3.5-35B-A3B    # MoE only
+#   ./pretrain_experiment.sh --models Qwen/Qwen3.5-9B-Base         # dense only
+#   ./pretrain_experiment.sh --models Qwen/Qwen3.5-35B-A3B-Base    # MoE only
 #   ./pretrain_experiment.sh --optimizer_strategies "zero_3 super_offload_0.9" \
 #       --param_positions "param_cpu param_gpu" --recompute_combos recompute_act
 set -euo pipefail
@@ -50,7 +50,7 @@ REPO_ROOT=${REPO_ROOT:-"$(cd "$SCRIPT_DIR/../../../.." && pwd)"}
 # ---------------------------------------------------------------------------
 # Outermost loop: HF model names — Qwen3.5 dense + Qwen3.5 MoE. MoE is
 # selected by the caller below from the model name.
-MODELS="Qwen/Qwen3.5-9B Qwen/Qwen3.5-35B-A3B"
+MODELS="Qwen/Qwen3.5-9B-Base Qwen/Qwen3.5-35B-A3B-Base"
 # The 35B-A3B MoE model is resized to 64 experts for the sweep (must be
 # divisible by AUTOEP_SIZE in pretrain.sh). Applied as an extra
 # --override num_experts=$MOE_NUM_EXPERTS for model names matching *A3B*.
@@ -136,6 +136,24 @@ while [ "$#" -gt 0 ]; do
             ;;
     esac
 done
+
+for MODEL in $MODELS; do
+    case "$MODEL" in
+        Qwen/Qwen3.5-9B-Base|Qwen/Qwen3.5-35B-A3B-Base) ;;
+        *)
+            echo "Unsupported comparison model: $MODEL; use the aligned Qwen3.5 Base model IDs" >&2
+            exit 2
+            ;;
+    esac
+done
+if [ "$APPLY_MODEL_SHAPE_OVERRIDES" != "false" ]; then
+    echo "Model shape overrides are disabled for the Megatron comparison; use native layer counts" >&2
+    exit 2
+fi
+if [ "$MOE_NUM_EXPERTS" -ne 64 ]; then
+    echo "The Megatron comparison fixes the MoE model to 64 experts" >&2
+    exit 2
+fi
 
 # ---------------------------------------------------------------------------
 # Output layout
@@ -261,7 +279,7 @@ SUMMARY_FILE="${RESULTS_ROOT}/experiment_summary_${INVOKE_TS}.txt"
 
 set +e  # keep sweeping after a failing/OOM run; status is recorded per run
 for MODEL in $MODELS; do
-    # Strip the HF org prefix for filesystem use: Qwen/Qwen3.5-9B -> Qwen3.5-9B.
+    # Strip the HF org prefix for filesystem use: Qwen/Qwen3.5-9B-Base -> Qwen3.5-9B-Base.
     # The _<N>layer tag follows the override configuration: it is only present
     # when the layer-shrink overrides are actually applied to the model.
     if [ "$APPLY_MODEL_SHAPE_OVERRIDES" = "true" ]; then

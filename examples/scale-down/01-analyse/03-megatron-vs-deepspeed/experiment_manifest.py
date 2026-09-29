@@ -63,10 +63,10 @@ def build_manifest(args: argparse.Namespace) -> dict[str, Any]:
     """Build a JSON-serializable model and training contract."""
     models = {
         "dense": _snapshot(args.dense_model),
-        "moe": _snapshot(args.moe_model),
+        "expert": _snapshot(args.moe_model),
     }
     if args.num_experts is not None:
-        models["moe"]["experiment_num_experts"] = args.num_experts
+        models["expert"]["experiment_num_experts"] = args.num_experts
     return {
         "schema_version": 1,
         "models": models,
@@ -85,12 +85,13 @@ def build_manifest(args: argparse.Namespace) -> dict[str, Any]:
         "parallelism": {
             "num_gpus": args.num_gpus,
             "dense": {"tensor": 1, "pipeline": 1, "context": 1, "expert": 1},
-            "moe": {"tensor": 1, "pipeline": 1, "context": 1, "expert": args.num_gpus},
+            "expert": {"tensor": 1, "pipeline": 1, "context": 1, "expert": args.num_gpus},
         },
         "comparability": {
             "deepspeed_param_cpu": "not_available_in_megatron_runner",
             "deepspeed_act_cpu": "module_fine_grained_offload_plus_selective_recompute",
             "optimizer_offload": "compare_memory_and_throughput_trend_only",
+            "megatron_sharding": "optim_grads_params (ZeRO-3 equivalent)",
         },
     }
 
@@ -99,8 +100,8 @@ def main() -> None:
     """Parse arguments and write the manifest."""
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output", type=Path, required=True)
-    parser.add_argument("--dense-model", default="Qwen/Qwen3.5-9B")
-    parser.add_argument("--moe-model", default="Qwen/Qwen3.5-35B-A3B")
+    parser.add_argument("--dense-model", default="Qwen/Qwen3.5-9B-Base")
+    parser.add_argument("--moe-model", default="Qwen/Qwen3.5-35B-A3B-Base")
     parser.add_argument("--num-experts", type=int, default=64)
     parser.add_argument("--sequence-length", type=int, default=4096)
     parser.add_argument("--num-gpus", type=int, default=4)

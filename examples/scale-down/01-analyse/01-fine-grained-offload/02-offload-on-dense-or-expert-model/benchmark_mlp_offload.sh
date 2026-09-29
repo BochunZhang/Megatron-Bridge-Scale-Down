@@ -260,7 +260,8 @@ run_dense_matrix() {
     run_case dense "${DENSE_MODEL_NAME}" "${DENSE_RECIPE_PREFIX}" default baseline null null false null "${micro_batch_size}"
     run_case dense "${DENSE_MODEL_NAME}" "${DENSE_RECIPE_PREFIX}" default offload-mlp null null true '[mlp_norm,mlp_act]' "${micro_batch_size}"
     if [[ "${MODEL_FAMILY}" == qwen ]]; then
-        local attention_offload_modules='[attn_norm,attn_proj]'
+        # MCore requires core_attn whenever attn_proj is enabled.
+        local attention_offload_modules='[attn_norm,core_attn,attn_proj]'
     else
         local attention_offload_modules='[attn_norm,qkv_linear,core_attn,attn_proj]'
     fi
@@ -277,7 +278,8 @@ run_expert_matrix() {
         run_case expert "${EXPERT_MODEL_NAME}" "${EXPERT_RECIPE_PREFIX}" "${dispatcher}" baseline null null false null "${micro_batch_size}"
         run_case expert "${EXPERT_MODEL_NAME}" "${EXPERT_RECIPE_PREFIX}" "${dispatcher}" offload-mlp null null true '[mlp_norm,expert_fc1,moe_act]' "${micro_batch_size}"
         if [[ "${MODEL_FAMILY}" == qwen ]]; then
-            local attention_offload_modules='[attn_norm,attn_proj]'
+            # MCore requires core_attn whenever attn_proj is enabled.
+            local attention_offload_modules='[attn_norm,core_attn,attn_proj]'
         else
             local attention_offload_modules='[attn_norm,qkv_linear,core_attn,attn_proj]'
         fi
@@ -310,4 +312,4 @@ if (( FAILURES > 0 )); then
 fi
 
 printf 'Raw results: %s (run_time=%s)\n' "${RESULTS_ROOT}" "${RUN_TIME}"
-printf 'Collect XLSX: %s/collect_mlp_offload_results.mjs\n' "${SCRIPT_DIR}"
+printf 'Collect XLSX: %s/collect_mlp_offload_results.py\n' "${SCRIPT_DIR}"

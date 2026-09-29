@@ -55,13 +55,14 @@ Usage: run_pretrain_fsdp1.sh \
     [--optimizer-cpu-offload <true|false>] \
     [--optimizer-offload-fraction <0.0-1.0>] \
     [--use-torch-optimizer-for-cpu-offload <true|false>] \
+    [--overlap-cpu-optimizer-d2h-h2d <true|false>] \
     [--seed <seed>] [--num-experts <count>] \
     [--dispatcher <default|alltoall|hybridep>] \
     [--record-memory-usage <true|false>] \
     [--memory-usage-start-step <step>] \
     [--profile-step-start <start>] \
     [--profile-step-end <end>] \
-    [--profile <nsys|torch>]
+    [--profile <none|nsys|torch>]
 
 The model, recipe, and precision are selected by the caller and are passed
 through without model/precision combination logic. Hydra values such as null,
@@ -428,7 +429,7 @@ export ACTIVATION_STRATEGY OPTIMIZER_STRATEGY TRAIN_ITERS WARMUP_STEPS GLOBAL_BA
 export RECOMPUTE_GRANULARITY RECOMPUTE_METHOD RECOMPUTE_NUM_LAYERS RECOMPUTE_MODULES
 export FINE_GRAINED_OFFLOAD OFFLOAD_MODULES OPTIMIZER_CPU_OFFLOAD OPTIMIZER_OFFLOAD_FRACTION
 export USE_TORCH_OPTIMIZER_FOR_CPU_OFFLOAD OVERLAP_CPU_OPTIMIZER_D2H_H2D DISPATCHER HYBRIDEP_NUM_SMS
-export RECORD_MEMORY_USAGE MEMORY_USAGE_START_STEP
+export PROFILE RECORD_MEMORY_USAGE MEMORY_USAGE_START_STEP
 
 # Derive profiling settings from the selected backend. Bridge's
 # ProfilingConfig.finalize() forbids enabling the nsys and PyTorch profilers at
@@ -494,6 +495,7 @@ OVERRIDES=(
     "checkpoint.save=null"
     "checkpoint.load=null"
     "logger.log_interval=1"
+    "logger.log_throughput=true"
     "logger.tensorboard_dir=${TENSORBOARD_DIR}"
     "logger.save_config_filepath=${RESULT_DIR}/config.yaml"
     "profiling.use_pytorch_profiler=${USE_PYTORCH_PROFILER}"
@@ -552,7 +554,7 @@ COMMAND=(
 COMMAND_TEXT="${COMMAND[*]}"
 export COMMAND_TEXT
 
-uv run --no-sync python -c 'import json, os, re; pattern = re.compile(r"(^|_)(TOKEN|SECRET|PASSWORD|PASSWD|API_KEY|ACCESS_KEY|SECRET_KEY|PRIVATE_KEY|AUTHORIZATION)(_|$)", re.I); root = os.environ["RESULT_DIR"]; env = {k: ("[REDACTED]" if pattern.search(k) else v) for k, v in sorted(os.environ.items())}; json.dump(env, open(os.path.join(root, "environment.json"), "w"), indent=2, sort_keys=True); open(os.path.join(root, "command.txt"), "w").write(os.environ["COMMAND_TEXT"] + "\n"); config = {"model": os.environ["MODEL"], "model_id": os.environ["MODEL_ID"], "precision": os.environ["PRECISION"], "run_name": os.environ["RUN_NAME"], "run_time": os.environ["RUN_TIME"], "recipe": os.environ["RECIPE"], "result_dir": root, "profile_ranks": [0, 1, 2, 3], "cache_paths": {"hf": env["HF_HOME"], "nemo": env["NEMO_HOME"]}, "activation_strategy": os.environ["ACTIVATION_STRATEGY"], "optimizer_strategy": os.environ["OPTIMIZER_STRATEGY"], "train_iters": int(os.environ["TRAIN_ITERS"]), "warmup_steps": int(os.environ["WARMUP_STEPS"]), "global_batch_size": int(os.environ["GLOBAL_BATCH_SIZE"]), "micro_batch_size": int(os.environ["MICRO_BATCH_SIZE"]), "data_parallel_sharding_strategy": "optim_grads_params", "recompute_granularity": os.environ["RECOMPUTE_GRANULARITY"], "recompute_method": os.environ["RECOMPUTE_METHOD"], "recompute_num_layers": os.environ["RECOMPUTE_NUM_LAYERS"], "recompute_modules": os.environ["RECOMPUTE_MODULES"], "fine_grained_offload": os.environ["FINE_GRAINED_OFFLOAD"] == "true", "offload_modules": os.environ["OFFLOAD_MODULES"], "optimizer_cpu_offload": os.environ["OPTIMIZER_CPU_OFFLOAD"] == "true", "optimizer_offload_fraction": float(os.environ["OPTIMIZER_OFFLOAD_FRACTION"]), "use_torch_optimizer_for_cpu_offload": os.environ["USE_TORCH_OPTIMIZER_FOR_CPU_OFFLOAD"] == "true", "overlap_cpu_optimizer_d2h_h2d": os.environ["OVERLAP_CPU_OPTIMIZER_D2H_H2D"] == "true", "dispatcher": os.environ["DISPATCHER"], "record_memory_usage": os.environ["RECORD_MEMORY_USAGE"] == "true", "memory_usage_start_step": int(os.environ["MEMORY_USAGE_START_STEP"]), "cli": os.environ["COMMAND_TEXT"]}; json.dump(config, open(os.path.join(root, "config.json"), "w"), indent=2, sort_keys=True)'
+uv run --no-sync python -c 'import json, os, re; pattern = re.compile(r"(^|_)(TOKEN|SECRET|PASSWORD|PASSWD|API_KEY|ACCESS_KEY|SECRET_KEY|PRIVATE_KEY|AUTHORIZATION)(_|$)", re.I); root = os.environ["RESULT_DIR"]; env = {k: ("[REDACTED]" if pattern.search(k) else v) for k, v in sorted(os.environ.items())}; json.dump(env, open(os.path.join(root, "environment.json"), "w"), indent=2, sort_keys=True); open(os.path.join(root, "command.txt"), "w").write(os.environ["COMMAND_TEXT"] + "\n"); config = {"model": os.environ["MODEL"], "model_id": os.environ["MODEL_ID"], "precision": os.environ["PRECISION"], "profile": os.environ["PROFILE"], "run_name": os.environ["RUN_NAME"], "run_time": os.environ["RUN_TIME"], "recipe": os.environ["RECIPE"], "result_dir": root, "profile_ranks": [0, 1, 2, 3], "cache_paths": {"hf": env["HF_HOME"], "nemo": env["NEMO_HOME"]}, "activation_strategy": os.environ["ACTIVATION_STRATEGY"], "optimizer_strategy": os.environ["OPTIMIZER_STRATEGY"], "train_iters": int(os.environ["TRAIN_ITERS"]), "warmup_steps": int(os.environ["WARMUP_STEPS"]), "global_batch_size": int(os.environ["GLOBAL_BATCH_SIZE"]), "micro_batch_size": int(os.environ["MICRO_BATCH_SIZE"]), "sequence_length": 4096, "data_parallel_sharding_strategy": "optim_grads_params", "recompute_granularity": os.environ["RECOMPUTE_GRANULARITY"], "recompute_method": os.environ["RECOMPUTE_METHOD"], "recompute_num_layers": os.environ["RECOMPUTE_NUM_LAYERS"], "recompute_modules": os.environ["RECOMPUTE_MODULES"], "fine_grained_offload": os.environ["FINE_GRAINED_OFFLOAD"] == "true", "offload_modules": os.environ["OFFLOAD_MODULES"], "optimizer_cpu_offload": os.environ["OPTIMIZER_CPU_OFFLOAD"] == "true", "optimizer_offload_fraction": float(os.environ["OPTIMIZER_OFFLOAD_FRACTION"]), "use_torch_optimizer_for_cpu_offload": os.environ["USE_TORCH_OPTIMIZER_FOR_CPU_OFFLOAD"] == "true", "overlap_cpu_optimizer_d2h_h2d": os.environ["OVERLAP_CPU_OPTIMIZER_D2H_H2D"] == "true", "dispatcher": os.environ["DISPATCHER"], "record_memory_usage": os.environ["RECORD_MEMORY_USAGE"] == "true", "memory_usage_start_step": int(os.environ["MEMORY_USAGE_START_STEP"]), "cli": os.environ["COMMAND_TEXT"]}; json.dump(config, open(os.path.join(root, "config.json"), "w"), indent=2, sort_keys=True)'
 
 printf 'model=%s precision=%s run_name=%s run_time=%s\n' "${MODEL}" "${PRECISION}" "${RUN_NAME}" "${RUN_TIME}" | tee "${RESULT_DIR}/run_info.txt"
 printf 'train_iters=%s global_batch_size=%s micro_batch_size=%s\n' "${TRAIN_ITERS}" "${GLOBAL_BATCH_SIZE}" "${MICRO_BATCH_SIZE}" | tee -a "${RESULT_DIR}/run_info.txt"
