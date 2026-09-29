@@ -52,11 +52,14 @@ DeepSeek-V3 的两种 proxy 由脚本 override 构造（不再限制 `--scope de
 
 - `benchmark_mlp_offload.sh` — 矩阵入口，展开所有组合并逐项调用训练脚本
 - `run_pretrain_fsdp1.sh` — 软链接到 `../01-mlp-scope-pretrain/`，实际执行 4-GPU FSDP1 训练
-- `collect_mlp_offload_results.mjs` — 扫描结果目录，生成 XLSX 吞吐对比表
+- `collect_mlp_offload_results.py` — Python 标准库版本，扫描结果目录并生成 XLSX 吞吐对比表
+- `analyse_mlp_offload_results.py` — Python 标准库版本，读取 GPU utilization 并生成 TFlops XLSX 对比表
+- `collect_mlp_offload_results.mjs` — Node.js 版本，保留用于已有 Node/artifact-tool 环境
+- `analyse_mlp_offload_results.mjs` — Node.js 版本，保留用于已有 Node/artifact-tool 环境
 
 ## 运行指令
 
-前置：仓库根目录 `uv sync`；4 张 GPU 可用（GB200 recipe）；`--profile nsys` 需要 `nsys`；生成 XLSX 需要 Node.js 和 `@oai/artifact-tool` 模块。
+前置：仓库根目录 `uv sync`；4 张 GPU 可用（GB200 recipe）；`--profile nsys` 需要 `nsys`。两个 Python XLSX 脚本只使用标准库，不需要 Node.js 或 `@oai/artifact-tool`。
 
 ```bash
 EXPERIMENT_DIR=examples/scale-down/01-analyse/01-fine-grained-offload/02-offload-on-dense-or-expert-model
@@ -73,11 +76,11 @@ EXPERIMENT_DIR=examples/scale-down/01-analyse/01-fine-grained-offload/02-offload
 ```bash
 # bf16
 bash "./examples/scale-down/01-analyse/01-fine-grained-offload/02-offload-on-dense-or-expert-model/benchmark_mlp_offload.sh" \
-  --model qwen --dtype bf16 --micro-batch-sizes 1,2,4,8
+  --model qwen --dtype bf16 --micro-batch-sizes 1,2,4
 
 # mxfp8
 bash "./examples/scale-down/01-analyse/01-fine-grained-offload/02-offload-on-dense-or-expert-model/benchmark_mlp_offload.sh" \
-  --model qwen --dtype mxfp8 --micro-batch-sizes 1,2,4,8
+  --model qwen --dtype mxfp8 --micro-batch-sizes 1,2,4
 ```
 
 **开启 nsys（定位瓶颈 / allreduce 来源，不进 XLSX）**，每个 dtype 同样 24 个运行：
@@ -85,11 +88,11 @@ bash "./examples/scale-down/01-analyse/01-fine-grained-offload/02-offload-on-den
 ```bash
 # bf16 + nsys
 bash "./examples/scale-down/01-analyse/01-fine-grained-offload/02-offload-on-dense-or-expert-model/benchmark_mlp_offload.sh" \
-  --model qwen --dtype bf16 --micro-batch-sizes 1,2,4,8 --profile nsys
+  --model qwen --dtype bf16 --micro-batch-sizes 1,2,4 --profile nsys
 
 # mxfp8 + nsys
 bash "./examples/scale-down/01-analyse/01-fine-grained-offload/02-offload-on-dense-or-expert-model/benchmark_mlp_offload.sh" \
-  --model qwen --dtype mxfp8 --micro-batch-sizes 1,2,4,8 --profile nsys
+  --model qwen --dtype mxfp8 --micro-batch-sizes 1,2,4 --profile nsys
 ```
 
 > nsys 只采集 step 7–8（`profile_step_start=7`、`profile_step_end=8`），单 run 开销可控；如只想对代表性 case 采集，可再叠加 `--scope`、`--case`、`--dispatcher`、`--micro-batch-size` 缩小矩阵。
@@ -97,7 +100,7 @@ bash "./examples/scale-down/01-analyse/01-fine-grained-offload/02-offload-on-den
 **吞吐矩阵跑完后汇总 TFlops**（只统计 `--profile none` 的成功运行）：
 
 ```bash
-node examples/scale-down/01-analyse/01-fine-grained-offload/02-offload-on-dense-or-expert-model/analyse_mlp_offload_results.mjs \
+uv run python examples/scale-down/01-analyse/01-fine-grained-offload/02-offload-on-dense-or-expert-model/analyse_mlp_offload_results.py \
   --model qwen
 ```
 
@@ -110,11 +113,11 @@ node examples/scale-down/01-analyse/01-fine-grained-offload/02-offload-on-dense-
 ```bash
 # bf16
 bash "./examples/scale-down/01-analyse/01-fine-grained-offload/02-offload-on-dense-or-expert-model/benchmark_mlp_offload.sh" \
-  --model deepseek --dtype bf16 --micro-batch-sizes 1,2,4,8
+  --model deepseek --dtype bf16 --micro-batch-sizes 1,2,4
 
 # mxfp8
 bash "./examples/scale-down/01-analyse/01-fine-grained-offload/02-offload-on-dense-or-expert-model/benchmark_mlp_offload.sh" \
-  --model deepseek --dtype mxfp8 --micro-batch-sizes 1,2,4,8
+  --model deepseek --dtype mxfp8 --micro-batch-sizes 1,2,4
 ```
 
 **开启 nsys（定位瓶颈 / allreduce 来源，不进 XLSX）**，每个 dtype 同样 24 个运行：
@@ -122,17 +125,17 @@ bash "./examples/scale-down/01-analyse/01-fine-grained-offload/02-offload-on-den
 ```bash
 # bf16 + nsys
 bash "./examples/scale-down/01-analyse/01-fine-grained-offload/02-offload-on-dense-or-expert-model/benchmark_mlp_offload.sh" \
-  --model deepseek --dtype bf16 --micro-batch-sizes 1,2,4,8 --profile nsys
+  --model deepseek --dtype bf16 --micro-batch-sizes 1,2,4 --profile nsys
 
 # mxfp8 + nsys
 bash "./examples/scale-down/01-analyse/01-fine-grained-offload/02-offload-on-dense-or-expert-model/benchmark_mlp_offload.sh" \
-  --model deepseek --dtype mxfp8 --micro-batch-sizes 1,2,4,8 --profile nsys
+  --model deepseek --dtype mxfp8 --micro-batch-sizes 1,2,4 --profile nsys
 ```
 
 **吞吐矩阵跑完后汇总 TFlops**（只统计 `--profile none` 的成功运行）：
 
 ```bash
-node examples/scale-down/01-analyse/01-fine-grained-offload/02-offload-on-dense-or-expert-model/analyse_mlp_offload_results.mjs \
+uv run python examples/scale-down/01-analyse/01-fine-grained-offload/02-offload-on-dense-or-expert-model/analyse_mlp_offload_results.py \
   --model deepseek
 ```
 
@@ -151,7 +154,7 @@ bash "./examples/scale-down/01-analyse/01-fine-grained-offload/02-offload-on-den
 ### 生成 XLSX 汇总（只收 `--profile none` 的成功运行）
 
 ```bash
-node "./examples/scale-down/01-analyse/01-fine-grained-offload/02-offload-on-dense-or-expert-model/collect_mlp_offload_results.mjs"
+uv run python examples/scale-down/01-analyse/01-fine-grained-offload/02-offload-on-dense-or-expert-model/collect_mlp_offload_results.py
 # 默认收集最新批次；回看旧批次加 --run-time <benchmark_id>
 # 只校验数据不写 XLSX：加 --dry-run
 ```
@@ -198,10 +201,10 @@ result/01-analyse/01-fine-grained-offload/02-offload-on-dense-or-expert-model/of
 ### 按模型汇总 TFlops
 
 ```bash
-node "./examples/scale-down/01-analyse/01-fine-grained-offload/02-offload-on-dense-or-expert-model/analyse_mlp_offload_results.mjs" \
+uv run python "./examples/scale-down/01-analyse/01-fine-grained-offload/02-offload-on-dense-or-expert-model/analyse_mlp_offload_results.py" \
   --model qwen
 
-node "./examples/scale-down/01-analyse/01-fine-grained-offload/02-offload-on-dense-or-expert-model/analyse_mlp_offload_results.mjs" \
+uv run python "./examples/scale-down/01-analyse/01-fine-grained-offload/02-offload-on-dense-or-expert-model/analyse_mlp_offload_results.py" \
   --model deepseek
 ```
 
