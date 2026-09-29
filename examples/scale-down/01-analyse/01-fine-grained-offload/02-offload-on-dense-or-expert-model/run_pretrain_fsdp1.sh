@@ -429,6 +429,7 @@ case "${PROFILE}" in
         USE_NSYS_PROFILER="true"
         USE_PYTORCH_PROFILER="false"
         RECORD_MEMORY_HISTORY="true"
+        RECORD_SHAPES="true"
         NVTX_RANGES="true"
         TENSORBOARD_DIR="null"
         ;;
@@ -436,6 +437,7 @@ case "${PROFILE}" in
         USE_NSYS_PROFILER="false"
         USE_PYTORCH_PROFILER="true"
         RECORD_MEMORY_HISTORY="true"
+        RECORD_SHAPES="true"
         NVTX_RANGES="true"
         TENSORBOARD_DIR="${RESULT_DIR}/profile/tensorboard"
         ;;
@@ -443,6 +445,7 @@ case "${PROFILE}" in
         USE_NSYS_PROFILER="false"
         USE_PYTORCH_PROFILER="false"
         RECORD_MEMORY_HISTORY="false"
+        RECORD_SHAPES="false"
         NVTX_RANGES="false"
         TENSORBOARD_DIR="null"
         ;;
@@ -482,6 +485,7 @@ OVERRIDES=(
     "profiling.profile_step_end=${PROFILE_STEP_END}"
     "profiling.profile_ranks=[0,1,2,3]"
     "profiling.record_memory_history=${RECORD_MEMORY_HISTORY}"
+    "profiling.record_shapes=${RECORD_SHAPES}"
     "profiling.memory_snapshot_path=${RESULT_DIR}/memory/snapshot.pickle"
     "profiling.nvtx_ranges=${NVTX_RANGES}"
 )
@@ -543,9 +547,9 @@ printf 'warmup_steps=%s optimizer_cpu_offload=%s optimizer_offload_fraction=%s o
 printf 'dispatcher=%s hybridep_num_sms=%s recompute_modules=%s offload_modules=%s\n' \
     "${DISPATCHER}" "${HYBRIDEP_NUM_SMS}" "${RECOMPUTE_MODULES}" "${OFFLOAD_MODULES}" \
     | tee -a "${RESULT_DIR}/run_info.txt"
-printf 'profile=%s profile_step_start=%s profile_step_end=%s use_nsys_profiler=%s use_pytorch_profiler=%s record_memory_history=%s nvtx_ranges=%s gpu_memory_trace_interval=%s\n' \
+printf 'profile=%s profile_step_start=%s profile_step_end=%s use_nsys_profiler=%s use_pytorch_profiler=%s record_memory_history=%s record_shapes=%s nvtx_ranges=%s gpu_memory_trace_interval=%s\n' \
     "${PROFILE}" "${PROFILE_STEP_START}" "${PROFILE_STEP_END}" "${USE_NSYS_PROFILER}" \
-    "${USE_PYTORCH_PROFILER}" "${RECORD_MEMORY_HISTORY}" "${NVTX_RANGES}" \
+    "${USE_PYTORCH_PROFILER}" "${RECORD_MEMORY_HISTORY}" "${RECORD_SHAPES}" "${NVTX_RANGES}" \
     "${GPU_MEMORY_TRACE_INTERVAL}" | tee -a "${RESULT_DIR}/run_info.txt"
 printf 'result_dir=%s\nprofile_ranks=0,1,2,3\ncommand=%s\n' "${RESULT_DIR}" "${COMMAND_TEXT}" | tee -a "${RESULT_DIR}/run_info.txt"
 
