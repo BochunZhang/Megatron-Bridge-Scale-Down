@@ -26,7 +26,7 @@
 
 ### 2.2 运行与目录
 
-本对比的 benchmark 入口和结果收集器放在 `examples/scale-down/01-analyse/01-fine-grained-offload/02-offload-on-dense-or-expert-model/`。通用训练入口仍由 `01-mlp-scope-pretrain/run_pretrain_fsdp1.sh` 维护，新目录通过相对软链接复用该脚本；不依赖 `srun`，统一使用：
+本对比的 benchmark 入口、专用训练脚本和结果收集器放在 `examples/scale-down/01-analyse/01-fine-grained-offload/02-offload-on-dense-or-expert-model/`。该目录的训练脚本专门服务 dense/expert 对比，不依赖 `srun`，统一使用：
 
 ```bash
 uv run python -m torch.distributed.run --nproc_per_node=<N> <script.py> ...

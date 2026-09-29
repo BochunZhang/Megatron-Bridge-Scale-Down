@@ -37,7 +37,7 @@ DEFAULT_RESULTS_ROOT = REPO_ROOT / "results/01-analyse/03-megatron-vs-deepspeed"
 SAMPLES_TO_AVERAGE = 4
 BYTES_PER_GIB = 1024**3
 ANSI_PATTERN = re.compile(r"\x1b\[[0-9;]*m")
-RUN_NAME_PATTERN = re.compile(
+LEGACY_RUN_NAME_PATTERN = re.compile(
     r"^model_(dense|expert)__activation_(baseline|recompute|recompute_offload)__"
     r"(optimizer_none|optimizer_cpu_090|optimizer_cpu_075|optimizer_cpu_100)__"
     r"mbs_(\d+)__gbs_(\d+)__repeat_(\d+)$"
@@ -189,17 +189,39 @@ def parse_run(config_path: Path) -> RunResult:
 
     config = read_json(config_path)
     result_dir = config_path.parent
-    test_name = str(config.get("run_name", ""))
-    identity = RUN_NAME_PATTERN.fullmatch(test_name)
-    if identity is None:
-        raise ValueError(f"Unrecognized run name in {config_path}: {test_name}")
-
-    model_kind, activation, optimizer, name_mbs, name_gbs, repeat = identity.groups()
+    run_name = str(config.get("run_name", ""))
     micro_batch_size = int(config.get("micro_batch_size", 0))
     global_batch_size = int(config.get("global_batch_size", 0))
     sequence_length = int(config.get("sequence_length", 4096))
-    if micro_batch_size != int(name_mbs) or global_batch_size != int(name_gbs):
-        raise ValueError(f"Run name and config batch sizes disagree: {config_path}")
+    if "model_kind" in config:
+        model_kind = str(config["model_kind"])
+        activation = str(config.get("activation_strategy", ""))
+        optimizer = str(config.get("optimizer_strategy", ""))
+        repeat = int(config.get("repeat", 0))
+        test_name = str(config.get("test_name", ""))
+        if not run_name.startswith(f"{model_kind}-") or run_name.removeprefix(f"{model_kind}-") != test_name:
+            raise ValueError(f"Run name and structured identity disagree: {config_path}")
+        result_path_name = str(config.get("result_path_name", ""))
+        if result_path_name and result_dir.parent.name != result_path_name:
+            raise ValueError(f"Result path name and directory disagree: {config_path}")
+    else:
+        identity = LEGACY_RUN_NAME_PATTERN.fullmatch(run_name)
+        if identity is None:
+            raise ValueError(f"Unrecognized run name in {config_path}: {run_name}")
+        model_kind, activation, optimizer, name_mbs, name_gbs, legacy_repeat = identity.groups()
+        if micro_batch_size != int(name_mbs) or global_batch_size != int(name_gbs):
+            raise ValueError(f"Run name and config batch sizes disagree: {config_path}")
+        repeat = int(legacy_repeat)
+        test_name = run_name
+
+    if model_kind not in {"dense", "expert"}:
+        raise ValueError(f"Unsupported model kind in {config_path}: {model_kind}")
+    if activation not in {"baseline", "recompute", "recompute_offload"}:
+        raise ValueError(f"Unsupported activation strategy in {config_path}: {activation}")
+    if optimizer not in {"optimizer_none", "optimizer_cpu_090", "optimizer_cpu_075", "optimizer_cpu_100"}:
+        raise ValueError(f"Unsupported optimizer strategy in {config_path}: {optimizer}")
+    if repeat <= 0:
+        raise ValueError(f"Invalid repeat in {config_path}: {repeat}")
     if min(micro_batch_size, global_batch_size, sequence_length) <= 0:
         raise ValueError(f"Invalid batch size or sequence length in {config_path}")
 
@@ -235,7 +257,7 @@ def parse_run(config_path: Path) -> RunResult:
         micro_batch_size=micro_batch_size,
         global_batch_size=global_batch_size,
         sequence_length=sequence_length,
-        repeat=int(repeat),
+        repeat=repeat,
         result_dir=str(result_dir),
         samples=samples,
         error=error,
@@ -264,7 +286,8 @@ def discover_runs(results_root: Path, requested_run_time: str | None) -> tuple[s
     for config_path in results_root.rglob("config.json"):
         config = read_json(config_path)
         run_name = str(config.get("run_name", ""))
-        if RUN_NAME_PATTERN.fullmatch(run_name) is not None:
+        model_kind = str(config.get("model_kind", ""))
+        if model_kind in {"dense", "expert"} or LEGACY_RUN_NAME_PATTERN.fullmatch(run_name) is not None:
             candidates.append((config_path, str(config.get("run_time", ""))))
     if not candidates:
         raise ValueError(f"No experiment runs found under {results_root}")
@@ -276,9 +299,11 @@ def discover_runs(results_root: Path, requested_run_time: str | None) -> tuple[s
     selected = sorted((parse_run(path) for path, value in candidates if value == run_time), key=_sort_key)
     if not selected:
         raise ValueError(f"No experiment runs found for run_time={run_time}")
-    names = [run.test_name for run in selected]
-    if len(names) != len(set(names)):
-        raise ValueError(f"Duplicate test names found for run_time={run_time}")
+    identities = [
+        (run.model_kind, run.test_name, run.micro_batch_size, run.global_batch_size, run.repeat) for run in selected
+    ]
+    if len(identities) != len(set(identities)):
+        raise ValueError(f"Duplicate test combinations found for run_time={run_time}")
     return run_time, selected
 
 

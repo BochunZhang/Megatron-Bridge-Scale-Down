@@ -64,7 +64,7 @@ DeepSeek-V3 的两种 proxy 由脚本 override 构造（不再限制 `--scope de
 ## 文件说明
 
 - `benchmark_mlp_offload.sh` — 矩阵入口，展开所有组合并逐项调用训练脚本
-- `run_pretrain_fsdp1.sh` — 软链接到 `../01-mlp-scope-pretrain/`，实际执行 4-GPU FSDP1 训练
+- `run_pretrain_fsdp1.sh` — dense/expert 对比专用的 4-GPU FSDP1 训练入口
 - `collect_mlp_offload_results.py` — Python 标准库版本，扫描结果目录并生成 XLSX 吞吐对比表
 - `analyse_mlp_offload_results.py` — Python 标准库版本，读取 GPU utilization 并生成 TFlops XLSX 对比表
 - `collect_mlp_offload_results.mjs` — Node.js 版本，保留用于已有 Node/artifact-tool 环境

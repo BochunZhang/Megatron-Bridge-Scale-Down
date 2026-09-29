@@ -10,7 +10,9 @@ RUNNER="${SCRIPT_DIR}/run_pretrain_fsdp1.sh"
 RESULTS_ROOT="${RESULTS_ROOT:-${REPO_ROOT}/results/01-analyse/03-megatron-vs-deepspeed}"
 MODELS="dense expert"
 ACTIVATION_STRATEGIES="baseline recompute recompute_offload"
-OPTIMIZER_STRATEGIES="optimizer_none optimizer_cpu_090 optimizer_cpu_075 optimizer_cpu_100"
+# CPU optimizer offload is disabled while it cannot be combined with Megatron FSDP.
+# OPTIMIZER_STRATEGIES="optimizer_none optimizer_cpu_090 optimizer_cpu_075 optimizer_cpu_100"
+OPTIMIZER_STRATEGIES="optimizer_none"
 MICRO_BATCH_SIZES="1 2 4"
 PRECISION="${PRECISION:-bf16}"
 TRAIN_ITERS="${TRAIN_ITERS:-10}"
@@ -28,7 +30,6 @@ Usage: pretrain_experiment.sh [options]
 Options:
   --models "dense expert"
   --activation-strategies "baseline recompute recompute_offload"
-  --optimizer-strategies "optimizer_none optimizer_cpu_090 optimizer_cpu_075 optimizer_cpu_100"
   --micro-batch-sizes "1 2 4"
   --precision <bf16|fp8mx>
   --train-iters <n>
@@ -36,7 +37,7 @@ Options:
   --repeats <n>
   --per-gpu-batch-size <n>
   --results-root <path>
-  --test                    Run only optimizer offload 0.75/1.0 with MBS=1
+  --test                    Run the smoke matrix with MBS=1
   --dry-run
   -h, --help
 EOF
@@ -46,7 +47,6 @@ while [[ $# -gt 0 ]]; do
     case "$1" in
         --models) MODELS="$2"; shift 2 ;;
         --activation-strategies) ACTIVATION_STRATEGIES="$2"; shift 2 ;;
-        --optimizer-strategies) OPTIMIZER_STRATEGIES="$2"; shift 2 ;;
         --micro-batch-sizes) MICRO_BATCH_SIZES="$2"; shift 2 ;;
         --precision) PRECISION="$2"; shift 2 ;;
         --train-iters) TRAIN_ITERS="$2"; shift 2 ;;
@@ -62,7 +62,6 @@ while [[ $# -gt 0 ]]; do
 done
 
 if [[ "${TEST_MODE}" == true ]]; then
-    OPTIMIZER_STRATEGIES="optimizer_cpu_075 optimizer_cpu_100"
     MICRO_BATCH_SIZES="1"
 fi
 
@@ -70,6 +69,8 @@ case "${PRECISION}" in
     bf16|fp8mx) ;;
     *) echo "Unsupported precision: ${PRECISION}" >&2; exit 2 ;;
 esac
+DENSE_RECIPE="qwen35_text_9b_pretrain_4gpu_gb200_${PRECISION}_fsdp1_config"
+EXPERT_RECIPE="qwen35_text_35b_a3b_pretrain_4gpu_gb200_${PRECISION}_fsdp1_config"
 if ! [[ "${TRAIN_ITERS}" =~ ^[1-9][0-9]*$ && "${WARMUP_STEPS}" =~ ^[0-9]+$ && \
     "${REPEATS}" =~ ^[1-9][0-9]*$ && "${PER_GPU_BATCH_SIZE}" =~ ^[1-9][0-9]*$ ]]; then
     echo "Iteration, repeat, and batch-size arguments must be integers" >&2
@@ -85,14 +86,14 @@ set_model() {
         dense)
             MODEL="qwen35_text_9b"
             HF_MODEL="Qwen/Qwen3.5-9B-Base"
-            RECIPE="qwen35_text_9b_pretrain_4gpu_gb200_${PRECISION}_fsdp1_config"
+            RECIPE="${DENSE_RECIPE}"
             DISPATCHER="default"
             NUM_EXPERTS=""
             ;;
         expert)
             MODEL="qwen35_text_35b_a3b"
             HF_MODEL="Qwen/Qwen3.5-35B-A3B-Base"
-            RECIPE="qwen35_text_35b_a3b_pretrain_4gpu_gb200_${PRECISION}_fsdp1_config"
+            RECIPE="${EXPERT_RECIPE}"
             DISPATCHER="hybridep"
             NUM_EXPERTS=64
             ;;
@@ -164,7 +165,11 @@ export RESULTS_ROOT RUN_TIME
 MANIFEST="${RESULTS_ROOT}/model_manifest.json"
 if [[ "${DRY_RUN}" == false ]]; then
     uv run --no-sync python "${SCRIPT_DIR}/experiment_manifest.py" \
-        --output "${MANIFEST}" --num-gpus 4 --num-experts 64
+        --output "${MANIFEST}" \
+        --dense-recipe "${DENSE_RECIPE}" \
+        --moe-recipe "${EXPERT_RECIPE}" \
+        --num-gpus 4 \
+        --num-experts 64
 fi
 
 SUMMARY_FILE="${RESULTS_ROOT}/experiment_summary_${RUN_TIME}.txt"
@@ -183,8 +188,14 @@ for MODEL_KIND in ${MODELS}; do
             for OPTIMIZER_STRATEGY in ${OPTIMIZER_STRATEGIES}; do
                 set_optimizer_strategy "${OPTIMIZER_STRATEGY}"
                 for ((REPEAT = 1; REPEAT <= REPEATS; REPEAT++)); do
-                    RUN_NAME="model_${MODEL_KIND}__activation_${ACTIVATION_STRATEGY}__${OPTIMIZER_STRATEGY}__mbs_${MBS}__gbs_${GLOBAL_BATCH_SIZE}__repeat_${REPEAT}"
-                    echo "matrix run=${RUN_NAME} model=${MODEL_KIND} hf_model=${HF_MODEL} activation=${ACTIVATION_STRATEGY} optimizer=${OPTIMIZER_STRATEGY} sharding=optim_grads_params recompute_granularity=${RECOMPUTE_GRANULARITY} recompute_method=${RECOMPUTE_METHOD} recompute_num_layers=${RECOMPUTE_NUM_LAYERS} recompute_modules=${RECOMPUTE_MODULES} fine_grained_activation_offloading=${FINE_GRAINED_OFFLOAD} offload_modules=${OFFLOAD_MODULES} optimizer_cpu_offload=${OPTIMIZER_CPU_OFFLOAD} optimizer_offload_fraction=${OPTIMIZER_OFFLOAD_FRACTION} overlap_cpu_optimizer_d2h_h2d=${OVERLAP_CPU_OPTIMIZER_D2H_H2D} record_memory_usage=true"
+                    TEST_NAME="${ACTIVATION_STRATEGY//_/-}-${OPTIMIZER_STRATEGY//_/-}-r${REPEAT}"
+                    RUN_NAME="${MODEL_KIND}-${TEST_NAME}"
+                    RESULT_PATH_NAME="dtype_${PRECISION}-mbs_${MBS}-gbs_${GLOBAL_BATCH_SIZE}"
+                    if [[ "${MODEL_KIND}" == expert ]]; then
+                        RESULT_PATH_NAME+="-dispatcher_${DISPATCHER}"
+                    fi
+                    RESULT_PATH_NAME+="-${TEST_NAME}"
+                    echo "matrix run=${RUN_NAME} result_path_name=${RESULT_PATH_NAME} model=${MODEL_KIND} hf_model=${HF_MODEL} activation=${ACTIVATION_STRATEGY} optimizer=${OPTIMIZER_STRATEGY} sharding=optim_grads_params recompute_granularity=${RECOMPUTE_GRANULARITY} recompute_method=${RECOMPUTE_METHOD} recompute_num_layers=${RECOMPUTE_NUM_LAYERS} recompute_modules=${RECOMPUTE_MODULES} fine_grained_activation_offloading=${FINE_GRAINED_OFFLOAD} offload_modules=${OFFLOAD_MODULES} optimizer_cpu_offload=${OPTIMIZER_CPU_OFFLOAD} optimizer_offload_fraction=${OPTIMIZER_OFFLOAD_FRACTION} overlap_cpu_optimizer_d2h_h2d=${OVERLAP_CPU_OPTIMIZER_D2H_H2D} record_memory_usage=true"
                     if [[ "${DRY_RUN}" == true ]]; then
                         echo "${RUN_NAME} DRY_RUN" >> "${SUMMARY_FILE}"
                         continue

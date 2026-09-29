@@ -303,20 +303,6 @@ MODEL_ID="${MODEL}"
 RESULT_MODEL_NAME="${MODEL}"
 TEST_NAME=""
 
-# The dense/expert comparison reuses this script through a symlink. Keep the
-# original entry point's result layout intact while giving the comparison its
-# own stable, compact result tree.
-IS_DENSE_OR_EXPERT_EXPERIMENT=false
-if [[ "${SCRIPT_DIR}" == */01-fine-grained-offload/02-offload-on-dense-or-expert-model ]]; then
-    IS_DENSE_OR_EXPERT_EXPERIMENT=true
-fi
-
-sanitize_path_component() {
-    local value="$1"
-    value="${value//[^[:alnum:]._-]/_}"
-    printf '%s' "${value}"
-}
-
 case "${DTYPE}" in
     bf16|mxfp8) ;;
     *) echo "Unsupported dtype: ${DTYPE}; expected bf16 or mxfp8" >&2; exit 2 ;;
@@ -354,55 +340,29 @@ case "${DISPATCHER}" in
     *) echo "--dispatcher must be one of default|alltoall|hybridep: ${DISPATCHER}" >&2; exit 2 ;;
 esac
 
-if [[ "${IS_DENSE_OR_EXPERT_EXPERIMENT}" == true ]]; then
-    RESULTS_ROOT="${RESULTS_ROOT:-${REPO_ROOT}/results/01-analyse/01-fine-grained-offload/02-offload-on-dense-or-expert-model}"
-else
-    RESULTS_ROOT="${RESULTS_ROOT:-${REPO_ROOT}/results/01-analyse/01-offload-on-dense-and-expert-model}"
-fi
+RESULTS_ROOT="${RESULTS_ROOT:-${REPO_ROOT}/results/01-analyse/01-fine-grained-offload/02-offload-on-dense-or-expert-model}"
 RUN_TIME="${RUN_TIME:-$(date +%Y%m%d-%H%M%S)}"
-SAFE_RUN_NAME="$(sanitize_path_component "${RUN_NAME}")"
-SAFE_NUM_LAYERS="$(sanitize_path_component "${NUM_LAYERS:-default}")"
-SAFE_NUM_EXPERTS="$(sanitize_path_component "${NUM_EXPERTS:-default}")"
 MODEL_KIND="${RUN_NAME%%-*}"
-if [[ "${IS_DENSE_OR_EXPERT_EXPERIMENT}" == true ]]; then
-    case "${RUN_NAME}" in
-        *-baseline-mbs*-r[0-9]*) TEST_NAME=baseline ;;
-        *-offload-mlp-mbs*-r[0-9]*) TEST_NAME=offload-mlp ;;
-        *-offload-attn-mlp-mbs*-r[0-9]*) TEST_NAME=offload-attn-mlp ;;
-        *) echo "Run name has an unsupported experiment case: ${RUN_NAME}" >&2; exit 2 ;;
-    esac
-else
-    case "${FINE_GRAINED_OFFLOAD}" in
-        true) TEST_NAME=offload ;;
-        false) TEST_NAME=baseline ;;
-    esac
+case "${MODEL_KIND}" in
+    dense|expert) ;;
+    *) echo "Run name must start with dense or expert: ${RUN_NAME}" >&2; exit 2 ;;
+esac
+case "${RUN_NAME}" in
+    *-baseline-mbs*-r[0-9]*) TEST_NAME=baseline ;;
+    *-offload-mlp-mbs*-r[0-9]*) TEST_NAME=offload-mlp ;;
+    *-offload-attn-mlp-mbs*-r[0-9]*) TEST_NAME=offload-attn-mlp ;;
+    *) echo "Run name has an unsupported experiment case: ${RUN_NAME}" >&2; exit 2 ;;
+esac
+if [[ "${MODEL}" == deepseek || "${MODEL}" == deepseek_v3 ]]; then
+    RESULT_MODEL_NAME="deepseek-${MODEL_KIND}"
 fi
-if [[ "${IS_DENSE_OR_EXPERT_EXPERIMENT}" == true ]]; then
-    case "${MODEL_KIND}" in
-        dense|expert) ;;
-        *) echo "Run name must start with dense or expert: ${RUN_NAME}" >&2; exit 2 ;;
-    esac
-    if [[ "${MODEL}" == deepseek || "${MODEL}" == deepseek_v3 ]]; then
-        RESULT_MODEL_NAME="deepseek-${MODEL_KIND}"
-    fi
-    RESULT_PATH_NAME="dtype_${DTYPE}-mbs_${MICRO_BATCH_SIZE}-gbs_${GLOBAL_BATCH_SIZE}"
-    if [[ "${MODEL_KIND}" == expert ]]; then
-        RESULT_PATH_NAME+="-dispatcher_${DISPATCHER}"
-    fi
-    RESULT_PATH_NAME+="-${TEST_NAME}"
-else
-    RESULT_PATH_NAME="${SAFE_RUN_NAME}__mbs${MICRO_BATCH_SIZE}_gbs${GLOBAL_BATCH_SIZE}_iters${TRAIN_ITERS}_layers${SAFE_NUM_LAYERS}_experts${SAFE_NUM_EXPERTS}_disp${DISPATCHER}_recompute${RECOMPUTE_GRANULARITY}_offload${FINE_GRAINED_OFFLOAD}_profile${PROFILE}"
+RESULT_PATH_NAME="dtype_${DTYPE}-mbs_${MICRO_BATCH_SIZE}-gbs_${GLOBAL_BATCH_SIZE}"
+if [[ "${MODEL_KIND}" == expert ]]; then
+    RESULT_PATH_NAME+="-dispatcher_${DISPATCHER}"
 fi
-if [[ "${IS_DENSE_OR_EXPERT_EXPERIMENT}" == true ]]; then
-    RESULT_DIR="${RESULTS_ROOT}/${RESULT_MODEL_NAME}/${RESULT_PATH_NAME}/${RUN_TIME}"
-else
-    RESULT_DIR="${RESULTS_ROOT}/${RESULT_MODEL_NAME}/${DTYPE}/${RESULT_PATH_NAME}/${RUN_TIME}"
-fi
-if [[ "${IS_DENSE_OR_EXPERT_EXPERIMENT}" == true ]]; then
-    NSYS_RESULT_NAME="${RESULT_MODEL_NAME}/${RESULT_PATH_NAME}/${RUN_TIME}"
-else
-    NSYS_RESULT_NAME="${RESULT_MODEL_NAME}/${DTYPE}/${RESULT_PATH_NAME}/${RUN_TIME}"
-fi
+RESULT_PATH_NAME+="-${TEST_NAME}"
+RESULT_DIR="${RESULTS_ROOT}/${RESULT_MODEL_NAME}/${RESULT_PATH_NAME}/${RUN_TIME}"
+NSYS_RESULT_NAME="${RESULT_MODEL_NAME}/${RESULT_PATH_NAME}/${RUN_TIME}"
 NSYS_RESULT_NAME="${NSYS_RESULT_NAME//\//-}"
 HF_CACHE="${REPO_ROOT}/.cache/huggingface"
 NEMO_CACHE="${REPO_ROOT}/.cache/nemo"

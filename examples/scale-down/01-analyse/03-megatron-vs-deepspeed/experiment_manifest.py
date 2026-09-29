@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 import argparse
+import importlib
 import json
 import logging
 from pathlib import Path
@@ -26,20 +27,7 @@ from transformers import AutoConfig
 
 
 LOGGER = logging.getLogger(__name__)
-CONTRACT_FIELDS = (
-    "model_type",
-    "num_hidden_layers",
-    "hidden_size",
-    "intermediate_size",
-    "num_attention_heads",
-    "num_key_value_heads",
-    "layer_types",
-    "num_experts",
-    "num_experts_per_tok",
-    "vocab_size",
-    "rope_theta",
-    "max_position_embeddings",
-)
+QWEN35_RECIPE_MODULE = "megatron.bridge.recipes.qwen.gb200.qwen35"
 
 
 def _text_config(model_id: str) -> Any:
@@ -48,27 +36,176 @@ def _text_config(model_id: str) -> Any:
     return getattr(config, "text_config", config)
 
 
-def _snapshot(model_id: str) -> dict[str, Any]:
-    """Extract stable architecture fields from a Hugging Face config."""
-    config = _text_config(model_id)
-    values: dict[str, Any] = {"model_id": model_id}
-    for field in CONTRACT_FIELDS:
-        value = getattr(config, field, None)
-        if value is not None:
-            values[field] = value
-    return values
+def _rope_value(config: Any, field: str) -> Any:
+    """Read a RoPE value from either the legacy attribute or nested mapping."""
+    value = getattr(config, field, None)
+    if value is not None:
+        return value
+    rope_parameters = getattr(config, "rope_parameters", None)
+    return rope_parameters.get(field) if isinstance(rope_parameters, dict) else None
+
+
+def _layer_types(num_layers: int, full_attention_interval: int) -> list[str]:
+    """Expand Megatron's attention interval into the equivalent HF layer list."""
+    return [
+        "full_attention" if (layer_index + 1) % full_attention_interval == 0 else "linear_attention"
+        for layer_index in range(num_layers)
+    ]
+
+
+def _hf_contract(config: Any, *, expert: bool) -> dict[str, Any]:
+    """Normalize a post-override DeepSpeed HF config into common model fields."""
+    contract = {
+        "num_layers": config.num_hidden_layers,
+        "hidden_size": config.hidden_size,
+        "num_attention_heads": config.num_attention_heads,
+        "num_query_groups": config.num_key_value_heads,
+        "head_dim": config.head_dim,
+        "vocab_size": config.vocab_size,
+        "layer_types": list(config.layer_types),
+        "linear_conv_kernel_dim": config.linear_conv_kernel_dim,
+        "linear_key_head_dim": config.linear_key_head_dim,
+        "linear_value_head_dim": config.linear_value_head_dim,
+        "linear_num_key_heads": config.linear_num_key_heads,
+        "linear_num_value_heads": config.linear_num_value_heads,
+        "mtp_num_layers": config.mtp_num_hidden_layers,
+        "rms_norm_eps": config.rms_norm_eps,
+        "initializer_range": config.initializer_range,
+        "attention_dropout": config.attention_dropout,
+        "tie_word_embeddings": config.tie_word_embeddings,
+        "attention_bias": config.attention_bias,
+        "rope_theta": _rope_value(config, "rope_theta"),
+        "partial_rotary_factor": _rope_value(config, "partial_rotary_factor"),
+    }
+    if expert:
+        contract.update(
+            {
+                "num_experts": config.num_experts,
+                "num_experts_per_tok": config.num_experts_per_tok,
+                "moe_intermediate_size": config.moe_intermediate_size,
+                "shared_expert_intermediate_size": config.shared_expert_intermediate_size,
+                "router_aux_loss_coef": config.router_aux_loss_coef,
+            }
+        )
+    else:
+        contract["intermediate_size"] = config.intermediate_size
+    return contract
+
+
+def _megatron_contract(provider: Any, *, expert: bool) -> dict[str, Any]:
+    """Normalize a post-override Megatron provider into common model fields."""
+    num_layers = int(provider.num_layers)
+    full_attention_interval = int(provider.linear_attention_freq)
+    contract = {
+        "num_layers": num_layers,
+        "hidden_size": provider.hidden_size,
+        "num_attention_heads": provider.num_attention_heads,
+        "num_query_groups": provider.num_query_groups,
+        "head_dim": provider.kv_channels,
+        "vocab_size": provider.vocab_size,
+        "layer_types": _layer_types(num_layers, full_attention_interval),
+        "linear_conv_kernel_dim": provider.linear_conv_kernel_dim,
+        "linear_key_head_dim": provider.linear_key_head_dim,
+        "linear_value_head_dim": provider.linear_value_head_dim,
+        "linear_num_key_heads": provider.linear_num_key_heads,
+        "linear_num_value_heads": provider.linear_num_value_heads,
+        "mtp_num_layers": provider.mtp_num_layers,
+        "rms_norm_eps": provider.layernorm_epsilon,
+        "initializer_range": provider.init_method_std,
+        "attention_dropout": provider.attention_dropout,
+        "tie_word_embeddings": provider.share_embeddings_and_output_weights,
+        "attention_bias": provider.add_qkv_bias,
+        "rope_theta": provider.rotary_base,
+        "partial_rotary_factor": provider.rotary_percent,
+    }
+    if expert:
+        contract.update(
+            {
+                "num_experts": provider.num_moe_experts,
+                "num_experts_per_tok": provider.moe_router_topk,
+                "moe_intermediate_size": provider.moe_ffn_hidden_size,
+                "shared_expert_intermediate_size": provider.moe_shared_expert_intermediate_size,
+                "router_aux_loss_coef": provider.moe_aux_loss_coeff,
+            }
+        )
+    else:
+        contract["intermediate_size"] = provider.ffn_hidden_size
+    return contract
+
+
+def _mismatches(deepspeed: dict[str, Any], megatron: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    """Return every differing canonical model field."""
+    return {
+        field: {"deepspeed": deepspeed.get(field), "megatron": megatron.get(field)}
+        for field in sorted(deepspeed.keys() | megatron.keys())
+        if deepspeed.get(field) != megatron.get(field)
+    }
+
+
+def _model_contract(
+    model_id: str,
+    recipe_name: str,
+    *,
+    expert: bool,
+    num_experts: int | None,
+) -> dict[str, Any]:
+    """Build and compare the exact post-override configs used by both runners."""
+    hf_config = _text_config(model_id)
+    hf_overrides: dict[str, Any] = {}
+    megatron_overrides: dict[str, Any] = {}
+    if num_experts is not None:
+        if not hasattr(hf_config, "num_experts"):
+            raise ValueError(f"{model_id} has no num_experts field")
+        hf_config.num_experts = num_experts
+        hf_overrides["num_experts"] = num_experts
+
+    recipe_module = importlib.import_module(QWEN35_RECIPE_MODULE)
+    recipe_factory = getattr(recipe_module, recipe_name, None)
+    if not callable(recipe_factory):
+        raise ValueError(f"Unknown Megatron recipe: {recipe_name}")
+    provider = recipe_factory().model
+    if num_experts is not None:
+        provider.num_moe_experts = num_experts
+        megatron_overrides["num_moe_experts"] = num_experts
+
+    deepspeed = _hf_contract(hf_config, expert=expert)
+    megatron = _megatron_contract(provider, expert=expert)
+    mismatches = _mismatches(deepspeed, megatron)
+    return {
+        "model_id": model_id,
+        "hf_commit_hash": getattr(hf_config, "_commit_hash", None),
+        "megatron_recipe": recipe_name,
+        "deepspeed_overrides": hf_overrides,
+        "megatron_overrides": megatron_overrides,
+        "deepspeed_effective": deepspeed,
+        "megatron_effective": megatron,
+        "aligned": not mismatches,
+        "mismatches": mismatches,
+    }
 
 
 def build_manifest(args: argparse.Namespace) -> dict[str, Any]:
     """Build a JSON-serializable model and training contract."""
     models = {
-        "dense": _snapshot(args.dense_model),
-        "expert": _snapshot(args.moe_model),
+        "dense": _model_contract(
+            args.dense_model,
+            args.dense_recipe,
+            expert=False,
+            num_experts=None,
+        ),
+        "expert": _model_contract(
+            args.moe_model,
+            args.moe_recipe,
+            expert=True,
+            num_experts=args.num_experts,
+        ),
     }
-    if args.num_experts is not None:
-        models["expert"]["experiment_num_experts"] = args.num_experts
     return {
-        "schema_version": 1,
+        "schema_version": 2,
+        "model_alignment": {
+            "status": "passed" if all(model["aligned"] for model in models.values()) else "failed",
+            "scope": "post-override model architecture fields shared by Hugging Face and Megatron",
+        },
         "models": models,
         "training": {
             "sequence_length": args.sequence_length,
@@ -90,7 +227,8 @@ def build_manifest(args: argparse.Namespace) -> dict[str, Any]:
         "comparability": {
             "deepspeed_param_cpu": "not_available_in_megatron_runner",
             "deepspeed_act_cpu": "module_fine_grained_offload_plus_selective_recompute",
-            "optimizer_offload": "compare_memory_and_throughput_trend_only",
+            "optimizer_offload": "disabled_while_megatron_fsdp_and_cpu_optimizer_are_incompatible",
+            "optimizer_placement": "gpu",
             "megatron_sharding": "optim_grads_params (ZeRO-3 equivalent)",
         },
     }
@@ -102,6 +240,8 @@ def main() -> None:
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--dense-model", default="Qwen/Qwen3.5-9B-Base")
     parser.add_argument("--moe-model", default="Qwen/Qwen3.5-35B-A3B-Base")
+    parser.add_argument("--dense-recipe", required=True)
+    parser.add_argument("--moe-recipe", required=True)
     parser.add_argument("--num-experts", type=int, default=64)
     parser.add_argument("--sequence-length", type=int, default=4096)
     parser.add_argument("--num-gpus", type=int, default=4)
@@ -111,6 +251,9 @@ def main() -> None:
     args.output.parent.mkdir(parents=True, exist_ok=True)
     manifest = build_manifest(args)
     args.output.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    if manifest["model_alignment"]["status"] != "passed":
+        mismatches = {name: model["mismatches"] for name, model in manifest["models"].items()}
+        raise ValueError(f"DeepSpeed and Megatron effective model configs differ: {mismatches}")
     LOGGER.info("Wrote model manifest to %s", args.output)
 
 
