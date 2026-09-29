@@ -37,7 +37,7 @@
 | DeepSeek-V3 dense proxy (4 层, 32 experts) | `--model deepseek --scope dense` | dense MLP | `[mlp_norm,mlp_act]` |
 | DeepSeek-V3 expert proxy (4 层, 32 experts) | `--model deepseek --scope expert` | expert MLP | `[mlp_norm,expert_fc1,moe_act]` |
 
-DeepSeek-V3 的两种 proxy 由脚本 override 构造（不再限制 `--scope dense`）：统一设置 `num_layers=4`、`num_moe_experts=32`、`num_nextn_predict_layers=0`；dense proxy 令 `moe_layer_freq=[0,0,0,0]`（4 层全部走 dense MLP，dispatcher 用 recipe 默认值），expert proxy 令 `moe_layer_freq=[1,1,1,1]`（4 层全部走 MoE）。
+DeepSeek-V3 的两种 proxy 由脚本 override 构造（不再限制 `--scope dense`）：统一设置 `num_layers=4`、`num_moe_experts=32`；dense proxy 令 `moe_layer_freq=[0,0,0,0]`（4 个主 layer 全部走 dense MLP），expert proxy 令 `moe_layer_freq=[1,1,1,1]`（4 个主 layer 全部走 MoE）。脚本不 override MTP 数量，DeepSeek 默认的 1 个 MTP layer 会复用最后一个主 layer 的 dense/expert 类型，因此最终分别得到 5 个 dense layer 或 5 个 expert layer。这些列表值通过 Hydra override 直接传入，而不是按字符串逐层拼接。
 
 扫描维度：
 

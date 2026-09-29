@@ -14,28 +14,51 @@
 
 """Four-GPU GB200 DeepSeek-V3 proxy recipes for offload analysis."""
 
-from megatron.bridge.recipes.deepseek.h100.deepseek_v3 import deepseek_v3_pretrain_1024gpu_h100_bf16_config
+import torch
+
+from megatron.bridge import AutoBridge
+from megatron.bridge.recipes.common import _pretrain_common
 from megatron.bridge.recipes.utils.environment_utils import COMMON_RECIPE_ENV_VARS
+from megatron.bridge.recipes.utils.tokenizer_utils import DEFAULT_NULL_TOKENIZER_VOCAB_SIZE
+from megatron.bridge.training.comm_overlap import CommOverlapConfig
 from megatron.bridge.training.config import ConfigContainer
-from megatron.bridge.training.mixed_precision import bf16_with_mxfp8_mixed
+from megatron.bridge.training.flex_dispatcher_backend import apply_flex_dispatcher_backend
+from megatron.bridge.training.mixed_precision import MixedPrecisionConfig, bf16_with_mxfp8_mixed
 
 
 def deepseek_v3_pretrain_4gpu_gb200_bf16_fsdp1_config() -> ConfigContainer:
     """Return a reduced DeepSeek-V3 config for four GB200 GPUs.
 
     This is a throughput-analysis proxy, not the full 671B training shape. It
-    retains DeepSeek-V3's MLA/MoE blocks while reducing the model to eight MoE
-    layers and 64 experts so baseline and activation-offload runs fit on four
-    GPUs. Unlike the full model, this proxy has no dense transformer layers.
+    retains DeepSeek-V3's MLA/MoE blocks while reducing the model to four
+    transformer layers and 32 experts so baseline and activation-offload runs
+    fit on four GPUs. MTP settings are inherited from the DeepSeek provider so
+    the runtime can reuse the final main layer's dense/expert type.
     """
-    cfg = deepseek_v3_pretrain_1024gpu_h100_bf16_config()
 
-    # cfg.model.num_layers = 8
-    # cfg.model.moe_layer_freq = [1] * 8
-    # cfg.model.num_moe_experts = 64
+    cfg = _pretrain_common()
+
+    # Model config
+    cfg.model = AutoBridge.from_hf_pretrained("deepseek-ai/DeepSeek-V3").to_megatron_provider(load_weights=False)
+
+    cfg.tokenizer.tokenizer_type = "NullTokenizer"
+    cfg.tokenizer.tokenizer_model = None
+    cfg.tokenizer.vocab_size = DEFAULT_NULL_TOKENIZER_VOCAB_SIZE
+
+    # Dataset config - mock data by default
+    cfg.dataset.blend = None  # Pass the path to the dataset here if not using mock data, along with weight. Ex: (["path/to/data1"], 0.2), [("path/to/data2", 0.8)]
+    cfg.dataset.num_workers = 8
+
+    # Model config, moe_layer_freq, 0: disable moe, 1: enable moe.
+    # cfg.model.num_layers = 4
+    # cfg.model.moe_layer_freq = [1] * 4
+    # cfg.model.num_moe_experts = 32
+
+    # Parallelism settings (32 nodes configuration)
     cfg.model.tensor_model_parallel_size = 1
     cfg.model.pipeline_model_parallel_size = 1
     cfg.model.pipeline_model_parallel_layout = None
+    cfg.model.pipeline_dtype = torch.bfloat16
     cfg.model.virtual_pipeline_model_parallel_size = None
     cfg.model.context_parallel_size = 1
     cfg.model.expert_model_parallel_size = 4
@@ -43,6 +66,25 @@ def deepseek_v3_pretrain_4gpu_gb200_bf16_fsdp1_config() -> ConfigContainer:
     cfg.model.sequence_parallel = False
     cfg.model.seq_length = 4096
 
+    # MTP (Multi-Token Prediction) configuration
+    cfg.model.mtp_num_layers = 1
+    cfg.model.mtp_loss_scaling_factor = 0.1
+
+    # Model-specific settings
+    cfg.model.init_method_std = 0.006
+    cfg.model.rotary_base = 10000.0
+    cfg.model.rotary_scaling_factor = 40
+    cfg.model.rotary_base = float(cfg.model.rotary_base)
+    cfg.model.rotary_scaling_factor = int(cfg.model.rotary_scaling_factor)
+
+    # Pipeline split settings
+    cfg.model.account_for_embedding_in_pipeline_split = False
+    cfg.model.account_for_loss_in_pipeline_split = False
+    cfg.model.num_layers_in_first_pipeline_stage = None
+    cfg.model.num_layers_in_last_pipeline_stage = None
+
+    # MoE Token Dispatcher settings
+    # Note: moe_token_dispatcher_type may be overridden by apply_flex_dispatcher_backend at the end
     cfg.model.moe_token_dispatcher_type = "flex"
     cfg.model.moe_flex_dispatcher_backend = "hybridep"
     cfg.model.moe_flex_dispatcher_num_sms = 16
@@ -61,9 +103,36 @@ def deepseek_v3_pretrain_4gpu_gb200_bf16_fsdp1_config() -> ConfigContainer:
     cfg.model.cuda_graph_modules = []
     cfg.model.init_model_with_meta_device = True
 
+    cfg.model.transformer_impl = "transformer_engine"
+    cfg.model.attention_backend = None
+    cfg.model.moe_router_fusion = False
+    cfg.model.moe_permute_fusion = True
+    cfg.model.moe_grouped_gemm = True
+    cfg.model.cross_entropy_loss_fusion = True
+    cfg.model.cross_entropy_fusion_impl = "te"
+    cfg.model.moe_router_padding_for_fp8 = False
+
     cfg.dataset.seq_length = 4096
     cfg.train.global_batch_size = 32
     cfg.train.micro_batch_size = 1
+    cfg.train.manual_gc = True
+    cfg.train.manual_gc_interval = 5
+    cfg.train.manual_gc_eval = 5
+    cfg.scheduler.lr_warmup_iters = 2000
+
+    cfg.mixed_precision = MixedPrecisionConfig(
+        bf16=True,
+        params_dtype=torch.bfloat16,
+        pipeline_dtype=torch.bfloat16,
+        autocast_enabled=False,
+        grad_reduce_in_fp32=False,
+    )
+
+    cfg.optimizer.use_precision_aware_optimizer = True
+    cfg.optimizer.main_params_dtype = torch.float32
+    cfg.optimizer.main_grads_dtype = torch.bfloat16
+    cfg.optimizer.exp_avg_dtype = torch.bfloat16
+    cfg.optimizer.exp_avg_sq_dtype = torch.bfloat16
 
     cfg.dist.use_megatron_fsdp = True
     cfg.dist.enable_megatron_core_experimental = True
@@ -76,13 +145,27 @@ def deepseek_v3_pretrain_4gpu_gb200_bf16_fsdp1_config() -> ConfigContainer:
     cfg.ddp.check_for_nan_in_grad = False
     cfg.ddp.grad_reduce_in_fp32 = False
 
+    cfg.comm_overlap = CommOverlapConfig(tp_comm_overlap=False)
     cfg.comm_overlap.overlap_grad_reduce = True
     cfg.comm_overlap.overlap_param_gather = True
-    cfg.comm_overlap.overlap_param_gather_with_optimizer_step = False
+    cfg.comm_overlap.delay_wgrad_compute = False
+    cfg.comm_overlap.overlap_moe_expert_parallel_comm = False
 
     cfg.checkpoint.ckpt_format = "fsdp_dtensor"
     cfg.checkpoint.load = None
     cfg.checkpoint.save = None
+    cfg.checkpoint.save_interval = 2000
+    cfg.checkpoint.async_save = False
+
+    cfg.validation.eval_interval = 0
+    cfg.validation.eval_iters = 0
+
+    cfg.model.moe_router_force_load_balancing = False
+    if cfg.model.apply_rope_fusion:
+        cfg.dist.enable_megatron_core_experimental = True
+
+    apply_flex_dispatcher_backend(cfg.model, cfg.model.moe_flex_dispatcher_backend)
+
     cfg.env_vars = {
         **COMMON_RECIPE_ENV_VARS,
         "CUDA_DEVICE_MAX_CONNECTIONS": 32,

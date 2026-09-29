@@ -181,7 +181,6 @@ run_case() {
     local num_layers="default"
     local num_experts="default"
     local moe_layer_freq="default"
-    local num_nextn_predict_layers="default"
     local -a profile_args=()
     local -a model_override_args=()
 
@@ -198,7 +197,6 @@ run_case() {
         # Keep the list in one argv element so Hydra parses it as list[int].
         num_layers="${DEEPSEEK_NUM_LAYERS}"
         num_experts="${DEEPSEEK_NUM_EXPERTS}"
-        num_nextn_predict_layers=0
         if [[ "${model_kind}" == expert ]]; then
             moe_layer_freq='[1,1,1,1]'
         else
@@ -208,7 +206,6 @@ run_case() {
             --num-layers "${DEEPSEEK_NUM_LAYERS}"
             --num-experts "${DEEPSEEK_NUM_EXPERTS}"
             --moe-layer-freq "${moe_layer_freq}"
-            --num-nextn-predict-layers "${num_nextn_predict_layers}"
         )
     elif [[ "${model_kind}" == expert ]]; then
         num_layers="${EXPERT_NUM_LAYERS}"
@@ -222,10 +219,10 @@ run_case() {
         fi
     fi
 
-    printf 'matrix model=%s dtype=%s recipe=%s case=%s dispatcher=%s mbs=%s repeat=1 layers=%s experts=%s moe_layer_freq=%s num_nextn_predict_layers=%s offload=%s recompute=%s\n' \
+    printf 'matrix model=%s dtype=%s recipe=%s case=%s dispatcher=%s mbs=%s repeat=1 layers=%s experts=%s moe_layer_freq=%s offload=%s recompute=%s\n' \
         "${model}" "${DTYPE}" "${recipe}" "${case_name}" "${dispatcher}" \
         "${micro_batch_size}" "${num_layers}" "${num_experts}" \
-        "${moe_layer_freq}" "${num_nextn_predict_layers}" \
+        "${moe_layer_freq}" \
         "${offload_modules}" "${recompute_modules}"
     if [[ "${DRY_RUN}" == true ]]; then
         return
