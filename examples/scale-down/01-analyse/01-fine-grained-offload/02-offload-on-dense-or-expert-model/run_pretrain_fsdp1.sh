@@ -355,7 +355,7 @@ case "${DISPATCHER}" in
 esac
 
 if [[ "${IS_DENSE_OR_EXPERT_EXPERIMENT}" == true ]]; then
-    RESULTS_ROOT="${RESULTS_ROOT:-${REPO_ROOT}/result/01-analyse/01-fine-grained-offload/02-offload-on-dense-or-expert-model}"
+    RESULTS_ROOT="${RESULTS_ROOT:-${REPO_ROOT}/results/01-analyse/01-fine-grained-offload/02-offload-on-dense-or-expert-model}"
 else
     RESULTS_ROOT="${RESULTS_ROOT:-${REPO_ROOT}/results/01-analyse/01-offload-on-dense-and-expert-model}"
 fi
