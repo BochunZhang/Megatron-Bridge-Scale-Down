@@ -25,7 +25,8 @@
 #       [--optimizer-offload-fraction <0..1>] \
 #       [--overlap-cpu-optimizer-d2h-h2d <true|false>] \
 #       [--seed <integer>] [--num-experts <integer>] \
-#       [--num-layers <layers>] [--linear-attention-freq <value>] \
+#       [--num-layers <layers>] [--moe-layer-freq <list>] \
+#       [--num-nextn-predict-layers <integer>] [--linear-attention-freq <value>] \
 #       [--dispatcher <default|alltoall|hybridep>] [--hybridep-num-sms <sms>] \
 #       [--profile-step-start <start>] [--profile-step-end <end>] \
 #       [--profile <nsys|torch>]
@@ -58,6 +59,8 @@ Usage: run_pretrain_fsdp1.sh \
     [--seed <integer>] \
     [--num-experts <integer>] \
     [--num-layers <layers>] \
+    [--moe-layer-freq <list>] \
+    [--num-nextn-predict-layers <integer>] \
     [--linear-attention-freq <value>] \
     [--dispatcher <default|alltoall|hybridep>] \
     [--hybridep-num-sms <sms>] \
@@ -77,6 +80,9 @@ Optional training parameters (with defaults):
     --seed                Override rng.seed and dataset.random_seed
     --num-experts         Override model.num_moe_experts
     --num-layers          Override model.num_layers
+    --moe-layer-freq      Override model.moe_layer_freq (Hydra list syntax)
+    --num-nextn-predict-layers
+                          Override model.num_nextn_predict_layers
     --linear-attention-freq  Override model.linear_attention_freq
     --dispatcher          Keep the recipe default, or explicitly select the
                           standard all-to-all or HybridEP dispatcher
@@ -116,6 +122,8 @@ OVERLAP_CPU_OPTIMIZER_D2H_H2D="false"
 SEED=""
 NUM_EXPERTS=""
 NUM_LAYERS=""
+MOE_LAYER_FREQ=""
+NUM_NEXTN_PREDICT_LAYERS=""
 LINEAR_ATTENTION_FREQ=""
 DISPATCHER="default"
 HYBRIDEP_NUM_SMS="${HYBRIDEP_NUM_SMS:-32}"
@@ -222,6 +230,16 @@ while [[ $# -gt 0 ]]; do
         --num-layers)
             [[ $# -ge 2 ]] || { usage >&2; exit 2; }
             NUM_LAYERS="$2"
+            shift 2
+            ;;
+        --moe-layer-freq)
+            [[ $# -ge 2 ]] || { usage >&2; exit 2; }
+            MOE_LAYER_FREQ="$2"
+            shift 2
+            ;;
+        --num-nextn-predict-layers)
+            [[ $# -ge 2 ]] || { usage >&2; exit 2; }
+            NUM_NEXTN_PREDICT_LAYERS="$2"
             shift 2
             ;;
         --linear-attention-freq)
@@ -376,6 +394,10 @@ if [[ -n "${NUM_LAYERS}" ]] && ! [[ "${NUM_LAYERS}" =~ ^[1-9][0-9]*$ ]]; then
     echo "num-layers must be a positive integer" >&2
     exit 2
 fi
+if [[ -n "${NUM_NEXTN_PREDICT_LAYERS}" ]] && ! [[ "${NUM_NEXTN_PREDICT_LAYERS}" =~ ^[0-9]+$ ]]; then
+    echo "num-nextn-predict-layers must be a non-negative integer" >&2
+    exit 2
+fi
 if ! [[ "${HYBRIDEP_NUM_SMS}" =~ ^[1-9][0-9]*$ ]]; then
     echo "hybridep-num-sms must be a positive integer" >&2
     exit 2
@@ -500,6 +522,12 @@ if [[ -n "${SEED}" ]]; then
 fi
 if [[ -n "${NUM_EXPERTS}" ]]; then
     OVERRIDES+=("model.num_moe_experts=${NUM_EXPERTS}")
+fi
+if [[ -n "${MOE_LAYER_FREQ}" ]]; then
+    OVERRIDES+=("model.moe_layer_freq=${MOE_LAYER_FREQ}")
+fi
+if [[ -n "${NUM_NEXTN_PREDICT_LAYERS}" ]]; then
+    OVERRIDES+=("model.num_nextn_predict_layers=${NUM_NEXTN_PREDICT_LAYERS}")
 fi
 case "${DISPATCHER}" in
     alltoall)

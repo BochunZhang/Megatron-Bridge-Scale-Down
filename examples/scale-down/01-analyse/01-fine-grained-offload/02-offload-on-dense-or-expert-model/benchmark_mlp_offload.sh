@@ -31,8 +31,9 @@ GLOBAL_BATCH_SIZE="${GLOBAL_BATCH_SIZE:-32}"
 MICRO_BATCH_SIZES="${MICRO_BATCH_SIZES:-1,2,4,8}"
 HYBRIDEP_NUM_SMS="${HYBRIDEP_NUM_SMS:-32}"
 QWEN_EXPERT_NUM_LAYERS=16
-DEEPSEEK_EXPERT_NUM_LAYERS=8
+DEEPSEEK_NUM_LAYERS=4
 EXPERT_NUM_EXPERTS=64
+DEEPSEEK_NUM_EXPERTS=32
 EXPERT_LINEAR_ATTENTION_FREQ=4
 RESULTS_ROOT="${RESULTS_ROOT:-${REPO_ROOT}/result/01-analyse/01-fine-grained-offload/02-offload-on-dense-or-expert-model}"
 RUN_TIME="${RUN_TIME:-$(date +%Y%m%d-%H%M%S)}"
@@ -44,10 +45,10 @@ usage() {
 Usage: benchmark_mlp_offload.sh [OPTIONS]
 
 Run a controlled MLP activation-memory benchmark on four local GB200 GPUs.
-Qwen runs dense and expert cases. DeepSeek-V3 is MoE-only and therefore runs
-only expert cases. The Qwen expert uses 16 layers; DeepSeek-V3 uses eight MoE
-layers with no dense layer. Both use 64 experts. Activation recompute is
-disabled in every case.
+Qwen runs dense and expert cases. DeepSeek-V3 runs both dense and expert
+proxies by overriding its four-layer MoE layout. The Qwen expert uses 16
+layers and 64 experts; DeepSeek-V3 uses 4 layers and 32 experts. Activation
+recompute is disabled in every case.
 
 Options:
     --scope <all|dense|expert>    Matrix subset (default: all)
@@ -103,10 +104,6 @@ done
 
 case "${SCOPE}" in all|dense|expert) ;; *) echo "Invalid scope: ${SCOPE}" >&2; exit 2 ;; esac
 case "${MODEL_FAMILY}" in qwen|deepseek) ;; *) echo "Invalid model: ${MODEL_FAMILY}; expected qwen or deepseek" >&2; exit 2 ;; esac
-if [[ "${MODEL_FAMILY}" == deepseek && "${SCOPE}" == dense ]]; then
-    echo "DeepSeek-V3 is an expert model; --scope dense is not supported with --model deepseek" >&2
-    exit 2
-fi
 case "${DENSE_MODEL}" in 9b|27b) ;; *) echo "Invalid dense model: ${DENSE_MODEL}" >&2; exit 2 ;; esac
 case "${DTYPE}" in
     bf16) RECIPE_DTYPE=bf16 ;;
@@ -147,7 +144,10 @@ for micro_batch_size in "${MICRO_BATCH_SIZE_VALUES[@]}"; do
 done
 
 if [[ "${MODEL_FAMILY}" == deepseek ]]; then
-    EXPERT_NUM_LAYERS="${DEEPSEEK_EXPERT_NUM_LAYERS}"
+    DENSE_MODEL_NAME="deepseek_v3"
+    DENSE_RECIPE_PREFIX="deepseek_v3_pretrain_4gpu_gb200"
+    EXPERT_NUM_LAYERS="${DEEPSEEK_NUM_LAYERS}"
+    EXPERT_NUM_EXPERTS="${DEEPSEEK_NUM_EXPERTS}"
     EXPERT_MODEL_NAME="deepseek_v3"
     EXPERT_RECIPE_PREFIX="deepseek_v3_pretrain_4gpu_gb200"
 else
@@ -180,6 +180,8 @@ run_case() {
     local recipe="${recipe_prefix}_${RECIPE_DTYPE}_fsdp1_config"
     local num_layers="default"
     local num_experts="default"
+    local moe_layer_freq="default"
+    local num_nextn_predict_layers="default"
     local -a profile_args=()
     local -a model_override_args=()
 
@@ -192,7 +194,23 @@ run_case() {
     if [[ "${PROFILE}" != none ]]; then
         profile_args=(--profile "${PROFILE}")
     fi
-    if [[ "${model_kind}" == expert ]]; then
+    if [[ "${MODEL_FAMILY}" == deepseek ]]; then
+        # Keep the list in one argv element so Hydra parses it as list[int].
+        num_layers="${DEEPSEEK_NUM_LAYERS}"
+        num_experts="${DEEPSEEK_NUM_EXPERTS}"
+        num_nextn_predict_layers=0
+        if [[ "${model_kind}" == expert ]]; then
+            moe_layer_freq='[1,1,1,1]'
+        else
+            moe_layer_freq='[0,0,0,0]'
+        fi
+        model_override_args=(
+            --num-layers "${DEEPSEEK_NUM_LAYERS}"
+            --num-experts "${DEEPSEEK_NUM_EXPERTS}"
+            --moe-layer-freq "${moe_layer_freq}"
+            --num-nextn-predict-layers "${num_nextn_predict_layers}"
+        )
+    elif [[ "${model_kind}" == expert ]]; then
         num_layers="${EXPERT_NUM_LAYERS}"
         num_experts="${EXPERT_NUM_EXPERTS}"
         model_override_args=(
@@ -204,9 +222,10 @@ run_case() {
         fi
     fi
 
-    printf 'matrix model=%s dtype=%s recipe=%s case=%s dispatcher=%s mbs=%s repeat=1 layers=%s experts=%s offload=%s recompute=%s\n' \
+    printf 'matrix model=%s dtype=%s recipe=%s case=%s dispatcher=%s mbs=%s repeat=1 layers=%s experts=%s moe_layer_freq=%s num_nextn_predict_layers=%s offload=%s recompute=%s\n' \
         "${model}" "${DTYPE}" "${recipe}" "${case_name}" "${dispatcher}" \
         "${micro_batch_size}" "${num_layers}" "${num_experts}" \
+        "${moe_layer_freq}" "${num_nextn_predict_layers}" \
         "${offload_modules}" "${recompute_modules}"
     if [[ "${DRY_RUN}" == true ]]; then
         return
@@ -264,9 +283,7 @@ printf 'benchmark_id=%s model=%s dtype=%s dispatcher=%s results_root=%s train_it
 for micro_batch_size in "${MICRO_BATCH_SIZE_VALUES[@]}"; do
     case "${SCOPE}" in
         all)
-            if [[ "${MODEL_FAMILY}" == qwen ]]; then
-                run_dense_matrix "${micro_batch_size}"
-            fi
+            run_dense_matrix "${micro_batch_size}"
             run_expert_matrix "${micro_batch_size}"
             ;;
         dense) run_dense_matrix "${micro_batch_size}" ;;
