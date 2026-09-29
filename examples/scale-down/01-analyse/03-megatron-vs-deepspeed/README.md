@@ -165,7 +165,6 @@ results/01-analyse/03-megatron-vs-deepspeed/megatron-vs-deepspeed-20260929-test.
 下面同时检查 Dense 和 Expert，在 baseline 与 recompute+offload 下比较无 optimizer offload 和 100% optimizer offload：
 
 ```bash
-RUN_TIME="20260929-benchmark" \
 ./examples/scale-down/01-analyse/03-megatron-vs-deepspeed/pretrain_experiment.sh \
   --models "dense expert" \
   --activation-strategies "baseline recompute_offload" \
@@ -179,6 +178,7 @@ RUN_TIME="20260929-benchmark" \
 ### 指定结果目录
 
 ```bash
+RUN_TIME="20260929-benchmark" \
 ./examples/scale-down/01-analyse/03-megatron-vs-deepspeed/pretrain_experiment.sh \
   --models "dense" \
   --activation-strategies "recompute_offload" \
