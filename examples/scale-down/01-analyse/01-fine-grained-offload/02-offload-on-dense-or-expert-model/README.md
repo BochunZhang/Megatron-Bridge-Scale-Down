@@ -164,7 +164,7 @@ node "./examples/scale-down/01-analyse/01-fine-grained-offload/02-offload-on-den
 
 ```text
 result/01-analyse/01-fine-grained-offload/02-offload-on-dense-or-expert-model/
-└── <qwen35_text_9b|qwen35_text_35b_a3b|deepseek>/<bf16|mxfp8>/<baseline|offload>/<run-time>/
+└── <qwen35_text_9b|qwen35_text_35b_a3b|deepseek-dense|deepseek-expert>/<test-name>/<run-time>/
     ├── config.json / config.yaml   # 最终 recipe 与 override（含 dtype、dispatcher）
     ├── command.txt                 # 实际 distributed 命令
     ├── train.log                   # 训练与 step time 日志
@@ -173,6 +173,18 @@ result/01-analyse/01-fine-grained-offload/02-offload-on-dense-or-expert-model/
     ├── memory/snapshot.pickle      # profiling 时的 CUDA memory snapshot
     ├── profile/                    # nsys 输出：nsys-*.nsys-rep（4 个 rank 各一份）
     └── rank_logs/
+```
+
+其中 `<test-name>` 按以下规则构建：
+
+```text
+dtype_<bf16|mxfp8>-mbs_<mbs>-gbs_<gbs>-<baseline|offload>
+```
+
+expert 模型会在 case 前补充 dispatcher：
+
+```text
+dtype_<bf16|mxfp8>-mbs_<mbs>-gbs_<gbs>-dispatcher_<alltoall|hybridep>-<baseline|offload>
 ```
 
 XLSX 汇总输出：
@@ -194,8 +206,8 @@ node "./examples/scale-down/01-analyse/01-fine-grained-offload/02-offload-on-den
 ```
 
 分析脚本只读取成功且 `profile=none` 的运行。它按 model、dispatcher、MBS、dtype、dense/expert
-配对 baseline 和 offload，分别选择各组最新的 baseline 与 offload，并对 iteration 5–9 的
-`MODEL_TFLOP/s/GPU` 取平均。结果默认写入：
+配对 baseline 和 offload，分别选择各组最新的 baseline 与 offload。每个运行必须提供至少 10 组
+GPU utilization 数据，分析时读取全部数据并对最后 4 组 `MODEL_TFLOP/s/GPU` 取平均。结果默认写入：
 
 ```text
 result/01-analyse/01-fine-grained-offload/02-offload-on-dense-or-expert-model/offload-throughput-<qwen|deepseek>.xlsx
@@ -206,7 +218,7 @@ result/01-analyse/01-fine-grained-offload/02-offload-on-dense-or-expert-model/of
 
 ## nsys / NVTX 分析
 
-- `--profile nsys` 会自动设置 `profiling.use_nsys_profiler=true`、`profiling.nvtx_ranges=true`、`profiling.record_memory_history=true`，并用 `nsys profile -s none -t cuda,nvtx --capture-range=cudaProfilerApi` 启动训练，只采集 step 7–8，4 个 rank 都记录。
+- `--profile nsys` 会自动设置 `profiling.use_nsys_profiler=true`、`profiling.nvtx_ranges=true`、`profiling.record_memory_history=true`，并用 `nsys profile -s none -t cuda,nvtx --capture-range=cudaProfilerApi` 启动训练，只采集 step 7–8，4 个 rank 都记录。nsys 文件名使用 `<model>/<test-name>/<run-time>` 的组件并将 `/` 替换为 `-`，例如 `nsys-qwen35_text_9b-dtype_bf16-mbs_1-gbs_32-baseline-<run-time>_%p_%h.nsys-rep`。
 - 用 Nsight Systems GUI 打开 `<run-dir>/profile/*.nsys-rep`：
   - 在时间轴上把 NCCL allreduce / reduce-scatter / all-gather kernel 与 NVTX range（forward、backward、optimizer、offload D2H/H2D 等）对齐，即可回答"allreduce 是哪个操作产生的"（目的 3）；
   - 对比 baseline 与 offload 的时间轴，找出无法被计算 overlap 的 copy / 通信段（目的 1）；

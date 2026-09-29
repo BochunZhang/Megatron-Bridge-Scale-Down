@@ -25,7 +25,8 @@ const DEFAULT_RESULTS_ROOT = path.join(
   REPO_ROOT,
   "results/01-analyse/01-fine-grained-offload/02-offload-on-dense-or-expert-model",
 );
-const SAMPLE_STEPS = [4, 5, 6, 7, 8]; // Zero-based keys for iterations 5-9.
+const MIN_GPU_UTILIZATION_SAMPLES = 10;
+const GPU_UTILIZATION_SAMPLES_TO_AVERAGE = 4;
 const RUN_NAME_PATTERN =
   /^(dense|expert)-(default|alltoall|hybridep)-(baseline|offload)(?:-mbs(\d+))?-r\d+$/;
 const HEADERS = [
@@ -44,7 +45,8 @@ function usage() {
 
 Read successful non-profiled runs, select the latest baseline and offload for
 each model/dispatcher/MBS/dtype/type combination, and write an XLSX throughput
-comparison using iterations 5-9.
+comparison using the final 4 GPU utilization values. Each run must contain at
+least 10 GPU utilization values.
 
 Options:
   --model <qwen|deepseek>  Model family to analyse (required)
@@ -195,10 +197,26 @@ function mean(values) {
 async function readMeanTflops(resultDir) {
   const metricsPath = path.join(resultDir, "gpu_utilization.json");
   const metrics = await readJson(metricsPath);
-  const values = SAMPLE_STEPS.map((step) => Number(metrics[String(step)]));
-  if (values.some((value) => !Number.isFinite(value))) {
-    throw new Error(`${metricsPath} is missing finite TFlops values for iterations 5-9`);
+  const samples = Object.entries(metrics)
+    .map(([step, rawValue]) => ({
+      step: Number(step),
+      value: Number(rawValue),
+    }))
+    .sort((left, right) => left.step - right.step);
+  if (
+    samples.some(({ step, value }) => !Number.isInteger(step) || step < 0 || !Number.isFinite(value))
+  ) {
+    throw new Error(`${metricsPath} contains invalid GPU utilization data`);
   }
+  if (samples.length < MIN_GPU_UTILIZATION_SAMPLES) {
+    throw new Error(
+      `${metricsPath} has ${samples.length} GPU utilization values; `
+        + `expected at least ${MIN_GPU_UTILIZATION_SAMPLES}`,
+    );
+  }
+  const values = samples
+    .slice(-GPU_UTILIZATION_SAMPLES_TO_AVERAGE)
+    .map(({ value }) => value);
   return { mean: mean(values), samples: values };
 }
 
