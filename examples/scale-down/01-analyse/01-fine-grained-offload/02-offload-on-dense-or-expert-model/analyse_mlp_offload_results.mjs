@@ -23,7 +23,7 @@ const SCRIPT_DIR = path.dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = path.resolve(SCRIPT_DIR, "../../../../..");
 const DEFAULT_RESULTS_ROOT = path.join(
   REPO_ROOT,
-  "result/01-analyse/01-fine-grained-offload/02-offload-on-dense-or-expert-model",
+  "results/01-analyse/01-fine-grained-offload/02-offload-on-dense-or-expert-model",
 );
 const SAMPLE_STEPS = [4, 5, 6, 7, 8]; // Zero-based keys for iterations 5-9.
 const RUN_NAME_PATTERN =
@@ -298,7 +298,7 @@ async function loadArtifactTool(specifier) {
   } catch (error) {
     throw new Error(
       `Unable to load @oai/artifact-tool from ${specifier}. ` +
-        "Install it for Node or pass --artifact-tool/ARTIFACT_TOOL_MODULE with its module path.",
+      "Install it for Node or pass --artifact-tool/ARTIFACT_TOOL_MODULE with its module path.",
       { cause: error },
     );
   }
