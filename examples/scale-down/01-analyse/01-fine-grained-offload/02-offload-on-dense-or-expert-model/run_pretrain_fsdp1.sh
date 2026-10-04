@@ -13,7 +13,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# Run one FSDP1 experiment on four local GPUs.
+# Run one FSDP1 experiment on four GPUs per node. Multi-node DLC runs use
+# `numarun` when --gpu is 16 or 32.
 #
 # Usage:
 #   run_pretrain_fsdp1.sh --model <model> --recipe <recipe> [--dtype <dtype>] \
@@ -29,7 +30,7 @@
 #       [--mtp-num-layers <integer>] [--linear-attention-freq <value>] \
 #       [--dispatcher <default|alltoall|hybridep>] [--hybridep-num-sms <sms>] \
 #       [--profile-step-start <start>] [--profile-step-end <end>] \
-#       [--profile <nsys|torch>]
+#       [--profile <nsys|torch>] [--gpu <16|32>]
 
 set -euo pipefail
 
@@ -66,7 +67,8 @@ Usage: run_pretrain_fsdp1.sh \
     [--hybridep-num-sms <sms>] \
     [--profile-step-start <start>] \
     [--profile-step-end <end>] \
-    [--profile <nsys|torch>]
+    [--profile <nsys|torch>] \
+    [--gpu <16|32>]
 
 The model and recipe are selected by the caller. Dtype defaults to bf16 and is
 recorded with the run; recipe selection remains the caller's responsibility.
@@ -98,6 +100,9 @@ Optional training parameters (with defaults):
                                    nvidia-smi during the run, then replay each
                                    memory snapshot pickle into a sibling
                                    per-rank JSON phase report via replay_step.py
+    --gpu <16|32>         Total GPUs for DLC multi-node runs (default: 4).
+                          GB200 uses four GPUs per node, so 16 GPUs means four
+                          nodes and 32 GPUs means eight nodes.
 EOF
 }
 
@@ -129,6 +134,7 @@ HYBRIDEP_NUM_SMS="${HYBRIDEP_NUM_SMS:-32}"
 PROFILE_STEP_START=""
 PROFILE_STEP_END=""
 PROFILE="${PROFILE:-none}"
+GPU_COUNT=4
 GPU_MEMORY_TRACE_INTERVAL="${GPU_MEMORY_TRACE_INTERVAL:-1.0}"
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -271,6 +277,11 @@ while [[ $# -gt 0 ]]; do
             PROFILE="$2"
             shift 2
             ;;
+        --gpu)
+            [[ $# -ge 2 ]] || { usage >&2; exit 2; }
+            GPU_COUNT="$2"
+            shift 2
+            ;;
         -h|--help)
             usage
             exit 0
@@ -339,6 +350,10 @@ case "${DISPATCHER}" in
     default|alltoall|hybridep) ;;
     *) echo "--dispatcher must be one of default|alltoall|hybridep: ${DISPATCHER}" >&2; exit 2 ;;
 esac
+case "${GPU_COUNT}" in
+    4|16|32) ;;
+    *) echo "--gpu must be one of 16 or 32 (default: 4): ${GPU_COUNT}" >&2; exit 2 ;;
+esac
 
 RESULTS_ROOT="${RESULTS_ROOT:-${REPO_ROOT}/results/01-analyse/01-fine-grained-offload/02-offload-on-dense-or-expert-model}"
 RUN_TIME="${RUN_TIME:-$(date +%Y%m%d-%H%M%S)}"
@@ -356,7 +371,7 @@ esac
 if [[ "${MODEL}" == deepseek || "${MODEL}" == deepseek_v3 ]]; then
     RESULT_MODEL_NAME="deepseek-${MODEL_KIND}"
 fi
-RESULT_PATH_NAME="dtype_${DTYPE}-mbs_${MICRO_BATCH_SIZE}-gbs_${GLOBAL_BATCH_SIZE}"
+RESULT_PATH_NAME="gpu_${GPU_COUNT}-dtype_${DTYPE}-mbs_${MICRO_BATCH_SIZE}-gbs_${GLOBAL_BATCH_SIZE}"
 if [[ "${MODEL_KIND}" == expert ]]; then
     RESULT_PATH_NAME+="-dispatcher_${DISPATCHER}"
 fi
@@ -368,6 +383,36 @@ HF_CACHE="${REPO_ROOT}/.cache/huggingface"
 NEMO_CACHE="${REPO_ROOT}/.cache/nemo"
 UV_CACHE="${REPO_ROOT}/.cache/uv"
 MASTER_PORT="${MASTER_PORT:-29501}"
+GPUS_PER_NODE=4
+NNODES=$((GPU_COUNT / GPUS_PER_NODE))
+NODE_RANK="${NODE_RANK:-${RANK:-0}}"
+MASTER_ADDR="${MASTER_ADDR:-${DLC_MASTER_ADDR:-localhost}}"
+NUMARUN="${NUMARUN-numarun}"
+
+if (( NNODES > 1 )); then
+    if ! [[ "${NODE_RANK}" =~ ^[0-9]+$ ]] || (( NODE_RANK >= NNODES )); then
+        echo "NODE_RANK/RANK must be in [0, $((NNODES - 1))] for --gpu ${GPU_COUNT}: ${NODE_RANK}" >&2
+        exit 2
+    fi
+    if [[ -z "${MASTER_ADDR}" || "${MASTER_ADDR}" == localhost || "${MASTER_ADDR}" == 127.0.0.1 ]]; then
+        echo "MASTER_ADDR must be the DLC rank-0 hostname/IP for --gpu ${GPU_COUNT}" >&2
+        exit 2
+    fi
+    if [[ -n "${NUMARUN}" ]]; then
+        read -r -a NUMARUN_COMMAND <<< "${NUMARUN}"
+        if ! command -v "${NUMARUN_COMMAND[0]}" >/dev/null 2>&1; then
+            echo "${NUMARUN_COMMAND[0]} is required for DLC multi-node runs; set NUMARUN= to launch torchrun manually on every node" >&2
+            exit 2
+        fi
+    fi
+fi
+
+# DLC starts this entrypoint on every node. Keep node-local logs and profiler
+# artifacts separate while preserving rank 0's root directory for collectors.
+RUN_RESULT_DIR="${RESULT_DIR}"
+if (( NNODES > 1 && NODE_RANK != 0 )); then
+    RUN_RESULT_DIR="${RESULT_DIR}/rank${NODE_RANK}"
+fi
 
 if ! [[ "${TRAIN_ITERS}" =~ ^[0-9]+$ && "${GLOBAL_BATCH_SIZE}" =~ ^[0-9]+$ && "${MICRO_BATCH_SIZE}" =~ ^[0-9]+$ && "${WARMUP_STEPS}" =~ ^[0-9]+$ ]]; then
     echo "Training sizes must be non-negative integers" >&2
@@ -400,8 +445,8 @@ if [[ "${PROFILE}" != none ]]; then
     fi
 fi
 
-mkdir -p "${RESULT_DIR}/memory" "${RESULT_DIR}/rank_logs" "${RESULT_DIR}/profile" \
-    "${RESULT_DIR}/gpu_memory" \
+mkdir -p "${RUN_RESULT_DIR}/memory" "${RUN_RESULT_DIR}/rank_logs" "${RUN_RESULT_DIR}/profile" \
+    "${RUN_RESULT_DIR}/gpu_memory" \
     "${HF_CACHE}" "${NEMO_CACHE}/datasets" "${NEMO_CACHE}/models" "${UV_CACHE}"
 
 export HF_HOME="${HF_CACHE}"
@@ -422,9 +467,9 @@ export NCCL_NVLS_ENABLE="0"
 export NCCL_DEBUG="WARN"
 export NCCL_GRAPH_REGISTER="0"
 export TOKENIZERS_PARALLELISM="false"
-export RESULT_DIR MODEL MODEL_ID RESULT_MODEL_NAME DTYPE RUN_NAME RUN_TIME RECIPE RESULT_PATH_NAME TEST_NAME
+export RESULT_DIR RUN_RESULT_DIR MODEL MODEL_ID RESULT_MODEL_NAME DTYPE RUN_NAME RUN_TIME RECIPE RESULT_PATH_NAME TEST_NAME
 export RECOMPUTE_GRANULARITY RECOMPUTE_MODULES FINE_GRAINED_OFFLOAD OFFLOAD_MODULES
-export TRAIN_ITERS GLOBAL_BATCH_SIZE MICRO_BATCH_SIZE WARMUP_STEPS DISPATCHER HYBRIDEP_NUM_SMS PROFILE
+export TRAIN_ITERS GLOBAL_BATCH_SIZE MICRO_BATCH_SIZE WARMUP_STEPS DISPATCHER HYBRIDEP_NUM_SMS PROFILE GPU_COUNT GPUS_PER_NODE NNODES NODE_RANK MASTER_ADDR MASTER_PORT
 export OPTIMIZER_CPU_OFFLOAD OPTIMIZER_OFFLOAD_FRACTION OVERLAP_CPU_OPTIMIZER_D2H_H2D
 
 # Derive profiling settings from the selected backend. Bridge's
@@ -432,7 +477,7 @@ export OPTIMIZER_CPU_OFFLOAD OPTIMIZER_OFFLOAD_FRACTION OVERLAP_CPU_OPTIMIZER_D2
 # the same time, so exactly one of USE_NSYS_PROFILER/USE_PYTORCH_PROFILER may
 # be true. In torch mode, logger.tensorboard_dir is pointed into the result dir
 # so the profiler's trace_handler (which writes "{tensorboard_dir}/../torch_profile")
-# exports chrome traces to ${RESULT_DIR}/profile/torch_profile.
+# exports chrome traces to ${RUN_RESULT_DIR}/profile/torch_profile.
 case "${PROFILE}" in
     nsys)
         USE_NSYS_PROFILER="true"
@@ -448,7 +493,7 @@ case "${PROFILE}" in
         RECORD_MEMORY_HISTORY="true"
         RECORD_SHAPES="true"
         NVTX_RANGES="true"
-        TENSORBOARD_DIR="${RESULT_DIR}/profile/tensorboard"
+        TENSORBOARD_DIR="${RUN_RESULT_DIR}/profile/tensorboard"
         ;;
     *)
         USE_NSYS_PROFILER="false"
@@ -487,7 +532,7 @@ OVERRIDES=(
     "checkpoint.load=null"
     "logger.log_interval=1"
     "logger.tensorboard_dir=${TENSORBOARD_DIR}"
-    "logger.save_config_filepath=${RESULT_DIR}/config.yaml"
+    "logger.save_config_filepath=${RUN_RESULT_DIR}/config.yaml"
     "profiling.use_pytorch_profiler=${USE_PYTORCH_PROFILER}"
     "profiling.use_nsys_profiler=${USE_NSYS_PROFILER}"
     "profiling.profile_step_start=${PROFILE_STEP_START}"
@@ -495,7 +540,7 @@ OVERRIDES=(
     "profiling.profile_ranks=[0,1,2,3]"
     "profiling.record_memory_history=${RECORD_MEMORY_HISTORY}"
     "profiling.record_shapes=${RECORD_SHAPES}"
-    "profiling.memory_snapshot_path=${RESULT_DIR}/memory/snapshot.pickle"
+    "profiling.memory_snapshot_path=${RUN_RESULT_DIR}/memory/snapshot.pickle"
     "profiling.nvtx_ranges=${NVTX_RANGES}"
 )
 if [[ -n "${NUM_LAYERS}" ]]; then
@@ -533,50 +578,112 @@ case "${DISPATCHER}" in
         ;;
 esac
 
-COMMAND=(
-    uv run --no-sync python -m torch.distributed.run
-    --standalone
-    --nproc_per_node=4
-    --master_port="${MASTER_PORT}"
-    --log_dir="${RESULT_DIR}/rank_logs"
-    --redirects=3
-    --tee=3
+TRAINING_SCRIPT_ARGS=(
     scripts/training/run_recipe.py
     --recipe "${RECIPE}"
     --step-func llm_step
     "${OVERRIDES[@]}"
 )
+
+if (( NNODES == 1 )); then
+    COMMAND=(
+        uv run --no-sync python -m torch.distributed.run
+        --standalone
+        --nproc_per_node="${GPUS_PER_NODE}"
+        --master_port="${MASTER_PORT}"
+        --log_dir="${RUN_RESULT_DIR}/rank_logs"
+        --redirects=3
+        --tee=3
+        "${TRAINING_SCRIPT_ARGS[@]}"
+    )
+else
+    DISTRIBUTED_ARGS=(
+        --nproc_per_node="${GPUS_PER_NODE}"
+        --nnodes="${NNODES}"
+        --node_rank="${NODE_RANK}"
+        --master_addr="${MASTER_ADDR}"
+        --master_port="${MASTER_PORT}"
+    )
+    if [[ -n "${NUMARUN}" ]]; then
+        COMMAND=(
+            "${NUMARUN_COMMAND[@]}"
+            torchrun
+            "${DISTRIBUTED_ARGS[@]}"
+            --log_dir="${RUN_RESULT_DIR}/rank_logs"
+            --redirects=3
+            --tee=3
+            "${TRAINING_SCRIPT_ARGS[@]}"
+        )
+    else
+        COMMAND=(
+            uv run --no-sync python -m torch.distributed.run
+            "${DISTRIBUTED_ARGS[@]}"
+            --log_dir="${RUN_RESULT_DIR}/rank_logs"
+            --redirects=3
+            --tee=3
+            "${TRAINING_SCRIPT_ARGS[@]}"
+        )
+    fi
+fi
+NSYS_PROFILE_ARGS=(
+    nsys profile
+    -s none
+    -t cuda,nvtx
+    --capture-range=cudaProfilerApi
+    --capture-range-end=stop
+    -o "${RUN_RESULT_DIR}/profile/nsys-${NSYS_RESULT_NAME}_%p_%h"
+    --force-overwrite=true
+)
+if (( NNODES > 1 )) && [[ -n "${NUMARUN}" ]]; then
+    NSYS_COMMAND=(
+        "${NUMARUN_COMMAND[@]}"
+        "${NSYS_PROFILE_ARGS[@]}"
+        torchrun
+        "${DISTRIBUTED_ARGS[@]}"
+        --log_dir="${RUN_RESULT_DIR}/rank_logs"
+        --redirects=3
+        --tee=3
+        "${TRAINING_SCRIPT_ARGS[@]}"
+    )
+else
+    NSYS_COMMAND=("${NSYS_PROFILE_ARGS[@]}" "${COMMAND[@]}")
+fi
 COMMAND_TEXT="${COMMAND[*]}"
 export COMMAND_TEXT
 
-uv run --no-sync python -c 'import json, os, re; pattern = re.compile(r"(^|_)(TOKEN|SECRET|PASSWORD|PASSWD|API_KEY|ACCESS_KEY|SECRET_KEY|PRIVATE_KEY|AUTHORIZATION)(_|$)", re.I); root = os.environ["RESULT_DIR"]; env = {k: ("[REDACTED]" if pattern.search(k) else v) for k, v in sorted(os.environ.items())}; json.dump(env, open(os.path.join(root, "environment.json"), "w"), indent=2, sort_keys=True); open(os.path.join(root, "command.txt"), "w").write(os.environ["COMMAND_TEXT"] + "\n"); config = {"model": os.environ["MODEL"], "model_id": os.environ["MODEL_ID"], "dtype": os.environ["DTYPE"], "precision": os.environ["DTYPE"], "profile": os.environ["PROFILE"], "run_name": os.environ["RUN_NAME"], "test_name": os.environ["TEST_NAME"], "result_path_name": os.environ["RESULT_PATH_NAME"], "run_time": os.environ["RUN_TIME"], "recipe": os.environ["RECIPE"], "result_dir": root, "profile_ranks": [0, 1, 2, 3], "cache_paths": {"hf": env["HF_HOME"], "nemo": env["NEMO_HOME"]}, "train_iters": int(os.environ["TRAIN_ITERS"]), "global_batch_size": int(os.environ["GLOBAL_BATCH_SIZE"]), "micro_batch_size": int(os.environ["MICRO_BATCH_SIZE"]), "sequence_length": 4096, "recompute_granularity": os.environ["RECOMPUTE_GRANULARITY"], "recompute_modules": os.environ["RECOMPUTE_MODULES"], "fine_grained_offload": os.environ["FINE_GRAINED_OFFLOAD"] == "true", "offload_modules": os.environ["OFFLOAD_MODULES"], "dispatcher": os.environ["DISPATCHER"], "hybridep_num_sms": int(os.environ["HYBRIDEP_NUM_SMS"]), "cli": os.environ["COMMAND_TEXT"]}; json.dump(config, open(os.path.join(root, "config.json"), "w"), indent=2, sort_keys=True)'
-uv run --no-sync python -c 'import json, os; path = os.path.join(os.environ["RESULT_DIR"], "config.json"); config = json.load(open(path, encoding="utf-8")); config.update({"warmup_steps": int(os.environ["WARMUP_STEPS"]), "optimizer_cpu_offload": os.environ["OPTIMIZER_CPU_OFFLOAD"] == "true", "optimizer_offload_fraction": float(os.environ["OPTIMIZER_OFFLOAD_FRACTION"]), "overlap_cpu_optimizer_d2h_h2d": os.environ["OVERLAP_CPU_OPTIMIZER_D2H_H2D"] == "true"}); json.dump(config, open(path, "w", encoding="utf-8"), indent=2, sort_keys=True)'
+if (( NODE_RANK == 0 )); then
+    uv run --no-sync python -c 'import json, os, re; pattern = re.compile(r"(^|_)(TOKEN|SECRET|PASSWORD|PASSWD|API_KEY|ACCESS_KEY|SECRET_KEY|PRIVATE_KEY|AUTHORIZATION)(_|$)", re.I); root = os.environ["RUN_RESULT_DIR"]; env = {k: ("[REDACTED]" if pattern.search(k) else v) for k, v in sorted(os.environ.items())}; json.dump(env, open(os.path.join(root, "environment.json"), "w"), indent=2, sort_keys=True); open(os.path.join(root, "command.txt"), "w").write(os.environ["COMMAND_TEXT"] + "\n"); config = {"model": os.environ["MODEL"], "model_id": os.environ["MODEL_ID"], "dtype": os.environ["DTYPE"], "precision": os.environ["DTYPE"], "profile": os.environ["PROFILE"], "run_name": os.environ["RUN_NAME"], "test_name": os.environ["TEST_NAME"], "result_path_name": os.environ["RESULT_PATH_NAME"], "run_time": os.environ["RUN_TIME"], "recipe": os.environ["RECIPE"], "result_dir": root, "gpu_count": int(os.environ["GPU_COUNT"]), "gpus_per_node": int(os.environ["GPUS_PER_NODE"]), "nnodes": int(os.environ["NNODES"]), "profile_ranks": [0, 1, 2, 3], "cache_paths": {"hf": env["HF_HOME"], "nemo": env["NEMO_HOME"]}, "train_iters": int(os.environ["TRAIN_ITERS"]), "global_batch_size": int(os.environ["GLOBAL_BATCH_SIZE"]), "micro_batch_size": int(os.environ["MICRO_BATCH_SIZE"]), "sequence_length": 4096, "recompute_granularity": os.environ["RECOMPUTE_GRANULARITY"], "recompute_modules": os.environ["RECOMPUTE_MODULES"], "fine_grained_offload": os.environ["FINE_GRAINED_OFFLOAD"] == "true", "offload_modules": os.environ["OFFLOAD_MODULES"], "dispatcher": os.environ["DISPATCHER"], "hybridep_num_sms": int(os.environ["HYBRIDEP_NUM_SMS"]), "cli": os.environ["COMMAND_TEXT"]}; json.dump(config, open(os.path.join(root, "config.json"), "w"), indent=2, sort_keys=True)'
+    uv run --no-sync python -c 'import json, os; path = os.path.join(os.environ["RUN_RESULT_DIR"], "config.json"); config = json.load(open(path, encoding="utf-8")); config.update({"warmup_steps": int(os.environ["WARMUP_STEPS"]), "optimizer_cpu_offload": os.environ["OPTIMIZER_CPU_OFFLOAD"] == "true", "optimizer_offload_fraction": float(os.environ["OPTIMIZER_OFFLOAD_FRACTION"]), "overlap_cpu_optimizer_d2h_h2d": os.environ["OVERLAP_CPU_OPTIMIZER_D2H_H2D"] == "true"}); json.dump(config, open(path, "w", encoding="utf-8"), indent=2, sort_keys=True)'
+fi
 
 printf 'model=%s dtype=%s run_name=%s result_path_name=%s run_time=%s\n' \
     "${MODEL}" "${DTYPE}" "${RUN_NAME}" "${RESULT_PATH_NAME}" "${RUN_TIME}" \
-    | tee "${RESULT_DIR}/run_info.txt"
-printf 'train_iters=%s global_batch_size=%s micro_batch_size=%s\n' "${TRAIN_ITERS}" "${GLOBAL_BATCH_SIZE}" "${MICRO_BATCH_SIZE}" | tee -a "${RESULT_DIR}/run_info.txt"
+    | tee "${RUN_RESULT_DIR}/run_info.txt"
+printf 'train_iters=%s global_batch_size=%s micro_batch_size=%s\n' "${TRAIN_ITERS}" "${GLOBAL_BATCH_SIZE}" "${MICRO_BATCH_SIZE}" | tee -a "${RUN_RESULT_DIR}/run_info.txt"
 printf 'warmup_steps=%s optimizer_cpu_offload=%s optimizer_offload_fraction=%s overlap_cpu_optimizer_d2h_h2d=%s\n' \
     "${WARMUP_STEPS}" "${OPTIMIZER_CPU_OFFLOAD}" "${OPTIMIZER_OFFLOAD_FRACTION}" \
-    "${OVERLAP_CPU_OPTIMIZER_D2H_H2D}" | tee -a "${RESULT_DIR}/run_info.txt"
+    "${OVERLAP_CPU_OPTIMIZER_D2H_H2D}" | tee -a "${RUN_RESULT_DIR}/run_info.txt"
 printf 'dispatcher=%s hybridep_num_sms=%s recompute_modules=%s offload_modules=%s\n' \
     "${DISPATCHER}" "${HYBRIDEP_NUM_SMS}" "${RECOMPUTE_MODULES}" "${OFFLOAD_MODULES}" \
-    | tee -a "${RESULT_DIR}/run_info.txt"
+    | tee -a "${RUN_RESULT_DIR}/run_info.txt"
+printf 'gpu_count=%s gpus_per_node=%s nnodes=%s node_rank=%s master_addr=%s master_port=%s numarun=%s\n' \
+    "${GPU_COUNT}" "${GPUS_PER_NODE}" "${NNODES}" "${NODE_RANK}" "${MASTER_ADDR}" "${MASTER_PORT}" \
+    "${NUMARUN:-disabled}" | tee -a "${RUN_RESULT_DIR}/run_info.txt"
 printf 'profile=%s profile_step_start=%s profile_step_end=%s use_nsys_profiler=%s use_pytorch_profiler=%s record_memory_history=%s record_shapes=%s nvtx_ranges=%s gpu_memory_trace_interval=%s\n' \
     "${PROFILE}" "${PROFILE_STEP_START}" "${PROFILE_STEP_END}" "${USE_NSYS_PROFILER}" \
     "${USE_PYTORCH_PROFILER}" "${RECORD_MEMORY_HISTORY}" "${RECORD_SHAPES}" "${NVTX_RANGES}" \
-    "${GPU_MEMORY_TRACE_INTERVAL}" | tee -a "${RESULT_DIR}/run_info.txt"
-printf 'result_dir=%s\nprofile_ranks=0,1,2,3\ncommand=%s\n' "${RESULT_DIR}" "${COMMAND_TEXT}" | tee -a "${RESULT_DIR}/run_info.txt"
+    "${GPU_MEMORY_TRACE_INTERVAL}" | tee -a "${RUN_RESULT_DIR}/run_info.txt"
+printf 'result_dir=%s\nprofile_ranks=0,1,2,3\ncommand=%s\n' "${RESULT_DIR}" "${COMMAND_TEXT}" | tee -a "${RUN_RESULT_DIR}/run_info.txt"
 
 GPU_MONITOR_PID=""
-GPU_MONITOR_READY_FILE="${RESULT_DIR}/.gpu-monitor-ready"
+GPU_MONITOR_READY_FILE="${RUN_RESULT_DIR}/.gpu-monitor-ready"
 
 start_gpu_memory_monitor() {
     rm -f "${GPU_MONITOR_READY_FILE}"
     uv run --no-sync python "${REPO_ROOT}/scripts/scale-down/nvidia-smi/check_gpu.py" \
         --interval "${GPU_MEMORY_TRACE_INTERVAL}" \
         --ready-file "${GPU_MONITOR_READY_FILE}" \
-        --output-dir "${RESULT_DIR}/gpu_memory" &
+        --output-dir "${RUN_RESULT_DIR}/gpu_memory" &
     GPU_MONITOR_PID=$!
 
     while [[ ! -e "${GPU_MONITOR_READY_FILE}" ]]; do
@@ -609,31 +716,24 @@ cleanup_gpu_memory_monitor() {
 
 trap cleanup_gpu_memory_monitor EXIT
 
-printf 'Starting nvidia-smi memory monitor...\n' | tee -a "${RESULT_DIR}/run_info.txt"
+printf 'Starting nvidia-smi memory monitor...\n' | tee -a "${RUN_RESULT_DIR}/run_info.txt"
 start_gpu_memory_monitor
 
 # Run training with optional nsys profiling.
 if [[ "${USE_NSYS_PROFILER}" == true ]]; then
-    printf 'Running with nsys profiling enabled...\n' | tee -a "${RESULT_DIR}/run_info.txt"
+    printf 'Running with nsys profiling enabled...\n' | tee -a "${RUN_RESULT_DIR}/run_info.txt"
     set +e
-    nsys profile \
-        -s none \
-        -t cuda,nvtx \
-        --capture-range=cudaProfilerApi \
-        --capture-range-end=stop \
-        -o "${RESULT_DIR}/profile/nsys-${NSYS_RESULT_NAME}_%p_%h" \
-        --force-overwrite=true \
-        "${COMMAND[@]}" 2>&1 | tee "${RESULT_DIR}/train.log"
+    "${NSYS_COMMAND[@]}" 2>&1 | tee "${RUN_RESULT_DIR}/train.log"
     RUN_STATUS=${PIPESTATUS[0]}
     set -e
-    if compgen -G "${RESULT_DIR}/profile/*.nsys-rep" > /dev/null; then
-        printf 'nsys profile reports (written after training):\n' | tee -a "${RESULT_DIR}/run_info.txt"
-        find "${RESULT_DIR}/profile" -maxdepth 1 -type f -name '*.nsys-rep' -print | sort | tee -a "${RESULT_DIR}/run_info.txt"
+    if compgen -G "${RUN_RESULT_DIR}/profile/*.nsys-rep" > /dev/null; then
+        printf 'nsys profile reports (written after training):\n' | tee -a "${RUN_RESULT_DIR}/run_info.txt"
+        find "${RUN_RESULT_DIR}/profile" -maxdepth 1 -type f -name '*.nsys-rep' -print | sort | tee -a "${RUN_RESULT_DIR}/run_info.txt"
     fi
 else
-    printf 'Running without nsys profiling...\n' | tee -a "${RESULT_DIR}/run_info.txt"
+    printf 'Running without nsys profiling...\n' | tee -a "${RUN_RESULT_DIR}/run_info.txt"
     set +e
-    "${COMMAND[@]}" 2>&1 | tee "${RESULT_DIR}/train.log"
+    "${COMMAND[@]}" 2>&1 | tee "${RUN_RESULT_DIR}/train.log"
     RUN_STATUS=${PIPESTATUS[0]}
     set -e
 fi
@@ -641,13 +741,13 @@ fi
 stop_gpu_memory_monitor || {
     MONITOR_STATUS=$?
     printf 'GPU memory monitor failed with status %s.\n' "${MONITOR_STATUS}" \
-        | tee -a "${RESULT_DIR}/run_info.txt" >&2
+        | tee -a "${RUN_RESULT_DIR}/run_info.txt" >&2
     if [[ "${RUN_STATUS}" -eq 0 ]]; then
         RUN_STATUS="${MONITOR_STATUS}"
     fi
 }
-printf 'GPU memory traces: %s\n' "${RESULT_DIR}/gpu_memory" \
-    | tee -a "${RESULT_DIR}/run_info.txt"
+printf 'GPU memory traces: %s\n' "${RUN_RESULT_DIR}/gpu_memory" \
+    | tee -a "${RUN_RESULT_DIR}/run_info.txt"
 
 if [[ "${PROFILE}" == torch ]]; then
 
@@ -658,33 +758,37 @@ if [[ "${PROFILE}" == torch ]]; then
     # torch mode. Failures are logged but do not fail the training run: a
     # snapshot without ProfilerStep markers is an analysis gap, not a training
     # failure.
-    printf 'Replaying memory snapshots to JSON...\n' | tee -a "${RESULT_DIR}/run_info.txt"
+    printf 'Replaying memory snapshots to JSON...\n' | tee -a "${RUN_RESULT_DIR}/run_info.txt"
     shopt -s nullglob
-    MEMORY_PICKLES=("${RESULT_DIR}"/memory/snapshot*.pickle)
+    MEMORY_PICKLES=("${RUN_RESULT_DIR}"/memory/snapshot*.pickle)
     shopt -u nullglob
     if (( ${#MEMORY_PICKLES[@]} == 0 )); then
-        printf 'No memory snapshots found under %s/memory.\n' "${RESULT_DIR}" \
-            | tee -a "${RESULT_DIR}/run_info.txt" >&2
+        printf 'No memory snapshots found under %s/memory.\n' "${RUN_RESULT_DIR}" \
+            | tee -a "${RUN_RESULT_DIR}/run_info.txt" >&2
     fi
     for snapshot_pickle in ${MEMORY_PICKLES[@]+"${MEMORY_PICKLES[@]}"}; do
         snapshot_json="${snapshot_pickle%.pickle}.json"
         if uv run --no-sync python "${REPO_ROOT}/scripts/scale-down/analyse/replay_step.py" \
                 "${snapshot_pickle}" --all-steps --json > "${snapshot_json}"; then
-            printf 'Memory replay JSON: %s\n' "${snapshot_json}" | tee -a "${RESULT_DIR}/run_info.txt"
+            printf 'Memory replay JSON: %s\n' "${snapshot_json}" | tee -a "${RUN_RESULT_DIR}/run_info.txt"
         else
             printf 'replay_step.py failed for %s; removed partial JSON.\n' "${snapshot_pickle}" \
-                | tee -a "${RESULT_DIR}/run_info.txt" >&2
+                | tee -a "${RUN_RESULT_DIR}/run_info.txt" >&2
             rm -f "${snapshot_json}"
         fi
     done
 fi
 
-GPU_UTILIZATION_PATH="${RESULT_DIR}/gpu_utilization.json"
+GPU_UTILIZATION_PATH="${RUN_RESULT_DIR}/gpu_utilization.json"
 uv run --no-sync python "${REPO_ROOT}/scripts/scale-down/analyse/export_gpu_utilization.py" \
-    --log-file "${RESULT_DIR}/train.log" \
+    --log-file "${RUN_RESULT_DIR}/train.log" \
     --output "${GPU_UTILIZATION_PATH}"
 printf 'GPU utilization metrics: %s\n' "${GPU_UTILIZATION_PATH}" \
-    | tee -a "${RESULT_DIR}/run_info.txt"
+    | tee -a "${RUN_RESULT_DIR}/run_info.txt"
 
 export RUN_STATUS
-uv run --no-sync python -c 'import json, os; root = os.environ["RESULT_DIR"]; result = {"status": int(os.environ["RUN_STATUS"]), "model": os.environ["MODEL"], "dtype": os.environ["DTYPE"], "precision": os.environ["DTYPE"], "run_name": os.environ["RUN_NAME"], "test_name": os.environ["TEST_NAME"], "result_path_name": os.environ["RESULT_PATH_NAME"], "run_time": os.environ["RUN_TIME"], "recipe": os.environ["RECIPE"], "result_dir": root, "profile_ranks": [0, 1, 2, 3], "optimizer_cpu_offload": os.environ["OPTIMIZER_CPU_OFFLOAD"] == "true", "optimizer_offload_fraction": float(os.environ["OPTIMIZER_OFFLOAD_FRACTION"]) }; json.dump(result, open(os.path.join(root, "summary.json"), "w"), indent=2, sort_keys=True); raise SystemExit(result["status"])'
+if (( NODE_RANK == 0 )); then
+    uv run --no-sync python -c 'import json, os; root = os.environ["RUN_RESULT_DIR"]; result = {"status": int(os.environ["RUN_STATUS"]), "model": os.environ["MODEL"], "dtype": os.environ["DTYPE"], "precision": os.environ["DTYPE"], "run_name": os.environ["RUN_NAME"], "test_name": os.environ["TEST_NAME"], "result_path_name": os.environ["RESULT_PATH_NAME"], "run_time": os.environ["RUN_TIME"], "recipe": os.environ["RECIPE"], "result_dir": root, "gpu_count": int(os.environ["GPU_COUNT"]), "gpus_per_node": int(os.environ["GPUS_PER_NODE"]), "nnodes": int(os.environ["NNODES"]), "profile_ranks": [0, 1, 2, 3], "optimizer_cpu_offload": os.environ["OPTIMIZER_CPU_OFFLOAD"] == "true", "optimizer_offload_fraction": float(os.environ["OPTIMIZER_OFFLOAD_FRACTION"]) }; json.dump(result, open(os.path.join(root, "summary.json"), "w"), indent=2, sort_keys=True); raise SystemExit(result["status"])'
+else
+    exit "${RUN_STATUS}"
+fi

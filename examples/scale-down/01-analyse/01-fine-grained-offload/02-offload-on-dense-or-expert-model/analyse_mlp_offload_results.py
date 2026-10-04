@@ -13,31 +13,25 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Analyze GPU utilization samples and write an MLP throughput XLSX workbook."""
+"""Analyze GPU utilization samples and write MLP throughput XLSX and CSV reports."""
 
 from __future__ import annotations
 
 import argparse
+import csv
 import json
 import math
 import re
 import sys
 import zipfile
 from dataclasses import dataclass
+from html import escape
 from pathlib import Path
 
-from collect_mlp_offload_results import (
-    DEFAULT_RESULTS_ROOT,
-    column_name,
-    content_types_xml,
-    inline_string_cell,
-    make_sheet_xml,
-    number_cell,
-    package_rels_xml,
-    styles_xml,
-)
 
-
+SCRIPT_DIR = Path(__file__).resolve().parent
+REPO_ROOT = SCRIPT_DIR.parents[4]
+DEFAULT_RESULTS_ROOT = REPO_ROOT / "results/01-analyse/01-fine-grained-offload/02-offload-on-dense-or-expert-model"
 MIN_GPU_UTILIZATION_SAMPLES = 10
 GPU_UTILIZATION_SAMPLES_TO_AVERAGE = 4
 RUN_NAME_PATTERN = re.compile(
@@ -52,8 +46,25 @@ HEADERS = (
     "baseline (TFlops)",
     "offload-mlp (TFlops)",
     "offload-attn-mlp (TFlops)",
-    "offload-mlp 相对于 baseline 的性能下降幅度",
-    "offload-attn-mlp 相对于 baseline 的性能下降幅度",
+    "offload-mlp vs. baseline",
+    "offload-attn-mlp vs. baseline",
+)
+
+SAMPLE_HEADERS = (
+    "model",
+    "dispatcher",
+    "mbs",
+    "dtype",
+    "type",
+    "case",
+    "run time",
+    "iteration 1 (TFlops)",
+    "iteration 2 (TFlops)",
+    "iteration 3 (TFlops)",
+    "iteration 4 (TFlops)",
+    "average (TFlops)",
+    "variance (TFlops^2)",
+    "std dev (TFlops)",
 )
 
 
@@ -98,6 +109,91 @@ class ThroughputRow:
     baseline_samples: tuple[float, ...]
     offload_mlp_samples: tuple[float, ...]
     offload_attn_mlp_samples: tuple[float, ...]
+
+
+def column_name(index: int) -> str:
+    """Convert a zero-based column index to an Excel column name."""
+
+    result = ""
+    while index >= 0:
+        index, remainder = divmod(index, 26)
+        result = chr(65 + remainder) + result
+        index -= 1
+    return result
+
+
+def xml_text(value: object) -> str:
+    """Escape a value for use in XML text."""
+
+    return escape(str(value), quote=False)
+
+
+def inline_string_cell(reference: str, value: object) -> str:
+    """Build an inline-string worksheet cell."""
+
+    return f'<c r="{reference}" t="inlineStr"><is><t>{xml_text(value)}</t></is></c>'
+
+
+def number_cell(reference: str, value: object) -> str:
+    """Build a numeric worksheet cell."""
+
+    return f'<c r="{reference}"><v>{xml_text(value)}</v></c>'
+
+
+def make_sheet_xml(
+    rows: list[list[str]],
+    *,
+    max_column: int,
+    max_row: int,
+    frozen_rows: int | None = None,
+) -> str:
+    """Build worksheet XML from already-rendered cells."""
+
+    sheet_rows = [f'<row r="{row_number}">{"".join(cells)}</row>' for row_number, cells in enumerate(rows, start=1)]
+    pane = ""
+    if frozen_rows is not None:
+        pane = (
+            f'<sheetViews><sheetView workbookViewId="0"><pane ySplit="{frozen_rows}" '
+            f'topLeftCell="A{frozen_rows + 1}" activePane="bottomLeft" state="frozen"/>'
+            '<selection pane="bottomLeft" activeCell="A1" sqref="A1"/>'
+            "</sheetView></sheetViews>"
+        )
+    return (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        '<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">'
+        f'<dimension ref="A1:{column_name(max_column - 1)}{max_row}"/>'
+        f'{pane}<sheetFormatPr defaultRowHeight="15"/>'
+        f"<sheetData>{''.join(sheet_rows)}</sheetData>"
+        "</worksheet>"
+    )
+
+
+def styles_xml() -> str:
+    """Return the workbook's default, unformatted style table."""
+
+    return """<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<styleSheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">
+  <fonts count="1"><font><sz val="11"/><name val="Calibri"/></font></fonts>
+  <fills count="2"><fill><patternFill patternType="none"/></fill><fill><patternFill patternType="gray125"/></fill></fills>
+  <borders count="1"><border/></borders>
+  <cellStyleXfs count="1"><xf numFmtId="0" fontId="0" fillId="0" borderId="0"/></cellStyleXfs>
+  <cellXfs count="1"><xf numFmtId="0" fontId="0" fillId="0" borderId="0"/></cellXfs>
+  <cellStyles count="1"><cellStyle name="Normal" xfId="0" builtinId="0"/></cellStyles>
+</styleSheet>"""
+
+
+def content_types_xml() -> str:
+    """Return package content type declarations."""
+
+    return """<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/><Override PartName="/xl/worksheets/sheet1.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/><Override PartName="/xl/worksheets/sheet2.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/><Override PartName="/xl/styles.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.styles+xml"/></Types>"""
+
+
+def package_rels_xml() -> str:
+    """Return the package root relationship metadata."""
+
+    return """<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/></Relationships>"""
 
 
 def read_json(path: Path) -> dict[str, object]:
@@ -200,11 +296,7 @@ def discover_rows(results_root: Path, model_family: str) -> list[ThroughputRow]:
 
     rows: list[ThroughputRow] = []
     for key, case_runs in groups.items():
-        if (
-            not case_runs["baseline"]
-            or not case_runs["offload-mlp"]
-            or not case_runs["offload-attn-mlp"]
-        ):
+        if not case_runs["baseline"] or not case_runs["offload-mlp"] or not case_runs["offload-attn-mlp"]:
             raise ValueError(f"Missing baseline or offload case run for {key}")
         baseline_time = sorted(case_runs["baseline"])[-1]
         offload_mlp_time = sorted(case_runs["offload-mlp"])[-1]
@@ -252,95 +344,175 @@ def discover_rows(results_root: Path, model_family: str) -> list[ThroughputRow]:
 
 
 def workbook_xml() -> str:
-    """Return one-sheet workbook metadata."""
+    """Return two-sheet workbook metadata."""
 
-    return '<?xml version="1.0" encoding="UTF-8" standalone="yes"?><workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><sheets><sheet name="Throughput" sheetId="1" r:id="rId1"/></sheets><calcPr calcMode="auto" fullCalcOnLoad="1" forceFullCalc="1"/></workbook>'
+    return '<?xml version="1.0" encoding="UTF-8" standalone="yes"?><workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><sheets><sheet name="Summary" sheetId="1" r:id="rId1"/><sheet name="Samples" sheetId="2" r:id="rId2"/></sheets><calcPr calcMode="auto" fullCalcOnLoad="1" forceFullCalc="1"/></workbook>'
 
 
 def workbook_rels_xml() -> str:
-    """Return one-sheet workbook relationships."""
+    """Return two-sheet workbook relationships."""
 
-    return '<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/><Relationship Id="rId2" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles" Target="styles.xml"/></Relationships>'
+    return '<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/><Relationship Id="rId2" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet2.xml"/><Relationship Id="rId3" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles" Target="styles.xml"/></Relationships>'
+
+
+def sample_statistics(samples: tuple[float, ...]) -> tuple[float, float, float]:
+    """Return the average, sample variance, and sample standard deviation."""
+
+    average = sum(samples) / len(samples)
+    variance = sum((sample - average) ** 2 for sample in samples) / (len(samples) - 1)
+    return average, variance, math.sqrt(variance)
 
 
 def write_workbook(rows: list[ThroughputRow], output_path: Path) -> None:
-    """Write throughput rows to a formatted XLSX workbook."""
+    """Write summary and sampled throughput rows to an XLSX workbook."""
 
     sheet_rows = [[inline_string_cell(f"{column_name(index)}1", header) for index, header in enumerate(HEADERS)]]
     for row_number, row in enumerate(rows, start=2):
-        sheet_rows.append([
-            inline_string_cell(f"A{row_number}", row.model),
-            inline_string_cell(f"B{row_number}", row.dispatcher),
-            number_cell(f"C{row_number}", row.mbs),
-            inline_string_cell(f"D{row_number}", row.dtype),
-            inline_string_cell(f"E{row_number}", row.model_type),
-            number_cell(f"F{row_number}", row.baseline_tflops),
-            number_cell(f"G{row_number}", row.offload_mlp_tflops),
-            number_cell(f"H{row_number}", row.offload_attn_mlp_tflops),
-            number_cell(f"I{row_number}", row.offload_mlp_performance_drop),
-            number_cell(f"J{row_number}", row.offload_attn_mlp_performance_drop),
-        ])
+        sheet_rows.append(
+            [
+                inline_string_cell(f"A{row_number}", row.model),
+                inline_string_cell(f"B{row_number}", row.dispatcher),
+                number_cell(f"C{row_number}", row.mbs),
+                inline_string_cell(f"D{row_number}", row.dtype),
+                inline_string_cell(f"E{row_number}", row.model_type),
+                number_cell(f"F{row_number}", row.baseline_tflops),
+                number_cell(f"G{row_number}", row.offload_mlp_tflops),
+                number_cell(f"H{row_number}", row.offload_attn_mlp_tflops),
+                number_cell(f"I{row_number}", row.offload_mlp_performance_drop),
+                number_cell(f"J{row_number}", row.offload_attn_mlp_performance_drop),
+            ]
+        )
     sheet = make_sheet_xml(
         sheet_rows,
         max_column=10,
         max_row=max(1, len(sheet_rows)),
+        frozen_rows=1,
     )
-    content_types = content_types_xml().replace(
-        '<Override PartName="/xl/worksheets/sheet2.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>',
-        "",
+
+    sample_rows: list[list[str]] = [
+        [inline_string_cell(f"{column_name(index)}1", header) for index, header in enumerate(SAMPLE_HEADERS)]
+    ]
+    for row in rows:
+        for case_name, run_time, samples in (
+            ("baseline", row.baseline_run_time, row.baseline_samples),
+            ("offload-mlp", row.offload_mlp_run_time, row.offload_mlp_samples),
+            ("offload-attn-mlp", row.offload_attn_mlp_run_time, row.offload_attn_mlp_samples),
+        ):
+            average, variance, standard_deviation = sample_statistics(samples)
+            row_number = len(sample_rows) + 1
+            values: list[str] = [
+                inline_string_cell(f"A{row_number}", row.model),
+                inline_string_cell(f"B{row_number}", row.dispatcher),
+                number_cell(f"C{row_number}", row.mbs),
+                inline_string_cell(f"D{row_number}", row.dtype),
+                inline_string_cell(f"E{row_number}", row.model_type),
+                inline_string_cell(f"F{row_number}", case_name),
+                inline_string_cell(f"G{row_number}", run_time),
+            ]
+            values.extend(
+                number_cell(f"{column_name(column)}{row_number}", sample)
+                for column, sample in enumerate(samples, start=7)
+            )
+            values.extend(
+                (
+                    number_cell(f"L{row_number}", average),
+                    number_cell(f"M{row_number}", variance),
+                    number_cell(f"N{row_number}", standard_deviation),
+                )
+            )
+            sample_rows.append(values)
+    samples_sheet = make_sheet_xml(
+        sample_rows,
+        max_column=len(SAMPLE_HEADERS),
+        max_row=max(1, len(sample_rows)),
+        frozen_rows=1,
     )
     output_path.parent.mkdir(parents=True, exist_ok=True)
     with zipfile.ZipFile(output_path, "w", compression=zipfile.ZIP_DEFLATED) as archive:
-        archive.writestr("[Content_Types].xml", content_types)
+        archive.writestr("[Content_Types].xml", content_types_xml())
         archive.writestr("_rels/.rels", package_rels_xml())
         archive.writestr("xl/workbook.xml", workbook_xml())
         archive.writestr("xl/_rels/workbook.xml.rels", workbook_rels_xml())
         archive.writestr("xl/styles.xml", styles_xml())
         archive.writestr("xl/worksheets/sheet1.xml", sheet)
+        archive.writestr("xl/worksheets/sheet2.xml", samples_sheet)
+
+
+def write_summary_csv(rows: list[ThroughputRow], output_path: Path) -> None:
+    """Write the summary comparison table as a comma-separated file."""
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    with output_path.open("w", encoding="utf-8", newline="") as file:
+        writer = csv.writer(file, lineterminator="\n")
+        writer.writerow(HEADERS)
+        for row in rows:
+            writer.writerow(
+                (
+                    row.model,
+                    row.dispatcher,
+                    row.mbs,
+                    row.dtype,
+                    row.model_type,
+                    row.baseline_tflops,
+                    row.offload_mlp_tflops,
+                    row.offload_attn_mlp_tflops,
+                    row.offload_mlp_performance_drop,
+                    row.offload_attn_mlp_performance_drop,
+                )
+            )
 
 
 def run_cli(argv: list[str]) -> int:
-    """Parse options, analyze runs, and write the throughput workbook."""
+    """Parse options, analyze runs, and write the throughput reports."""
 
-    parser = argparse.ArgumentParser(description="Analyze MLP offload GPU utilization and write an XLSX workbook.")
+    parser = argparse.ArgumentParser(description="Analyze MLP offload GPU utilization and write XLSX and CSV reports.")
     parser.add_argument("--model", required=True, choices=("qwen", "deepseek"))
     parser.add_argument("--results-root", type=Path, default=DEFAULT_RESULTS_ROOT)
     parser.add_argument("--output", type=Path)
+    parser.add_argument("--csv-output", type=Path)
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args(argv)
     results_root = args.results_root.resolve()
     rows = discover_rows(results_root, args.model)
     output_path = (args.output or results_root / f"offload-throughput-{args.model}.xlsx").resolve()
+    csv_output_path = (args.csv_output or output_path.with_suffix(".csv")).resolve()
     if args.dry_run:
-        print(json.dumps({
-            "modelFamily": args.model,
-            "outputPath": str(output_path),
-            "headers": HEADERS,
-            "rows": [
+        print(
+            json.dumps(
                 {
-                    "model": row.model,
-                    "dispatcher": row.dispatcher,
-                    "mbs": row.mbs,
-                    "dtype": row.dtype,
-                    "type": row.model_type,
-                    "baselineTflops": row.baseline_tflops,
-                    "offloadMlpTflops": row.offload_mlp_tflops,
-                    "offloadAttnMlpTflops": row.offload_attn_mlp_tflops,
-                    "offloadMlpPerformanceDrop": row.offload_mlp_performance_drop,
-                    "offloadAttnMlpPerformanceDrop": row.offload_attn_mlp_performance_drop,
-                    "baselineRunTime": row.baseline_run_time,
-                    "offloadMlpRunTime": row.offload_mlp_run_time,
-                    "offloadAttnMlpRunTime": row.offload_attn_mlp_run_time,
-                    "baselineSamples": row.baseline_samples,
-                    "offloadMlpSamples": row.offload_mlp_samples,
-                    "offloadAttnMlpSamples": row.offload_attn_mlp_samples,
-                }
-                for row in rows
-            ],
-        }, indent=2))
+                    "modelFamily": args.model,
+                    "outputPath": str(output_path),
+                    "csvOutputPath": str(csv_output_path),
+                    "headers": HEADERS,
+                    "rows": [
+                        {
+                            "model": row.model,
+                            "dispatcher": row.dispatcher,
+                            "mbs": row.mbs,
+                            "dtype": row.dtype,
+                            "type": row.model_type,
+                            "baselineTflops": row.baseline_tflops,
+                            "offloadMlpTflops": row.offload_mlp_tflops,
+                            "offloadAttnMlpTflops": row.offload_attn_mlp_tflops,
+                            "offloadMlpPerformanceDrop": row.offload_mlp_performance_drop,
+                            "offloadAttnMlpPerformanceDrop": row.offload_attn_mlp_performance_drop,
+                            "baselineRunTime": row.baseline_run_time,
+                            "offloadMlpRunTime": row.offload_mlp_run_time,
+                            "offloadAttnMlpRunTime": row.offload_attn_mlp_run_time,
+                            "baselineSamples": row.baseline_samples,
+                            "offloadMlpSamples": row.offload_mlp_samples,
+                            "offloadAttnMlpSamples": row.offload_attn_mlp_samples,
+                        }
+                        for row in rows
+                    ],
+                },
+                indent=2,
+            )
+        )
         return 0
     write_workbook(rows, output_path)
-    print(f"Wrote {len(rows)} throughput comparison row(s): {output_path}")
+    write_summary_csv(rows, csv_output_path)
+    print(f"Wrote {len(rows)} throughput comparison row(s): {output_path} and {csv_output_path}")
     return 0
 
 

@@ -59,20 +59,19 @@ DeepSeek-V3 的两种 proxy 由脚本 override 构造（不再限制 `--scope de
 - **dispatcher**（仅 MoE）：`alltoall` / `hybridep`；默认两个都跑，可用 `--dispatcher <alltoall|hybridep>` 只跑其一
 - **case**：`baseline`、`offload-mlp`、`offload-attn-mlp`
 
-固定条件：4 GPU FSDP1、seq len 4096、GBS 32、train-iters 10、关闭 recompute / CUDA graph / optimizer offload / checkpoint。
+固定条件：默认单机 4 GPU FSDP1、seq len 4096、GBS 32、train-iters 10、关闭 recompute / CUDA graph / optimizer offload / checkpoint。使用 `--gpu 16` 或 `--gpu 32` 时，脚本按 GB200 每节点 4 卡分别扩展到 4 节点或 8 节点。
 
 ## 文件说明
 
 - `benchmark_mlp_offload.sh` — 矩阵入口，展开所有组合并逐项调用训练脚本
-- `run_pretrain_fsdp1.sh` — dense/expert 对比专用的 4-GPU FSDP1 训练入口
-- `collect_mlp_offload_results.py` — Python 标准库版本，扫描结果目录并生成 XLSX 吞吐对比表
-- `analyse_mlp_offload_results.py` — Python 标准库版本，读取 GPU utilization 并生成 TFlops XLSX 对比表
+- `run_pretrain_fsdp1.sh` — dense/expert 对比专用的 4-GPU-per-node FSDP1 训练入口
+- `analyse_mlp_offload_results.py` — Python 标准库版本，读取 GPU utilization 并生成 TFlops XLSX/CSV 对比表
 - `collect_mlp_offload_results.mjs` — Node.js 版本，保留用于已有 Node/artifact-tool 环境
 - `analyse_mlp_offload_results.mjs` — Node.js 版本，保留用于已有 Node/artifact-tool 环境
 
 ## 运行指令
 
-前置：仓库根目录 `uv sync`；4 张 GPU 可用（GB200 recipe）；`--profile nsys` 需要 `nsys`。两个 Python XLSX 脚本只使用标准库，不需要 Node.js 或 `@oai/artifact-tool`。
+前置：仓库根目录 `uv sync`；默认需要 4 张 GPU（GB200 recipe），DLC 多机运行按 `--gpu` 分配 16 或 32 张 GPU；`--profile nsys` 需要 `nsys`。Python 分析脚本只使用标准库，不需要 Node.js 或 `@oai/artifact-tool`。
 
 Python 生成的 XLSX 使用简单数据表格式：第一行是字段名，后续行是数据，不额外添加颜色、边框、合并单元格或数字格式。
 
@@ -80,7 +79,33 @@ Python 生成的 XLSX 使用简单数据表格式：第一行是字段名，后�
 EXPERIMENT_DIR=examples/scale-down/01-analyse/01-fine-grained-offload/02-offload-on-dense-or-expert-model
 ```
 
-每次启动会自动生成批次标识（`benchmark_id`，即 `RUN_TIME`）。如需把 bf16 / mxfp8 两组吞吐运行合并进同一个 XLSX，给两条 `--profile none` 命令传相同的 `RUN_TIME` 环境变量即可（收集器按 `model/dtype/dispatcher/case/mbs` 区分运行，dtype 不同不会冲突）。
+### DLC 跨机启动（16 卡 / 32 卡）
+
+`benchmark_mlp_offload.sh` 和 `run_pretrain_fsdp1.sh` 都支持 `--gpu 16`、`--gpu 32`。脚本固定按每台 GB200 4 卡计算节点数，并在多机模式下复用参考 `train.sh` 的 `numarun + torchrun` 启动方式：
+
+- `--gpu 16`：4 节点 × 4 GPU，`nnodes=4`；
+- `--gpu 32`：8 节点 × 4 GPU，`nnodes=8`；
+- 不传 `--gpu`：单机 4 GPU，使用 `torch.distributed.run --standalone`。
+
+DLC 多机环境需要让每个 worker 执行同一入口，并提供 rank-0 节点的可达地址 `MASTER_ADDR`（以及可选的 `MASTER_PORT`，默认 `29501`）；DLC 提供当前节点的 `RANK`（节点 rank，范围为 `0..nnodes-1`）。例如在 DLC 的多机 worker 启动命令中使用：
+
+```bash
+# 16 卡：4 个 DLC 节点，每节点 4 卡
+export MASTER_ADDR=<rank-0-host-or-ip>
+export MASTER_PORT=29501
+bash "${EXPERIMENT_DIR}/benchmark_mlp_offload.sh" \
+  --gpu 16 --model deepseek --dtype bf16 --micro-batch-sizes 1,2,4
+
+# 32 卡：8 个 DLC 节点，每节点 4 卡
+export MASTER_ADDR=<rank-0-host-or-ip>
+export MASTER_PORT=29501
+bash "${EXPERIMENT_DIR}/benchmark_mlp_offload.sh" \
+  --gpu 32 --model deepseek --dtype bf16 --micro-batch-sizes 1,2,4
+```
+
+多机模式默认使用 `numarun` 做 NUMA 绑定；若环境没有该包装器，可以设置 `NUMARUN=`，脚本会直接使用带 `--nnodes`、`--node_rank`、`--master_addr`、`--master_port` 的 `torchrun` 参数。每次运行的结果目录会包含 `gpu_4`、`gpu_16` 或 `gpu_32` 标识，避免不同规模的结果互相覆盖。
+
+每次启动会自动生成批次标识（`benchmark_id`，即 `RUN_TIME`）。分析脚本按 `model/dtype/dispatcher/case/mbs` 区分运行，并为每个 case 选择最新的成功结果。
 
 ### 测试 1：qwen3.5 dense + expert 综合矩阵（MBS 1,2,4,8）
 
@@ -115,11 +140,7 @@ bash "./examples/scale-down/01-analyse/01-fine-grained-offload/02-offload-on-den
 **吞吐矩阵跑完后汇总 TFlops**（只统计 `--profile none` 的成功运行）：
 
 ```bash
-# 生成逐次迭代吞吐对比表（Summary + Samples）
-uv run python examples/scale-down/01-analyse/01-fine-grained-offload/02-offload-on-dense-or-expert-model/collect_mlp_offload_results.py \
-  --run-time <benchmark_id>
-
-# 生成 GPU utilization/TFlops 对比表（最后 4 组数据的平均值）
+# 生成 GPU utilization/TFlops 对比表（Summary + Samples）和 CSV
 uv run python examples/scale-down/01-analyse/01-fine-grained-offload/02-offload-on-dense-or-expert-model/analyse_mlp_offload_results.py \
   --model qwen \
   --output result/01-analyse/01-fine-grained-offload/02-offload-on-dense-or-expert-model/offload-throughput-qwen.xlsx
@@ -156,11 +177,7 @@ bash "./examples/scale-down/01-analyse/01-fine-grained-offload/02-offload-on-den
 **吞吐矩阵跑完后汇总 TFlops**（只统计 `--profile none` 的成功运行）：
 
 ```bash
-# 生成逐次迭代吞吐对比表（Summary + Samples）
-uv run python examples/scale-down/01-analyse/01-fine-grained-offload/02-offload-on-dense-or-expert-model/collect_mlp_offload_results.py \
-  --run-time <benchmark_id>
-
-# 生成 GPU utilization/TFlops 对比表（最后 4 组数据的平均值）
+# 生成 GPU utilization/TFlops 对比表（Summary + Samples）和 CSV
 uv run python examples/scale-down/01-analyse/01-fine-grained-offload/02-offload-on-dense-or-expert-model/analyse_mlp_offload_results.py \
   --model deepseek \
   --output result/01-analyse/01-fine-grained-offload/02-offload-on-dense-or-expert-model/offload-throughput-deepseek.xlsx
@@ -178,16 +195,6 @@ bash "./examples/scale-down/01-analyse/01-fine-grained-offload/02-offload-on-den
 
 运行 3 个 case（baseline / offload-mlp / offload-attn-mlp）。
 
-### 生成 XLSX 汇总（只收 `--profile none` 的成功运行）
-
-```bash
-uv run python examples/scale-down/01-analyse/01-fine-grained-offload/02-offload-on-dense-or-expert-model/collect_mlp_offload_results.py
-# 默认收集最新批次；回看旧批次加 --run-time <benchmark_id>
-# 只校验数据不写 XLSX：加 --dry-run
-```
-
-收集器固定读取 iteration 5–9 的 step time，所以 `--train-iters` 不能小于 10。
-
 ## 结果存储位置
 
 训练结果根目录（可用 `--results-root <path>` 改）：
@@ -201,29 +208,23 @@ result/01-analyse/01-fine-grained-offload/02-offload-on-dense-or-expert-model/
     ├── summary.json                # status=0 表示成功
     ├── gpu_memory/                 # nvidia-smi 显存采样
     ├── memory/snapshot.pickle      # profiling 时的 CUDA memory snapshot
-    ├── profile/                    # nsys 输出：nsys-*.nsys-rep（4 个 rank 各一份）
+    ├── profile/                    # nsys 输出：nsys-*.nsys-rep（每节点 4 个 rank）
     └── rank_logs/
 ```
+
+多机运行时 rank 0 保留上述根目录文件，其他节点的 `train.log`、`gpu_memory/`、`memory/`、`profile/` 和 `rank_logs/` 写入同一目录下的 `rank<N>/`，避免 DLC 各节点并发覆盖文件。
 
 其中 `<test-name>` 按以下规则构建：
 
 ```text
-dtype_<bf16|mxfp8>-mbs_<mbs>-gbs_<gbs>-<baseline|offload-mlp|offload-attn-mlp>
+gpu_<4|16|32>-dtype_<bf16|mxfp8>-mbs_<mbs>-gbs_<gbs>-<baseline|offload-mlp|offload-attn-mlp>
 ```
 
 expert 模型会在 case 前补充 dispatcher：
 
 ```text
-dtype_<bf16|mxfp8>-mbs_<mbs>-gbs_<gbs>-dispatcher_<alltoall|hybridep>-<baseline|offload-mlp|offload-attn-mlp>
+gpu_<4|16|32>-dtype_<bf16|mxfp8>-mbs_<mbs>-gbs_<gbs>-dispatcher_<alltoall|hybridep>-<baseline|offload-mlp|offload-attn-mlp>
 ```
-
-XLSX 汇总输出：
-
-```text
-result/01-analyse/01-fine-grained-offload/02-offload-on-dense-or-expert-model/offload-comparison-<run-time>.xlsx
-```
-
-包含 `Summary`（每 run 吞吐均值/中位数/波动、相对 baseline 的比例）和 `Samples`（逐 iteration step time、tokens/s、raw result 目录）两个 sheet。
 
 ### 按模型汇总 TFlops
 
@@ -241,9 +242,11 @@ GPU utilization 数据，分析时读取全部数据并对最后 4 组 `MODEL_TF
 
 ```text
 result/01-analyse/01-fine-grained-offload/02-offload-on-dense-or-expert-model/offload-throughput-<qwen|deepseek>.xlsx
+result/01-analyse/01-fine-grained-offload/02-offload-on-dense-or-expert-model/offload-throughput-<qwen|deepseek>.csv
 ```
 
-表格按 dispatcher、MBS、dtype、dense/expert 排序。两个 offload case 的性能下降幅度分别按
+XLSX 包含 `Summary`（三种 case 的平均 TFlops 和相对 baseline 的性能下降）与 `Samples`（最后 4 组
+TFlops、均值、方差和标准差）两个 sheet；CSV 保存 Summary。表格按 dispatcher、MBS、dtype、dense/expert 排序。两个 offload case 的性能下降幅度分别按
 `(baseline - offload_case) / baseline` 计算。
 
 ## nsys / NVTX 分析
@@ -253,7 +256,7 @@ result/01-analyse/01-fine-grained-offload/02-offload-on-dense-or-expert-model/of
   - 在时间轴上把 NCCL allreduce / reduce-scatter / all-gather kernel 与 NVTX range（forward、backward、optimizer、offload D2H/H2D 等）对齐，即可回答"allreduce 是哪个操作产生的"（目的 3）；
 - 对比 baseline、offload-mlp 与 offload-attn-mlp 的时间轴，找出无法被计算 overlap 的 copy / 通信段（目的 1）；
   - 对比 qwen3.5 与 deepseek 的 kernel 间隙和通信占比，定位效率差距来源（目的 2）。
-- profiling 运行不会被 XLSX 收集器纳入吞吐比较；显存细节看 `memory/snapshot.pickle` 和 `gpu_memory/`。
+- profiling 运行不会被分析脚本纳入吞吐比较；显存细节看 `memory/snapshot.pickle` 和 `gpu_memory/`。
 
 ## 如何解读
 

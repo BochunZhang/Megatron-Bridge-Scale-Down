@@ -26,6 +26,7 @@ DTYPE="${DTYPE:-bf16}"
 PROFILE="none"
 CASE_FILTER="all"
 DISPATCHER_FILTER="all"
+GPU_COUNT=4
 TRAIN_ITERS="${TRAIN_ITERS:-10}"
 GLOBAL_BATCH_SIZE="${GLOBAL_BATCH_SIZE:-32}"
 MICRO_BATCH_SIZES="${MICRO_BATCH_SIZES:-1,2,4,8}"
@@ -44,7 +45,9 @@ usage() {
     cat <<'EOF'
 Usage: benchmark_mlp_offload.sh [OPTIONS]
 
-Run a controlled MLP activation-memory benchmark on four local GB200 GPUs.
+Run a controlled MLP activation-memory benchmark on GB200 GPUs. By default the
+benchmark uses four GPUs on one node. `--gpu 16` and `--gpu 32` use four GPUs
+per node across four and eight DLC nodes, respectively.
 Qwen runs dense and expert cases. DeepSeek-V3 runs both dense and expert
 proxies by overriding its four-layer MoE layout. The Qwen expert uses 16
 layers and 64 experts; DeepSeek-V3 uses 4 layers and 32 experts. Activation
@@ -56,6 +59,7 @@ Options:
     --dense-model <9b|27b>       Dense model size (default: 9b)
     --dtype <bf16|mxfp8>         Training dtype (default: bf16)
     --profile <none|nsys|torch>  Profiling backend (default: none)
+    --gpu <16|32>                Total GPUs for DLC multi-node runs (default: 4)
     --case <name|all>            Run baseline, offload-mlp, or offload-attn-mlp (default: all)
     --dispatcher <all|alltoall|hybridep>
                                  MoE dispatcher filter (default: all)
@@ -88,6 +92,7 @@ while [[ $# -gt 0 ]]; do
             shift 2
             ;;
         --profile) PROFILE="$2"; shift 2 ;;
+        --gpu) GPU_COUNT="$2"; shift 2 ;;
         --case) CASE_FILTER="$2"; shift 2 ;;
         --dispatcher) DISPATCHER_FILTER="$2"; shift 2 ;;
         --train-iters) TRAIN_ITERS="$2"; shift 2 ;;
@@ -118,6 +123,11 @@ esac
 case "${DISPATCHER_FILTER}" in
     all|alltoall|hybridep) ;;
     *) echo "Invalid dispatcher: ${DISPATCHER_FILTER}" >&2; exit 2 ;;
+esac
+
+case "${GPU_COUNT}" in
+    4|16|32) ;;
+    *) echo "Invalid GPU count: ${GPU_COUNT}; expected 16 or 32 (default: 4)" >&2; exit 2 ;;
 esac
 
 for value_name in TRAIN_ITERS GLOBAL_BATCH_SIZE HYBRIDEP_NUM_SMS; do
@@ -219,8 +229,8 @@ run_case() {
         fi
     fi
 
-    printf 'matrix model=%s dtype=%s recipe=%s case=%s dispatcher=%s mbs=%s repeat=1 layers=%s experts=%s moe_layer_freq=%s offload=%s recompute=%s\n' \
-        "${model}" "${DTYPE}" "${recipe}" "${case_name}" "${dispatcher}" \
+    printf 'matrix model=%s dtype=%s gpu=%s recipe=%s case=%s dispatcher=%s mbs=%s repeat=1 layers=%s experts=%s moe_layer_freq=%s offload=%s recompute=%s\n' \
+        "${model}" "${DTYPE}" "${GPU_COUNT}" "${recipe}" "${case_name}" "${dispatcher}" \
         "${micro_batch_size}" "${num_layers}" "${num_experts}" \
         "${moe_layer_freq}" \
         "${offload_modules}" "${recompute_modules}"
@@ -237,6 +247,7 @@ run_case() {
         --dtype "${DTYPE}" \
         --run-name "${run_name}" \
         --dispatcher "${dispatcher}" \
+        --gpu "${GPU_COUNT}" \
         --hybridep-num-sms "${HYBRIDEP_NUM_SMS}" \
         --recompute-granularity "${recompute_granularity}" \
         --recompute-modules "${recompute_modules}" \
@@ -287,9 +298,9 @@ run_expert_matrix() {
     done
 }
 
-export RESULTS_ROOT RUN_TIME
-printf 'benchmark_id=%s model=%s dtype=%s dispatcher=%s results_root=%s train_iters=%s runs_per_case=1 micro_batch_sizes=%s\n' \
-    "${RUN_TIME}" "${MODEL_FAMILY}" "${DTYPE}" "${DISPATCHER_FILTER}" "${RESULTS_ROOT}" "${TRAIN_ITERS}" "${MICRO_BATCH_SIZES}"
+export RESULTS_ROOT RUN_TIME GPU_COUNT
+printf 'benchmark_id=%s model=%s dtype=%s dispatcher=%s gpu=%s results_root=%s train_iters=%s runs_per_case=1 micro_batch_sizes=%s\n' \
+    "${RUN_TIME}" "${MODEL_FAMILY}" "${DTYPE}" "${DISPATCHER_FILTER}" "${GPU_COUNT}" "${RESULTS_ROOT}" "${TRAIN_ITERS}" "${MICRO_BATCH_SIZES}"
 
 for micro_batch_size in "${MICRO_BATCH_SIZE_VALUES[@]}"; do
     case "${SCOPE}" in
@@ -312,4 +323,4 @@ if (( FAILURES > 0 )); then
 fi
 
 printf 'Raw results: %s (run_time=%s)\n' "${RESULTS_ROOT}" "${RUN_TIME}"
-printf 'Collect XLSX: %s/collect_mlp_offload_results.py\n' "${SCRIPT_DIR}"
+printf 'Analyze reports: %s/analyse_mlp_offload_results.py --model %s\n' "${SCRIPT_DIR}" "${MODEL_FAMILY}"

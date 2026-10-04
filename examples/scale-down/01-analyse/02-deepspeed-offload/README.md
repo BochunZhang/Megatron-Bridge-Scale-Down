@@ -43,9 +43,34 @@
 | 维度 | 取值 | 实现方式 |
 | --- | --- | --- |
 | shard | ZeRO-3（固定） | `zero_optimization.stage = 3` |
-| param 位置 | GPU / CPU | `offload_param.device = "none" / "cpu"`（CPU 即 ZeRO-Infinity 参数卸载） |
+| param 位置 | GPU / CPU / NVMe | `offload_param.device = "none" / "cpu" / "nvme"`（CPU/NVMe 均为 ZeRO-Infinity 参数卸载） |
 | optimizer 位置与计算 | GPU / ZeRO-Offload(CPU) / SuperOffload(CPU+GPU 混合) | `offload_optimizer.device`、`super_offload`、`ratio` |
 | recompute | none / act / act+cpu | `--activation_checkpointing`（HF 逐层 gradient checkpointing）+ DeepSpeed `CheckpointHiddenStatesOffload`（见 §3.1） |
+
+### NVMe parameter offload
+
+`pretrain_experiment.sh` 的 `param_nvme` 轴会将 parameter partition 卸载到 NVMe。
+针对 `/dev/nvme2n1` 挂载到 `/tmp` 的机器，可用下面命令跑最小单点测试：
+
+```bash
+bash examples/scale-down/01-analyse/02-deepspeed-offload/pretrain_experiment.sh \
+  --models Qwen/Qwen3.5-9B-Base \
+  --optimizer_strategies zero_3 \
+  --param_positions param_nvme \
+  --recompute_combos recompute_act \
+  --micro_batch_sizes 1 \
+  --nvme_path /tmp/deepspeed_nvme_offload \
+  --nvme_device /dev/nvme2n1
+```
+
+启动前会确认目录可写、所在文件系统来自 `/dev/nvme2n1`，并加载 DeepSpeed
+`async_io` op。如果容器内看不到宿主机 block-device source，可显式加
+`--nvme_device_check false`，但应先在宿主机确认该目录确实是 NVMe 挂载。
+
+每个 run 使用独立子目录，结束或中断时默认删除 swap 数据，避免全矩阵将
+2.4 TB 空间耗尽。调试时可用 `--keep_nvme_data true` 保留。`max_in_cpu=0`
+保证该轴实际测到 NVMe 常驻；默认 `buffer_size=4e8` 用于容纳当前 4-GPU
+Qwen3.5 矩阵的最大单参数分片，改变 GPU 数后应通过 `--nvme_buffer_size` 重新校准。
 
 ### 3.1 Recompute + CPU 激活卸载的实现方案
 
