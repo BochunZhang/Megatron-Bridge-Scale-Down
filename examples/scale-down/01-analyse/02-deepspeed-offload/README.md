@@ -23,7 +23,7 @@
 | --- | --- | --- |
 | 模型 | Qwen3-14B | Qwen3-30B-A3B |
 | 启动脚本 | `pretrain_qwen35_7b.sh` | `pretrain_qwen35_35b_a3b.sh` |
-| GPU 数 | 1 | 4 |
+| GPU 数 | 4 | 4 |
 | ZeRO leaf module | 无 | `Qwen3MoeSparseMoeBlock`（`set_z3_leaf_modules`，MoE 模型必需） |
 
 公共控制变量（两个模型一致，全部 run 固定）：
@@ -50,6 +50,8 @@
 ### NVMe parameter offload
 
 `pretrain_experiment.sh` 的 `param_nvme` 轴会将 parameter partition 卸载到 NVMe。
+该 harness 默认使用 `1e-4` 的 AdamW 学习率，适合随机初始化模型的短步数稳定性对比；
+可用 `--learning_rate` 覆盖，但正式从头预训练仍应另外配置 warmup 和学习率曲线。
 针对 `/dev/nvme2n1` 挂载到 `/tmp` 的机器，可用下面命令跑最小单点测试：
 
 ```bash
@@ -121,6 +123,60 @@ HF 构建的模型采用 **HF 原生逐层重计算 + DeepSpeed 激活 CPU 卸�
 - act+cpu（激活卸载）依赖 act（逐层重计算）开启：offload ctx 只对 HF
   `GradientCheckpointingLayer` 的 checkpoint 层输入打标记，单独开启无意义；
   且必须 `use_reentrant=False`。
+
+### 3.2 SuperOffload 与 NVMe 参数卸载的兼容性补丁
+
+参数位置和 optimizer 主参数位置是两个独立维度：`offload_param.device="nvme"`
+只决定低精度 parameter partition 的驻留位置；`subgroup_to_device[sub_group_id]`
+由 SuperOffload 的 `ratio` 决定，取值为 CPU 或 GPU。它不会取值为 `"nvme"`。
+
+启用 NVMe 参数卸载后，DeepSpeed 只为不超过 `max_in_cpu` 的参数建立 CPU flat
+buffer。超过预算的 subgroup 会令
+`fp16_partitioned_groups_flat[sub_group_id]` 为 `None`，表示该 subgroup 没有常驻
+CPU flat buffer，需要由 NVMe swapper 按需换入和换出。`max_in_cpu=0` 时，大多数
+subgroup 出现 `None` 是预期行为。
+
+ZeRO-3 父类在 flat buffer 为 `None` 时会调用
+`_partitioned_params_swap_out()`。当前 SuperOffload Stage-3 的重载函数先根据
+`subgroup_to_device` 判断 CPU/GPU，再无条件访问 `.data`，因此在“参数位于 NVMe、
+optimizer subgroup 位于 CPU”的组合下会触发：
+
+```text
+AttributeError: 'NoneType' object has no attribute 'data'
+```
+
+本目录提供两个可逆补丁，针对 DeepSpeed `c7cc64a90` 的
+`deepspeed/runtime/superoffload/superoffload_stage3.py`：
+
+- `patches/superoffload_nvme_override.patch`：覆盖 SuperOffload 方法，保留原实现为
+  注释，并复用 ZeRO-3 父类的 NVMe-safe 实现；
+- `patches/superoffload_nvme_recovery.patch`：恢复原 SuperOffload 的可执行实现，
+  同时保留覆盖补丁的父类调用作为注释。
+
+默认应用覆盖补丁：
+
+```bash
+bash examples/scale-down/01-analyse/02-deepspeed-offload/apply_superoffload_nvme_patch.sh
+```
+
+恢复原实现：
+
+```bash
+bash examples/scale-down/01-analyse/02-deepspeed-offload/apply_superoffload_nvme_patch.sh --recovery
+```
+
+脚本通过 `PYTHON_BIN` 对应的 Python 环境执行 `importlib.util.find_spec("deepspeed")`
+自动定位 DeepSpeed 存储位置，不再要求用户指定目录。默认使用当前环境的 `python`；
+如果训练使用另一套虚拟环境，只需使用该环境的 Python，例如：
+
+```bash
+PYTHON_BIN=/path/to/venv/bin/python \
+  bash examples/scale-down/01-analyse/02-deepspeed-offload/apply_superoffload_nvme_patch.sh
+```
+
+脚本优先使用 `git apply`，对于没有 Git 元数据的 `site-packages` 父目录则回退到
+`patch`；补丁无法干净应用时会直接报错，避免覆盖本地修改。应用后需要确认训练进程
+实际导入的 DeepSpeed 路径就是 Python 自动定位并修改的路径。
 
 ## 4. 测试策略列表
 
@@ -210,7 +266,7 @@ HF 构建的模型采用 **HF 原生逐层重计算 + DeepSpeed 激活 CPU 卸�
 
 | 配置 | `basic_optimizer` | ZeRO-3 外层 | 实际更新路径 |
 |---|---|---|---|
-| `zero_3`（无 offload） | `FusedAdam`（GPU） | `DeepSpeedZeroOptimizer_Stage3` | GPU 上的 FP32 master partition + FusedAdam |
+| `zero_3`（无 offload） | `torch.optim.AdamW`（GPU；配置了 `torch_adam=true`） | `DeepSpeedZeroOptimizer_Stage3` | GPU 上的 FP32 master partition + torch AdamW |
 | `zero_offload_cpu` | `DeepSpeedCPUAdam` | `DeepSpeedZeroOptimizer_Stage3` | CPU 上的 FP32 master partition + CPUAdam |
 | `super_offload_1.0` | `DeepSpeedCPUAdam` | `SuperOffloadOptimizer_Stage3` | CPU worker 中的 DeepSpeedCPUAdam，全部 subgroup 走 CPU |
 | `super_offload_0.9/0.75/0.1` | `DeepSpeedCPUAdam` | `SuperOffloadOptimizer_Stage3` | CPU worker 更新 CPU subgroup；GPU subgroup 通过额外的 `torch.optim.AdamW` backup optimizer 更新 |
@@ -222,8 +278,8 @@ HF 构建的模型采用 **HF 原生逐层重计算 + DeepSpeed 激活 CPU 卸�
   Adam 的实现差别会导致从 step 2 开始的 loss 出现差异。
 - 例如 super-offload 0.75 & super-offload 0.5 算出来的 loss 是不同的。
 - 但是 zero-offload / super-offload_0.9 / super-offload_1.0 算出来的结果是相同的，暂时没有找到问题所在。
-- zero-3 使用 deepspeed 的 FusedAdam 训练，会稳定出现 non-finit 报错，改用 torch 的 Adam 后错误消失。
-  这个错误在 dense 和 expert 模型里面都出现了，应该是 FusedAdam 的实现存在问题。
+- 旧版配置在 zero-3 中使用 DeepSpeed FusedAdam 时曾稳定出现 non-finite 报错，改用 torch AdamW 后错误消失。
+  当前 `pretrain_experiment.sh` 已固定 `torch_adam=true`，因此这条观察不能直接说明当前默认 zero-3 路径仍在使用 FusedAdam。
 - 同样使用 torch Adam，super-offload 0.0 和 zero-3 + torch Adam 的结果不同，
   推测是 Adam 的参数配置存在差异，导致后面的 loss 有差别。
   因为 super-offload 的 torch Adam 参数是从 DeepSpeed 的 CpuAdam 派生出来的。

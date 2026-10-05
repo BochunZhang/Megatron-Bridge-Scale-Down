@@ -43,7 +43,12 @@
 #   ./pretrain_experiment.sh --models Qwen/Qwen3.5-9B-Base \
 #       --optimizer_strategies zero_3 --param_positions param_nvme \
 #       --recompute_combos recompute_act --micro_batch_sizes 1 \
-#       --nvme_path /tmp/deepspeed_nvme_offload
+#       --nvme_path /tmp/deepspeed_nvme_offload \
+#       --nvme_device /dev/nvme2n1
+#   # NVMe-only sweep using the default model, batch, recompute, and optimizer axes:
+#   ./pretrain_experiment.sh --param_positions param_nvme \
+#       --nvme_path /tmp/deepspeed_nvme_offload \
+#       --nvme_device /dev/nvme2n1
 set -euo pipefail
 
 SCRIPT_DIR=$(cd "$(dirname "$0")" && pwd)
@@ -81,6 +86,10 @@ PARAM_POSITIONS="param_cpu param_gpu param_nvme"
 # PER_GPU_BATCH_SIZE in pretrain.sh).
 PER_GPU_BATCH_SIZE=16
 NUM_GPUS=4
+# Conservative AdamW learning rate for the short random-initialization
+# stability/throughput comparison. 1e-3 is too large for this model scale and
+# can turn a valid first update into NaN/Inf before the offload path is tested.
+LEARNING_RATE=${LEARNING_RATE:-1e-4}
 # Shrunk layer count; only applied — and only tagged onto result folder names
 # as _<N>layer — when APPLY_MODEL_SHAPE_OVERRIDES=true (see pretrain.sh model
 # shape section). Passed explicitly to pretrain.sh.
@@ -116,6 +125,7 @@ Options use space-separated values where noted:
   --optimizer_strategies VALUE
   --param_positions VALUE
   --per_gpu_batch_size VALUE
+  --learning_rate VALUE
   --num_gpus VALUE
   --num_layers VALUE
   --apply_model_shape_overrides true|false
@@ -135,7 +145,7 @@ EOF
 while [ "$#" -gt 0 ]; do
     case "$1" in
         --models|--micro_batch_sizes|--recompute_combos|--optimizer_strategies|--param_positions|\
-        --per_gpu_batch_size|--num_gpus|--num_layers|--apply_model_shape_overrides|--moe_num_experts|--autoep_size)
+        --per_gpu_batch_size|--learning_rate|--num_gpus|--num_layers|--apply_model_shape_overrides|--moe_num_experts|--autoep_size)
             if [ "$#" -lt 2 ]; then
                 echo "Missing value for $1" >&2
                 exit 2
@@ -147,6 +157,7 @@ while [ "$#" -gt 0 ]; do
                 --optimizer_strategies) OPTIMIZER_STRATEGIES=$2 ;;
                 --param_positions) PARAM_POSITIONS=$2 ;;
                 --per_gpu_batch_size) PER_GPU_BATCH_SIZE=$2 ;;
+                --learning_rate) LEARNING_RATE=$2 ;;
                 --num_gpus) NUM_GPUS=$2 ;;
                 --num_layers) NUM_LAYERS=$2 ;;
                 --apply_model_shape_overrides) APPLY_MODEL_SHAPE_OVERRIDES=$2 ;;
@@ -199,6 +210,11 @@ for MODEL in $MODELS; do
 done
 if [ "$APPLY_MODEL_SHAPE_OVERRIDES" != "false" ]; then
     echo "Model shape overrides are disabled for the Megatron comparison; use native layer counts" >&2
+    exit 2
+fi
+if ! [[ "$LEARNING_RATE" =~ ^[0-9]+([.][0-9]+)?([eE][-+]?[0-9]+)?$ ]] || \
+    ! awk -v lr="$LEARNING_RATE" 'BEGIN { exit !(lr + 0 > 0) }'; then
+    echo "--learning_rate must be a positive finite decimal or scientific-notation value" >&2
     exit 2
 fi
 if [ "$MOE_NUM_EXPERTS" -ne 64 ]; then
@@ -385,7 +401,7 @@ build_ds_config() {
     "optimizer": {
         "type": "AdamW",
         "params": {
-            "lr": 0.001,
+            "lr": $LEARNING_RATE,
             "betas": [0.9, 0.999],
             "eps": 1e-8,
             "weight_decay": 0.01${optimizer_params_block}

@@ -1,0 +1,44 @@
+--- a/deepspeed/runtime/superoffload/superoffload_stage3.py
++++ b/deepspeed/runtime/superoffload/superoffload_stage3.py
+@@ -113,26 +113,21 @@
+ 
+     @instrument_w_nvtx
+     def _reassign_or_swap_out_partitioned_parameters(self, sub_group_id):
+-        # Keep the original implementation below as a commented reference for recovery.
+-        # It dereferences the low-precision flat buffer before checking whether
+-        # NVMe parameter offload left this subgroup without a resident CPU flat buffer.
+-        #
+-        # if self.subgroup_to_device[sub_group_id] == 'cpu':
+-        #     self.fp16_partitioned_groups_flat[sub_group_id].data.copy_(
+-        #         self.fp32_partitioned_groups_flat[sub_group_id].data)
+-        #     self._unflatten_partitioned_parameters(sub_group_id)
+-        #     return
+-        #
+-        # if self.fp16_partitioned_groups_flat[sub_group_id] is not None:
+-        #     self.fp16_partitioned_groups_flat[sub_group_id].data.copy_(
+-        #         self.fp32_partitioned_groups_flat[sub_group_id].data)
+-        #     self._unflatten_partitioned_parameters(sub_group_id)
+-        # else:
+-        #     self._partitioned_params_swap_out(sub_group_id)
+-        #
+-        # The parent implementation checks for a missing flat buffer first and
+-        # swaps NVMe-backed parameters out when needed.
+-        return super()._reassign_or_swap_out_partitioned_parameters(sub_group_id)
++        # Recovery mode restores the original SuperOffload behavior. Keep the
++        # NVMe-safe parent call from the override patch as a reference.
++        # return super()._reassign_or_swap_out_partitioned_parameters(sub_group_id)
++        if self.subgroup_to_device[sub_group_id] == 'cpu':
++            self.fp16_partitioned_groups_flat[sub_group_id].data.copy_(
++                self.fp32_partitioned_groups_flat[sub_group_id].data)
++            self._unflatten_partitioned_parameters(sub_group_id)
++            return
++
++        if self.fp16_partitioned_groups_flat[sub_group_id] is not None:
++            self.fp16_partitioned_groups_flat[sub_group_id].data.copy_(
++                self.fp32_partitioned_groups_flat[sub_group_id].data)
++            self._unflatten_partitioned_parameters(sub_group_id)
++        else:
++            self._partitioned_params_swap_out(sub_group_id)
+ 
+     @instrument_w_nvtx
+     def _reassign_or_swap_out_partitioned_parameters_async(self, sub_group_id, updated_param):
