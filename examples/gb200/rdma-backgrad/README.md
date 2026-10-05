@@ -21,10 +21,46 @@ stream 上执行 H2D/D2H 拷贝，另一个 CUDA stream 的 NCCL collective 在�
 
    `drop_percent = (baseline_mean_gb_s - concurrent_mean_gb_s) / baseline_mean_gb_s * 100`
 
-wrapper 设置 `NCCL_NET=IB`，并设置 `NCCL_P2P_DISABLE=1`、`NCCL_SHM_DISABLE=1`
+wrapper 设置 `NCCL_NET=IB`，并设置 `NCCL_P2P_DISABLE=1`、`NCCL_NVB_DISABLE=1`、`NCCL_PXN_DISABLE=1`、`NCCL_SHM_DISABLE=1`
 和 `NCCL_NVLS_ENABLE=0`，禁止 NCCL 使用 GPU P2P/NVLink、共享内存和 NVLink
 Switch 回退。只有 NCCL 日志同时确认 `NET/IB` 和 `GDRDMA` 时，wrapper 才会接受
 本次运行结果。
+
+### 单节点为什么仍然有 TCP/Gloo
+
+单节点不等于完全不需要 TCP。`torchrun` 的 `c10d` rendezvous 需要一个
+TCPStore 来让 4 个 worker 相互发现；程序中的两个 Gloo 进程组也需要 TCP socket，
+分别用于 phase barrier、停止后台线程和汇总 CPU 对象。这些是控制面，不是被测的
+GPU 数据面。真正的后台 all-reduce 在默认 NCCL 进程组和 CUDA stream 上执行，数据面
+仍由 `NCCL_NET=IB` 选择 RDMA。
+
+wrapper 将控制面固定到本机 IPv4 loopback：
+
+```text
+GLOO_SOCKET_IFNAME=lo
+NCCL_SOCKET_IFNAME=lo
+NCCL_SOCKET_FAMILY=AF_INET
+torchrun --rdzv-backend=c10d --rdzv-endpoint=127.0.0.1:0 ...
+```
+
+这里的 `NCCL_SOCKET_IFNAME=lo` 只约束 NCCL 的 socket bootstrap；它不会把
+`NCCL_NET=IB` 的 collective 改成 TCP。运行后应在 `nccl-*.log` 中看到 `NET/IB` 和
+`GDRDMA`，并且没有 `NET/Socket`。因此不应为了消除控制面的 TCP 而删除 Gloo：将
+控制组改成 NCCL 会把控制 collective 也放进 GPU/NCCL 流量，改变被测负载，并可能与
+后台 all-reduce 发生 collective 顺序冲突。
+
+如果看到 `TCP client failed to connect/validate to host`，先看错误前缀和第一条失败：
+
+- `TCPStore.cpp` 通常表示 torchrun rendezvous；检查 `run.log` 中的启动参数和
+  `torchrun.log`，当前 wrapper 应使用 `127.0.0.1:0`，不会依赖 DLC 注入的
+  `MASTER_ADDR`/`MASTER_PORT`。
+- `[gloo/transport/tcp]` 表示 Gloo 控制组的 socket；确认 wrapper 的 `lo` 配置
+  没有被后续脚本覆盖。
+- 如果还没有生成 `nccl-*.log`，失败发生在 NCCL 初始化之前，TCP 报错通常是首个
+  rank 退出后其它 rank 的连带错误。
+- 如果第一条错误是 `numactl`、`set_mempolicy` 或权限错误，说明容器不允许
+  `numarun` 的 NUMA 内存绑定；可以临时用 `NUMARUN_MEMBIND=0` 定位问题，确认
+  启动链路后再恢复默认的 `1`。
 
 ## `torchrun` 与 `numarun` 的调用层次
 
@@ -60,8 +96,7 @@ wrapper 默认导出 `NUMARUN_MEMBIND=1`，让 `numarun` 同时执行 CPU 绑定
 ```bash
 bash examples/gb200/rdma-backgrad/run_gb200_c2c_rdma_benchmark.sh \
   --gpus 0,1,2,3 \
-  --hca mlx5_bond_0 \
-  --output-dir results/gb200/rdma-backward/c2c-rdma-$(date +%s)
+  --hca mlx5_bond_0
 ```
 
 如果不指定 `--hca`，wrapper 不会设置或覆盖 `NCCL_IB_HCA`；如果调用环境中也没有该
@@ -69,8 +104,7 @@ bash examples/gb200/rdma-backgrad/run_gb200_c2c_rdma_benchmark.sh \
 
 ```bash
 bash examples/gb200/rdma-backgrad/run_gb200_c2c_rdma_benchmark.sh \
-  --gpus 0,1,2,3 \
-  --output-dir results/gb200/rdma-backward/c2c-rdma-$(date +%s)
+  --gpus 0,1,2,3
 ```
 
 需要生成 Nsight Systems trace 时，在命令末尾增加 `--nsys`：
@@ -79,9 +113,11 @@ bash examples/gb200/rdma-backgrad/run_gb200_c2c_rdma_benchmark.sh \
 bash examples/gb200/rdma-backgrad/run_gb200_c2c_rdma_benchmark.sh \
   --gpus 0,1,2,3 \
   --hca mlx5_bond_0 \
-  --nsys \
-  --output-dir results/gb200/rdma-backward/c2c-rdma-$(date +%s)
+  --nsys
 ```
+
+未传入 `--output-dir` 时，脚本自动使用
+`results/gb200/rdma-backward/c2c-rdma-<timestamp>`；也可以显式传入自定义目录。
 
 ## 检查 `mlx5_bond_0` 是否存在
 
@@ -137,6 +173,8 @@ export NCCL_NET=IB
 export NCCL_NET_GDR_LEVEL=PHB
 export NCCL_NET_GDR_C2C=1
 export NCCL_P2P_DISABLE=1
+export NCCL_NVB_DISABLE=1
+export NCCL_PXN_DISABLE=1
 export NCCL_SHM_DISABLE=1
 export NCCL_NVLS_ENABLE=0
 export NCCL_DEBUG=INFO
@@ -144,7 +182,11 @@ export NCCL_DEBUG_SUBSYS=INIT,NET,GRAPH
 export NCCL_DEBUG_FILE=/tmp/gb200-c2c-rdma-manual/nccl-%h-%p.log
 
 mkdir -p /tmp/gb200-c2c-rdma-manual
-torchrun --standalone --nnodes=1 --nproc-per-node=4 --no-python \
+export GLOO_SOCKET_IFNAME=lo
+export NCCL_SOCKET_IFNAME=lo
+export NCCL_SOCKET_FAMILY=AF_INET
+torchrun --rdzv-backend=c10d --rdzv-endpoint=127.0.0.1:0 \
+  --nnodes=1 --nproc-per-node=4 --no-python \
   numarun python examples/gb200/rdma-backgrad/gb200_c2c_rdma_benchmark.py \
   --c2c-buffer-mib 512 \
   --rdma-buffer-mib 256 \
@@ -171,7 +213,7 @@ wrapper 支持的参数：
 | `--rdma-warmup-seconds` | `3` | concurrent 测量前保持 RDMA 的时间 |
 | `--rdma-ready-timeout-seconds` | `120` | 首个 RDMA collective 的超时时间 |
 | `--nsys` | 关闭 | 为每个 torchrun worker 生成 Nsight Systems trace |
-| `--output-dir` | `/tmp/gb200-c2c-rdma-<user>` | 日志和 rank 0 JSON 目录 |
+| `--output-dir` | `results/gb200/rdma-backward/c2c-rdma-<timestamp>` | 日志和 rank 0 JSON 目录 |
 
 ## 强制 RDMA 配置
 
@@ -179,29 +221,40 @@ wrapper 支持的参数：
 | --- | --- | --- |
 | `NCCL_NET` | `IB` | 选择 NCCL IB 网络后端 |
 | `NCCL_IB_DISABLE` | `0` | 开启 IB |
-| `NCCL_IB_HCA` | 传入 `--hca` 时设置，否则保持调用环境原值 | 选择 ConnectX HCA；未设置时由 NCCL 自动选择 |
+| `NCCL_IB_HCA` | 传入 `--hca` 时设置，否则保留原值 | 选择 ConnectX HCA；未设置时由 NCCL 自动选择 |
 | `NCCL_P2P_DISABLE` | `1` | 禁止 GPU P2P，包括 NVLink/PCI P2P |
+| `NCCL_NVB_DISABLE` | `1` | 禁止经中间 GPU 的同节点 NVLink 路径 |
+| `NCCL_PXN_DISABLE` | `1` | 禁止经 NVLink 和中间 GPU 使用非本地 NIC |
 | `NCCL_SHM_DISABLE` | `1` | 禁止同机共享内存传输 |
 | `NCCL_NVLS_ENABLE` | `0` | 禁止 NVLink Switch collective |
 | `NCCL_MNNVL_ENABLE` | `0` | 禁止 MNNVL 路径 |
 | `NCCL_NET_GDR_LEVEL` | `PHB` | 允许 PHB 范围的 GPU Direct RDMA |
 | `NCCL_NET_GDR_C2C` | `1` | 开启 C2C GPU Direct RDMA |
+| `GLOO_SOCKET_IFNAME` | `lo` | 将 Gloo 控制组固定到本机 loopback |
+| `NCCL_SOCKET_IFNAME` | `lo` | 将 NCCL socket bootstrap 固定到本机 loopback |
+| `NCCL_SOCKET_FAMILY` | `AF_INET` | 使用 IPv4 loopback，避免容器 IPv6/主机名解析问题 |
 
 环境变量只是启动配置，最终以 NCCL 日志为准。省略 `--hca` 只会放开 HCA 选择，
 wrapper 仍然强制 `NCCL_NET=IB`、GDRDMA 和其他 RDMA 相关配置。运行失败或日志出现
 Socket 回退时，wrapper 不会报告成功结果。
 
+`NCCL_PXN_DISABLE=1` 会拒绝通过 NVLink 和中间 GPU 把数据转到非本地 HCA；因此如果
+某个 GPU 没有可用的直连 HCA/C2C 路径，NCCL 可能初始化失败。这是严格验证“数据面
+走 RDMA 且不借助 NVLink”的预期结果，应根据 NCCL `GRAPH` 日志检查实际拓扑，而不是
+把失败改成 Socket 或 NVLink 回退。
+
 例如，`--hca mlx5_bond` 会交给 NCCL 做前缀匹配；如果需要只选择指定设备，可以使用
 `--hca '=mlx5_bond_0,=mlx5_bond_1,=mlx5_bond_2'`。
 
 这里的 RDMA 路径指后台 NCCL `all_reduce` 的数据传输；torchrun rendezvous 和
-Gloo 控制组仍可能使用本机 TCP，它们不属于被测的 GPU 数据流量。
+Gloo 控制组使用本机 loopback TCP，它们不属于被测的 GPU 数据流量。
 
 ## 输出与判读
 
 输出目录包含：
 
 - `result.json`：rank 0 汇总结果。
+- `run.log`：wrapper、torchrun worker 和传输检查的完整运行日志。
 - `torchrun.log`：4 个 worker 的标准输出和错误输出。
 - `nccl-<host>-<pid>.log`：NCCL 初始化、网络拓扑和实际传输路径。
 - 使用 `--nsys` 时还会生成 `nsys-<pid>.nsys-rep` 等 Nsight Systems 报告文件。
@@ -226,7 +279,12 @@ Gloo 控制组仍可能使用本机 TCP，它们不属于被测的 GPU 数据流
   "transport": {
     "NCCL_NET": "IB",
     "NCCL_P2P_DISABLE": "1",
-    "NCCL_SHM_DISABLE": "1"
+    "NCCL_NVB_DISABLE": "1",
+    "NCCL_PXN_DISABLE": "1",
+    "NCCL_SHM_DISABLE": "1",
+    "GLOO_SOCKET_IFNAME": "lo",
+    "NCCL_SOCKET_IFNAME": "lo",
+    "NCCL_SOCKET_FAMILY": "AF_INET"
   }
 }
 ```

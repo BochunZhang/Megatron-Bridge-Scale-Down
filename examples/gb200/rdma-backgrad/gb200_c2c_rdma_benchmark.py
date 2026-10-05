@@ -162,8 +162,13 @@ def _validate_transport_environment() -> str:
         "NCCL_NET_GDR_LEVEL": "PHB",
         "NCCL_NET_GDR_C2C": "1",
         "NCCL_P2P_DISABLE": "1",
+        "NCCL_NVB_DISABLE": "1",
+        "NCCL_PXN_DISABLE": "1",
         "NCCL_SHM_DISABLE": "1",
         "NCCL_NVLS_ENABLE": "0",
+        "GLOO_SOCKET_IFNAME": "lo",
+        "NCCL_SOCKET_IFNAME": "lo",
+        "NCCL_SOCKET_FAMILY": "AF_INET",
     }
     mismatches = {
         name: os.environ.get(name) for name, expected in required_values.items() if os.environ.get(name) != expected
@@ -486,8 +491,13 @@ def _run(args: argparse.Namespace) -> None:
                     "NCCL_NET_GDR_LEVEL": os.environ["NCCL_NET_GDR_LEVEL"],
                     "NCCL_NET_GDR_C2C": os.environ["NCCL_NET_GDR_C2C"],
                     "NCCL_P2P_DISABLE": os.environ["NCCL_P2P_DISABLE"],
+                    "NCCL_NVB_DISABLE": os.environ["NCCL_NVB_DISABLE"],
+                    "NCCL_PXN_DISABLE": os.environ["NCCL_PXN_DISABLE"],
                     "NCCL_SHM_DISABLE": os.environ["NCCL_SHM_DISABLE"],
                     "NCCL_NVLS_ENABLE": os.environ["NCCL_NVLS_ENABLE"],
+                    "GLOO_SOCKET_IFNAME": os.environ["GLOO_SOCKET_IFNAME"],
+                    "NCCL_SOCKET_IFNAME": os.environ["NCCL_SOCKET_IFNAME"],
+                    "NCCL_SOCKET_FAMILY": os.environ["NCCL_SOCKET_FAMILY"],
                 },
                 "torch_version": str(torch.__version__),
             }

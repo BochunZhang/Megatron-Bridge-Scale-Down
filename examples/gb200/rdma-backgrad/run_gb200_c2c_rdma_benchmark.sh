@@ -38,12 +38,12 @@ Options:
   --rdma-ready-timeout-seconds S
                             Timeout for the first RDMA collective (default: 120)
   --nsys                    Profile every worker with Nsight Systems
-  --output-dir DIR          Logs and rank-0 JSON result directory
+  --output-dir DIR          Logs and rank-0 JSON directory (default: results/gb200/rdma-backward/c2c-rdma-<timestamp>)
   -h, --help                Show this help
 
 Example:
   bash examples/gb200/rdma-backgrad/run_gb200_c2c_rdma_benchmark.sh \
-    --gpus 0,1,2,3 --hca mlx5_bond_0 --output-dir /tmp/gb200-c2c-rdma
+    --gpus 0,1,2,3 --hca mlx5_bond_0
 USAGE
 }
 
@@ -63,6 +63,7 @@ require_value() {
 script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 repo_root="$(cd -- "${script_dir}/../../.." && pwd)"
 benchmark_script="${script_dir}/gb200_c2c_rdma_benchmark.py"
+default_output_dir="${repo_root}/results/gb200/rdma-backward/c2c-rdma-$(date +%s)"
 
 gpu_list="${GPU_LIST:-0,1,2,3}"
 hca=""
@@ -73,7 +74,7 @@ copy_iterations="20"
 rdma_warmup_seconds="3"
 rdma_ready_timeout_seconds="120"
 nsys_enabled=false
-output_dir="${RDMA_C2C_OUTPUT_DIR:-/tmp/gb200-c2c-rdma-${USER:-unknown}}"
+output_dir="${RDMA_C2C_INTERNAL_OUTPUT_DIR:-$default_output_dir}"
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -136,6 +137,18 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
+if [[ "${RDMA_C2C_LOG_CAPTURED:-0}" != 1 ]]; then
+    mkdir -p "$output_dir"
+    run_log="${output_dir}/run.log"
+    [[ ! -e "$run_log" ]] || die "output directory already contains run.log; use a fresh directory: $output_dir"
+    [[ ! -e "${output_dir}/torchrun.log" ]] \
+        || die "output directory already contains torchrun.log; use a fresh directory: $output_dir"
+    export RDMA_C2C_LOG_CAPTURED=1
+    export RDMA_C2C_INTERNAL_OUTPUT_DIR="$output_dir"
+    bash "$0" "$@" 2>&1 | tee "$run_log"
+    exit "${PIPESTATUS[0]}"
+fi
+
 [[ -f "$benchmark_script" ]] || die "benchmark not found: $benchmark_script"
 command -v nvidia-smi >/dev/null || die "nvidia-smi is required"
 command -v numactl >/dev/null || die "numactl is required by numarun"
@@ -174,6 +187,8 @@ done
 gpu_pci_bus_ids_csv="$(IFS=,; echo "${gpu_pci_bus_ids[*]}")"
 
 mkdir -p "$output_dir"
+run_log="${output_dir}/run.log"
+torchrun_log="${output_dir}/torchrun.log"
 shopt -s nullglob
 existing_nccl_logs=("${output_dir}"/nccl-*)
 [[ ${#existing_nccl_logs[@]} -eq 0 ]] \
@@ -183,7 +198,6 @@ if [[ "$nsys_enabled" == true ]]; then
     [[ ${#existing_nsys_reports[@]} -eq 0 ]] \
         || die "output directory already contains Nsight reports; use a fresh directory: $output_dir"
 fi
-
 export CUDA_VISIBLE_DEVICES="$gpu_list"
 export BENCHMARK_GPU_PCI_BUS_IDS="$gpu_pci_bus_ids_csv"
 export NUMARUN_MEMBIND="${NUMARUN_MEMBIND:-1}"
@@ -196,20 +210,34 @@ export NCCL_NET=IB
 export NCCL_NET_GDR_LEVEL=PHB
 export NCCL_NET_GDR_C2C=1
 export NCCL_P2P_DISABLE=1
+export NCCL_NVB_DISABLE=1
+export NCCL_PXN_DISABLE=1
 export NCCL_SHM_DISABLE=1
 export NCCL_NVLS_ENABLE=0
 export NCCL_DEBUG=INFO
 export NCCL_DEBUG_SUBSYS=INIT,NET,GRAPH
 export NCCL_DEBUG_FILE="${output_dir}/nccl-%h-%p.log"
+export GLOO_SOCKET_IFNAME=lo
+export NCCL_SOCKET_IFNAME=lo
+export NCCL_SOCKET_FAMILY=AF_INET
+unset MASTER_ADDR MASTER_PORT
 
 hca_for_log="${hca:-${NCCL_IB_HCA:-auto}}"
 echo "gpus=$gpu_list pci_bus_ids=$gpu_pci_bus_ids_csv hca=$hca_for_log" >&2
-echo "transport=IB p2p=disabled shm=disabled numarun_membind=$NUMARUN_MEMBIND" >&2
+echo "transport=IB p2p=disabled nvb=disabled pxn=disabled shm=disabled numarun_membind=$NUMARUN_MEMBIND" >&2
+echo "control_transport=gloo/lo nccl_bootstrap=lo rdzv=127.0.0.1:0" >&2
 echo "output_dir=$output_dir" >&2
+
+if command -v ip >/dev/null; then
+    ip addr
+else
+    echo "WARNING: ip command is unavailable; skipping network interface dump" >&2
+fi
 
 launch_command=(
     torchrun
-    --standalone
+    --rdzv-backend=c10d
+    --rdzv-endpoint=127.0.0.1:0
     --nnodes=1
     --nproc-per-node=4
     --no-python
@@ -238,7 +266,7 @@ launch_command+=(
     --output "${output_dir}/result.json"
 )
 
-"${launch_command[@]}" 2>&1 | tee "${output_dir}/torchrun.log"
+"${launch_command[@]}" 2>&1 | tee "$torchrun_log"
 
 nccl_logs=("${output_dir}"/nccl-*)
 [[ ${#nccl_logs[@]} -gt 0 ]] || die "NCCL did not create transport logs in ${output_dir}"
