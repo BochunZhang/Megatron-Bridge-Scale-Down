@@ -238,6 +238,7 @@ launch_command=(
     torchrun
     --rdzv-backend=c10d
     --rdzv-endpoint=127.0.0.1:0
+    --rdzv_conf="timeout=60"
     --nnodes=1
     --nproc-per-node=4
     --no-python
