@@ -37,6 +37,7 @@ Options:
   --rdma-warmup-seconds S   RDMA-only warmup before C2C starts (default: 3)
   --rdma-ready-timeout-seconds S
                             Timeout for the first RDMA collective (default: 120)
+  --rdma-alone-iterations N Run standalone all-reduce iterations (default: 20)
   --nsys                    Profile torchrun and its workers with Nsight Systems
   --output-dir DIR          Logs and rank-0 JSON directory (default: results/gb200/rdma-backward/c2c-rdma-<timestamp>)
   -h, --help                Show this help
@@ -73,8 +74,11 @@ warmup_iterations="5"
 copy_iterations="20"
 rdma_warmup_seconds="3"
 rdma_ready_timeout_seconds="120"
+rdma_alone_iterations="20"
 nsys_enabled=false
 output_dir="${RDMA_C2C_INTERNAL_OUTPUT_DIR:-$default_output_dir}"
+
+original_args=("$@")
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -118,6 +122,11 @@ while [[ $# -gt 0 ]]; do
             rdma_ready_timeout_seconds="$2"
             shift 2
             ;;
+        --rdma-alone-iterations)
+            require_value "$1" "$#"
+            rdma_alone_iterations="$2"
+            shift 2
+            ;;
         --nsys)
             nsys_enabled=true
             shift
@@ -145,7 +154,7 @@ if [[ "${RDMA_C2C_LOG_CAPTURED:-0}" != 1 ]]; then
         || die "output directory already contains torchrun.log; use a fresh directory: $output_dir"
     export RDMA_C2C_LOG_CAPTURED=1
     export RDMA_C2C_INTERNAL_OUTPUT_DIR="$output_dir"
-    bash "$0" "$@" 2>&1 | tee "$run_log"
+    bash "$0" "${original_args[@]}" 2>&1 | tee "$run_log"
     exit "${PIPESTATUS[0]}"
 fi
 
@@ -251,6 +260,7 @@ torchrun_command=(
     --rdzv-backend=c10d
     --rdzv-endpoint=127.0.0.1:0
     --rdzv_conf="timeout=60"
+    --local_addr=127.0.0.1
     --nnodes=1
     --nproc-per-node=4
     --no-python
@@ -266,6 +276,7 @@ torchrun_command+=(
     --copy-iterations "$copy_iterations"
     --rdma-warmup-seconds "$rdma_warmup_seconds"
     --rdma-ready-timeout-seconds "$rdma_ready_timeout_seconds"
+    --rdma-alone-iterations "$rdma_alone_iterations"
     --output "${output_dir}/result.json"
 )
 

@@ -15,9 +15,12 @@ stream 上执行 H2D/D2H 拷贝，另一个 CUDA stream 的 NCCL collective 在�
 持续运行：
 
 1. 先测没有 RDMA 负载时的 H2D、D2H baseline。
-2. 启动 4-rank NCCL `all_reduce`，等待首个 collective 完成并预热。
-3. 在 RDMA 仍运行时再次测量 H2D、D2H concurrent 带宽。
-4. rank 0 汇总所有 rank 的均值，并计算：
+2. 单独运行固定次数的 4-rank NCCL `all_reduce`，记录单次完成时间；首个
+   communicator warmup 不计入 alone 统计。
+3. 启动后台 NCCL `all_reduce`，等待首个 collective 完成并预热。
+4. 在 RDMA 仍运行时再次测量 H2D、D2H concurrent 带宽，同时记录与 C2C 时间窗口
+   重叠的 all-reduce 完成时间。
+5. rank 0 汇总所有 rank 的均值，并计算：
 
    `drop_percent = (baseline_mean_gb_s - concurrent_mean_gb_s) / baseline_mean_gb_s * 100`
 
@@ -25,6 +28,13 @@ wrapper 设置 `NCCL_NET=IB`，并设置 `NCCL_P2P_DISABLE=1`、`NCCL_NVB_DISABL
 和 `NCCL_NVLS_ENABLE=0`，禁止 NCCL 使用 GPU P2P/NVLink、共享内存和 NVLink
 Switch 回退。只有 NCCL 日志同时确认 `NET/IB` 和 `GDRDMA` 时，wrapper 才会接受
 本次运行结果。
+
+baseline 只包含 H2D/D2H；alone 只包含 all-reduce；concurrent 才是 all-reduce 与
+H2D/D2H 的重叠测试。H2D 和 D2H 在每个阶段内仍然顺序执行。
+
+默认 C2C buffer 为 512 MiB、每个方向计时 20 次，因此每个方向传输 10 GiB；RDMA
+buffer 为 256 MiB，alone 默认计时 20 次 all-reduce。可以用
+`--rdma-alone-iterations` 调整 alone 样本数。
 
 ### 单节点为什么仍然有 TCP/Gloo
 
@@ -212,6 +222,7 @@ wrapper 支持的参数：
 | `--copy-iterations` | `20` | 每个拷贝方向的计时次数 |
 | `--rdma-warmup-seconds` | `3` | concurrent 测量前保持 RDMA 的时间 |
 | `--rdma-ready-timeout-seconds` | `120` | 首个 RDMA collective 的超时时间 |
+| `--rdma-alone-iterations` | `20` | alone 阶段的计时 all-reduce 次数；首个 warmup 不计入 |
 | `--nsys` | 关闭 | 在 torchrun 外层追踪 launcher 和所有 worker，生成一个进程树报告 |
 | `--output-dir` | `results/gb200/rdma-backward/c2c-rdma-<timestamp>` | 日志和 rank 0 JSON 目录 |
 
@@ -276,6 +287,13 @@ Gloo 控制组使用本机 loopback TCP，它们不属于被测的 GPU 数据流
     }
   },
   "rdma_covers_entire_concurrent_c2c": true,
+  "rdma_completion": {
+    "alone_mean_completion_ms": 3.2,
+    "concurrent_mean_completion_ms": 4.1,
+    "slowdown_percent": 28.125,
+    "alone_mean_iterations": 20.0,
+    "concurrent_mean_iterations": 24.0
+  },
   "transport": {
     "NCCL_NET": "IB",
     "NCCL_P2P_DISABLE": "1",
@@ -293,6 +311,14 @@ Gloo 控制组使用本机 loopback TCP，它们不属于被测的 GPU 数据流
 - `drop_percent < 0` 表示该次运行中 concurrent 更快，应结合重复运行和测量波动判断。
 - `rdma_covers_entire_concurrent_c2c` 是后台线程首尾时间戳的粗粒度覆盖判断，不能
   替代 Nsight 时间线对每个 DMA 操作的精确重叠分析。
+- `rdma_completion` 比较 alone 与 concurrent 的平均单次 all-reduce 主机观测完成时间；
+  `slowdown_percent > 0` 表示 concurrent 下 all-reduce 变慢。concurrent 只统计与
+  C2C 窗口重叠的 collective，因此两者的迭代数可能不同，不能直接比较总 elapsed。
+- 每个 rank 的 `rdma_alone.average_all_reduce_ms` 和
+  `rdma_concurrent.average_all_reduce_ms` 保留原始完成时间，便于检查 rank 间差异。
+- 每个 rank 的 `rdma` 是 concurrent 阶段后台线程从启动到停止的完整诊断统计，包含
+  C2C 窗口外的 all-reduce；比较 alone 与 concurrent 时应使用上面的
+  `rdma_completion` 或对应的 `rdma_alone`/`rdma_concurrent` 字段。
 - `ranks[].rdma.payload_gbit_s` 是完成的 tensor payload 速率，不是网卡 wire-level
   速率；all-reduce 算法、协议和 NCCL 版本都会影响它。
 - 后台 all-reduce 每轮会等待完成并同步 stream，循环可能存在短暂 host 间隔，因此
@@ -344,7 +370,7 @@ nsys profile --trace=cuda,nvtx,osrt --sample=none --cpuctxsw=none \
 ```
 
 Python 程序通过 `torch.cuda.nvtx.range_push/range_pop` 标记
-`phase_baseline`、`phase_rdma_warmup`、`phase_concurrent`、H2D/D2H timed copy
+`phase_baseline`、`phase_rdma_alone`、`phase_rdma_warmup`、`phase_concurrent`、H2D/D2H timed copy
 以及每次 `rdma_all_reduce`。打开 `.nsys-rep` 后可以观察 CUDA DMA、NCCL kernel/stream
 和 concurrent 阶段的重叠关系；RDMA 是否实际使用 IB/GDRDMA 仍以 NCCL 日志为准。
 `--nsys` 要求 `nsys` 已加入 `PATH`。

@@ -72,7 +72,10 @@ class RdmaMeasurement:
 
     Args:
         iterations: Completed all-reduce operations.
-        elapsed_seconds: Time from the first all-reduce launch through shutdown.
+        elapsed_seconds: Wall-clock span used for this measurement; window-derived metrics
+            cover the selected all-reduce operations, while the full background metric
+            covers the load lifecycle.
+        average_all_reduce_ms: Mean host-observed completion time of one all-reduce.
         payload_gbit_s: Tensor payload rate, not an estimate of wire-level bytes.
         started_monotonic_seconds: Local monotonic timestamp before the first all-reduce.
         finished_monotonic_seconds: Local monotonic timestamp after the last all-reduce.
@@ -80,6 +83,7 @@ class RdmaMeasurement:
 
     iterations: int
     elapsed_seconds: float
+    average_all_reduce_ms: float
     payload_gbit_s: float
     started_monotonic_seconds: float
     finished_monotonic_seconds: float
@@ -99,6 +103,8 @@ class RankMeasurement:
     baseline: dict[str, CopyMeasurement]
     concurrent: dict[str, CopyMeasurement]
     rdma: RdmaMeasurement
+    rdma_alone: RdmaMeasurement
+    rdma_concurrent: RdmaMeasurement
     concurrent_c2c_started_monotonic_seconds: float
     concurrent_c2c_finished_monotonic_seconds: float
     rdma_covers_entire_concurrent_c2c: bool
@@ -126,6 +132,7 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--copy-iterations", type=_positive_int, default=20)
     parser.add_argument("--rdma-warmup-seconds", type=_positive_float, default=3.0)
     parser.add_argument("--rdma-ready-timeout-seconds", type=_positive_float, default=120.0)
+    parser.add_argument("--rdma-alone-iterations", type=_positive_int, default=20)
     parser.add_argument("--output", type=Path, required=True)
     return parser
 
@@ -267,15 +274,18 @@ class _RdmaLoad:
         device: torch.device,
         buffer_bytes: int,
         control_group: dist.ProcessGroup,
+        max_iterations: int | None = None,
     ) -> None:
         self._device = device
         self._buffer_bytes = buffer_bytes
         self._control_group = control_group
+        self._max_iterations = max_iterations
         self._ready = threading.Event()
         self._stop = threading.Event()
         self._thread = threading.Thread(target=self._run, name="nccl-rdma-load", daemon=True)
         self._error: BaseException | None = None
         self._measurement: RdmaMeasurement | None = None
+        self._iteration_windows: list[tuple[float, float]] = []
 
     def start(self) -> None:
         self._thread.start()
@@ -295,6 +305,34 @@ class _RdmaLoad:
             raise RuntimeError("RDMA load stopped without producing a measurement")
         return self._measurement
 
+    def join(self) -> RdmaMeasurement:
+        """Wait for a fixed-iteration load to finish without requesting stop."""
+        self._thread.join()
+        if self._error is not None:
+            raise RuntimeError("RDMA load failed") from self._error
+        if self._measurement is None:
+            raise RuntimeError("RDMA load stopped without producing a measurement")
+        return self._measurement
+
+    def measurement_for_window(self, *, started_at: float, finished_at: float) -> RdmaMeasurement:
+        """Return all-reduce timings whose execution overlaps a C2C window."""
+        windows = [
+            (iteration_started_at, iteration_finished_at)
+            for iteration_started_at, iteration_finished_at in self._iteration_windows
+            if iteration_finished_at >= started_at and iteration_started_at <= finished_at
+        ]
+        return _measurement_from_windows(
+            windows=windows,
+            buffer_bytes=self._buffer_bytes,
+        )
+
+    def measurement_from_iteration(self, *, start_index: int) -> RdmaMeasurement:
+        """Return timings after skipping a specified number of warmup operations."""
+        return _measurement_from_windows(
+            windows=self._iteration_windows[start_index:],
+            buffer_bytes=self._buffer_bytes,
+        )
+
     def _run(self) -> None:
         try:
             torch.cuda.set_device(self._device)
@@ -307,15 +345,21 @@ class _RdmaLoad:
             with _nvtx_range("rdma_background"):
                 while True:
                     for _ in range(RDMA_STOP_CHECK_INTERVAL):
+                        if self._max_iterations is not None and iterations >= self._max_iterations:
+                            break
+                        iteration_started_at = time.monotonic()
                         with _nvtx_range("rdma_all_reduce"):
                             with torch.cuda.stream(rdma_stream):
                                 work = dist.all_reduce(rdma_buffer, op=dist.ReduceOp.SUM, async_op=True)
                             work.wait()
                             rdma_stream.synchronize()
+                        self._iteration_windows.append((iteration_started_at, time.monotonic()))
                         iterations += 1
                         if iterations == 1:
                             self._ready.set()
 
+                    if self._max_iterations is not None and iterations >= self._max_iterations:
+                        break
                     stop_tensor.fill_(int(self._stop.is_set()))
                     dist.all_reduce(stop_tensor, op=dist.ReduceOp.MAX, group=self._control_group)
                     if stop_tensor.item() != 0:
@@ -323,14 +367,11 @@ class _RdmaLoad:
 
             rdma_stream.synchronize()
             finished_at = time.monotonic()
-            elapsed_seconds = finished_at - started_at
-            payload_bits = iterations * self._buffer_bytes * BITS_PER_BYTE
-            self._measurement = RdmaMeasurement(
-                iterations=iterations,
-                elapsed_seconds=elapsed_seconds,
-                payload_gbit_s=payload_bits / elapsed_seconds / BYTES_PER_GB,
-                started_monotonic_seconds=started_at,
-                finished_monotonic_seconds=finished_at,
+            self._measurement = _measurement_from_windows(
+                windows=self._iteration_windows,
+                buffer_bytes=self._buffer_bytes,
+                started_at=started_at,
+                finished_at=finished_at,
             )
         except BaseException as error:
             self._error = error
@@ -365,6 +406,35 @@ def _initialize_distributed() -> tuple[
     return rank, world_size, device, control_group, rdma_control_group
 
 
+def _measurement_from_windows(
+    *,
+    windows: list[tuple[float, float]],
+    buffer_bytes: int,
+    started_at: float | None = None,
+    finished_at: float | None = None,
+) -> RdmaMeasurement:
+    if not windows:
+        raise RuntimeError("no completed all-reduce operations were recorded")
+    completion_seconds = sum(finished - started for started, finished in windows)
+    if completion_seconds <= 0:
+        raise RuntimeError("all-reduce completion time must be positive")
+    first_started = windows[0][0] if started_at is None else started_at
+    last_finished = windows[-1][1] if finished_at is None else finished_at
+    elapsed_seconds = last_finished - first_started
+    if elapsed_seconds <= 0:
+        raise RuntimeError("all-reduce elapsed time must be positive")
+    iterations = len(windows)
+    payload_bits = iterations * buffer_bytes * BITS_PER_BYTE
+    return RdmaMeasurement(
+        iterations=iterations,
+        elapsed_seconds=elapsed_seconds,
+        average_all_reduce_ms=completion_seconds / iterations * 1000.0,
+        payload_gbit_s=payload_bits / elapsed_seconds / BYTES_PER_GB,
+        started_monotonic_seconds=first_started,
+        finished_monotonic_seconds=last_finished,
+    )
+
+
 def _summarize(rank_measurements: list[dict[str, object]]) -> dict[str, object]:
     summary: dict[str, object] = {}
     for direction in ("h2d", "d2h"):
@@ -387,6 +457,33 @@ def _summarize(rank_measurements: list[dict[str, object]]) -> dict[str, object]:
             ),
         }
     return summary
+
+
+def _summarize_rdma_completion(rank_measurements: list[dict[str, object]]) -> dict[str, float]:
+    alone_values = [
+        cast(dict[str, float], measurement["rdma_alone"])["average_all_reduce_ms"] for measurement in rank_measurements
+    ]
+    concurrent_values = [
+        cast(dict[str, float], measurement["rdma_concurrent"])["average_all_reduce_ms"]
+        for measurement in rank_measurements
+    ]
+    alone_iterations = [
+        cast(dict[str, float], measurement["rdma_alone"])["iterations"] for measurement in rank_measurements
+    ]
+    concurrent_iterations = [
+        cast(dict[str, float], measurement["rdma_concurrent"])["iterations"] for measurement in rank_measurements
+    ]
+    alone_mean = fmean(alone_values)
+    concurrent_mean = fmean(concurrent_values)
+    if alone_mean <= 0:
+        raise ValueError("alone all-reduce completion time must be positive")
+    return {
+        "alone_mean_completion_ms": alone_mean,
+        "concurrent_mean_completion_ms": concurrent_mean,
+        "slowdown_percent": (concurrent_mean - alone_mean) / alone_mean * 100.0,
+        "alone_mean_iterations": fmean(alone_iterations),
+        "concurrent_mean_iterations": fmean(concurrent_iterations),
+    }
 
 
 def _run(args: argparse.Namespace) -> None:
@@ -414,6 +511,22 @@ def _run(args: argparse.Namespace) -> None:
                 copy_iterations=args.copy_iterations,
             )
             LOGGER.info("rank=%d phase=baseline complete", rank)
+            dist.barrier(group=control_group)
+
+        with _nvtx_range("phase_rdma_alone"):
+            dist.barrier(group=control_group)
+            LOGGER.info("rank=%d phase=rdma_alone start", rank)
+            alone_load = _RdmaLoad(
+                device=device,
+                buffer_bytes=rdma_buffer_bytes,
+                control_group=rdma_control_group,
+                max_iterations=args.rdma_alone_iterations + 1,
+            )
+            alone_load.start()
+            alone_load.wait_until_ready(timeout_seconds=args.rdma_ready_timeout_seconds)
+            alone_load.join()
+            rdma_alone = alone_load.measurement_from_iteration(start_index=1)
+            LOGGER.info("rank=%d phase=rdma_alone complete", rank)
             dist.barrier(group=control_group)
 
         rdma_load = _RdmaLoad(
@@ -446,6 +559,10 @@ def _run(args: argparse.Namespace) -> None:
         with _nvtx_range("phase_rdma_shutdown"):
             dist.barrier(group=control_group)
             rdma = rdma_load.stop_and_join()
+            rdma_concurrent = rdma_load.measurement_for_window(
+                started_at=concurrent_started_at,
+                finished_at=concurrent_finished_at,
+            )
             dist.barrier(group=control_group)
 
         properties = torch.cuda.get_device_properties(device)
@@ -460,6 +577,8 @@ def _run(args: argparse.Namespace) -> None:
             baseline=baseline,
             concurrent=concurrent,
             rdma=rdma,
+            rdma_alone=rdma_alone,
+            rdma_concurrent=rdma_concurrent,
             concurrent_c2c_started_monotonic_seconds=concurrent_started_at,
             concurrent_c2c_finished_monotonic_seconds=concurrent_finished_at,
             rdma_covers_entire_concurrent_c2c=(
@@ -478,6 +597,7 @@ def _run(args: argparse.Namespace) -> None:
                 raise RuntimeError(f"expected all four ranks on one node, got hosts: {sorted(hostnames)}")
             output = {
                 "summary": _summarize(records),
+                "rdma_completion": _summarize_rdma_completion(records),
                 "ranks": records,
                 "rdma_covers_entire_concurrent_c2c": all(
                     cast(bool, record["rdma_covers_entire_concurrent_c2c"]) for record in records
@@ -512,6 +632,13 @@ def _run(args: argparse.Namespace) -> None:
                     values["concurrent_mean_gb_s"],
                     values["drop_percent"],
                 )
+            rdma_completion = cast(dict[str, float], output["rdma_completion"])
+            LOGGER.info(
+                "RDMA all_reduce alone=%.3f ms concurrent=%.3f ms slowdown=%.2f%%",
+                rdma_completion["alone_mean_completion_ms"],
+                rdma_completion["concurrent_mean_completion_ms"],
+                rdma_completion["slowdown_percent"],
+            )
     finally:
         dist.destroy_process_group(rdma_control_group)
         dist.destroy_process_group(control_group)
