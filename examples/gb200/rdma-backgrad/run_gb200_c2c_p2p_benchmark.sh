@@ -73,6 +73,8 @@ p2p_iterations="20"
 nsys_enabled=false
 output_dir="${RDMA_C2C_P2P_INTERNAL_OUTPUT_DIR:-$default_output_dir}"
 
+original_args=("$@")
+
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --gpus)
@@ -137,7 +139,7 @@ if [[ "${RDMA_C2C_P2P_LOG_CAPTURED:-0}" != 1 ]]; then
         || die "output directory already contains torchrun.log; use a fresh directory: $output_dir"
     export RDMA_C2C_P2P_LOG_CAPTURED=1
     export RDMA_C2C_P2P_INTERNAL_OUTPUT_DIR="$output_dir"
-    bash "$0" "$@" 2>&1 | tee "$run_log"
+    bash "$0" "${original_args[@]}" 2>&1 | tee "$run_log"
     exit "${PIPESTATUS[0]}"
 fi
 
@@ -244,6 +246,7 @@ torchrun_command=(
     --rdzv-backend=c10d
     --rdzv-endpoint=127.0.0.1:0
     --rdzv_conf="timeout=60"
+    --local_addr=127.0.0.1
     --nnodes=1
     --nproc-per-node=4
     --no-python
@@ -263,7 +266,6 @@ if [[ "$nsys_enabled" == true ]]; then
     launch_command=(
         nsys profile
         --trace=cuda,nvtx,osrt
-        --cuda-trace-scope=process-tree
         --sample=none
         --cpuctxsw=none
         --output "${output_dir}/nsys"

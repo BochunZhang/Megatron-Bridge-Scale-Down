@@ -287,6 +287,7 @@ def _run_p2p_iterations(
     device_buffer: torch.Tensor,
     copy_stream: torch.cuda.Stream,
     iterations: int,
+    p2p_warmup_iterations: int,
     copy_direction: str | None,
     copy_warmup_iterations: int,
     nvtx_name: str,
@@ -306,6 +307,25 @@ def _run_p2p_iterations(
                 for _ in range(copy_warmup_iterations):
                     destination.copy_(source, non_blocking=True)
         copy_stream.synchronize()
+
+    for _ in range(p2p_warmup_iterations):
+        with _nvtx_range(f"{nvtx_name}_{direction}_warmup"):
+            with torch.cuda.stream(p2p_stream):
+                requests = _launch_p2p(
+                    direction=direction,
+                    tensor=p2p_buffer,
+                    peer_rank=peer_rank,
+                    stream=p2p_stream,
+                )
+                if copy_direction is not None:
+                    with _nvtx_range(f"{nvtx_name}_{copy_direction}_warmup"):
+                        with torch.cuda.stream(copy_stream):
+                            destination.copy_(source, non_blocking=True)
+                for request in requests:
+                    request.wait()
+            p2p_stream.synchronize()
+            if copy_direction is not None:
+                copy_stream.synchronize()
 
     copy_start_event = torch.cuda.Event(enable_timing=True) if copy_direction is not None else None
     copy_end_event = torch.cuda.Event(enable_timing=True) if copy_direction is not None else None
@@ -393,12 +413,21 @@ def _summarize_p2p(rank_measurements: list[dict[str, object]]) -> dict[str, dict
         copy_values = _summary_values(rank_measurements, copy_key)
         alone_completion = fmean(cast(float, value["average_completion_ms"]) for value in alone)
         concurrent_completion = fmean(cast(float, value["average_completion_ms"]) for value in concurrent)
+        alone_host_completion = fmean(
+            cast(float, value.get("host_average_completion_ms", value["average_completion_ms"])) for value in alone
+        )
+        concurrent_host_completion = fmean(
+            cast(float, value.get("host_average_completion_ms", value["average_completion_ms"]))
+            for value in concurrent
+        )
         alone_bandwidth = fmean(cast(float, value["bandwidth_gb_s"]) for value in alone)
         concurrent_bandwidth = fmean(cast(float, value["bandwidth_gb_s"]) for value in concurrent)
         copy_direction = "d2h" if direction == "send" else "h2d"
         result[direction] = {
             "alone_mean_completion_ms": alone_completion,
             f"with_{copy_direction}_mean_completion_ms": concurrent_completion,
+            "alone_mean_host_completion_ms": alone_host_completion,
+            f"with_{copy_direction}_mean_host_completion_ms": concurrent_host_completion,
             "completion_slowdown_percent": (concurrent_completion - alone_completion) / alone_completion * 100.0,
             "alone_mean_bandwidth_gb_s": alone_bandwidth,
             f"with_{copy_direction}_mean_bandwidth_gb_s": concurrent_bandwidth,
@@ -472,29 +501,7 @@ def _run(args: argparse.Namespace) -> None:
 
         with _nvtx_range("phase_p2p_alone"):
             dist.barrier(group=control_group)
-            alone_windows, _ = _run_p2p_iterations(
-                rank=rank,
-                p2p_buffer=p2p_buffer,
-                p2p_stream=p2p_stream,
-                host_buffer=host_buffer,
-                device_buffer=device_buffer,
-                copy_stream=copy_stream,
-                iterations=args.p2p_iterations + 1,
-                copy_direction=None,
-                copy_warmup_iterations=0,
-                nvtx_name="p2p_alone",
-            )
-            alone = _measurement_from_windows(
-                direction=direction,
-                peer_rank=peer_rank,
-                windows=alone_windows[1:],
-                buffer_bytes=p2p_buffer_bytes,
-            )
-            dist.barrier(group=control_group)
-
-        with _nvtx_range("phase_p2p_send_d2h"):
-            dist.barrier(group=control_group)
-            send_windows, send_copy = _run_p2p_iterations(
+            alone_windows, alone_gpu_windows, _ = _run_p2p_iterations(
                 rank=rank,
                 p2p_buffer=p2p_buffer,
                 p2p_stream=p2p_stream,
@@ -502,6 +509,31 @@ def _run(args: argparse.Namespace) -> None:
                 device_buffer=device_buffer,
                 copy_stream=copy_stream,
                 iterations=args.p2p_iterations,
+                p2p_warmup_iterations=args.warmup_iterations,
+                copy_direction=None,
+                copy_warmup_iterations=0,
+                nvtx_name="p2p_alone",
+            )
+            alone = _measurement_from_windows(
+                direction=direction,
+                peer_rank=peer_rank,
+                windows=alone_windows,
+                buffer_bytes=p2p_buffer_bytes,
+                gpu_windows=alone_gpu_windows,
+            )
+            dist.barrier(group=control_group)
+
+        with _nvtx_range("phase_p2p_send_d2h"):
+            dist.barrier(group=control_group)
+            send_windows, send_gpu_windows, send_copy = _run_p2p_iterations(
+                rank=rank,
+                p2p_buffer=p2p_buffer,
+                p2p_stream=p2p_stream,
+                host_buffer=host_buffer,
+                device_buffer=device_buffer,
+                copy_stream=copy_stream,
+                iterations=args.p2p_iterations,
+                p2p_warmup_iterations=args.warmup_iterations,
                 copy_direction="d2h" if direction == "send" else None,
                 copy_warmup_iterations=args.warmup_iterations,
                 nvtx_name="p2p_send_with_d2h",
@@ -511,12 +543,13 @@ def _run(args: argparse.Namespace) -> None:
                 peer_rank=peer_rank,
                 windows=send_windows,
                 buffer_bytes=p2p_buffer_bytes,
+                gpu_windows=send_gpu_windows,
             )
             dist.barrier(group=control_group)
 
         with _nvtx_range("phase_p2p_recv_h2d"):
             dist.barrier(group=control_group)
-            recv_windows, recv_copy = _run_p2p_iterations(
+            recv_windows, recv_gpu_windows, recv_copy = _run_p2p_iterations(
                 rank=rank,
                 p2p_buffer=p2p_buffer,
                 p2p_stream=p2p_stream,
@@ -524,6 +557,7 @@ def _run(args: argparse.Namespace) -> None:
                 device_buffer=device_buffer,
                 copy_stream=copy_stream,
                 iterations=args.p2p_iterations,
+                p2p_warmup_iterations=args.warmup_iterations,
                 copy_direction="h2d" if direction == "recv" else None,
                 copy_warmup_iterations=args.warmup_iterations,
                 nvtx_name="p2p_recv_with_h2d",
@@ -533,6 +567,7 @@ def _run(args: argparse.Namespace) -> None:
                 peer_rank=peer_rank,
                 windows=recv_windows,
                 buffer_bytes=p2p_buffer_bytes,
+                gpu_windows=recv_gpu_windows,
             )
             dist.barrier(group=control_group)
 
@@ -592,7 +627,8 @@ def _run(args: argparse.Namespace) -> None:
             for p2p_direction, values in p2p_summary.items():
                 copy_direction = "d2h" if p2p_direction == "send" else "h2d"
                 LOGGER.info(
-                    "%s alone=%.3f ms/%.2f GB/s with-%s=%.3f ms/%.2f GB/s completion-slowdown=%.2f%%",
+                    "%s alone=%.3f ms/%.2f GB/s with-%s=%.3f ms/%.2f GB/s "
+                    "device-slowdown=%.2f%% host-alone=%.3f ms host-with-%s=%.3f ms",
                     p2p_direction,
                     values["alone_mean_completion_ms"],
                     values["alone_mean_bandwidth_gb_s"],
@@ -600,6 +636,9 @@ def _run(args: argparse.Namespace) -> None:
                     values[f"with_{copy_direction}_mean_completion_ms"],
                     values[f"with_{copy_direction}_mean_bandwidth_gb_s"],
                     values["completion_slowdown_percent"],
+                    values["alone_mean_host_completion_ms"],
+                    copy_direction,
+                    values[f"with_{copy_direction}_mean_host_completion_ms"],
                 )
     finally:
         dist.destroy_process_group(control_group)
