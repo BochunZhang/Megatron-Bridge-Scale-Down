@@ -47,10 +47,20 @@ bash examples/gb200/rdma-backgrad/run_gb200_c2c_p2p_benchmark.sh \
 ```
 
 不传 `--hca` 时保持 NCCL 的 HCA 自动选择；默认输出目录为
-`results/gb200/rdma-backward/c2c-p2p-$(date +%s)`，脚本会自动保存
+`results/gb200/rdma-backward/c2c-p2p-rdma-$(date +%s)`，脚本会自动保存
 `run.log`、`torchrun.log`、NCCL 日志和 `result.json`。参数和原 benchmark 相同地使用
 `torchrun`、`numarun`、loopback Gloo 控制组、严格的 `NCCL_NET=IB`/GDRDMA 配置，
 也支持 `--nsys`。
+
+P2P wrapper 的主要参数为：
+
+| 参数 | 默认值 | 作用 |
+| --- | ---: | --- |
+| `--c2c-buffer-mib` | `512` | H2D/D2H pinned host 和 GPU buffer 大小 |
+| `--p2p-buffer-mib` | `256` | 每次 send/recv 的 GPU payload 大小 |
+| `--warmup-iterations` | `5` | C2C warmup 拷贝次数 |
+| `--copy-iterations` | `20` | baseline C2C 计时次数 |
+| `--p2p-iterations` | `20` | alone（除首个 warmup 外）和 concurrent 的 P2P 计时次数 |
 
 P2P 拓扑固定为单向 pair `0 -> 1`、`2 -> 3`：
 
@@ -63,13 +73,16 @@ P2P 拓扑固定为单向 pair `0 -> 1`、`2 -> 3`：
 4. `p2p_recv_h2d` 中只有 recv rank 执行 H2D，send rank 只执行匹配的 isend，得到
    recv 与 H2D 的直接竞争结果。
 
-每个 P2P 操作都通过 `dist.batch_isend_irecv` 发起，并在专用 CUDA stream 上等待
+P2P 脚本使用一个 Gloo 进程组做 phase barrier 和结果汇总。每个 P2P 操作都通过
+`dist.batch_isend_irecv` 发起，并在专用 CUDA stream 上等待
 `request.wait()` 和 stream 完成。`result.json` 的 `p2p_summary.send` 比较
 `p2p_send_alone` 与 `p2p_send_with_d2h`，`p2p_summary.recv` 比较
 `p2p_recv_alone` 与 `p2p_recv_with_h2d`。每一项都报告：
 
-- `*_mean_completion_ms`：主机观测的单次 send/recv 完成时间；
-- `*_mean_bandwidth_gb_s`：每个 sender/receiver rank 的完成 tensor payload 带宽，按
+- `alone_mean_completion_ms`、`with_d2h_mean_completion_ms` 或
+  `with_h2d_mean_completion_ms`：主机观测的单次 send/recv 完成时间；
+- `alone_mean_bandwidth_gb_s`、`with_d2h_mean_bandwidth_gb_s` 或
+  `with_h2d_mean_bandwidth_gb_s`：每个 sender/receiver rank 的完成 tensor payload 带宽，按
   十进制 GB/s 计算，不是网卡 wire-level 带宽；
 - `completion_slowdown_percent`：有对应 C2C 拷贝时完成时间的增加比例；
 - `bandwidth_drop_percent`：有对应 C2C 拷贝时 P2P payload 带宽的下降比例。
@@ -83,10 +96,10 @@ Socket fallback 时会失败退出。两组 pair 的汇总是每个参与 rank �
 ### 单节点为什么仍然有 TCP/Gloo
 
 单节点不等于完全不需要 TCP。`torchrun` 的 `c10d` rendezvous 需要一个
-TCPStore 来让 4 个 worker 相互发现；程序中的两个 Gloo 进程组也需要 TCP socket，
-分别用于 phase barrier、停止后台线程和汇总 CPU 对象。这些是控制面，不是被测的
-GPU 数据面。真正的后台 all-reduce 在默认 NCCL 进程组和 CUDA stream 上执行，数据面
-仍由 `NCCL_NET=IB` 选择 RDMA。
+TCPStore 来让 4 个 worker 相互发现；all-reduce 脚本中的两个 Gloo 进程组、P2P 脚本
+中的一个 Gloo 进程组也需要 TCP socket，用于 phase barrier、停止/同步和汇总 CPU
+对象。这些是控制面，不是被测的 GPU 数据面。真正的 GPU 通信在默认 NCCL 进程组和
+CUDA stream 上执行，数据面仍由 `NCCL_NET=IB` 选择 RDMA。
 
 wrapper 将控制面固定到本机 IPv4 loopback：
 
@@ -351,6 +364,44 @@ Gloo 控制组使用本机 loopback TCP，它们不属于被测的 GPU 数据流
 }
 ```
 
+P2P 脚本的汇总结构如下；`send` 使用 sender ranks 0、2，`recv` 使用 receiver ranks
+1、3：
+
+```json
+{
+  "p2p_topology": {
+    "pairs": [[0, 1], [2, 3]],
+    "sender_ranks": [0, 2],
+    "receiver_ranks": [1, 3]
+  },
+  "p2p_summary": {
+    "send": {
+      "alone_mean_completion_ms": 4.0,
+      "with_d2h_mean_completion_ms": 4.8,
+      "completion_slowdown_percent": 20.0,
+      "alone_mean_bandwidth_gb_s": 64.0,
+      "with_d2h_mean_bandwidth_gb_s": 53.3,
+      "bandwidth_drop_percent": 16.7,
+      "copy_mean_bandwidth_gb_s": 410.0
+    },
+    "recv": {
+      "alone_mean_completion_ms": 4.1,
+      "with_h2d_mean_completion_ms": 5.0,
+      "completion_slowdown_percent": 22.0,
+      "alone_mean_bandwidth_gb_s": 62.4,
+      "with_h2d_mean_bandwidth_gb_s": 51.2,
+      "bandwidth_drop_percent": 17.9,
+      "copy_mean_bandwidth_gb_s": 398.0
+    }
+  }
+}
+```
+
+`ranks[]` 中的 `p2p_send_alone`、`p2p_send_with_d2h`、`p2p_recv_alone` 和
+`p2p_recv_with_h2d` 包含每个 rank 的 `peer_rank`、迭代数、平均完成时间、传输字节数
+和 payload 带宽；不属于该 role 的字段为 `null`。`send_d2h_copy` 和 `recv_h2d_copy`
+记录对应竞争阶段的 C2C 带宽。
+
 - `drop_percent > 0` 表示 concurrent 带宽低于 baseline。
 - `drop_percent < 0` 表示该次运行中 concurrent 更快，应结合重复运行和测量波动判断。
 - `rdma_covers_entire_concurrent_c2c` 是后台线程首尾时间戳的粗粒度覆盖判断，不能
@@ -419,6 +470,10 @@ Python 程序通过 `torch.cuda.nvtx.range_push/range_pop` 标记
 和 concurrent 阶段的重叠关系；RDMA 是否实际使用 IB/GDRDMA 仍以 NCCL 日志为准。
 `--nsys` 要求 `nsys` 已加入 `PATH`。
 
+P2P 脚本额外标记 `phase_p2p_alone`、`phase_p2p_send_d2h`、`phase_p2p_recv_h2d`、
+`p2p_send`、`p2p_recv` 及对应 C2C copy ranges，可在同一时间线上检查指定方向的
+P2P 与 D2H/H2D 是否重叠。
+
 脚本会把 `NSYS_TMPDIR` 默认设为输出目录下的隐藏临时目录，避免容器的 `/tmp` 空间
 不足或不可写。运行结束后脚本会检查 `.nsys-rep`/`.qdrep` 是否确实生成；如果只留下
 `.qdstrm`，说明采集完成但报告转换没有完成，可以使用同版本 `nsys import` 转换。
@@ -438,8 +493,11 @@ Python 程序通过 `torch.cuda.nvtx.range_push/range_pop` 标记
 
 ```bash
 bash -n examples/gb200/rdma-backgrad/run_gb200_c2c_rdma_benchmark.sh
+bash -n examples/gb200/rdma-backgrad/run_gb200_c2c_p2p_benchmark.sh
 python3 -m py_compile examples/gb200/rdma-backgrad/gb200_c2c_rdma_benchmark.py
+python3 -m py_compile examples/gb200/rdma-backgrad/gb200_c2c_p2p_benchmark.py
 uv run python -m pytest tests/unit_tests/scripts/performance/test_gb200_c2c_rdma_benchmark.py
+uv run python -m pytest tests/unit_tests/scripts/performance/test_gb200_c2c_p2p_benchmark.py
 ```
 
 单元测试只覆盖带宽计算、汇总和环境校验等硬件无关逻辑，不能替代真实 NCCL

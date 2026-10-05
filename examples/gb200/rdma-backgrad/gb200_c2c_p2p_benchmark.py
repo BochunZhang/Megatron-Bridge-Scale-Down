@@ -59,13 +59,20 @@ class CopyMeasurement:
 
 @dataclass(frozen=True)
 class P2PMeasurement:
-    """Result of one rank's NCCL P2P send or receive operations."""
+    """Result of one rank's NCCL P2P send or receive operations.
+
+    ``average_completion_ms`` and ``elapsed_seconds`` use CUDA events on the
+    P2P stream so they can be compared with Nsight CUDA activity. The host
+    fields retain the end-to-end Python/request/synchronization timing.
+    """
 
     direction: str
     peer_rank: int
     iterations: int
     elapsed_seconds: float
     average_completion_ms: float
+    host_elapsed_seconds: float
+    host_average_completion_ms: float
     bandwidth_gb_s: float
     transferred_bytes: int
 
@@ -97,13 +104,6 @@ def _positive_int(value: str) -> int:
     return parsed
 
 
-def _positive_float(value: str) -> float:
-    parsed = float(value)
-    if parsed <= 0:
-        raise argparse.ArgumentTypeError(f"expected a positive number, got {value}")
-    return parsed
-
-
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--c2c-buffer-mib", type=_positive_int, default=512)
@@ -111,7 +111,6 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--warmup-iterations", type=_positive_int, default=5)
     parser.add_argument("--copy-iterations", type=_positive_int, default=20)
     parser.add_argument("--p2p-iterations", type=_positive_int, default=20)
-    parser.add_argument("--rdma-ready-timeout-seconds", type=_positive_float, default=120.0)
     parser.add_argument("--output", type=Path, required=True)
     return parser
 
@@ -217,6 +216,7 @@ def _measurement_from_windows(
     peer_rank: int,
     windows: list[tuple[float, float]],
     buffer_bytes: int,
+    gpu_windows: list[tuple[torch.cuda.Event, torch.cuda.Event]] | None = None,
 ) -> P2PMeasurement:
     if not windows:
         raise RuntimeError(f"no completed P2P {direction} operations were recorded")
@@ -228,13 +228,27 @@ def _measurement_from_windows(
         raise RuntimeError("P2P elapsed time must be positive")
     iterations = len(windows)
     transferred_bytes = iterations * buffer_bytes
+    host_average_completion_ms = completion_seconds / iterations * 1000.0
+    if gpu_windows is None:
+        gpu_average_completion_ms = host_average_completion_ms
+        gpu_elapsed_seconds = elapsed_seconds
+    else:
+        if len(gpu_windows) != iterations:
+            raise ValueError("GPU and host P2P timing windows must have equal lengths")
+        gpu_completion_ms = [start.elapsed_time(end) for start, end in gpu_windows]
+        gpu_average_completion_ms = fmean(gpu_completion_ms)
+        gpu_elapsed_seconds = gpu_windows[0][0].elapsed_time(gpu_windows[-1][1]) / 1000.0
+        if gpu_elapsed_seconds <= 0:
+            raise RuntimeError("GPU P2P elapsed time must be positive")
     return P2PMeasurement(
         direction=direction,
         peer_rank=peer_rank,
         iterations=iterations,
-        elapsed_seconds=elapsed_seconds,
-        average_completion_ms=completion_seconds / iterations * 1000.0,
-        bandwidth_gb_s=_bandwidth_gb_s(transferred_bytes=transferred_bytes, elapsed_seconds=elapsed_seconds),
+        elapsed_seconds=gpu_elapsed_seconds,
+        average_completion_ms=gpu_average_completion_ms,
+        host_elapsed_seconds=elapsed_seconds,
+        host_average_completion_ms=host_average_completion_ms,
+        bandwidth_gb_s=_bandwidth_gb_s(transferred_bytes=transferred_bytes, elapsed_seconds=gpu_elapsed_seconds),
         transferred_bytes=transferred_bytes,
     )
 
@@ -276,7 +290,11 @@ def _run_p2p_iterations(
     copy_direction: str | None,
     copy_warmup_iterations: int,
     nvtx_name: str,
-) -> tuple[list[tuple[float, float]], CopyMeasurement | None]:
+) -> tuple[
+    list[tuple[float, float]],
+    list[tuple[torch.cuda.Event, torch.cuda.Event]],
+    CopyMeasurement | None,
+]:
     direction, peer_rank = _p2p_role(rank)
     source, destination = (host_buffer, device_buffer) if copy_direction == "h2d" else (device_buffer, host_buffer)
     if copy_direction is not None and copy_direction not in {"h2d", "d2h"}:
@@ -296,23 +314,30 @@ def _run_p2p_iterations(
             copy_start_event.record(copy_stream)
 
     windows: list[tuple[float, float]] = []
+    gpu_windows: list[tuple[torch.cuda.Event, torch.cuda.Event]] = []
     for _ in range(iterations):
         started_at = time.monotonic()
+        start_event = torch.cuda.Event(enable_timing=True)
+        end_event = torch.cuda.Event(enable_timing=True)
         with _nvtx_range(f"{nvtx_name}_{direction}"):
-            requests = _launch_p2p(
-                direction=direction,
-                tensor=p2p_buffer,
-                peer_rank=peer_rank,
-                stream=p2p_stream,
-            )
-            if copy_direction is not None:
-                with _nvtx_range(f"{nvtx_name}_{copy_direction}"):
-                    with torch.cuda.stream(copy_stream):
-                        destination.copy_(source, non_blocking=True)
-            for request in requests:
-                request.wait()
+            with torch.cuda.stream(p2p_stream):
+                start_event.record(p2p_stream)
+                requests = _launch_p2p(
+                    direction=direction,
+                    tensor=p2p_buffer,
+                    peer_rank=peer_rank,
+                    stream=p2p_stream,
+                )
+                if copy_direction is not None:
+                    with _nvtx_range(f"{nvtx_name}_{copy_direction}"):
+                        with torch.cuda.stream(copy_stream):
+                            destination.copy_(source, non_blocking=True)
+                for request in requests:
+                    request.wait()
+                end_event.record(p2p_stream)
             p2p_stream.synchronize()
         windows.append((started_at, time.monotonic()))
+        gpu_windows.append((start_event, end_event))
 
     copy_measurement = None
     if copy_end_event is not None and copy_start_event is not None:
@@ -330,7 +355,7 @@ def _run_p2p_iterations(
             elapsed_seconds=elapsed_seconds,
             transferred_bytes=transferred_bytes,
         )
-    return windows, copy_measurement
+    return windows, gpu_windows, copy_measurement
 
 
 def _initialize_distributed() -> tuple[int, int, torch.device, dist.ProcessGroup]:
@@ -370,18 +395,19 @@ def _summarize_p2p(rank_measurements: list[dict[str, object]]) -> dict[str, dict
         concurrent_completion = fmean(cast(float, value["average_completion_ms"]) for value in concurrent)
         alone_bandwidth = fmean(cast(float, value["bandwidth_gb_s"]) for value in alone)
         concurrent_bandwidth = fmean(cast(float, value["bandwidth_gb_s"]) for value in concurrent)
+        copy_direction = "d2h" if direction == "send" else "h2d"
         result[direction] = {
             "alone_mean_completion_ms": alone_completion,
-            "with_copy_mean_completion_ms": concurrent_completion,
+            f"with_{copy_direction}_mean_completion_ms": concurrent_completion,
             "completion_slowdown_percent": (concurrent_completion - alone_completion) / alone_completion * 100.0,
             "alone_mean_bandwidth_gb_s": alone_bandwidth,
-            "with_copy_mean_bandwidth_gb_s": concurrent_bandwidth,
+            f"with_{copy_direction}_mean_bandwidth_gb_s": concurrent_bandwidth,
             "bandwidth_drop_percent": _drop_percent(
                 baseline_gb_s=alone_bandwidth,
                 concurrent_gb_s=concurrent_bandwidth,
             ),
             "alone_mean_iterations": fmean(cast(int, value["iterations"]) for value in alone),
-            "with_copy_mean_iterations": fmean(cast(int, value["iterations"]) for value in concurrent),
+            f"with_{copy_direction}_mean_iterations": fmean(cast(int, value["iterations"]) for value in concurrent),
             "copy_mean_bandwidth_gb_s": fmean(cast(float, value["bandwidth_gb_s"]) for value in copy_values),
         }
     return result
@@ -395,7 +421,10 @@ def _summarize_copy(rank_measurements: list[dict[str, object]]) -> dict[str, dic
             for record in rank_measurements
             if record[concurrent_key] is not None
         ]
-        concurrent = [cast(dict[str, object], value)["bandwidth_gb_s"] for value in _summary_values(rank_measurements, concurrent_key)]
+        concurrent = [
+            cast(dict[str, object], value)["bandwidth_gb_s"]
+            for value in _summary_values(rank_measurements, concurrent_key)
+        ]
         baseline_mean = fmean(cast(float, value) for value in baseline)
         concurrent_mean = fmean(cast(float, value) for value in concurrent)
         result[direction] = {
@@ -559,14 +588,17 @@ def _run(args: argparse.Namespace) -> None:
             args.output.parent.mkdir(parents=True, exist_ok=True)
             args.output.write_text(json.dumps(output, indent=2, sort_keys=True) + "\n")
             LOGGER.info("wrote P2P benchmark result to %s", args.output)
-            for p2p_direction, values in output["p2p_summary"].items():
+            p2p_summary = cast(dict[str, dict[str, float]], output["p2p_summary"])
+            for p2p_direction, values in p2p_summary.items():
+                copy_direction = "d2h" if p2p_direction == "send" else "h2d"
                 LOGGER.info(
-                    "%s alone=%.3f ms/%.2f GB/s with-copy=%.3f ms/%.2f GB/s completion-slowdown=%.2f%%",
+                    "%s alone=%.3f ms/%.2f GB/s with-%s=%.3f ms/%.2f GB/s completion-slowdown=%.2f%%",
                     p2p_direction,
                     values["alone_mean_completion_ms"],
                     values["alone_mean_bandwidth_gb_s"],
-                    values["with_copy_mean_completion_ms"],
-                    values["with_copy_mean_bandwidth_gb_s"],
+                    copy_direction,
+                    values[f"with_{copy_direction}_mean_completion_ms"],
+                    values[f"with_{copy_direction}_mean_bandwidth_gb_s"],
                     values["completion_slowdown_percent"],
                 )
     finally:
