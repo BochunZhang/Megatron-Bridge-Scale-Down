@@ -15,11 +15,11 @@ stream 上执行 H2D/D2H 拷贝，另一个 CUDA stream 的 NCCL collective 在�
 持续运行：
 
 1. 先测没有 RDMA 负载时的 H2D、D2H baseline。
-2. 单独运行固定次数的 4-rank NCCL `all_reduce`，记录单次完成时间；首个
+2. 单独运行固定次数的 4-rank NCCL `all_reduce`，记录 CUDA event 单次完成时间；首个
    communicator warmup 不计入 alone 统计。
 3. 启动后台 NCCL `all_reduce`，等待首个 collective 完成并预热。
 4. 在 RDMA 仍运行时再次测量 H2D、D2H concurrent 带宽，同时记录与 C2C 时间窗口
-   重叠的 all-reduce 完成时间。
+   重叠的 all-reduce CUDA event 完成时间。
 5. rank 0 汇总所有 rank 的均值，并计算：
 
    `drop_percent = (baseline_mean_gb_s - concurrent_mean_gb_s) / baseline_mean_gb_s * 100`
@@ -58,29 +58,38 @@ P2P wrapper 的主要参数为：
 | --- | ---: | --- |
 | `--c2c-buffer-mib` | `512` | H2D/D2H pinned host 和 GPU buffer 大小 |
 | `--p2p-buffer-mib` | `256` | 每次 send/recv 的 GPU payload 大小 |
-| `--warmup-iterations` | `5` | C2C warmup 拷贝次数 |
+| `--warmup-iterations` | `5` | C2C 和 P2P warmup 次数 |
 | `--copy-iterations` | `20` | baseline C2C 计时次数 |
-| `--p2p-iterations` | `20` | alone（除首个 warmup 外）和 concurrent 的 P2P 计时次数 |
+| `--p2p-iterations` | `20` | alone 和 concurrent 在 warmup 后的 P2P 计时次数 |
 
 P2P 拓扑固定为单向 pair `0 -> 1`、`2 -> 3`：
 
 1. `baseline` 在每个 rank 上分别测 H2D 和 D2H；send rank（0、2）的 D2H baseline
    用于 send 对比，recv rank（1、3）的 H2D baseline 用于 recv 对比。
-2. `p2p_alone` 只运行匹配的 NCCL P2P send/recv，没有 H2D/D2H；首个 P2P 操作只做
-   communicator warmup，不计入统计。
+2. `p2p_alone` 只运行匹配的 NCCL P2P send/recv，没有 H2D/D2H；前
+   `--warmup-iterations` 个 P2P 操作用于 communicator warmup，不计入统计。
 3. `p2p_send_d2h` 中只有 send rank 执行 D2H，recv rank 只执行匹配的 irecv，得到
-   send 与 D2H 的直接竞争结果。
+   send 与 D2H 的直接竞争结果。前 `--warmup-iterations` 个 P2P/拷贝组合只用于 warmup。
 4. `p2p_recv_h2d` 中只有 recv rank 执行 H2D，send rank 只执行匹配的 isend，得到
-   recv 与 H2D 的直接竞争结果。
+   recv 与 H2D 的直接竞争结果，warmup 规则相同。
 
 P2P 脚本使用一个 Gloo 进程组做 phase barrier 和结果汇总。每个 P2P 操作都通过
 `dist.batch_isend_irecv` 发起，并在专用 CUDA stream 上等待
-`request.wait()` 和 stream 完成。`result.json` 的 `p2p_summary.send` 比较
+`request.wait()` 和 stream 完成。P2P 的每个 phase 都先执行相同数量的 warmup，再开始
+CUDA event 计时；因此 alone 与 concurrent 不会因为 phase 的第一个通信操作而产生额外偏差。
+warmup 结束后还会让四个 rank 在 Gloo barrier 对齐，以消除 send/recv 两侧 C2C warmup
+工作量不同造成的启动偏移。
+`result.json` 的 `p2p_summary.send` 比较
 `p2p_send_alone` 与 `p2p_send_with_d2h`，`p2p_summary.recv` 比较
 `p2p_recv_alone` 与 `p2p_recv_with_h2d`。每一项都报告：
 
 - `alone_mean_completion_ms`、`with_d2h_mean_completion_ms` 或
-  `with_h2d_mean_completion_ms`：主机观测的单次 send/recv 完成时间；
+  `with_h2d_mean_completion_ms`：P2P stream 上 CUDA event 测得的单次 send/recv 完成时间，
+  可与 nsys 中一次完整 P2P CUDA/NCCL activity 的起止范围比较；不要直接和单个
+  `ncclDevKernel` 的 duration 或重叠 kernel duration 求和比较；
+- `alone_mean_host_completion_ms`、`with_d2h_mean_host_completion_ms` 或
+  `with_h2d_mean_host_completion_ms`：主机墙钟观测的单次完成时间，包含 Python 发起、
+  `Work.wait()` 和 stream 同步开销，用于诊断调度开销，不能直接和 nsys kernel duration 对比；
 - `alone_mean_bandwidth_gb_s`、`with_d2h_mean_bandwidth_gb_s` 或
   `with_h2d_mean_bandwidth_gb_s`：每个 sender/receiver rank 的完成 tensor payload 带宽，按
   十进制 GB/s 计算，不是网卡 wire-level 带宽；
@@ -93,13 +102,57 @@ GDRDMA 配置后，实际路径仍必须以 NCCL 日志中的 `NET/IB`、`GDRDMA
 Socket fallback 时会失败退出。两组 pair 的汇总是每个参与 rank 的 per-peer 数值；不把
 两个 pair 的 payload 相加成单个 wire-rate。
 
+## CPU 背景 all-reduce 和 send/recv 实验
+
+如果要隔离 CPU 通信对 C2C 的影响，可以使用新增的两个实验入口。它们都在四个
+torchrun worker 上创建 CPU tensor，并使用 Gloo 的 `IBVERBS` transport 运行背景流量；
+只有被测的 H2D/D2H 拷贝使用 GPU。这样输出中的 `summary.h2d` 和 `summary.d2h` 分别
+给出两种方向的 baseline、背景流量并发带宽和下降比例。CPU payload 的数据路径是
+RDMA Verbs，Gloo 的 rendezvous 仍需要通过 torchrun 的 TCPStore 交换连接信息。
+
+CPU all-reduce：
+
+```bash
+bash examples/gb200/rdma-backgrad/run_gb200_c2c_cpu_allreduce_benchmark.sh \
+  --gpus 0,1,2,3 --hca mlx5_bond_0
+```
+
+CPU send/recv（固定 pair `0 -> 1`、`2 -> 3`）：
+
+```bash
+bash examples/gb200/rdma-backgrad/run_gb200_c2c_cpu_p2p_benchmark.sh \
+  --gpus 0,1,2,3 --hca mlx5_bond_0
+```
+
+两个入口支持相同的参数：`--hca`（默认自动选择 ibverbs device）、
+`--c2c-buffer-mib`（默认 `512`）、
+`--background-buffer-mib`（默认 `256`）、`--warmup-iterations`（默认 `5`）、
+`--copy-iterations`（默认 `20`）、`--background-warmup-seconds`（默认 `3`）、
+`--background-alone-iterations`（默认 `20`）和 `--nsys`。输出目录默认为
+`results/gb200/rdma-backward/c2c-cpu-<mode>-<timestamp>`。`result.json` 的
+`background_device` 固定为 `cpu`、`background_backend` 固定为 `gloo-ibverbs`，
+`background_summary` 按 all-reduce 或 send/recv role 汇总背景流量完成时间和
+CPU tensor payload 带宽，并在 `transport` 中记录 `GLOO_DEVICE_TRANSPORT` 和
+`TORCH_GLOO_IBV_NAME`。CPU
+all-reduce 的背景 tensor 使用 `float32`，因此
+`--background-buffer-mib` 必须能被 4 字节整除（默认值满足该条件）。
+CPU 数据组、phase barrier 和停止控制使用独立的 Gloo 进程组，避免后台操作与
+生命周期同步发生 collective 顺序冲突。
+
+CPU 背景 wrapper 默认让 Gloo 自动选择第一个 ibverbs device；用 `--hca` 指定
+`TORCH_GLOO_IBV_NAME`。它会设置 `GLOO_DEVICE_TRANSPORT=IBVERBS` 并清除
+`GLOO_SOCKET_IFNAME`，因为 socket interface 名称会被 Gloo 当作 ibverbs device
+名称传入。PyTorch 必须以 Gloo ibverbs 支持构建（`USE_GLOO_IBVERBS=1`），并且
+容器中能看到对应的 RDMA device；否则初始化阶段会直接报错，而不会退回 TCP Gloo。
+
 ### 单节点为什么仍然有 TCP/Gloo
 
-单节点不等于完全不需要 TCP。`torchrun` 的 `c10d` rendezvous 需要一个
-TCPStore 来让 4 个 worker 相互发现；all-reduce 脚本中的两个 Gloo 进程组、P2P 脚本
-中的一个 Gloo 进程组也需要 TCP socket，用于 phase barrier、停止/同步和汇总 CPU
-对象。这些是控制面，不是被测的 GPU 数据面。真正的 GPU 通信在默认 NCCL 进程组和
-CUDA stream 上执行，数据面仍由 `NCCL_NET=IB` 选择 RDMA。
+单节点不等于完全不需要 TCP。所有 wrapper 的 `torchrun` `c10d` rendezvous 都需要
+TCPStore 来让 4 个 worker 相互发现。原有 GPU all-reduce 和 GPU P2P 脚本的 Gloo
+进程组还使用 TCP socket 做 phase barrier、停止/同步和 CPU 对象汇总；这些是控制面，
+不是被测的 GPU 数据面。真正的 GPU 通信在默认 NCCL 进程组和 CUDA stream 上执行，
+数据面仍由 `NCCL_NET=IB` 选择 RDMA。CPU 背景 wrapper 的 Gloo 进程组则使用
+`IBVERBS`，只有 rendezvous 和 Gloo 建链所需的 store 仍是 TCP。
 
 wrapper 将控制面固定到本机 IPv4 loopback：
 
@@ -115,6 +168,8 @@ torchrun --rdzv-backend=c10d --rdzv-endpoint=127.0.0.1:0 ...
 `GDRDMA`，并且没有 `NET/Socket`。因此不应为了消除控制面的 TCP 而删除 Gloo：将
 控制组改成 NCCL 会把控制 collective 也放进 GPU/NCCL 流量，改变被测负载，并可能与
 后台 all-reduce 发生 collective 顺序冲突。
+上面的 CPU 背景实验是独立模式：其数据组使用 CPU Gloo ibverbs，不读取或验证 NCCL
+日志，输出中的 `background_device` 和 `background_backend` 会明确标出这一点。
 
 如果看到 `TCP client failed to connect/validate to host`，先看错误前缀和第一条失败：
 
@@ -347,6 +402,8 @@ Gloo 控制组使用本机 loopback TCP，它们不属于被测的 GPU 数据流
   "rdma_completion": {
     "alone_mean_completion_ms": 3.2,
     "concurrent_mean_completion_ms": 4.1,
+    "alone_mean_host_completion_ms": 3.5,
+    "concurrent_mean_host_completion_ms": 4.6,
     "slowdown_percent": 28.125,
     "alone_mean_iterations": 20.0,
     "concurrent_mean_iterations": 24.0
@@ -378,6 +435,8 @@ P2P 脚本的汇总结构如下；`send` 使用 sender ranks 0、2，`recv` 使�
     "send": {
       "alone_mean_completion_ms": 4.0,
       "with_d2h_mean_completion_ms": 4.8,
+      "alone_mean_host_completion_ms": 4.3,
+      "with_d2h_mean_host_completion_ms": 5.2,
       "completion_slowdown_percent": 20.0,
       "alone_mean_bandwidth_gb_s": 64.0,
       "with_d2h_mean_bandwidth_gb_s": 53.3,
@@ -387,6 +446,8 @@ P2P 脚本的汇总结构如下；`send` 使用 sender ranks 0、2，`recv` 使�
     "recv": {
       "alone_mean_completion_ms": 4.1,
       "with_h2d_mean_completion_ms": 5.0,
+      "alone_mean_host_completion_ms": 4.4,
+      "with_h2d_mean_host_completion_ms": 5.5,
       "completion_slowdown_percent": 22.0,
       "alone_mean_bandwidth_gb_s": 62.4,
       "with_h2d_mean_bandwidth_gb_s": 51.2,
@@ -398,19 +459,23 @@ P2P 脚本的汇总结构如下；`send` 使用 sender ranks 0、2，`recv` 使�
 ```
 
 `ranks[]` 中的 `p2p_send_alone`、`p2p_send_with_d2h`、`p2p_recv_alone` 和
-`p2p_recv_with_h2d` 包含每个 rank 的 `peer_rank`、迭代数、平均完成时间、传输字节数
-和 payload 带宽；不属于该 role 的字段为 `null`。`send_d2h_copy` 和 `recv_h2d_copy`
+`p2p_recv_with_h2d` 包含每个 rank 的 `peer_rank`、迭代数、CUDA event 平均完成时间、
+主机平均完成时间、传输字节数和 payload 带宽；不属于该 role 的字段为 `null`。
+`send_d2h_copy` 和 `recv_h2d_copy`
 记录对应竞争阶段的 C2C 带宽。
 
 - `drop_percent > 0` 表示 concurrent 带宽低于 baseline。
 - `drop_percent < 0` 表示该次运行中 concurrent 更快，应结合重复运行和测量波动判断。
 - `rdma_covers_entire_concurrent_c2c` 是后台线程首尾时间戳的粗粒度覆盖判断，不能
   替代 Nsight 时间线对每个 DMA 操作的精确重叠分析。
-- `rdma_completion` 比较 alone 与 concurrent 的平均单次 all-reduce 主机观测完成时间；
-  `slowdown_percent > 0` 表示 concurrent 下 all-reduce 变慢。concurrent 只统计与
+- `rdma_completion` 的 `alone_mean_completion_ms` 和
+  `concurrent_mean_completion_ms` 是 CUDA event 完成时间；对应的
+  `alone_mean_host_completion_ms` 和 `concurrent_mean_host_completion_ms` 是主机观测时间。
+  `slowdown_percent > 0` 表示 concurrent 下设备侧 all-reduce 变慢。concurrent 只统计与
   C2C 窗口重叠的 collective，因此两者的迭代数可能不同，不能直接比较总 elapsed。
 - 每个 rank 的 `rdma_alone.average_all_reduce_ms` 和
-  `rdma_concurrent.average_all_reduce_ms` 保留原始完成时间，便于检查 rank 间差异。
+  `rdma_concurrent.average_all_reduce_ms` 是 CUDA event 完成时间；同一对象中的
+  `host_average_all_reduce_ms` 可用于检查 Python/同步开销和 rank 间差异。
 - 每个 rank 的 `rdma` 是 concurrent 阶段后台线程从启动到停止的完整诊断统计，包含
   C2C 窗口外的 all-reduce；比较 alone 与 concurrent 时应使用上面的
   `rdma_completion` 或对应的 `rdma_alone`/`rdma_concurrent` 字段。

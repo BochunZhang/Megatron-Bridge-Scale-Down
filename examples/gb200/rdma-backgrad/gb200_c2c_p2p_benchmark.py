@@ -286,6 +286,7 @@ def _run_p2p_iterations(
     host_buffer: torch.Tensor,
     device_buffer: torch.Tensor,
     copy_stream: torch.cuda.Stream,
+    control_group: dist.ProcessGroup,
     iterations: int,
     p2p_warmup_iterations: int,
     copy_direction: str | None,
@@ -326,6 +327,11 @@ def _run_p2p_iterations(
             p2p_stream.synchronize()
             if copy_direction is not None:
                 copy_stream.synchronize()
+
+    # Copy warmup only runs on the rank that owns the corresponding C2C role.
+    # Synchronize all ranks before recording the timed P2P windows so one side
+    # cannot charge the other side for asymmetric warmup work.
+    dist.barrier(group=control_group)
 
     copy_start_event = torch.cuda.Event(enable_timing=True) if copy_direction is not None else None
     copy_end_event = torch.cuda.Event(enable_timing=True) if copy_direction is not None else None
@@ -508,6 +514,7 @@ def _run(args: argparse.Namespace) -> None:
                 host_buffer=host_buffer,
                 device_buffer=device_buffer,
                 copy_stream=copy_stream,
+                control_group=control_group,
                 iterations=args.p2p_iterations,
                 p2p_warmup_iterations=args.warmup_iterations,
                 copy_direction=None,
@@ -532,6 +539,7 @@ def _run(args: argparse.Namespace) -> None:
                 host_buffer=host_buffer,
                 device_buffer=device_buffer,
                 copy_stream=copy_stream,
+                control_group=control_group,
                 iterations=args.p2p_iterations,
                 p2p_warmup_iterations=args.warmup_iterations,
                 copy_direction="d2h" if direction == "send" else None,
@@ -556,6 +564,7 @@ def _run(args: argparse.Namespace) -> None:
                 host_buffer=host_buffer,
                 device_buffer=device_buffer,
                 copy_stream=copy_stream,
+                control_group=control_group,
                 iterations=args.p2p_iterations,
                 p2p_warmup_iterations=args.warmup_iterations,
                 copy_direction="h2d" if direction == "recv" else None,
@@ -617,7 +626,11 @@ def _run(args: argparse.Namespace) -> None:
                     "NCCL_SOCKET_IFNAME": os.environ["NCCL_SOCKET_IFNAME"],
                     "NCCL_SOCKET_FAMILY": os.environ["NCCL_SOCKET_FAMILY"],
                 },
-                "p2p_metric_note": "bandwidth_gb_s is completed tensor payload, not wire-level traffic",
+                "p2p_metric_note": (
+                    "average_completion_ms and elapsed_seconds use CUDA events on the P2P stream; "
+                    "host_* fields include Python/request/synchronization overhead; "
+                    "bandwidth_gb_s is completed tensor payload, not wire-level traffic"
+                ),
                 "torch_version": str(torch.__version__),
             }
             args.output.parent.mkdir(parents=True, exist_ok=True)
