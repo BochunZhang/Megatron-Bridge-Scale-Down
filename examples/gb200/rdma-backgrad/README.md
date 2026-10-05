@@ -230,6 +230,36 @@ Gloo 控制组仍可能使用本机 TCP，它们不属于被测的 GPU 数据流
 建议在同一节点、相同 HCA 和相同参数下重复运行多次。程序当前不计算标准差，也不
 同时发起 H2D 与 D2H，所以结论限于“两个方向依次测量时的相对带宽变化”。
 
+## DLC 节点环境检查
+
+在 DLC 容器中运行 benchmark 前，可以先执行节点诊断脚本，确认容器看到的环境、NVMe
+挂载、RDMA 网卡和设备节点：
+
+```bash
+bash examples/gb200/rdma-backgrad/check_dlc_node_environment.sh
+```
+
+脚本会自动在仓库根目录创建
+`results/gb200/rdma-backward/dlc-node-<timestamp>/node-environment.log`，不需要传入参数
+或手动创建输出目录。
+
+脚本按区块输出以下信息：
+
+- `printenv` 的全部环境变量，便于记录 DLC 注入的任务和分布式参数。
+- `df -h` 的全部文件系统，以及 `/dev/nvme*` 挂载数量；如果存在 `lsblk`，还会输出
+  NVMe 设备摘要。
+- `ip addr show` 的完整地址信息和 RDMA 相关接口摘要；如果安装了
+  `ibdev2netdev` 或 `rdma`，还会输出 HCA 到网卡的映射和链路状态，因此不会只依赖
+  网卡命名（RoCE 网卡可能命名为 `eth*` 或 `enp*`）。
+- `/dev` 下的 NVMe 命名空间、`/dev/infiniband` 条目，以及 `/sys/class/nvme`、
+  `/sys/class/infiniband` 下的控制器、HCA、端口状态和 NUMA 归属。
+- `lspci` 的 NVMe、InfiniBand、Mellanox/NVIDIA 设备摘要（命令存在时）。
+
+`df -h` 统计的是已挂载的 NVMe 文件系统，不等于物理 NVMe 数量；脚本同时报告 `/dev`
+块设备数、`/sys` 的 NVMe controller/namespace 数量，避免把挂载数量误认为物理盘数量。
+诊断脚本是只读检查，某个可选命令（例如 `ibv_devinfo` 或 `lspci`）不存在时会标记为
+unavailable 并继续输出其他信息。
+
 ## Nsight Systems
 
 默认不启动 `nsys`。传入 `--nsys` 后，wrapper 会让每个 worker 执行类似下面的
