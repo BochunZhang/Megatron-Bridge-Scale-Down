@@ -36,6 +36,50 @@ H2D/D2H 的重叠测试。H2D 和 D2H 在每个阶段内仍然顺序执行。
 buffer 为 256 MiB，alone 默认计时 20 次 all-reduce。可以用
 `--rdma-alone-iterations` 调整 alone 样本数。
 
+## P2P send/recv 与 C2C 竞争测试
+
+如果要测试点对点流量，使用新增的 `run_gb200_c2c_p2p_benchmark.sh`：
+
+```bash
+bash examples/gb200/rdma-backgrad/run_gb200_c2c_p2p_benchmark.sh \
+  --gpus 0,1,2,3 \
+  --hca mlx5_bond_0
+```
+
+不传 `--hca` 时保持 NCCL 的 HCA 自动选择；默认输出目录为
+`results/gb200/rdma-backward/c2c-p2p-$(date +%s)`，脚本会自动保存
+`run.log`、`torchrun.log`、NCCL 日志和 `result.json`。参数和原 benchmark 相同地使用
+`torchrun`、`numarun`、loopback Gloo 控制组、严格的 `NCCL_NET=IB`/GDRDMA 配置，
+也支持 `--nsys`。
+
+P2P 拓扑固定为单向 pair `0 -> 1`、`2 -> 3`：
+
+1. `baseline` 在每个 rank 上分别测 H2D 和 D2H；send rank（0、2）的 D2H baseline
+   用于 send 对比，recv rank（1、3）的 H2D baseline 用于 recv 对比。
+2. `p2p_alone` 只运行匹配的 NCCL P2P send/recv，没有 H2D/D2H；首个 P2P 操作只做
+   communicator warmup，不计入统计。
+3. `p2p_send_d2h` 中只有 send rank 执行 D2H，recv rank 只执行匹配的 irecv，得到
+   send 与 D2H 的直接竞争结果。
+4. `p2p_recv_h2d` 中只有 recv rank 执行 H2D，send rank 只执行匹配的 isend，得到
+   recv 与 H2D 的直接竞争结果。
+
+每个 P2P 操作都通过 `dist.batch_isend_irecv` 发起，并在专用 CUDA stream 上等待
+`request.wait()` 和 stream 完成。`result.json` 的 `p2p_summary.send` 比较
+`p2p_send_alone` 与 `p2p_send_with_d2h`，`p2p_summary.recv` 比较
+`p2p_recv_alone` 与 `p2p_recv_with_h2d`。每一项都报告：
+
+- `*_mean_completion_ms`：主机观测的单次 send/recv 完成时间；
+- `*_mean_bandwidth_gb_s`：每个 sender/receiver rank 的完成 tensor payload 带宽，按
+  十进制 GB/s 计算，不是网卡 wire-level 带宽；
+- `completion_slowdown_percent`：有对应 C2C 拷贝时完成时间的增加比例；
+- `bandwidth_drop_percent`：有对应 C2C 拷贝时 P2P payload 带宽的下降比例。
+
+P2P API 中的 `send`/`recv` 是 NCCL 的两端操作；`NCCL_P2P_DISABLE=1` 禁止的是
+NVLink/PCI 的直接 GPU P2P transport，配合 `NCCL_NET=IB`、`NCCL_SHM_DISABLE=1` 和
+GDRDMA 配置后，实际路径仍必须以 NCCL 日志中的 `NET/IB`、`GDRDMA` 为准。脚本发现
+Socket fallback 时会失败退出。两组 pair 的汇总是每个参与 rank 的 per-peer 数值；不把
+两个 pair 的 payload 相加成单个 wire-rate。
+
 ### 单节点为什么仍然有 TCP/Gloo
 
 单节点不等于完全不需要 TCP。`torchrun` 的 `c10d` rendezvous 需要一个
