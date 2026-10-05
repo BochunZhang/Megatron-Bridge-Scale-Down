@@ -17,6 +17,7 @@
 #                    <repo_root>/.tmp; archived into dirname(metrics_out) before launch)
 #   recompute        none | act | act_cpu  -> train.py checkpointing flags
 #   metrics_out      path of the per-run metrics CSV (inside the timestamped run dir)
+#   profile          optional profiling mode; currently only nsys is supported
 set -euo pipefail
 
 SCRIPT_DIR=$(cd "$(dirname "$0")" && pwd)
@@ -33,6 +34,9 @@ METRICS_OUT=""
 TRAIN_MODE=""
 AUTOEP_SIZE=""
 EXTRA_OVERRIDES=""
+PROFILE_MODE=""
+PROFILE_STEP_START=""
+PROFILE_STEP_END=""
 
 usage() {
     sed -n '2,20p' "${SCRIPT_DIR}/$(basename "$0")"
@@ -44,7 +48,7 @@ while [ "$#" -gt 0 ]; do
         --num_gpus|--num_layers|--per_gpu_batch_size|--linear_attention_freq|\
         --apply_model_shape_overrides|--tokenizer_name|--load_init_weights|\
         --dataset_name|--dataset_percentage|--seq_len|--steps|--warmup_steps|\
-        --log_interval|--seed)
+        --log_interval|--seed|--profile_step_start|--profile_step_end)
             if [ "$#" -lt 2 ]; then
                 echo "Missing value for $1" >&2
                 exit 2
@@ -71,7 +75,17 @@ while [ "$#" -gt 0 ]; do
                 --warmup_steps) WARMUP_STEPS=$2 ;;
                 --log_interval) LOG_INTERVAL=$2 ;;
                 --seed) SEED=$2 ;;
+                --profile_step_start) PROFILE_STEP_START=$2 ;;
+                --profile_step_end) PROFILE_STEP_END=$2 ;;
             esac
+            shift 2
+            ;;
+        --profile)
+            if [ "$#" -lt 2 ]; then
+                echo "Missing value for --profile" >&2
+                exit 2
+            fi
+            PROFILE_MODE=$2
             shift 2
             ;;
         --override)
@@ -110,6 +124,15 @@ esac
 
 if [ "$TRAIN_MODE" = "autoep" ] && [ -z "$AUTOEP_SIZE" ]; then
     echo "--autoep_size is required when --mode autoep" >&2
+    exit 2
+fi
+
+if [ -n "$PROFILE_MODE" ] && [ "$PROFILE_MODE" != "nsys" ]; then
+    echo "--profile must be nsys when specified" >&2
+    exit 2
+fi
+if [ "$PROFILE_MODE" = "nsys" ] && { [ -z "$PROFILE_STEP_START" ] || [ -z "$PROFILE_STEP_END" ]; }; then
+    echo "--profile nsys requires --profile_step_start and --profile_step_end" >&2
     exit 2
 fi
 
@@ -266,10 +289,15 @@ echo "Global batch:    $GLOBAL_BATCH_SIZE"
 echo "Steps:           $STEPS (warmup=$WARMUP_STEPS)"
 echo "Model shape:     $MODEL_SHAPE_DESC"
 echo "Metrics out:     $METRICS_OUT"
+echo "Profile:         ${PROFILE_MODE:-disabled}"
+if [ "$PROFILE_MODE" = "nsys" ]; then
+    echo "Nsys steps:      ${PROFILE_STEP_START}-${PROFILE_STEP_END}"
+    echo "Nsys output:     ${RUN_DIR}/nsys_trace"
+fi
 echo "================================================"
 
-# NOTE: no profiler arguments on purpose (--use_pytorch_profiler /
-# --record_memory_history / --profile_* are intentionally omitted).
+# Profiling is optional. When --profile nsys is selected, train.py starts and
+# stops CUDA capture at the fixed step range supplied by the experiment driver.
 # NUMARUN prefixes deepspeed to bind the process to the correct NUMA node;
 # expand to empty (NUMARUN=) to launch deepspeed directly.
 CMD=(deepspeed "--num_gpus=$NUM_GPUS")
@@ -308,5 +336,27 @@ case "$RECOMPUTE" in
     act) CMD+=(--activation_checkpointing) ;;
     act_cpu) CMD+=(--activation_checkpointing --cpu_checkpointing) ;;
 esac
+
+if [ "$PROFILE_MODE" = "nsys" ]; then
+    CMD+=(
+        --profile nsys
+        --profile_step_start "$PROFILE_STEP_START"
+        --profile_step_end "$PROFILE_STEP_END"
+    )
+fi
+
+if [ "$PROFILE_MODE" = "nsys" ]; then
+    NSYS_OUTPUT="${RUN_DIR}/nsys_trace"
+    CMD=(
+        nsys profile
+        -s none
+        -t nvtx,cuda
+        -o "$NSYS_OUTPUT"
+        --force-overwrite true
+        --capture-range=cudaProfilerApi
+        --capture-range-end=stop
+        "${CMD[@]}"
+    )
+fi
 
 "${CMD[@]}"

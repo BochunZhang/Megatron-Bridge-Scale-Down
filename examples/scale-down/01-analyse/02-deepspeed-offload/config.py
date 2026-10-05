@@ -83,6 +83,8 @@ class ProfilingConfig:
             dest = f.metadata.get("argparse_meta", {}).get("dest", f.name)
             value = getattr(args, dest, None)
             if value is not None:
+                if f.name == "use_nsys_profiler" and dest == "profile" and isinstance(value, str):
+                    value = value == "nsys"
                 kwargs[f.name] = value
         config = cls(**kwargs)
         config.finalize()

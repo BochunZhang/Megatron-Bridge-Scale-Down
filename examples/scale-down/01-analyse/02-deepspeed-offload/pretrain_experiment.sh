@@ -27,7 +27,8 @@
 #   <repo_root>/results/01-analyse/02-deepspeed/<model>[_<N>layer]/<TEST_NAME>/<timestamp>/
 #       ├── run.log        full stdout/stderr
 #       ├── metrics.csv    per-step metrics (train.py MetricsLogger)
-#       └── ds_config.json exact config used (copied by pretrain.sh)
+#       ├── ds_config.json exact config used (copied by pretrain.sh)
+#       └── nsys_trace.nsys-rep  iterations 7-8 (when --profile nsys)
 #   <repo_root>/results/01-analyse/02-deepspeed/experiment_summary_<ts>.txt
 #
 # The working ds_config JSONs are generated under <repo_root>/.tmp/ (built by
@@ -49,6 +50,8 @@
 #   ./pretrain_experiment.sh --param_positions param_nvme \
 #       --nvme_path /tmp/deepspeed_nvme_offload \
 #       --nvme_device /dev/nvme2n1
+#   # Capture iterations 7-8 with Nsight Systems:
+#   ./pretrain_experiment.sh --profile nsys --models Qwen/Qwen3.5-9B-Base
 set -euo pipefail
 
 SCRIPT_DIR=$(cd "$(dirname "$0")" && pwd)
@@ -113,6 +116,12 @@ NVME_MAX_IN_CPU=${NVME_MAX_IN_CPU:-0}
 KEEP_NVME_DATA=${KEEP_NVME_DATA:-false}
 PYTHON_BIN=${PYTHON_BIN:-python}
 DRY_RUN=false
+PROFILE_MODE=none
+# Nsys capture is intentionally fixed to these training iterations. The
+# profiler starts before step 7 and stops after step 8, so both iterations are
+# included in the trace.
+NSYS_PROFILE_STEP_START=7
+NSYS_PROFILE_STEP_END=8
 
 usage() {
     cat <<'EOF'
@@ -138,6 +147,7 @@ Options use space-separated values where noted:
   --nvme_buffer_size VALUE
   --nvme_max_in_cpu VALUE
   --keep_nvme_data true|false
+  --profile nsys
   --dry_run
 EOF
 }
@@ -183,6 +193,14 @@ while [ "$#" -gt 0 ]; do
             esac
             shift 2
             ;;
+        --profile)
+            if [ "$#" -lt 2 ]; then
+                echo "Missing value for --profile" >&2
+                exit 2
+            fi
+            PROFILE_MODE=$2
+            shift 2
+            ;;
         --dry_run)
             DRY_RUN=true
             shift
@@ -198,6 +216,11 @@ while [ "$#" -gt 0 ]; do
             ;;
     esac
 done
+
+if [ "$PROFILE_MODE" != "none" ] && [ "$PROFILE_MODE" != "nsys" ]; then
+    echo "--profile must be nsys when specified" >&2
+    exit 2
+fi
 
 for MODEL in $MODELS; do
     case "$MODEL" in
@@ -535,6 +558,9 @@ for MODEL in $MODELS; do
 
                     echo ""
                     echo "################ RUN ${MODEL_DIR}/${TEST_NAME}/${RUN_TS} ################"
+                    if [ "$PROFILE_MODE" = "nsys" ]; then
+                        echo "Profile: nsys (iterations ${NSYS_PROFILE_STEP_START}-${NSYS_PROFILE_STEP_END})"
+                    fi
                     PRETRAIN_ARGS=(
                         --test_name "$TEST_NAME"
                         --model "$MODEL"
@@ -550,6 +576,13 @@ for MODEL in $MODELS; do
                     if [ "$TRAIN_MODE" = "autoep" ]; then
                         PRETRAIN_ARGS+=(--autoep_size "$AUTOEP_SIZE")
                         PRETRAIN_ARGS+=(--override "num_experts=$MOE_NUM_EXPERTS")
+                    fi
+                    if [ "$PROFILE_MODE" = "nsys" ]; then
+                        PRETRAIN_ARGS+=(
+                            --profile nsys
+                            --profile_step_start "$NSYS_PROFILE_STEP_START"
+                            --profile_step_end "$NSYS_PROFILE_STEP_END"
+                        )
                     fi
                     if [ "$DRY_RUN" = "true" ]; then
                         cp "$DS_CONFIG" "${RUN_DIR}/ds_config.json"

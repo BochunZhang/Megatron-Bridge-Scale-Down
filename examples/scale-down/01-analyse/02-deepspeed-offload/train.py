@@ -166,6 +166,12 @@ def parse_args() -> argparse.Namespace:
     # Profiling arguments. All default to None so ProfilingConfig owns the
     # actual defaults; ProfilingConfig.from_args(args) parses them generically.
     parser.add_argument(
+        "--profile",
+        choices=["nsys"],
+        default=None,
+        help="Enable Nsight Systems profiling; capture is controlled by the profile step range.",
+    )
+    parser.add_argument(
         "--profile_step_start",
         type=int,
         default=None,
