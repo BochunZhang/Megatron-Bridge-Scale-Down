@@ -37,7 +37,7 @@ Options:
   --rdma-warmup-seconds S   RDMA-only warmup before C2C starts (default: 3)
   --rdma-ready-timeout-seconds S
                             Timeout for the first RDMA collective (default: 120)
-  --nsys                    Profile every worker with Nsight Systems
+  --nsys                    Profile torchrun and its workers with Nsight Systems
   --output-dir DIR          Logs and rank-0 JSON directory (default: results/gb200/rdma-backward/c2c-rdma-<timestamp>)
   -h, --help                Show this help
 
@@ -156,6 +156,7 @@ command -v torchrun >/dev/null || die "torchrun is required"
 command -v python >/dev/null || die "python is required"
 if [[ "$nsys_enabled" == true ]]; then
     command -v nsys >/dev/null || die "nsys is required when --nsys is enabled"
+    nsys --version
 fi
 
 if command -v numarun >/dev/null; then
@@ -189,12 +190,23 @@ gpu_pci_bus_ids_csv="$(IFS=,; echo "${gpu_pci_bus_ids[*]}")"
 mkdir -p "$output_dir"
 run_log="${output_dir}/run.log"
 torchrun_log="${output_dir}/torchrun.log"
+if [[ "$nsys_enabled" == true ]]; then
+    if [[ -z "${NSYS_TMPDIR:-}" ]]; then
+        export NSYS_TMPDIR="${output_dir}/.nsys-tmp"
+    fi
+    mkdir -p "$NSYS_TMPDIR"
+    [[ -w "$NSYS_TMPDIR" ]] || die "Nsight temporary directory is not writable: $NSYS_TMPDIR"
+fi
 shopt -s nullglob
 existing_nccl_logs=("${output_dir}"/nccl-*)
 [[ ${#existing_nccl_logs[@]} -eq 0 ]] \
     || die "output directory already contains NCCL logs; use a fresh directory: $output_dir"
 if [[ "$nsys_enabled" == true ]]; then
-    existing_nsys_reports=("${output_dir}"/nsys-*)
+    existing_nsys_reports=(
+        "${output_dir}"/nsys*.nsys-rep
+        "${output_dir}"/nsys*.qdrep
+        "${output_dir}"/nsys*.qdstrm
+    )
     [[ ${#existing_nsys_reports[@]} -eq 0 ]] \
         || die "output directory already contains Nsight reports; use a fresh directory: $output_dir"
 fi
@@ -234,7 +246,7 @@ else
     echo "WARNING: ip command is unavailable; skipping network interface dump" >&2
 fi
 
-launch_command=(
+torchrun_command=(
     torchrun
     --rdzv-backend=c10d
     --rdzv-endpoint=127.0.0.1:0
@@ -245,17 +257,7 @@ launch_command=(
     "${numarun_command[@]}"
 )
 
-if [[ "$nsys_enabled" == true ]]; then
-    launch_command+=(
-        nsys profile
-        --trace=cuda,nvtx,osrt
-        --sample=none
-        --cpuctxsw=none
-        --output "${output_dir}/nsys-%p"
-    )
-fi
-
-launch_command+=(
+torchrun_command+=(
     python
     "$benchmark_script"
     --c2c-buffer-mib "$c2c_buffer_mib"
@@ -267,7 +269,35 @@ launch_command+=(
     --output "${output_dir}/result.json"
 )
 
+launch_command=("${torchrun_command[@]}")
+
+if [[ "$nsys_enabled" == true ]]; then
+    launch_command=(
+        nsys profile
+        --trace=cuda,nvtx,osrt
+        --cuda-trace-scope=process-tree
+        --sample=none
+        --cpuctxsw=none
+        --output "${output_dir}/nsys"
+        "${torchrun_command[@]}"
+    )
+fi
+
+printf 'launch_command:' >&2
+printf ' %q' "${launch_command[@]}" >&2
+printf '\n' >&2
 "${launch_command[@]}" 2>&1 | tee "$torchrun_log"
+
+if [[ "$nsys_enabled" == true ]]; then
+    nsys_reports=("${output_dir}"/nsys*.nsys-rep "${output_dir}"/nsys*.qdrep)
+    if [[ ${#nsys_reports[@]} -eq 0 ]]; then
+        nsys_intermediate=("${output_dir}"/nsys*.qdstrm)
+        if [[ ${#nsys_intermediate[@]} -gt 0 ]]; then
+            die "nsys left intermediate files without a report: ${nsys_intermediate[*]}; inspect ${torchrun_log} and run nsys import"
+        fi
+        die "nsys did not create a report in ${output_dir}; inspect ${torchrun_log}"
+    fi
+fi
 
 nccl_logs=("${output_dir}"/nccl-*)
 [[ ${#nccl_logs[@]} -gt 0 ]] || die "NCCL did not create transport logs in ${output_dir}"

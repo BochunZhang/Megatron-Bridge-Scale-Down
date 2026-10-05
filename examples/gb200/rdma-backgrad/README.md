@@ -212,7 +212,7 @@ wrapper 支持的参数：
 | `--copy-iterations` | `20` | 每个拷贝方向的计时次数 |
 | `--rdma-warmup-seconds` | `3` | concurrent 测量前保持 RDMA 的时间 |
 | `--rdma-ready-timeout-seconds` | `120` | 首个 RDMA collective 的超时时间 |
-| `--nsys` | 关闭 | 为每个 torchrun worker 生成 Nsight Systems trace |
+| `--nsys` | 关闭 | 在 torchrun 外层追踪 launcher 和所有 worker，生成一个进程树报告 |
 | `--output-dir` | `results/gb200/rdma-backward/c2c-rdma-<timestamp>` | 日志和 rank 0 JSON 目录 |
 
 ## 强制 RDMA 配置
@@ -257,7 +257,7 @@ Gloo 控制组使用本机 loopback TCP，它们不属于被测的 GPU 数据流
 - `run.log`：wrapper、torchrun worker 和传输检查的完整运行日志。
 - `torchrun.log`：4 个 worker 的标准输出和错误输出。
 - `nccl-<host>-<pid>.log`：NCCL 初始化、网络拓扑和实际传输路径。
-- 使用 `--nsys` 时还会生成 `nsys-<pid>.nsys-rep` 等 Nsight Systems 报告文件。
+- 使用 `--nsys` 时还会生成一个 `nsys.nsys-rep`（旧版可能是 `nsys.qdrep`）进程树报告。
 
 `result.json` 关键字段示例：
 
@@ -333,18 +333,36 @@ unavailable 并继续输出其他信息。
 
 ## Nsight Systems
 
-默认不启动 `nsys`。传入 `--nsys` 后，wrapper 会让每个 worker 执行类似下面的
-命令，并用 `%p` 按进程 ID 区分报告，避免 4 个 rank 覆盖同一个文件：
+默认不启动 `nsys`。传入 `--nsys` 后，wrapper 将 `nsys profile` 放在 `torchrun`
+外层，让单节点的 launcher 和 4 个 worker 进入同一个进程树报告：
 
 ```text
 nsys profile --trace=cuda,nvtx,osrt --sample=none --cpuctxsw=none \
-  --output results/.../nsys-%p python gb200_c2c_rdma_benchmark.py ...
+  --cuda-trace-scope=process-tree \
+  --output results/.../nsys \
+  torchrun --rdzv-backend=c10d --rdzv-endpoint=127.0.0.1:0 ...
 ```
 
 Python 程序通过 `torch.cuda.nvtx.range_push/range_pop` 标记
 `phase_baseline`、`phase_rdma_warmup`、`phase_concurrent`、H2D/D2H timed copy
-以及每次 `rdma_all_reduce`。打开 `.nsys-rep` 后可以观察 CUDA DMA、NCCL kernel、
-RDMA stream 和 concurrent 阶段的重叠关系。`--nsys` 要求 `nsys` 已加入 `PATH`。
+以及每次 `rdma_all_reduce`。打开 `.nsys-rep` 后可以观察 CUDA DMA、NCCL kernel/stream
+和 concurrent 阶段的重叠关系；RDMA 是否实际使用 IB/GDRDMA 仍以 NCCL 日志为准。
+`--nsys` 要求 `nsys` 已加入 `PATH`。
+
+脚本会把 `NSYS_TMPDIR` 默认设为输出目录下的隐藏临时目录，避免容器的 `/tmp` 空间
+不足或不可写。运行结束后脚本会检查 `.nsys-rep`/`.qdrep` 是否确实生成；如果只留下
+`.qdstrm`，说明采集完成但报告转换没有完成，可以使用同版本 `nsys import` 转换。
+
+如果 `--nsys` 后没有报告，按以下顺序检查：
+
+- `run.log` 是否出现 `nsys is required`、参数不支持、权限或 `permission denied`；
+- `torchrun.log` 的第一条错误，尤其是 rendezvous、Gloo、NCCL 或 `numarun` 错误；
+  worker 提前退出、超时或收到 SIGTERM 时，Nsight 可能来不及 finalize 报告；
+- `test -w <output-dir>`、`df -h <output-dir>` 和 `df -h /tmp`；
+- `nsys --version`，确认 DLC 容器中挂载的是 Nsight Systems CLI，而不是只有 Python
+  环境；
+- `find <output-dir> -maxdepth 1 -name 'nsys*' -o -name '*.qdstrm'`，确认是否生成了
+  中间文件。
 
 ## 本地检查
 
