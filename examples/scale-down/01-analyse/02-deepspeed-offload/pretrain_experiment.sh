@@ -103,7 +103,7 @@ AUTOEP_SIZE=4
 NVME_PATH=${NVME_PATH:-/tmp/deepspeed_nvme_offload}
 NVME_DEVICE=${NVME_DEVICE:-/dev/nvme2n1}
 NVME_DEVICE_CHECK=${NVME_DEVICE_CHECK:-true}
-NVME_BUFFER_COUNT=${NVME_BUFFER_COUNT:-5}
+NVME_BUFFER_COUNT=${NVME_BUFFER_COUNT:-16}
 # Qwen3.5 has a large embedding parameter. 4e8 elements covers its per-rank
 # partition in the default four-GPU matrix; override when changing world size.
 NVME_BUFFER_SIZE=${NVME_BUFFER_SIZE:-400000000}
