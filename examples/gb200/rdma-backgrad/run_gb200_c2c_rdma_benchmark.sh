@@ -21,16 +21,15 @@ Run a single-node GB200 C2C bandwidth benchmark with sustained NCCL/IB RDMA.
 
 The wrapper launches four torchrun workers. Each worker is started through
 numarun so LOCAL_RANK selects its CPU and NUMA binding. P2P/NVLink and SHM
-NCCL transports are disabled; the collective must use the configured IB HCA.
+NCCL transports are disabled; the collective uses the configured IB HCA or
+NCCL's automatic HCA selection when --hca is omitted.
 
 Usage:
-  run_gb200_c2c_rdma_benchmark.sh --hca HCA [options]
-
-Required:
-  --hca HCA                 ConnectX device or comma-separated HCA list
+  run_gb200_c2c_rdma_benchmark.sh [options]
 
 Options:
   --gpus LIST               Physical GPUs exposed to torchrun (default: 0,1,2,3)
+  --hca HCA                 NCCL HCA name/prefix or comma-separated list (default: NCCL selects)
   --c2c-buffer-mib MIB      Pinned-host/GPU copy buffer (default: 512)
   --rdma-buffer-mib MIB     NCCL all-reduce buffer (default: 256)
   --warmup-iterations N     C2C warmup copies per direction (default: 5)
@@ -138,7 +137,6 @@ while [[ $# -gt 0 ]]; do
 done
 
 [[ -f "$benchmark_script" ]] || die "benchmark not found: $benchmark_script"
-[[ -n "$hca" ]] || die "--hca is required"
 command -v nvidia-smi >/dev/null || die "nvidia-smi is required"
 command -v numactl >/dev/null || die "numactl is required by numarun"
 command -v torchrun >/dev/null || die "torchrun is required"
@@ -175,13 +173,6 @@ for gpu in "${gpu_indices[@]}"; do
 done
 gpu_pci_bus_ids_csv="$(IFS=,; echo "${gpu_pci_bus_ids[*]}")"
 
-IFS=',' read -r -a hca_names <<< "$hca"
-for hca_name in "${hca_names[@]}"; do
-    hca_name="${hca_name#=}"
-    [[ -d "/sys/class/infiniband/${hca_name}" ]] \
-        || die "HCA not found: $hca_name"
-done
-
 mkdir -p "$output_dir"
 shopt -s nullglob
 existing_nccl_logs=("${output_dir}"/nccl-*)
@@ -196,7 +187,9 @@ fi
 export CUDA_VISIBLE_DEVICES="$gpu_list"
 export BENCHMARK_GPU_PCI_BUS_IDS="$gpu_pci_bus_ids_csv"
 export NUMARUN_MEMBIND="${NUMARUN_MEMBIND:-1}"
-export NCCL_IB_HCA="$hca"
+if [[ -n "$hca" ]]; then
+    export NCCL_IB_HCA="$hca"
+fi
 export NCCL_IB_DISABLE=0
 export NCCL_MNNVL_ENABLE=0
 export NCCL_NET=IB
@@ -209,7 +202,8 @@ export NCCL_DEBUG=INFO
 export NCCL_DEBUG_SUBSYS=INIT,NET,GRAPH
 export NCCL_DEBUG_FILE="${output_dir}/nccl-%h-%p.log"
 
-echo "gpus=$gpu_list pci_bus_ids=$gpu_pci_bus_ids_csv hca=$hca" >&2
+hca_for_log="${hca:-${NCCL_IB_HCA:-auto}}"
+echo "gpus=$gpu_list pci_bus_ids=$gpu_pci_bus_ids_csv hca=$hca_for_log" >&2
 echo "transport=IB p2p=disabled shm=disabled numarun_membind=$NUMARUN_MEMBIND" >&2
 echo "output_dir=$output_dir" >&2
 

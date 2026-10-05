@@ -48,8 +48,8 @@ wrapper 默认导出 `NUMARUN_MEMBIND=1`，让 `numarun` 同时执行 CPU 绑定
 - 单个 GB200 节点，至少 4 张可用 GPU。
 - `torchrun`、`python`、`nvidia-smi`、`numactl` 和 `numarun` 可用。
 - PyTorch 同时包含 NCCL 和 Gloo。
-- 具有可用的 ConnectX HCA 和支持 GPUDirect RDMA 的 NCCL。`NCCL_IB_HCA`
-  可以是一个 HCA，也可以是逗号分隔的 HCA 列表；应根据本机拓扑选择。
+- 具有可用的 ConnectX HCA 和支持 GPUDirect RDMA 的 NCCL。可以通过 `--hca` 指定一个
+  HCA、NCCL HCA 前缀或逗号分隔的列表；省略时由 NCCL 自动选择可用 HCA。
 - 强制 IB 的单节点路径必须得到硬件和 NCCL 网络插件支持。如果 NCCL 无法让
   同节点 rank 通过 HCA 互通，程序会失败；不能把 Socket 或 NVLink 结果当作
   RDMA 结果。
@@ -61,6 +61,15 @@ wrapper 默认导出 `NUMARUN_MEMBIND=1`，让 `numarun` 同时执行 CPU 绑定
 bash examples/gb200/rdma-backgrad/run_gb200_c2c_rdma_benchmark.sh \
   --gpus 0,1,2,3 \
   --hca mlx5_bond_0 \
+  --output-dir results/gb200/rdma-backward/c2c-rdma-$(date +%s)
+```
+
+如果不指定 `--hca`，wrapper 不会设置或覆盖 `NCCL_IB_HCA`；如果调用环境中也没有该
+变量，则由 NCCL 自动选择 HCA：
+
+```bash
+bash examples/gb200/rdma-backgrad/run_gb200_c2c_rdma_benchmark.sh \
+  --gpus 0,1,2,3 \
   --output-dir results/gb200/rdma-backward/c2c-rdma-$(date +%s)
 ```
 
@@ -102,7 +111,7 @@ cat /sys/class/infiniband/mlx5_bond_0/ports/1/state
 如果端口目录不是 `1`，把最后一条命令中的端口号替换成实际值。输出应显示端口为
 `ACTIVE`。如果 `mlx5_bond_0` 不存在，请从
 `ls -1 /sys/class/infiniband` 的实际名称中选择 HCA，并把它传给 `--hca`。
-wrapper 也会检查 `/sys/class/infiniband/<HCA>` 是否存在。
+wrapper 不会预先检查 HCA 路径，最终是否使用了目标 HCA 以 NCCL 日志为准。
 
 还应检查 HCA 与 GPU 的 NUMA 归属是否合理：
 
@@ -154,7 +163,7 @@ wrapper 支持的参数：
 | 参数 | 默认值 | 作用 |
 | --- | ---: | --- |
 | `--gpus` | `0,1,2,3` | 暴露给 4 个 rank 的物理 GPU 列表，必须正好 4 张 |
-| `--hca` | 必填 | ConnectX HCA 名称或逗号分隔列表 |
+| `--hca` | NCCL 自动选择 | ConnectX HCA 名称、NCCL 前缀或逗号分隔列表 |
 | `--c2c-buffer-mib` | `512` | H2D/D2H pinned host 和 GPU buffer 大小 |
 | `--rdma-buffer-mib` | `256` | NCCL all-reduce GPU buffer 大小 |
 | `--warmup-iterations` | `5` | 每个拷贝方向的预热次数 |
@@ -170,7 +179,7 @@ wrapper 支持的参数：
 | --- | --- | --- |
 | `NCCL_NET` | `IB` | 选择 NCCL IB 网络后端 |
 | `NCCL_IB_DISABLE` | `0` | 开启 IB |
-| `NCCL_IB_HCA` | 用户指定 | 选择 ConnectX HCA |
+| `NCCL_IB_HCA` | 传入 `--hca` 时设置，否则保持调用环境原值 | 选择 ConnectX HCA；未设置时由 NCCL 自动选择 |
 | `NCCL_P2P_DISABLE` | `1` | 禁止 GPU P2P，包括 NVLink/PCI P2P |
 | `NCCL_SHM_DISABLE` | `1` | 禁止同机共享内存传输 |
 | `NCCL_NVLS_ENABLE` | `0` | 禁止 NVLink Switch collective |
@@ -178,8 +187,12 @@ wrapper 支持的参数：
 | `NCCL_NET_GDR_LEVEL` | `PHB` | 允许 PHB 范围的 GPU Direct RDMA |
 | `NCCL_NET_GDR_C2C` | `1` | 开启 C2C GPU Direct RDMA |
 
-环境变量只是启动配置，最终以 NCCL 日志为准。运行失败或日志出现 Socket 回退时，
-wrapper 不会报告成功结果。
+环境变量只是启动配置，最终以 NCCL 日志为准。省略 `--hca` 只会放开 HCA 选择，
+wrapper 仍然强制 `NCCL_NET=IB`、GDRDMA 和其他 RDMA 相关配置。运行失败或日志出现
+Socket 回退时，wrapper 不会报告成功结果。
+
+例如，`--hca mlx5_bond` 会交给 NCCL 做前缀匹配；如果需要只选择指定设备，可以使用
+`--hca '=mlx5_bond_0,=mlx5_bond_1,=mlx5_bond_2'`。
 
 这里的 RDMA 路径指后台 NCCL `all_reduce` 的数据传输；torchrun rendezvous 和
 Gloo 控制组仍可能使用本机 TCP，它们不属于被测的 GPU 数据流量。

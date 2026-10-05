@@ -172,10 +172,7 @@ def _validate_transport_environment() -> str:
         details = ", ".join(f"{name}={value!r}" for name, value in sorted(mismatches.items()))
         raise RuntimeError(f"RDMA transport environment is not enforced: {details}")
 
-    hca = os.environ.get("NCCL_IB_HCA", "")
-    if not hca:
-        raise RuntimeError("NCCL_IB_HCA must select the GPU-local ConnectX device")
-    return hca
+    return os.environ.get("NCCL_IB_HCA", "")
 
 
 def _resolve_gpu_pci_bus_id(local_rank: int) -> str:
