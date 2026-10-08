@@ -36,7 +36,7 @@ Options:
   --copy-iterations N       Baseline C2C copies per direction (default: 20)
   --p2p-iterations N        Timed P2P operations per phase (default: 20)
   --nsys                    Profile torchrun and its workers with Nsight Systems
-  --output-dir DIR          Logs and rank-0 JSON directory (default: results/gb200/rdma-backward/c2c-gpu-rdma-p2p-<timestamp>)
+  --output-dir DIR          Logs and rank-0 JSON directory (default: results/gb200/rdma-background/c2c-gpu-rdma-p2p-<YYMMDD-HHMMSS>)
   -h, --help                Show this help
 
 Example:
@@ -61,7 +61,7 @@ require_value() {
 script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 repo_root="$(cd -- "${script_dir}/../../.." && pwd)"
 benchmark_script="${script_dir}/gb200_c2c_with_gpu_rdma_p2p_benchmark.py"
-default_output_dir="${repo_root}/results/gb200/rdma-backward/c2c-gpu-rdma-p2p-$(date +%s)"
+default_output_dir="${repo_root}/results/gb200/rdma-background/c2c-gpu-rdma-p2p-$(date +%y%m%d-%H%M%S)"
 
 gpu_list="${GPU_LIST:-0,1,2,3}"
 hca=""

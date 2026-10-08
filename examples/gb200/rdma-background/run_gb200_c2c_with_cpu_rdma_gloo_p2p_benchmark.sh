@@ -42,7 +42,7 @@ Options:
   --background-alone-iterations N
                             Standalone CPU background operations after warmup (default: 20)
   --nsys                    Profile torchrun and its workers with Nsight Systems
-  --output-dir DIR          Logs and rank-0 JSON directory
+  --output-dir DIR          Logs and rank-0 JSON directory (default suffix: YYMMDD-HHMMSS, local time)
   -h, --help                Show this help
 
 Examples:
@@ -149,7 +149,7 @@ while [[ $# -gt 0 ]]; do
 done
 
 if [[ -z "$output_dir" ]]; then
-    output_dir="${repo_root}/results/gb200/rdma-backward/c2c-cpu-rdma-gloo-p2p-$(date +%s)"
+    output_dir="${repo_root}/results/gb200/rdma-background/c2c-cpu-rdma-gloo-p2p-$(date +%y%m%d-%H%M%S)"
 fi
 
 if [[ "${CPU_C2C_GLOO_P2P_LOG_CAPTURED:-0}" != 1 ]]; then

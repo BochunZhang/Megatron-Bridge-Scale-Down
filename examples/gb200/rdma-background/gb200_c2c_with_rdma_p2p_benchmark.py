@@ -13,14 +13,17 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Measure GPU0 C2C bandwidth while the shell runs persistent host RDMA traffic.
+"""Measure GPU0 C2C bandwidth without and with persistent host or CUDA RDMA traffic.
 
-The launcher starts the ``ib_write_bw`` receiver and sender, waits ten seconds,
-and then runs this single-process benchmark with ``CUDA_VISIBLE_DEVICES=0``.
-This script measures D2H and H2D copies on ``cuda:0`` using CUDA events. The
-launcher owns the background processes and stops them after this script exits.
-The results describe C2C bandwidth during external RDMA traffic; RDMA throughput
-is recorded separately by perftest.
+The launcher first runs a baseline with ``--rdma-role none`` and no background
+traffic. For each RDMA direction, it then starts the ``ib_write_bw`` receiver and
+sender, waits ten seconds, and invokes this benchmark with ``--rdma-role recv``
+or ``send`` to identify GPU0's NIC role. Every round uses
+``CUDA_VISIBLE_DEVICES=0`` and measures D2H/H2D copies on ``cuda:0`` using CUDA
+events. The launcher owns the background processes and stops them after this
+script exits before starting the next round. ``--rdma-memory`` records whether
+perftest uses host memory or CUDA buffers for its background traffic. RDMA
+throughput is recorded separately by perftest.
 """
 
 from __future__ import annotations
@@ -65,6 +68,18 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--c2c-buffer-mib", type=_positive_int, default=512)
     parser.add_argument("--warmup-iterations", type=_positive_int, default=5)
     parser.add_argument("--copy-iterations", type=_positive_int, default=20)
+    parser.add_argument(
+        "--rdma-role",
+        choices=("none", "recv", "send"),
+        required=True,
+        help="GPU0 NIC's role in the external RDMA traffic; none measures the baseline without background traffic",
+    )
+    parser.add_argument(
+        "--rdma-memory",
+        choices=("host", "cuda"),
+        default="host",
+        help="Memory used by the external RDMA background (default: host)",
+    )
     parser.add_argument("--output", type=Path, required=True)
     return parser
 
@@ -144,12 +159,18 @@ def _run(args: argparse.Namespace) -> None:
         )
         for direction in ("d2h", "h2d")
     ]
+    has_background = args.rdma_role != "none"
+    measurement_suffix = args.rdma_role if has_background else "baseline"
     output = {
-        "benchmark": "gb200_c2c_with_cpu_rdma_p2p",
-        "background_backend": "perftest/ib_write_bw",
-        "background_managed_by": "shell",
-        "measurement_phase": "with_background",
-        "gpu_data_transport": "host-device C2C only",
+        "benchmark": "gb200_c2c_with_rdma_p2p",
+        "background_backend": "perftest/ib_write_bw" if has_background else None,
+        "background_managed_by": "shell" if has_background else None,
+        "measurement_phase": "with_background" if has_background else "baseline",
+        "rdma_role": args.rdma_role,
+        "rdma_memory": args.rdma_memory if has_background else None,
+        "rdma_sender_gpu_index": {"recv": 3, "send": 0}.get(args.rdma_role),
+        "rdma_receiver_gpu_index": {"recv": 0, "send": 3}.get(args.rdma_role),
+        "gpu_data_transport": "measured host-device C2C copies",
         "hostname": socket.gethostname(),
         "gpu_index": 0,
         "gpu_name": torch.cuda.get_device_name(0),
@@ -159,15 +180,19 @@ def _run(args: argparse.Namespace) -> None:
             "warmup_iterations": args.warmup_iterations,
             "copy_iterations": args.copy_iterations,
         },
-        "measurements": [asdict(measurement) for measurement in measurements],
+        "measurements": [
+            {"name": f"{measurement.direction}_{measurement_suffix}", **asdict(measurement)}
+            for measurement in measurements
+        ],
     }
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(json.dumps(output, indent=2) + "\n", encoding="utf-8")
-    LOGGER.info("wrote GPU0 C2C measurements with external RDMA background to %s", args.output)
+    LOGGER.info("wrote GPU0 C2C %s measurements to %s", measurement_suffix, args.output)
     for measurement in measurements:
         LOGGER.info(
-            "%s with background: %.3f GB/s (%.6f seconds, %d bytes)",
+            "%s_%s: %.3f GB/s (%.6f seconds, %d bytes)",
             measurement.direction,
+            measurement_suffix,
             measurement.bandwidth_gb_s,
             measurement.elapsed_seconds,
             measurement.transferred_bytes,
@@ -175,7 +200,7 @@ def _run(args: argparse.Namespace) -> None:
 
 
 def main() -> None:
-    """Parse arguments and measure GPU0 copies while the launcher runs RDMA."""
+    """Measure GPU0 copies without background traffic or while its NIC sends or receives RDMA."""
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     _run(_build_parser().parse_args())
 
