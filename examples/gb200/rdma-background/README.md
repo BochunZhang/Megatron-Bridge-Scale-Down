@@ -104,40 +104,52 @@ Socket fallback 时会失败退出。两组 pair 的汇总是每个参与 rank �
 
 ## CPU RDMA Verbs P2P 与 C2C 竞争测试
 
-开发机不支持 Gloo + IB，因此 CPU 背景流量使用 linux-rdma perftest 的
-`ib_write_bw`，Gloo 只保留 TCP 控制面。运行新的 wrapper：
+CPU 背景流量由 Bash 启动的两个 linux-rdma perftest `ib_write_bw` 进程提供：
+GPU0 对应的 HCA 接收，GPU3 对应的 HCA 发送。后台流量启动 10 秒后，Bash 在
+GPU0 上启动单个 Python 进程测量 D2H/H2D C2C 带宽：
 
 ```bash
-bash examples/gb200/rdma-backgrad/run_gb200_c2c_with_cpu_rdma_p2p_benchmark.sh \
-  --gpus 0,1,2,3 --rdma-size-mib 256
+bash examples/gb200/rdma-background/run_gb200_c2c_with_cpu_rdma_p2p_benchmark.sh \
+  --rdma-size-mib 256
 ```
 
-`ib_write_bw` 使用固定的 `-s` 消息大小和 `--run_infinitely` 持续发送；每个 rank
-启动一个独立的 server/client 进程，C2C CUDA event 完成后才停止进程。`-R` 选择
-RDMA CM，`-d`、`--bind_source_ip` 和 `--numa_node` 分别固定 HCA、源 IP 和 NUMA。
-可以通过 `--ib-write-bw`、`--rdma-qp`、`--rdma-tx-depth`、`--rdma-report-interval`
-和 `--rdma-ready-timeout-seconds` 调整 perftest 参数，但不会 sweep 发送大小。
+GPU/HCA 绑定固定如下，不接受 `--gpus` 参数：
 
-本机记录的 GPU/NIC 绑定如下：
+| GPU | HCA | 后台进程角色 | C2C 测量 |
+| --- | --- | --- | --- |
+| 0 | `mlx5_bond_0` | server / receiver | D2H 和 H2D |
+| 3 | `mlx5_bond_3` | client / sender | 无 |
 
-| GPU | 最近 NIC | HCA | IP | NUMA | 拓扑关系 |
-| --- | --- | --- | --- | ---: | --- |
-| 0 | NIC0 / bond0 | `mlx5_bond_0` | `186.148.87.162` | 0 | NODE |
-| 1 | NIC1 / bond1 | `mlx5_bond_1` | `186.148.87.166` | 0 | NODE |
-| 2 | NIC2 / bond2 | `mlx5_bond_2` | `186.148.87.170` | 1 | NODE |
-| 3 | NIC3 / bond3 | `mlx5_bond_3` | `186.148.87.174` | 1 | NODE |
+Bash 在每次运行时读取实时 `rdma link show` 和 `ip addr`，解析 HCA 对应的网卡、
+bond master 和 IPv4 地址；GPU 所在 NUMA 节点从 PCI sysfs 读取。
+不读取预先保存的拓扑或地址文本，不调用 `nvidia-smi topo`，也不固定 IP 地址。
 
-固定 pair 是 `GPU0 -> GPU1` 和 `GPU2 -> GPU3`：偶数 GPU 运行 perftest client/sender，
-奇数 GPU 运行 server/receiver。脚本启动时保存实时 `ip addr` 和 `rdma link show` 到输出目录，并解析
-`.cache/nvidia-smi_topo.txt` 和该文件选择 HCA/IP；若 GPU 到对应 NIC 的关系是
-`NV*`、`SYS` 或拓扑行缺失，启动会失败。背景流量只使用 host memory 的 RDMA WRITE，
-Python 进程没有 NCCL、GPU collective 或 GPU-GPU copy，因此背景 RDMA 流量不会经过
-NVLink；C2C host-device copy 仍然是唯一的 GPU 数据面测量。
+两个 `ib_write_bw` 进程都绑定到对应 GPU 所在的 NUMA 节点，但 RDMA WRITE 的
+buffer 使用 host memory。`-R` 选择 RDMA CM，`-d` 和 `--bind_source_ip` 分别固定
+HCA 和源 IP；`-s` 固定消息大小，`--run_infinitely` 让 GPU3 对应的 sender 持续
+向 GPU0 对应的 receiver 发送数据。Bash 先启动 receiver，留出 1 秒打开端点，
+再启动 sender；从 sender 启动开始固定等待 10 秒，并每秒检查两个进程是否存活，
+然后运行 Python。Python 完成后停止并回收两个后台进程。
+启动失败、Python 失败或收到终止信号时也会清理后台进程。
 
-每次运行报告四组独立结果：`d2h_send`、`d2h_recv`、`h2d_send`、`h2d_recv`。组名的
-前半部分是被测 C2C 方向，后半部分是同时运行的 RDMA sender/receiver 角色；只有
-对应角色的两个 rank 测 C2C，另一角色等待。每组都包含无背景 baseline、有背景
-`with_background` 带宽和 `drop_percent`，结果写入 `result.json`。
+Python 只在 GPU0 上测量有背景流量时的 `d2h` 和 `h2d` 带宽，结果写入
+`result.json`；不再测量无背景 baseline 或四个方向/角色组合，也不计算
+`drop_percent`。这一模式不使用 Gloo、NCCL 或 `torchrun`。
+
+可用参数如下：
+
+- `--c2c-buffer-mib`、`--warmup-iterations`、`--copy-iterations`：C2C buffer 大小和拷贝次数。
+- `--ib-write-bw`：perftest 可执行文件。
+- `--rdma-size-mib`、`--rdma-qp`、`--rdma-tx-depth`、`--rdma-report-interval`、
+  `--rdma-port`：固定大小的后台 RDMA 流量参数。
+- `--nsys`：用 Nsight Systems 采集 GPU0 上的 Python C2C 测量。
+- `--output-dir`：输出目录。
+
+默认输出目录是 `results/gb200/rdma-background/c2c-cpu-rdma-p2p-<timestamp>`，
+其中包含 `run.log`、`c2c.log`、`rdma_logs/gpu0.recv.log`、
+`rdma_logs/gpu3.send.log` 和 `result.json`。运行需要 CUDA 版 PyTorch、Python、
+`ib_write_bw`、`ip`、`rdma`、`nvidia-smi`、`numactl` 和 `setsid`；`setsid` 为各进程
+建立独立进程组，以便统一清理子进程。启用 `--nsys` 时还需要 Nsight Systems。
 
 如果机器支持 Gloo ibverbs，旧实现仍保留在
 `gb200_c2c_with_cpu_rdma_gloo_p2p_benchmark.py` 及对应的
@@ -145,15 +157,16 @@ NVLink；C2C host-device copy 仍然是唯一的 GPU 数据面测量。
 
 ### 单节点为什么仍然有 TCP/Gloo
 
-单节点不等于完全不需要 TCP。所有 wrapper 的 `torchrun` `c10d` rendezvous 都需要
+以下说明适用于 GPU all-reduce、GPU P2P 和旧的 Gloo ibverbs 模式。
+单节点不等于完全不需要 TCP。这些 wrapper 的 `torchrun` `c10d` rendezvous 都需要
 TCPStore 来让 4 个 worker 相互发现。原有 GPU all-reduce 和 GPU P2P 脚本的 Gloo
 进程组还使用 TCP socket 做 phase barrier、停止/同步和 CPU 对象汇总；这些是控制面，
 不是被测的 GPU 数据面。真正的 GPU 通信在默认 NCCL 进程组和 CUDA stream 上执行，
 数据面仍由 `NCCL_NET=IB` 选择 RDMA。旧的 Gloo ibverbs wrapper 的数据组使用
-`IBVERBS`；新的 perftest CPU wrapper 将 Gloo 固定为 TCP，RDMA 数据组由
-`ib_write_bw` 直接建立。所有模式的 rendezvous 都使用 TCPStore。
+`IBVERBS`。这些分布式模式的 rendezvous 都使用 TCPStore。CPU perftest wrapper
+由 Bash 管理进程，RDMA 连接由 `ib_write_bw` 直接建立，不需要 TCPStore 或 Gloo。
 
-wrapper 将控制面固定到本机 IPv4 loopback：
+分布式 wrapper 将控制面固定到本机 IPv4 loopback：
 
 ```text
 GLOO_SOCKET_IFNAME=lo
@@ -186,7 +199,8 @@ CPU 背景实验是独立模式：新的 perftest 结果不读取或验证 NCCL 
 
 ## `torchrun` 与 `numarun` 的调用层次
 
-`.cache/numarun` 是一个依赖 `LOCAL_RANK` 和 `LOCAL_WORLD_SIZE` 的 worker 包装器。
+以下调用层次仅适用于分布式模式；CPU perftest wrapper 直接按 PCI sysfs 的 NUMA
+节点绑定进程。`.cache/numarun` 是一个依赖 `LOCAL_RANK` 和 `LOCAL_WORLD_SIZE` 的 worker 包装器。
 因此必须让 `torchrun` 先创建 worker，再由每个 worker 执行 `numarun`：
 
 ```text
@@ -202,6 +216,8 @@ wrapper 默认导出 `NUMARUN_MEMBIND=1`，让 `numarun` 同时执行 CPU 绑定
 该启发式映射符合本机 GPU、CPU socket 和 HCA 拓扑。
 
 ## 运行条件
+
+以下是 GPU RDMA 分布式模式的运行条件；CPU perftest 模式的依赖见上面的独立说明。
 
 - 单个 GB200 节点，至少 4 张可用 GPU。
 - `torchrun`、`python`、`nvidia-smi`、`numactl` 和 `numarun` 可用。
@@ -559,15 +575,16 @@ P2P 与 D2H/H2D 是否重叠。
 ```bash
 bash -n examples/gb200/rdma-backgrad/run_gb200_c2c_with_gpu_rdma_allreduce_benchmark.sh
 bash -n examples/gb200/rdma-backgrad/run_gb200_c2c_with_gpu_rdma_p2p_benchmark.sh
-bash -n examples/gb200/rdma-backgrad/run_gb200_c2c_with_cpu_rdma_p2p_benchmark.sh
+bash -n examples/gb200/rdma-background/run_gb200_c2c_with_cpu_rdma_p2p_benchmark.sh
 bash -n examples/gb200/rdma-backgrad/run_gb200_c2c_with_cpu_rdma_gloo_p2p_benchmark.sh
 python3 -m py_compile examples/gb200/rdma-backgrad/gb200_c2c_with_gpu_rdma_allreduce_benchmark.py
 python3 -m py_compile examples/gb200/rdma-backgrad/gb200_c2c_with_gpu_rdma_p2p_benchmark.py
-python3 -m py_compile examples/gb200/rdma-backgrad/gb200_c2c_with_cpu_rdma_p2p_benchmark.py
+python3 -m py_compile examples/gb200/rdma-background/gb200_c2c_with_cpu_rdma_p2p_benchmark.py
 python3 -m py_compile examples/gb200/rdma-backgrad/gb200_c2c_with_cpu_rdma_gloo_p2p_benchmark.py
 uv run python -m pytest tests/unit_tests/scripts/performance/test_gb200_c2c_with_gpu_rdma_allreduce_benchmark.py
 uv run python -m pytest tests/unit_tests/scripts/performance/test_gb200_c2c_with_gpu_rdma_p2p_benchmark.py
 uv run python -m pytest tests/unit_tests/scripts/performance/test_gb200_c2c_with_cpu_rdma_p2p_benchmark.py
+uv run python -m pytest tests/unit_tests/scripts/performance/test_gb200_c2c_with_cpu_rdma_p2p_launcher.py
 uv run python -m pytest tests/unit_tests/scripts/performance/test_gb200_c2c_with_cpu_rdma_gloo_p2p_benchmark.py
 ```
 

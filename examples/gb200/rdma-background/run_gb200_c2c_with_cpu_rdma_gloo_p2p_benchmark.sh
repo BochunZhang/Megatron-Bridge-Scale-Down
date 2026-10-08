@@ -46,7 +46,7 @@ Options:
   -h, --help                Show this help
 
 Examples:
-  bash examples/gb200/rdma-backgrad/run_gb200_c2c_with_cpu_rdma_gloo_p2p_benchmark.sh \
+  bash examples/gb200/rdma-background/run_gb200_c2c_with_cpu_rdma_gloo_p2p_benchmark.sh \
     --gpus 0,1,2,3 --hca mlx5_bond_0
 USAGE
 }
