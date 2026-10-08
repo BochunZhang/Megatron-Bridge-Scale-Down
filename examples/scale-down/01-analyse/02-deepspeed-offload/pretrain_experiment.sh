@@ -90,9 +90,9 @@ PARAM_POSITIONS="param_cpu param_gpu param_nvme"
 PER_GPU_BATCH_SIZE=16
 NUM_GPUS=4
 # Conservative AdamW learning rate for the short random-initialization
-# stability/throughput comparison. 1e-3 is too large for this model scale and
-# can turn a valid first update into NaN/Inf before the offload path is tested.
-LEARNING_RATE=${LEARNING_RATE:-1e-4}
+# stability/throughput comparison. Keep this low enough to avoid turning the
+# first update into NaN/Inf before the offload path is tested.
+LEARNING_RATE=${LEARNING_RATE:-1e-6}
 # Shrunk layer count; only applied — and only tagged onto result folder names
 # as _<N>layer — when APPLY_MODEL_SHAPE_OVERRIDES=true (see pretrain.sh model
 # shape section). Passed explicitly to pretrain.sh.
@@ -421,6 +421,7 @@ build_ds_config() {
     "train_micro_batch_size_per_gpu": $mbs,
     "gradient_accumulation_steps": $grad_accum,
     "bf16": { "enabled": true },
+    "gradient_clipping": 1.0,
     "optimizer": {
         "type": "AdamW",
         "params": {

@@ -1,0 +1,35 @@
+--- a/deepspeed/runtime/zero/stage3.py
++++ b/deepspeed/runtime/zero/stage3.py
+@@ -1097,18 +1097,31 @@
+                     swap_from_cpu_memory_usage += (fp32_element_size * num_elements)
+                     swappable_fp32_tensors.append(self.fp32_partitioned_groups_flat[i])
+                     swappable_fp16_src_tensors.append(self.fp16_partitioned_groups_flat[i])
+             else:
+                 cpu_memory_usage += (fp32_element_size * num_elements)
+                 cpu_memory_sub_groups += 1
+ 
+                 if self.params_in_nvme_and_cpu and tensor is None:
++                    # Original implementation (restored by the recovery patch):
++                    # unpinned_fp32_buffer = torch.empty(num_elements,
++                    #                                    device=self.device,
++                    #                                    dtype=self.master_weights_and_grads_dtype)
++                    #
++                    # NVMe parameter partitions have no resident fp16 flat buffer.
++                    # With partial SuperOffload, the FP32 master buffer must follow
++                    # the optimizer subgroup device so its gradient has the same device.
++                    target_device = (
++                        self.subgroup_to_device[i]
++                        if self.offload_optimizer and not self.swap_optimizer
++                        else self.device
++                    )
+                     unpinned_fp32_buffer = torch.empty(num_elements,
+-                                                       device=self.device,
++                                                       device=target_device,
+                                                        dtype=self.master_weights_and_grads_dtype)
+                     self._swap_in_sub_group_to_flat_buffer(unpinned_fp32_buffer, i)
+                     self.fp32_partitioned_groups_flat.append(unpinned_fp32_buffer)
+                     self._create_momentum_buffer(num_elements, i, ds_id)
+                 elif self.offload_optimizer:
+                     converted = self.fp16_partitioned_groups_flat[i].to(self.subgroup_to_device[i],
+                                                                         dtype=self.master_weights_and_grads_dtype)
+                     self.fp32_partitioned_groups_flat.append(converted.clone().detach())

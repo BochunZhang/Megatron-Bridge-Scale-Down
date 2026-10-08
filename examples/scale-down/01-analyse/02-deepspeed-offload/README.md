@@ -24,7 +24,7 @@
 
 - 数据与训练:数据集 `wikitext`,加载比例 1.0%(见 §6.2),`seq_len=4096`,`steps=10`,`warmup_steps=2`,`seed=42`,只统计 warmup 之后的稳定步;
 - batch:每 GPU 每 optimizer step 处理 16 个样本,`grad_accum = 16 / micro_batch_size`,保证 mbs 扫描时全局 batch 恒定;
-- optimizer:AdamW(`betas=(0.9, 0.999)`、`eps=1e-8`、`weight_decay=0.01`),学习率默认 `1e-4`(见 §6.1);`zero_3` 策略配置 `torch_adam=true`,offload 策略使用 `DeepSpeedCPUAdam`;
+- optimizer:AdamW(`betas=(0.9, 0.999)`、`eps=1e-8`、`weight_decay=0.01`),学习率默认 `1e-6`(见 §6.1),全局梯度裁剪阈值为 `1.0`;`zero_3` 策略配置 `torch_adam=true`,offload 策略使用 `DeepSpeedCPUAdam`;
 - ZeRO-3:`overlap_comm=true`(可用 `OVERLAP_COMM` 环境变量覆盖),`reduce_bucket_size = sub_group_size = 4e8`,所有 CPU/NVMe 卸载均 `pin_memory=true`;
 - SuperOffload:统一 `cpuadam_cores_perc=0.90`,`pretrain.sh` 检测到 ds_config 含 `super_offload` 时自动为 deepspeed launcher 追加 `--bind_cores_to_rank`;
 - 环境变量:`PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`(act+cpu 的 offload/restore 循环易产生碎片,`train.py` 缺失该项会拒绝启动),`DS_PIN_MEMORY_BACKEND=torch`(不能设为 `native`,否则 side-stream DMA 会 stall),另有 `TORCH_NCCL_AVOID_RECORD_STREAMS=1`、`NCCL_NVLS_ENABLE=0` 等由 `pretrain.sh` 统一导出;
@@ -162,7 +162,7 @@ bash examples/scale-down/01-analyse/02-deepspeed-offload/pretrain_experiment.sh 
 
 **修正此前的归因**:此前把 non-finite 归因为 DeepSpeed FusedAdam 的实现问题(在 zero-3 中改用 torch AdamW 后错误曾消失),但后来观察到 zero_offload(走 `DeepSpeedCPUAdam`,与 FusedAdam 无关)也出现相同的 non-finite 问题,说明该归因不成立,应从其他角度继续排查。**尚未解释的现象**:观察到有两个异构(CPU+GPU 混合更新)的实验 loss 曲线完全一致,这与"实现不同必然分叉"的预期矛盾,暂时无法解释。
 
-**学习率问题**:早期实验将 learning rate 设为 `1e-3`,对随机初始化的模型来说过大,一次合法的首轮更新也可能直接把权重推到 NaN/Inf,在 offload 路径被测到之前就产生 non-finite。合理的方案是减小学习率后重新测试,当前 `pretrain_experiment.sh` 已把默认学习率降为 `1e-4`,可用 `--learning_rate` 覆盖;正式从头预训练仍应另行配置 warmup 与学习率曲线。
+**学习率与梯度裁剪**:早期实验将 learning rate 设为 `1e-3`,对随机初始化的模型来说过大,一次合法的首轮更新也可能直接把权重推到 NaN/Inf,在 offload 路径被测到之前就产生 non-finite。随后将默认值降到 `1e-4`仍不能排除首轮更新不稳定,因此稳定性排查阶段使用 `1e-6` 并启用全局梯度裁剪 `1.0`;学习率仍可用 `--learning_rate` 覆盖。梯度裁剪只能限制有限的大梯度,不能修复已经包含 NaN/Inf 的梯度。该配置用于短跑稳定性测试,正式从头预训练仍应另行配置 warmup 与学习率曲线。
 
 ### 6.2 加速测试
 
@@ -181,7 +181,7 @@ bash examples/scale-down/01-analyse/02-deepspeed-offload/pretrain_experiment.sh 
 | 类别 | 项目 | 配置方式(CLI / 环境变量) | 默认值 | 说明 |
 | --- | --- | --- | --- | --- |
 | 矩阵轴 | 每 GPU 每 step 样本数 | `--per_gpu_batch_size` | `16` | `grad_accum = 该值 / mbs`,全局 batch 恒定 |
-| 矩阵轴 | 学习率 | `--learning_rate` / `LEARNING_RATE` | `1e-4` | 必须为正数;不用 `1e-3` 的原因见 §6.1 |
+| 矩阵轴 | 学习率 | `--learning_rate` / `LEARNING_RATE` | `1e-6` | 必须为正数;稳定性排查使用更保守的值,原因见 §6.1 |
 | 矩阵轴 | GPU 数 | `--num_gpus` | `4` | 与 `CUDA_VISIBLE_DEVICES` 配合切分 GPU 组 |
 | 矩阵轴 | AutoEP 大小 | `--autoep_size` | `4` | 仅 MoE 模型使用,须整除专家数 |
 | 矩阵轴 | MoE 专家数 | `--moe_num_experts` | `64` | 对比实验固定为 64,其余取值直接报错 |
