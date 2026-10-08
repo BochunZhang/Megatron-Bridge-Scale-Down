@@ -14,7 +14,7 @@
 # limitations under the License.
 """Measure GB200 C2C bandwidth with and without sustained RDMA traffic.
 
-Run this program through ``run_gb200_c2c_rdma_benchmark.sh`` on one node with
+Run this program through ``run_gb200_c2c_with_gpu_rdma_allreduce_benchmark.sh`` on one node with
 four GPUs. The NCCL process group generates GPU-buffer IB traffic while a
 separate Gloo process group coordinates the measurement lifecycle. P2P/NVLink
 and shared-memory NCCL paths are disabled by the wrapper so the collective

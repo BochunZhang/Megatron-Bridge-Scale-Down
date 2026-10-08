@@ -14,7 +14,7 @@
 # limitations under the License.
 """Measure NCCL P2P send/recv interference with C2C H2D/D2H copies.
 
-Run this program through ``run_gb200_c2c_p2p_benchmark.sh`` on one node with
+Run this program through ``run_gb200_c2c_with_gpu_rdma_p2p_benchmark.sh`` on one node with
 four GPUs. Ranks are paired as ``0 -> 1`` and ``2 -> 3``. The sender ranks
 run D2H copies in the send contention phase; the receiver ranks run H2D copies
 in the receive contention phase. NCCL transport settings are supplied by the

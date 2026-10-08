@@ -38,16 +38,16 @@ buffer 为 256 MiB，alone 默认计时 20 次 all-reduce。可以用
 
 ## P2P send/recv 与 C2C 竞争测试
 
-如果要测试点对点流量，使用新增的 `run_gb200_c2c_p2p_benchmark.sh`：
+如果要测试点对点流量，使用新增的 `run_gb200_c2c_with_gpu_rdma_p2p_benchmark.sh`：
 
 ```bash
-bash examples/gb200/rdma-backgrad/run_gb200_c2c_p2p_benchmark.sh \
+bash examples/gb200/rdma-backgrad/run_gb200_c2c_with_gpu_rdma_p2p_benchmark.sh \
   --gpus 0,1,2,3 \
   --hca mlx5_bond_0
 ```
 
 不传 `--hca` 时保持 NCCL 的 HCA 自动选择；默认输出目录为
-`results/gb200/rdma-backward/c2c-p2p-rdma-$(date +%s)`，脚本会自动保存
+`results/gb200/rdma-backward/c2c-gpu-rdma-p2p-$(date +%s)`，脚本会自动保存
 `run.log`、`torchrun.log`、NCCL 日志和 `result.json`。参数和原 benchmark 相同地使用
 `torchrun`、`numarun`、loopback Gloo 控制组、严格的 `NCCL_NET=IB`/GDRDMA 配置，
 也支持 `--nsys`。
@@ -102,48 +102,46 @@ GDRDMA 配置后，实际路径仍必须以 NCCL 日志中的 `NET/IB`、`GDRDMA
 Socket fallback 时会失败退出。两组 pair 的汇总是每个参与 rank 的 per-peer 数值；不把
 两个 pair 的 payload 相加成单个 wire-rate。
 
-## CPU 背景 all-reduce 和 send/recv 实验
+## CPU RDMA Verbs P2P 与 C2C 竞争测试
 
-如果要隔离 CPU 通信对 C2C 的影响，可以使用新增的两个实验入口。它们都在四个
-torchrun worker 上创建 CPU tensor，并使用 Gloo 的 `IBVERBS` transport 运行背景流量；
-只有被测的 H2D/D2H 拷贝使用 GPU。这样输出中的 `summary.h2d` 和 `summary.d2h` 分别
-给出两种方向的 baseline、背景流量并发带宽和下降比例。CPU payload 的数据路径是
-RDMA Verbs，Gloo 的 rendezvous 仍需要通过 torchrun 的 TCPStore 交换连接信息。
-
-CPU all-reduce：
+开发机不支持 Gloo + IB，因此 CPU 背景流量使用 linux-rdma perftest 的
+`ib_write_bw`，Gloo 只保留 TCP 控制面。运行新的 wrapper：
 
 ```bash
-bash examples/gb200/rdma-backgrad/run_gb200_c2c_cpu_allreduce_benchmark.sh \
-  --gpus 0,1,2,3 --hca mlx5_bond_0
+bash examples/gb200/rdma-backgrad/run_gb200_c2c_with_cpu_rdma_p2p_benchmark.sh \
+  --gpus 0,1,2,3 --rdma-size-mib 256
 ```
 
-CPU send/recv（固定 pair `0 -> 1`、`2 -> 3`）：
+`ib_write_bw` 使用固定的 `-s` 消息大小和 `--run_infinitely` 持续发送；每个 rank
+启动一个独立的 server/client 进程，C2C CUDA event 完成后才停止进程。`-R` 选择
+RDMA CM，`-d`、`--bind_source_ip` 和 `--numa_node` 分别固定 HCA、源 IP 和 NUMA。
+可以通过 `--ib-write-bw`、`--rdma-qp`、`--rdma-tx-depth`、`--rdma-report-interval`
+和 `--rdma-ready-timeout-seconds` 调整 perftest 参数，但不会 sweep 发送大小。
 
-```bash
-bash examples/gb200/rdma-backgrad/run_gb200_c2c_cpu_p2p_benchmark.sh \
-  --gpus 0,1,2,3 --hca mlx5_bond_0
-```
+本机记录的 GPU/NIC 绑定如下：
 
-两个入口支持相同的参数：`--hca`（默认自动选择 ibverbs device）、
-`--c2c-buffer-mib`（默认 `512`）、
-`--background-buffer-mib`（默认 `256`）、`--warmup-iterations`（默认 `5`）、
-`--copy-iterations`（默认 `20`）、`--background-warmup-seconds`（默认 `3`）、
-`--background-alone-iterations`（默认 `20`）和 `--nsys`。输出目录默认为
-`results/gb200/rdma-backward/c2c-cpu-<mode>-<timestamp>`。`result.json` 的
-`background_device` 固定为 `cpu`、`background_backend` 固定为 `gloo-ibverbs`，
-`background_summary` 按 all-reduce 或 send/recv role 汇总背景流量完成时间和
-CPU tensor payload 带宽，并在 `transport` 中记录 `GLOO_DEVICE_TRANSPORT` 和
-`TORCH_GLOO_IBV_NAME`。CPU
-all-reduce 的背景 tensor 使用 `float32`，因此
-`--background-buffer-mib` 必须能被 4 字节整除（默认值满足该条件）。
-CPU 数据组、phase barrier 和停止控制使用独立的 Gloo 进程组，避免后台操作与
-生命周期同步发生 collective 顺序冲突。
+| GPU | 最近 NIC | HCA | IP | NUMA | 拓扑关系 |
+| --- | --- | --- | --- | ---: | --- |
+| 0 | NIC0 / bond0 | `mlx5_bond_0` | `186.148.87.162` | 0 | NODE |
+| 1 | NIC1 / bond1 | `mlx5_bond_1` | `186.148.87.166` | 0 | NODE |
+| 2 | NIC2 / bond2 | `mlx5_bond_2` | `186.148.87.170` | 1 | NODE |
+| 3 | NIC3 / bond3 | `mlx5_bond_3` | `186.148.87.174` | 1 | NODE |
 
-CPU 背景 wrapper 默认让 Gloo 自动选择第一个 ibverbs device；用 `--hca` 指定
-`TORCH_GLOO_IBV_NAME`。它会设置 `GLOO_DEVICE_TRANSPORT=IBVERBS` 并清除
-`GLOO_SOCKET_IFNAME`，因为 socket interface 名称会被 Gloo 当作 ibverbs device
-名称传入。PyTorch 必须以 Gloo ibverbs 支持构建（`USE_GLOO_IBVERBS=1`），并且
-容器中能看到对应的 RDMA device；否则初始化阶段会直接报错，而不会退回 TCP Gloo。
+固定 pair 是 `GPU0 -> GPU1` 和 `GPU2 -> GPU3`：偶数 GPU 运行 perftest client/sender，
+奇数 GPU 运行 server/receiver。脚本启动时保存实时 `ip addr` 和 `rdma link show` 到输出目录，并解析
+`.cache/nvidia-smi_topo.txt` 和该文件选择 HCA/IP；若 GPU 到对应 NIC 的关系是
+`NV*`、`SYS` 或拓扑行缺失，启动会失败。背景流量只使用 host memory 的 RDMA WRITE，
+Python 进程没有 NCCL、GPU collective 或 GPU-GPU copy，因此背景 RDMA 流量不会经过
+NVLink；C2C host-device copy 仍然是唯一的 GPU 数据面测量。
+
+每次运行报告四组独立结果：`d2h_send`、`d2h_recv`、`h2d_send`、`h2d_recv`。组名的
+前半部分是被测 C2C 方向，后半部分是同时运行的 RDMA sender/receiver 角色；只有
+对应角色的两个 rank 测 C2C，另一角色等待。每组都包含无背景 baseline、有背景
+`with_background` 带宽和 `drop_percent`，结果写入 `result.json`。
+
+如果机器支持 Gloo ibverbs，旧实现仍保留在
+`gb200_c2c_with_cpu_rdma_gloo_p2p_benchmark.py` 及对应的
+`run_gb200_c2c_with_cpu_rdma_gloo_p2p_benchmark.sh`；它不适用于当前开发机。
 
 ### 单节点为什么仍然有 TCP/Gloo
 
@@ -151,8 +149,9 @@ CPU 背景 wrapper 默认让 Gloo 自动选择第一个 ibverbs device；用 `--
 TCPStore 来让 4 个 worker 相互发现。原有 GPU all-reduce 和 GPU P2P 脚本的 Gloo
 进程组还使用 TCP socket 做 phase barrier、停止/同步和 CPU 对象汇总；这些是控制面，
 不是被测的 GPU 数据面。真正的 GPU 通信在默认 NCCL 进程组和 CUDA stream 上执行，
-数据面仍由 `NCCL_NET=IB` 选择 RDMA。CPU 背景 wrapper 的 Gloo 进程组则使用
-`IBVERBS`，只有 rendezvous 和 Gloo 建链所需的 store 仍是 TCP。
+数据面仍由 `NCCL_NET=IB` 选择 RDMA。旧的 Gloo ibverbs wrapper 的数据组使用
+`IBVERBS`；新的 perftest CPU wrapper 将 Gloo 固定为 TCP，RDMA 数据组由
+`ib_write_bw` 直接建立。所有模式的 rendezvous 都使用 TCPStore。
 
 wrapper 将控制面固定到本机 IPv4 loopback：
 
@@ -168,8 +167,9 @@ torchrun --rdzv-backend=c10d --rdzv-endpoint=127.0.0.1:0 ...
 `GDRDMA`，并且没有 `NET/Socket`。因此不应为了消除控制面的 TCP 而删除 Gloo：将
 控制组改成 NCCL 会把控制 collective 也放进 GPU/NCCL 流量，改变被测负载，并可能与
 后台 all-reduce 发生 collective 顺序冲突。
-上面的 CPU 背景实验是独立模式：其数据组使用 CPU Gloo ibverbs，不读取或验证 NCCL
-日志，输出中的 `background_device` 和 `background_backend` 会明确标出这一点。
+CPU 背景实验是独立模式：新的 perftest 结果不读取或验证 NCCL 日志，`result.json`
+中的 `background_backend` 会标出 `perftest/ib_write_bw`；旧 Gloo 版本则标出
+`gloo/ibverbs`。
 
 如果看到 `TCP client failed to connect/validate to host`，先看错误前缀和第一条失败：
 
@@ -190,7 +190,7 @@ torchrun --rdzv-backend=c10d --rdzv-endpoint=127.0.0.1:0 ...
 因此必须让 `torchrun` 先创建 worker，再由每个 worker 执行 `numarun`：
 
 ```text
-torchrun --no-python numarun python gb200_c2c_rdma_benchmark.py ...
+torchrun --no-python numarun python gb200_c2c_with_gpu_rdma_allreduce_benchmark.py ...
 ```
 
 不能写成 `numarun torchrun ...`，因为外层 `numarun` 启动时还没有 rank 环境变量，
@@ -216,7 +216,7 @@ wrapper 默认导出 `NUMARUN_MEMBIND=1`，让 `numarun` 同时执行 CPU 绑定
 ## 推荐调用
 
 ```bash
-bash examples/gb200/rdma-backgrad/run_gb200_c2c_rdma_benchmark.sh \
+bash examples/gb200/rdma-backgrad/run_gb200_c2c_with_gpu_rdma_allreduce_benchmark.sh \
   --gpus 0,1,2,3 \
   --hca mlx5_bond_0
 ```
@@ -225,21 +225,21 @@ bash examples/gb200/rdma-backgrad/run_gb200_c2c_rdma_benchmark.sh \
 变量，则由 NCCL 自动选择 HCA：
 
 ```bash
-bash examples/gb200/rdma-backgrad/run_gb200_c2c_rdma_benchmark.sh \
+bash examples/gb200/rdma-backgrad/run_gb200_c2c_with_gpu_rdma_allreduce_benchmark.sh \
   --gpus 0,1,2,3
 ```
 
 需要生成 Nsight Systems trace 时，在命令末尾增加 `--nsys`：
 
 ```bash
-bash examples/gb200/rdma-backgrad/run_gb200_c2c_rdma_benchmark.sh \
+bash examples/gb200/rdma-backgrad/run_gb200_c2c_with_gpu_rdma_allreduce_benchmark.sh \
   --gpus 0,1,2,3 \
   --hca mlx5_bond_0 \
   --nsys
 ```
 
 未传入 `--output-dir` 时，脚本自动使用
-`results/gb200/rdma-backward/c2c-rdma-<timestamp>`；也可以显式传入自定义目录。
+`results/gb200/rdma-backward/c2c-gpu-rdma-allreduce-<timestamp>`；也可以显式传入自定义目录。
 
 ## 检查 `mlx5_bond_0` 是否存在
 
@@ -301,22 +301,22 @@ export NCCL_SHM_DISABLE=1
 export NCCL_NVLS_ENABLE=0
 export NCCL_DEBUG=INFO
 export NCCL_DEBUG_SUBSYS=INIT,NET,GRAPH
-export NCCL_DEBUG_FILE=/tmp/gb200-c2c-rdma-manual/nccl-%h-%p.log
+export NCCL_DEBUG_FILE=/tmp/gb200-c2c-gpu-rdma-allreduce-manual/nccl-%h-%p.log
 
-mkdir -p /tmp/gb200-c2c-rdma-manual
+mkdir -p /tmp/gb200-c2c-gpu-rdma-allreduce-manual
 export GLOO_SOCKET_IFNAME=lo
 export NCCL_SOCKET_IFNAME=lo
 export NCCL_SOCKET_FAMILY=AF_INET
 torchrun --rdzv-backend=c10d --rdzv-endpoint=127.0.0.1:0 \
   --nnodes=1 --nproc-per-node=4 --no-python \
-  numarun python examples/gb200/rdma-backgrad/gb200_c2c_rdma_benchmark.py \
+  numarun python examples/gb200/rdma-backgrad/gb200_c2c_with_gpu_rdma_allreduce_benchmark.py \
   --c2c-buffer-mib 512 \
   --rdma-buffer-mib 256 \
   --warmup-iterations 5 \
   --copy-iterations 20 \
   --rdma-warmup-seconds 3 \
   --rdma-ready-timeout-seconds 120 \
-  --output /tmp/gb200-c2c-rdma-manual/result.json
+  --output /tmp/gb200-c2c-gpu-rdma-allreduce-manual/result.json
 ```
 
 上面的 `NCCL_IB_HCA='=mlx5_bond_0'` 使用 NCCL 的精确匹配前缀。使用多个 HCA 时，
@@ -336,7 +336,7 @@ wrapper 支持的参数：
 | `--rdma-ready-timeout-seconds` | `120` | 首个 RDMA collective 的超时时间 |
 | `--rdma-alone-iterations` | `20` | alone 阶段的计时 all-reduce 次数；首个 warmup 不计入 |
 | `--nsys` | 关闭 | 在 torchrun 外层追踪 launcher 和所有 worker，生成一个进程树报告 |
-| `--output-dir` | `results/gb200/rdma-backward/c2c-rdma-<timestamp>` | 日志和 rank 0 JSON 目录 |
+| `--output-dir` | `results/gb200/rdma-backward/c2c-gpu-rdma-allreduce-<timestamp>` | 日志和 rank 0 JSON 目录 |
 
 ## 强制 RDMA 配置
 
@@ -557,12 +557,18 @@ P2P 与 D2H/H2D 是否重叠。
 ## 本地检查
 
 ```bash
-bash -n examples/gb200/rdma-backgrad/run_gb200_c2c_rdma_benchmark.sh
-bash -n examples/gb200/rdma-backgrad/run_gb200_c2c_p2p_benchmark.sh
-python3 -m py_compile examples/gb200/rdma-backgrad/gb200_c2c_rdma_benchmark.py
-python3 -m py_compile examples/gb200/rdma-backgrad/gb200_c2c_p2p_benchmark.py
-uv run python -m pytest tests/unit_tests/scripts/performance/test_gb200_c2c_rdma_benchmark.py
-uv run python -m pytest tests/unit_tests/scripts/performance/test_gb200_c2c_p2p_benchmark.py
+bash -n examples/gb200/rdma-backgrad/run_gb200_c2c_with_gpu_rdma_allreduce_benchmark.sh
+bash -n examples/gb200/rdma-backgrad/run_gb200_c2c_with_gpu_rdma_p2p_benchmark.sh
+bash -n examples/gb200/rdma-backgrad/run_gb200_c2c_with_cpu_rdma_p2p_benchmark.sh
+bash -n examples/gb200/rdma-backgrad/run_gb200_c2c_with_cpu_rdma_gloo_p2p_benchmark.sh
+python3 -m py_compile examples/gb200/rdma-backgrad/gb200_c2c_with_gpu_rdma_allreduce_benchmark.py
+python3 -m py_compile examples/gb200/rdma-backgrad/gb200_c2c_with_gpu_rdma_p2p_benchmark.py
+python3 -m py_compile examples/gb200/rdma-backgrad/gb200_c2c_with_cpu_rdma_p2p_benchmark.py
+python3 -m py_compile examples/gb200/rdma-backgrad/gb200_c2c_with_cpu_rdma_gloo_p2p_benchmark.py
+uv run python -m pytest tests/unit_tests/scripts/performance/test_gb200_c2c_with_gpu_rdma_allreduce_benchmark.py
+uv run python -m pytest tests/unit_tests/scripts/performance/test_gb200_c2c_with_gpu_rdma_p2p_benchmark.py
+uv run python -m pytest tests/unit_tests/scripts/performance/test_gb200_c2c_with_cpu_rdma_p2p_benchmark.py
+uv run python -m pytest tests/unit_tests/scripts/performance/test_gb200_c2c_with_cpu_rdma_gloo_p2p_benchmark.py
 ```
 
 单元测试只覆盖带宽计算、汇总和环境校验等硬件无关逻辑，不能替代真实 NCCL

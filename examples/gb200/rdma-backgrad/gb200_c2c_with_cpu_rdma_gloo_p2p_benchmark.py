@@ -13,14 +13,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Measure GB200 C2C bandwidth while CPU Gloo/ibverbs traffic runs in the background.
+"""Measure C2C bandwidth while CPU Gloo/ibverbs P2P traffic runs in the background.
 
-The ``all-reduce`` mode continuously reduces a CPU tensor across four Gloo
-workers. The ``p2p`` mode continuously sends and receives CPU tensors over
+The CPU background traffic continuously sends and receives CPU tensors over
 fixed pairs ``0 -> 1`` and ``2 -> 3``. Gloo is configured with its ibverbs
-transport, so the CPU payload path uses RDMA Verbs. Both modes measure GPU
-H2D and D2H copies while the CPU traffic is active. No background tensor is
-allocated on the GPU; the GPU is used only for the C2C copy under test.
+transport, so the CPU payload path uses RDMA Verbs. The benchmark measures GPU
+H2D and D2H copies while the CPU P2P traffic is active. No background tensor
+is allocated on the GPU; the GPU is used only for the C2C copy under test.
 """
 
 from __future__ import annotations
@@ -48,8 +47,6 @@ BYTES_PER_MIB = 1024 * 1024
 BYTES_PER_GB = 1_000_000_000
 EXPECTED_WORLD_SIZE = 4
 BACKGROUND_STOP_CHECK_INTERVAL = 32
-FLOAT32_BYTES = 4
-CPU_ALL_REDUCE = "all-reduce"
 CPU_P2P = "p2p"
 GLOO_IBVERBS_TRANSPORT = "IBVERBS"
 
@@ -114,7 +111,6 @@ def _positive_float(value: str) -> float:
 
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--background", choices=(CPU_ALL_REDUCE, CPU_P2P), required=True)
     parser.add_argument("--c2c-buffer-mib", type=_positive_int, default=512)
     parser.add_argument("--background-buffer-mib", type=_positive_int, default=256)
     parser.add_argument("--warmup-iterations", type=_positive_int, default=5)
@@ -269,21 +265,18 @@ def _measurement_from_windows(
 
 
 class _CpuBackgroundLoad:
-    """Run CPU Gloo/ibverbs all-reduce or P2P traffic on a background thread."""
+    """Run CPU Gloo/ibverbs P2P traffic on a background thread."""
 
     def __init__(
         self,
         *,
-        mode: str,
         rank: int,
         buffer_bytes: int,
         data_group: dist.ProcessGroup,
         control_group: dist.ProcessGroup,
         max_iterations: int | None = None,
     ) -> None:
-        if mode not in {CPU_ALL_REDUCE, CPU_P2P}:
-            raise ValueError(f"unsupported CPU background mode: {mode}")
-        self._mode = mode
+        self._mode = CPU_P2P
         self._rank = rank
         self._buffer_bytes = buffer_bytes
         self._data_group = data_group
@@ -291,13 +284,10 @@ class _CpuBackgroundLoad:
         self._max_iterations = max_iterations
         self._role: str
         self._peer_rank: int | None
-        if mode == CPU_P2P:
-            self._role, self._peer_rank = _p2p_role(rank)
-        else:
-            self._role, self._peer_rank = "all-reduce", None
+        self._role, self._peer_rank = _p2p_role(rank)
         self._ready = threading.Event()
         self._stop = threading.Event()
-        self._thread = threading.Thread(target=self._run, name=f"cpu-{mode}-load", daemon=True)
+        self._thread = threading.Thread(target=self._run, name="cpu-p2p-load", daemon=True)
         self._error: BaseException | None = None
         self._measurement: BackgroundMeasurement | None = None
         self._iteration_windows: list[tuple[float, float]] = []
@@ -361,16 +351,10 @@ class _CpuBackgroundLoad:
         )
 
     def _make_buffer(self) -> torch.Tensor:
-        if self._mode == CPU_ALL_REDUCE:
-            if self._buffer_bytes % FLOAT32_BYTES != 0:
-                raise ValueError("all-reduce background buffer size must be divisible by four bytes")
-            return torch.zeros(self._buffer_bytes // FLOAT32_BYTES, dtype=torch.float32, device="cpu")
         return torch.zeros(self._buffer_bytes, dtype=torch.uint8, device="cpu")
 
     def _run_operation(self, buffer: torch.Tensor) -> None:
-        if self._mode == CPU_ALL_REDUCE:
-            work = dist.all_reduce(buffer, op=dist.ReduceOp.SUM, group=self._data_group, async_op=True)
-        elif self._role == "send":
+        if self._role == "send":
             work = dist.isend(buffer, dst=cast(int, self._peer_rank), group=self._data_group, tag=0)
         else:
             work = dist.irecv(buffer, src=cast(int, self._peer_rank), group=self._data_group, tag=0)
@@ -379,7 +363,6 @@ class _CpuBackgroundLoad:
     def _run(self) -> None:
         try:
             background_buffer = self._make_buffer()
-            stop_tensor = torch.zeros(1, dtype=torch.int32, device="cpu")
             iterations = 0
             started_at = time.monotonic()
             with _nvtx_range(f"cpu_{self._mode}_background"):
@@ -397,9 +380,8 @@ class _CpuBackgroundLoad:
 
                     if self._max_iterations is not None and iterations >= self._max_iterations:
                         break
-                    stop_tensor.fill_(int(self._stop.is_set()))
-                    dist.all_reduce(stop_tensor, op=dist.ReduceOp.MAX, group=self._control_group)
-                    if stop_tensor.item() != 0:
+                    dist.barrier(group=self._control_group)
+                    if self._stop.is_set():
                         break
 
             self._measurement = _measurement_from_windows(
@@ -477,10 +459,9 @@ def _summarize_c2c(records: list[dict[str, object]]) -> dict[str, dict[str, floa
     return result
 
 
-def _summarize_background(records: list[dict[str, object]], mode: str) -> dict[str, dict[str, float]]:
+def _summarize_background(records: list[dict[str, object]]) -> dict[str, dict[str, float]]:
     result: dict[str, dict[str, float]] = {}
-    directions = ("all-reduce",) if mode == CPU_ALL_REDUCE else ("send", "recv")
-    for direction in directions:
+    for direction in ("send", "recv"):
         alone = [
             cast(dict[str, object], record["background_alone"])
             for record in records
@@ -542,7 +523,6 @@ def _run(args: argparse.Namespace) -> None:
         with _nvtx_range("phase_cpu_background_alone"):
             dist.barrier(group=phase_group)
             alone_load = _CpuBackgroundLoad(
-                mode=args.background,
                 rank=rank,
                 buffer_bytes=background_buffer_bytes,
                 data_group=data_group,
@@ -556,7 +536,6 @@ def _run(args: argparse.Namespace) -> None:
             dist.barrier(group=phase_group)
 
         background_load = _CpuBackgroundLoad(
-            mode=args.background,
             rank=rank,
             buffer_bytes=background_buffer_bytes,
             data_group=data_group,
@@ -597,7 +576,7 @@ def _run(args: argparse.Namespace) -> None:
             hostname=socket.gethostname(),
             gpu_name=properties.name,
             gpu_pci_bus_id=_resolve_gpu_pci_bus_id(local_rank),
-            background_mode=args.background,
+            background_mode=CPU_P2P,
             background_role=background_load.role,
             peer_rank=background_load.peer_rank,
             c2c_buffer_mib=args.c2c_buffer_mib,
@@ -619,9 +598,9 @@ def _run(args: argparse.Namespace) -> None:
             output = {
                 "background_device": "cpu",
                 "background_backend": "gloo-ibverbs",
-                "background_mode": args.background,
+                "background_mode": CPU_P2P,
                 "summary": _summarize_c2c(records),
-                "background_summary": _summarize_background(records, args.background),
+                "background_summary": _summarize_background(records),
                 "ranks": records,
                 "transport": {
                     "background": "cpu/gloo-ibverbs",

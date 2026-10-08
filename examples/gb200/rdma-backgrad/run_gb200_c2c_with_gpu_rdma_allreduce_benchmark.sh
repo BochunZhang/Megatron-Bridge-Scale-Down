@@ -17,30 +17,33 @@ set -euo pipefail
 
 usage() {
     cat <<'USAGE'
-Run a single-node GB200 NCCL P2P send/recv benchmark with C2C contention.
+Run a single-node GB200 C2C bandwidth benchmark with sustained NCCL/IB RDMA.
 
 The wrapper launches four torchrun workers. Each worker is started through
 numarun so LOCAL_RANK selects its CPU and NUMA binding. P2P/NVLink and SHM
-NCCL transports are disabled; P2P send/recv must use the configured IB HCA or
+NCCL transports are disabled; the collective uses the configured IB HCA or
 NCCL's automatic HCA selection when --hca is omitted.
 
 Usage:
-  run_gb200_c2c_p2p_benchmark.sh [options]
+  run_gb200_c2c_with_gpu_rdma_allreduce_benchmark.sh [options]
 
 Options:
   --gpus LIST               Physical GPUs exposed to torchrun (default: 0,1,2,3)
   --hca HCA                 NCCL HCA name/prefix or comma-separated list (default: NCCL selects)
   --c2c-buffer-mib MIB      Pinned-host/GPU copy buffer (default: 512)
-  --p2p-buffer-mib MIB      P2P send/recv GPU buffer (default: 256)
-  --warmup-iterations N     C2C/P2P warmup operations (default: 5)
-  --copy-iterations N       Baseline C2C copies per direction (default: 20)
-  --p2p-iterations N        Timed P2P operations per phase (default: 20)
+  --rdma-buffer-mib MIB     NCCL all-reduce buffer (default: 256)
+  --warmup-iterations N     C2C warmup copies per direction (default: 5)
+  --copy-iterations N       Timed C2C copies per direction (default: 20)
+  --rdma-warmup-seconds S   RDMA-only warmup before C2C starts (default: 3)
+  --rdma-ready-timeout-seconds S
+                            Timeout for the first RDMA collective (default: 120)
+  --rdma-alone-iterations N Run standalone all-reduce iterations (default: 20)
   --nsys                    Profile torchrun and its workers with Nsight Systems
-  --output-dir DIR          Logs and rank-0 JSON directory (default: results/gb200/rdma-backward/c2c-p2p-rdma-<timestamp>)
+  --output-dir DIR          Logs and rank-0 JSON directory (default: results/gb200/rdma-backward/c2c-gpu-rdma-allreduce-<timestamp>)
   -h, --help                Show this help
 
 Example:
-  bash examples/gb200/rdma-backgrad/run_gb200_c2c_p2p_benchmark.sh \
+  bash examples/gb200/rdma-backgrad/run_gb200_c2c_with_gpu_rdma_allreduce_benchmark.sh \
     --gpus 0,1,2,3 --hca mlx5_bond_0
 USAGE
 }
@@ -60,18 +63,20 @@ require_value() {
 
 script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 repo_root="$(cd -- "${script_dir}/../../.." && pwd)"
-benchmark_script="${script_dir}/gb200_c2c_p2p_benchmark.py"
-default_output_dir="${repo_root}/results/gb200/rdma-backward/c2c-p2p-rdma-$(date +%s)"
+benchmark_script="${script_dir}/gb200_c2c_with_gpu_rdma_allreduce_benchmark.py"
+default_output_dir="${repo_root}/results/gb200/rdma-backward/c2c-gpu-rdma-allreduce-$(date +%s)"
 
 gpu_list="${GPU_LIST:-0,1,2,3}"
 hca=""
 c2c_buffer_mib="512"
-p2p_buffer_mib="256"
+rdma_buffer_mib="256"
 warmup_iterations="5"
 copy_iterations="20"
-p2p_iterations="20"
+rdma_warmup_seconds="3"
+rdma_ready_timeout_seconds="120"
+rdma_alone_iterations="20"
 nsys_enabled=false
-output_dir="${RDMA_C2C_P2P_INTERNAL_OUTPUT_DIR:-$default_output_dir}"
+output_dir="${GPU_RDMA_C2C_ALLREDUCE_INTERNAL_OUTPUT_DIR:-$default_output_dir}"
 
 original_args=("$@")
 
@@ -92,9 +97,9 @@ while [[ $# -gt 0 ]]; do
             c2c_buffer_mib="$2"
             shift 2
             ;;
-        --p2p-buffer-mib)
+        --rdma-buffer-mib)
             require_value "$1" "$#"
-            p2p_buffer_mib="$2"
+            rdma_buffer_mib="$2"
             shift 2
             ;;
         --warmup-iterations)
@@ -107,9 +112,19 @@ while [[ $# -gt 0 ]]; do
             copy_iterations="$2"
             shift 2
             ;;
-        --p2p-iterations)
+        --rdma-warmup-seconds)
             require_value "$1" "$#"
-            p2p_iterations="$2"
+            rdma_warmup_seconds="$2"
+            shift 2
+            ;;
+        --rdma-ready-timeout-seconds)
+            require_value "$1" "$#"
+            rdma_ready_timeout_seconds="$2"
+            shift 2
+            ;;
+        --rdma-alone-iterations)
+            require_value "$1" "$#"
+            rdma_alone_iterations="$2"
             shift 2
             ;;
         --nsys)
@@ -131,14 +146,14 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
-if [[ "${RDMA_C2C_P2P_LOG_CAPTURED:-0}" != 1 ]]; then
+if [[ "${GPU_RDMA_C2C_ALLREDUCE_LOG_CAPTURED:-0}" != 1 ]]; then
     mkdir -p "$output_dir"
     run_log="${output_dir}/run.log"
     [[ ! -e "$run_log" ]] || die "output directory already contains run.log; use a fresh directory: $output_dir"
     [[ ! -e "${output_dir}/torchrun.log" ]] \
         || die "output directory already contains torchrun.log; use a fresh directory: $output_dir"
-    export RDMA_C2C_P2P_LOG_CAPTURED=1
-    export RDMA_C2C_P2P_INTERNAL_OUTPUT_DIR="$output_dir"
+    export GPU_RDMA_C2C_ALLREDUCE_LOG_CAPTURED=1
+    export GPU_RDMA_C2C_ALLREDUCE_INTERNAL_OUTPUT_DIR="$output_dir"
     bash "$0" "${original_args[@]}" 2>&1 | tee "$run_log"
     exit "${PIPESTATUS[0]}"
 fi
@@ -204,7 +219,6 @@ if [[ "$nsys_enabled" == true ]]; then
     [[ ${#existing_nsys_reports[@]} -eq 0 ]] \
         || die "output directory already contains Nsight reports; use a fresh directory: $output_dir"
 fi
-
 export CUDA_VISIBLE_DEVICES="$gpu_list"
 export BENCHMARK_GPU_PCI_BUS_IDS="$gpu_pci_bus_ids_csv"
 export NUMARUN_MEMBIND="${NUMARUN_MEMBIND:-1}"
@@ -231,7 +245,7 @@ unset MASTER_ADDR MASTER_PORT
 
 hca_for_log="${hca:-${NCCL_IB_HCA:-auto}}"
 echo "gpus=$gpu_list pci_bus_ids=$gpu_pci_bus_ids_csv hca=$hca_for_log" >&2
-echo "transport=IB p2p=network-only nvb=disabled pxn=disabled shm=disabled numarun_membind=$NUMARUN_MEMBIND" >&2
+echo "transport=IB p2p=disabled nvb=disabled pxn=disabled shm=disabled numarun_membind=$NUMARUN_MEMBIND" >&2
 echo "control_transport=gloo/lo nccl_bootstrap=lo rdzv=127.0.0.1:0" >&2
 echo "output_dir=$output_dir" >&2
 
@@ -251,17 +265,23 @@ torchrun_command=(
     --nproc-per-node=4
     --no-python
     "${numarun_command[@]}"
+)
+
+torchrun_command+=(
     python
     "$benchmark_script"
     --c2c-buffer-mib "$c2c_buffer_mib"
-    --p2p-buffer-mib "$p2p_buffer_mib"
+    --rdma-buffer-mib "$rdma_buffer_mib"
     --warmup-iterations "$warmup_iterations"
     --copy-iterations "$copy_iterations"
-    --p2p-iterations "$p2p_iterations"
+    --rdma-warmup-seconds "$rdma_warmup_seconds"
+    --rdma-ready-timeout-seconds "$rdma_ready_timeout_seconds"
+    --rdma-alone-iterations "$rdma_alone_iterations"
     --output "${output_dir}/result.json"
 )
 
 launch_command=("${torchrun_command[@]}")
+
 if [[ "$nsys_enabled" == true ]]; then
     launch_command=(
         nsys profile
