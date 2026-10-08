@@ -141,7 +141,7 @@ Python 只在 GPU0 上测量有背景流量时的 `d2h` 和 `h2d` 带宽，结�
 - `--c2c-buffer-mib`、`--warmup-iterations`、`--copy-iterations`：C2C buffer 大小和拷贝次数。
 - `--ib-write-bw`：perftest 可执行文件。
 - `--rdma-size-mib`、`--rdma-qp`、`--rdma-tx-depth`、`--rdma-report-interval`、
-  `--rdma-port`：固定大小的后台 RDMA 流量参数。
+  `--rdma-port`：固定大小的后台 RDMA 流量参数，其中 QP 默认数量为 8。
 - `--nsys`：用 Nsight Systems 采集 GPU0 上的 Python C2C 测量。
 - `--output-dir`：输出目录。
 

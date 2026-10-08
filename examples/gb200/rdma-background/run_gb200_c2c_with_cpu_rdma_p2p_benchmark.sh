@@ -33,7 +33,7 @@ Options:
   --copy-iterations N       Timed C2C copies (default: 20)
   --ib-write-bw PATH        ib_write_bw executable (default: ib_write_bw)
   --rdma-size-mib MIB       Fixed ib_write_bw message size (default: 256)
-  --rdma-qp N               ib_write_bw queue pairs (default: 1)
+  --rdma-qp N               ib_write_bw queue pairs (default: 8)
   --rdma-tx-depth N         ib_write_bw TX depth (default: 128)
   --rdma-report-interval S  Perftest report interval (default: 5)
   --rdma-port PORT          Perftest connection port (default: 18515)
@@ -151,7 +151,7 @@ main() {
     repo_root="$(cd -- "${script_dir}/../../.." && pwd)"
     benchmark_script="${script_dir}/gb200_c2c_with_cpu_rdma_p2p_benchmark.py"
     local c2c_buffer_mib=512 warmup_iterations=5 copy_iterations=20
-    local ib_write_bw=ib_write_bw rdma_size_mib=256 rdma_qp=1 rdma_tx_depth=128
+    local ib_write_bw=ib_write_bw rdma_size_mib=256 rdma_qp=8 rdma_tx_depth=128
     local rdma_report_interval=5 rdma_port=18515 nsys_enabled=false output_dir=""
     while [[ $# -gt 0 ]]; do
         case "$1" in
