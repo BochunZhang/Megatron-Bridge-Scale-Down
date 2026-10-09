@@ -24,6 +24,8 @@ from megatron.bridge.recipes.qwen.gb200.qwen35 import (
     qwen35_text_27b_pretrain_4gpu_gb200_fp8mx_fsdp1_config,
     qwen35_text_35b_a3b_pretrain_4gpu_gb200_bf16_fsdp1_config,
     qwen35_text_35b_a3b_pretrain_4gpu_gb200_fp8mx_fsdp1_config,
+    qwen35_text_122b_a10b_pretrain_4gpu_gb200_bf16_fsdp1_config,
+    qwen35_text_397b_a17b_pretrain_4gpu_gb200_bf16_fsdp1_config,
 )
 
 
@@ -37,4 +39,6 @@ __all__ = [
     "qwen35_text_35b_a3b_pretrain_4gpu_gb200_fp8mx_fsdp1_config",
     "qwen35_text_27b_pretrain_4gpu_gb200_bf16_fsdp1_config",
     "qwen35_text_27b_pretrain_4gpu_gb200_fp8mx_fsdp1_config",
+    "qwen35_text_122b_a10b_pretrain_4gpu_gb200_bf16_fsdp1_config",
+    "qwen35_text_397b_a17b_pretrain_4gpu_gb200_bf16_fsdp1_config",
 ]

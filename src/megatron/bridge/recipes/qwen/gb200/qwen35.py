@@ -29,6 +29,127 @@ from megatron.bridge.training.mixed_precision import bf16_mixed, bf16_with_mxfp8
 _QWEN35_9B_BASE = "Qwen/Qwen3.5-9B-Base"
 _QWEN35_35B_A3B_BASE = "Qwen/Qwen3.5-35B-A3B-Base"
 _QWEN35_27B_BASE = "Qwen/Qwen3.5-27B"
+_QWEN35_122B_A10B_BASE = "Qwen/Qwen3.5-122B-A10B"
+_QWEN35_397B_A17B_BASE = "Qwen/Qwen3.5-397B-A17B"
+
+
+def _qwen35_text_4gpu_gb200_fsdp1_config(
+    hf_path: str,
+    architecture: str,
+    *,
+    is_moe: bool,
+) -> ConfigContainer:
+    """Build a 4-GPU GB200 FSDP1 recipe from the complete HF architecture.
+
+    The caller can override ``model.num_layers`` and ``model.num_moe_experts``
+    for scale-down experiments.  The recipe itself deliberately keeps the
+    layer and expert counts reported by the selected Hugging Face config.
+
+    Args:
+        hf_path: Hugging Face model identifier used to load the text config.
+        architecture: Causal-LM architecture name consumed by ``AutoBridge``.
+        is_moe: Whether to enable the MoE-specific kernels and dispatcher.
+
+    Returns:
+        A mock-data, BF16 Megatron FSDP1 configuration.
+    """
+    cfg = _pretrain_common()
+
+    text_config = AutoConfig.from_pretrained(hf_path).text_config
+    text_config.architectures = [architecture]
+    cfg.model = AutoBridge.from_hf_config(text_config).to_megatron_provider(load_weights=False)
+    cfg.tokenizer.tokenizer_model = hf_path
+    cfg.dataset.seq_length = 4096
+    cfg.dataset.blend = None
+    cfg.dataset.num_workers = 8
+
+    # Four-GPU GB200 topology: one data-parallel group.  EP=1 keeps expert
+    # parameters in the same FSDP group as the dense parameters.
+    cfg.model.tensor_model_parallel_size = 1
+    cfg.model.pipeline_model_parallel_size = 1
+    cfg.model.pipeline_model_parallel_layout = None
+    cfg.model.pipeline_dtype = torch.bfloat16
+    cfg.model.virtual_pipeline_model_parallel_size = None
+    cfg.model.context_parallel_size = 1
+    cfg.model.expert_model_parallel_size = 1
+    cfg.model.expert_tensor_parallel_size = 1
+    cfg.model.sequence_parallel = False
+    cfg.model.seq_length = 4096
+    cfg.model.init_method_std = 0.02
+    cfg.train.global_batch_size = 512
+    cfg.train.micro_batch_size = 1
+
+    cfg.model.transformer_impl = "transformer_engine"
+    cfg.model.bias_activation_fusion = True
+    cfg.model.apply_rope_fusion = True
+    cfg.model.cross_entropy_loss_fusion = True
+    cfg.model.cross_entropy_fusion_impl = "native"
+    if is_moe:
+        cfg.model.moe_router_fusion = True
+        cfg.model.moe_permute_fusion = True
+        cfg.model.moe_grouped_gemm = True
+        cfg.model.moe_token_dispatcher_type = "alltoall"
+        cfg.model.moe_flex_dispatcher_backend = None
+        cfg.model.moe_shared_expert_overlap = False
+        cfg.model.moe_router_force_load_balancing = False
+        cfg.model.moe_router_dtype = "fp32"
+    else:
+        cfg.model.moe_router_fusion = False
+        cfg.model.moe_permute_fusion = False
+        cfg.model.moe_grouped_gemm = False
+
+    cfg.model.recompute_granularity = None
+    cfg.model.recompute_method = None
+    cfg.model.recompute_num_layers = None
+    cfg.model.recompute_modules = None
+    cfg.model.fine_grained_activation_offloading = False
+    cfg.model.offload_modules = None
+
+    cfg.model.cuda_graph_impl = "transformer_engine"
+    cfg.model.cuda_graph_scope = None
+    cfg.model.cuda_graph_modules = ["attn", "moe_router", "moe_preprocess"] if is_moe else ["attn"]
+    cfg.model.cuda_graph_warmup_steps = 3
+    cfg.model.use_te_rng_tracker = True
+    cfg.rng.te_rng_tracker = True
+
+    cfg.optimizer.use_precision_aware_optimizer = False
+    cfg.optimizer.main_grads_dtype = torch.float32
+    cfg.optimizer.main_params_dtype = torch.float32
+    cfg.optimizer.exp_avg_dtype = torch.float32
+    cfg.optimizer.exp_avg_sq_dtype = torch.float32
+    cfg.optimizer.overlap_param_gather_with_optimizer_step = False
+
+    cfg.checkpoint.ckpt_format = "fsdp_dtensor"
+    cfg.checkpoint.load = None
+    cfg.checkpoint.save = None
+    cfg.rerun_state_machine.check_for_nan_in_loss = True
+
+    # Megatron FSDP1 settings.  FSDP3 experiments override the sharding
+    # strategy and overlap flags from the launcher.
+    cfg.ddp.overlap_grad_reduce = False
+    cfg.ddp.overlap_param_gather = False
+    cfg.ddp.check_for_nan_in_grad = True
+    cfg.ddp.use_distributed_optimizer = True
+    cfg.ddp.grad_reduce_in_fp32 = True
+    cfg.ddp.average_in_collective = True
+    cfg.ddp.data_parallel_sharding_strategy = "optim"
+    cfg.dist.use_megatron_fsdp = True
+    cfg.ddp.use_megatron_fsdp = True
+    cfg.ddp.fsdp_double_buffer = True
+    cfg.ddp.megatron_fsdp_max_pool_double_buffer = True
+    cfg.ddp.nccl_ub = False
+    cfg.ddp.fsdp_db_use_persist_buf_on_alloc_fail = True
+    cfg.ddp.num_distributed_optimizer_instances = 1
+
+    cfg.mixed_precision = bf16_mixed()
+    cfg.mixed_precision.grad_reduce_in_fp32 = True
+    cfg.comm_overlap = CommOverlapConfig(
+        tp_comm_overlap=False,
+        overlap_grad_reduce=False,
+        overlap_param_gather=False,
+    )
+    return cfg
+
 
 def qwen35_text_9b_pretrain_8gpu_gb200_bf16_config() -> ConfigContainer:
     """Return a text-only Qwen3.5-9B pretraining config for eight GB200 GPUs."""
@@ -325,104 +446,8 @@ def qwen35_text_35b_a3b_pretrain_4gpu_gb200_fp8mx_fsdp1_config() -> ConfigContai
 
 
 def qwen35_text_27b_pretrain_4gpu_gb200_bf16_fsdp1_config() -> ConfigContainer:
-    """Return a 4-GPU GB200 Qwen3.8 27B dense model FSDP training config.
-
-    The provider is initialized from the Qwen3.8 27B architecture.
-    The recipe intentionally does not load a checkpoint and uses mock data.
-
-    fork from
-    - base config: qwen38_text_35b_a3b_pretrain_4gpu_gb200_bf16_fsdp1_config
-    """
-    cfg = _pretrain_common()
-
-    text_config = AutoConfig.from_pretrained(_QWEN35_27B_BASE).text_config
-    # Set architecture for AutoBridge to select the correct bridge
-    text_config.architectures = ["Qwen3_5ForCausalLM"]
-    cfg.model = AutoBridge.from_hf_config(text_config).to_megatron_provider(load_weights=False)
-    cfg.tokenizer.tokenizer_model = _QWEN35_27B_BASE
-    cfg.dataset.seq_length = 4096
-    cfg.dataset.blend = None  # Declarative mock-data mode.
-    cfg.dataset.num_workers = 8
-
-    # Four-GPU GB200 topology: one data-parallel group.
-    cfg.model.tensor_model_parallel_size = 1
-    cfg.model.pipeline_model_parallel_size = 1
-    cfg.model.pipeline_model_parallel_layout = None
-    cfg.model.pipeline_dtype = torch.bfloat16
-    cfg.model.virtual_pipeline_model_parallel_size = None
-    cfg.model.context_parallel_size = 1
-    cfg.model.expert_model_parallel_size = 1  # Dense model, no MoE
-    cfg.model.expert_tensor_parallel_size = 1
-    cfg.model.sequence_parallel = False
-    cfg.model.seq_length = 4096
-    cfg.model.init_method_std = 0.02
-    cfg.train.global_batch_size = 512
-    cfg.train.micro_batch_size = 1
-
-    cfg.model.transformer_impl = "transformer_engine"
-    cfg.model.bias_activation_fusion = True
-    cfg.model.apply_rope_fusion = True
-
-    # Dense model settings - disable MoE specific settings
-    cfg.model.moe_router_fusion = False
-    cfg.model.moe_permute_fusion = False
-    cfg.model.moe_grouped_gemm = False
-    cfg.model.cross_entropy_loss_fusion = True
-    cfg.model.cross_entropy_fusion_impl = "native"
-
-    # Fine-grained activation offload
-    cfg.model.recompute_granularity = None
-    cfg.model.recompute_method = None
-    cfg.model.recompute_num_layers = None
-    cfg.model.recompute_modules = None
-    cfg.model.fine_grained_activation_offloading = False
-    cfg.model.offload_modules = None
-
-    # CUDA graph settings
-    cfg.model.cuda_graph_impl = "transformer_engine"
-    cfg.model.cuda_graph_scope = None
-    cfg.model.cuda_graph_modules = ["attn"]
-    cfg.model.cuda_graph_warmup_steps = 3
-    cfg.model.use_te_rng_tracker = True
-    cfg.rng.te_rng_tracker = True
-
-    cfg.optimizer.use_precision_aware_optimizer = False
-    cfg.optimizer.main_grads_dtype = torch.float32
-    cfg.optimizer.main_params_dtype = torch.float32
-    cfg.optimizer.exp_avg_dtype = torch.float32
-    cfg.optimizer.exp_avg_sq_dtype = torch.float32
-    cfg.optimizer.overlap_param_gather_with_optimizer_step = False
-
-    cfg.checkpoint.ckpt_format = "fsdp_dtensor"
-    cfg.checkpoint.load = None
-    cfg.checkpoint.save = None
-    cfg.rerun_state_machine.check_for_nan_in_loss = True
-
-    # Megatron FSDP settings
-    cfg.ddp.overlap_grad_reduce = False
-    cfg.ddp.overlap_param_gather = False
-    cfg.ddp.check_for_nan_in_grad = True
-    cfg.ddp.use_distributed_optimizer = True
-    cfg.ddp.grad_reduce_in_fp32 = True
-
-    cfg.ddp.average_in_collective = True
-    cfg.ddp.data_parallel_sharding_strategy = "optim"
-    cfg.ddp.use_megatron_fsdp = True
-    cfg.ddp.fsdp_double_buffer = True
-    cfg.ddp.megatron_fsdp_max_pool_double_buffer = True
-    cfg.ddp.nccl_ub = False
-    cfg.ddp.fsdp_db_use_persist_buf_on_alloc_fail = True
-    cfg.ddp.num_distributed_optimizer_instances = 1
-
-    cfg.mixed_precision = bf16_mixed()
-    cfg.mixed_precision.grad_reduce_in_fp32 = True
-
-    cfg.comm_overlap = CommOverlapConfig(
-        tp_comm_overlap=False,
-        overlap_grad_reduce=False,
-        overlap_param_gather=False,
-    )
-    return cfg
+    """Return a 4-GPU GB200 Qwen3.5 27B dense model FSDP1 config."""
+    return _qwen35_text_4gpu_gb200_fsdp1_config(_QWEN35_27B_BASE, "Qwen3_5ForCausalLM", is_moe=False)
 
 
 def qwen35_text_27b_pretrain_4gpu_gb200_fp8mx_fsdp1_config() -> ConfigContainer:
@@ -437,6 +462,32 @@ def qwen35_text_27b_pretrain_4gpu_gb200_fp8mx_fsdp1_config() -> ConfigContainer:
     cfg.mixed_precision.fp8_param_gather = False
     cfg.mixed_precision.reuse_grad_buf_for_mxfp8_param_ag = False
     return cfg
+
+
+def qwen35_text_122b_a10b_pretrain_4gpu_gb200_bf16_fsdp1_config() -> ConfigContainer:
+    """Return a 4-GPU GB200 Qwen3.5-122B-A10B MoE FSDP1 config.
+
+    The complete Hugging Face layer and expert counts are retained so callers
+    can choose scale-down overrides at launch time.
+    """
+    return _qwen35_text_4gpu_gb200_fsdp1_config(
+        _QWEN35_122B_A10B_BASE,
+        "Qwen3_5MoeForCausalLM",
+        is_moe=True,
+    )
+
+
+def qwen35_text_397b_a17b_pretrain_4gpu_gb200_bf16_fsdp1_config() -> ConfigContainer:
+    """Return a 4-GPU GB200 Qwen3.5-397B-A17B MoE FSDP1 config.
+
+    The complete Hugging Face layer and expert counts are retained so callers
+    can choose scale-down overrides at launch time.
+    """
+    return _qwen35_text_4gpu_gb200_fsdp1_config(
+        _QWEN35_397B_A17B_BASE,
+        "Qwen3_5MoeForCausalLM",
+        is_moe=True,
+    )
 
 
 def qwen35_text_9b_pretrain_4gpu_gb200_bf16_fsdp1_config() -> ConfigContainer:
