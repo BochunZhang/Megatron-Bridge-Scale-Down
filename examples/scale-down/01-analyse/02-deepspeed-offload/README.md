@@ -22,7 +22,7 @@
 
 公共控制变量(两个模型一致,全部 run 固定,均由 `pretrain_experiment.sh` / `pretrain.sh` 统一注入):
 
-- 数据与训练:数据集 `wikitext`,加载比例 1.0%(见 §6.2),`seq_len=4096`,`steps=10`,`warmup_steps=2`,`seed=42`,只统计 warmup 之后的稳定步;
+- 数据与训练:数据集 `wikitext`,加载比例 1.0%(见 §6.2),`seq_len=4096`,`steps=10`,`warmup_steps=1000`,`measure_warmup_steps=2`,`seed=42`; 学习率 warmup 与测量窗口独立配置, profile 可只覆盖前 10 个 step;
 - batch:每 GPU 每 optimizer step 处理 16 个样本,`grad_accum = 16 / micro_batch_size`,保证 mbs 扫描时全局 batch 恒定;
 - optimizer:AdamW(`betas=(0.9, 0.999)`、`eps=1e-8`、`weight_decay=0.01`),学习率默认 `1e-6`(见 §6.1),全局梯度裁剪阈值为 `1.0`;`zero_3` 策略配置 `torch_adam=true`,offload 策略使用 `DeepSpeedCPUAdam`;
 - ZeRO-3:`overlap_comm=true`(可用 `OVERLAP_COMM` 环境变量覆盖),`reduce_bucket_size = sub_group_size = 4e8`,所有 CPU/NVMe 卸载均 `pin_memory=true`;
@@ -162,7 +162,7 @@ bash examples/scale-down/01-analyse/02-deepspeed-offload/pretrain_experiment.sh 
 
 **修正此前的归因**:此前把 non-finite 归因为 DeepSpeed FusedAdam 的实现问题(在 zero-3 中改用 torch AdamW 后错误曾消失),但后来观察到 zero_offload(走 `DeepSpeedCPUAdam`,与 FusedAdam 无关)也出现相同的 non-finite 问题,说明该归因不成立,应从其他角度继续排查。**尚未解释的现象**:观察到有两个异构(CPU+GPU 混合更新)的实验 loss 曲线完全一致,这与"实现不同必然分叉"的预期矛盾,暂时无法解释。
 
-**学习率与梯度裁剪**:早期实验将 learning rate 设为 `1e-3`,对随机初始化的模型来说过大,一次合法的首轮更新也可能直接把权重推到 NaN/Inf,在 offload 路径被测到之前就产生 non-finite。随后将默认值降到 `1e-4`仍不能排除首轮更新不稳定,因此稳定性排查阶段使用 `1e-6` 并启用全局梯度裁剪 `1.0`;学习率仍可用 `--learning_rate` 覆盖。梯度裁剪只能限制有限的大梯度,不能修复已经包含 NaN/Inf 的梯度。该配置用于短跑稳定性测试,正式从头预训练仍应另行配置 warmup 与学习率曲线。
+**学习率与梯度裁剪**:早期实验将 learning rate 设为 `1e-3`,对随机初始化的模型来说过大,一次合法的首轮更新也可能直接把权重推到 NaN/Inf,在 offload 路径被测到之前就产生 non-finite。随后将默认值降到 `1e-4`仍不能排除首轮更新不稳定,因此稳定性排查阶段使用 `1e-6` 并启用全局梯度裁剪 `1.0`;学习率仍可用 `--learning_rate` 覆盖。现在 `pretrain_experiment.sh` 会用 `WarmupLR` 从 `0` 线性升到目标学习率,学习率 warmup 长度由 `--warmup_steps` / `WARMUP_STEPS` 控制,默认 `1000` 个 optimizer step;测量窗口单独由 `--measure_warmup_steps` / `MEASURE_WARMUP_STEPS` 控制。梯度裁剪只能限制有限的大梯度,不能修复已经包含 NaN/Inf 的梯度;正式从头预训练仍应根据总步数调整 warmup 长度与学习率曲线。
 
 ### 6.2 加速测试
 
@@ -196,7 +196,8 @@ bash examples/scale-down/01-analyse/02-deepspeed-offload/pretrain_experiment.sh 
 | NVMe | 保留 swap 数据 | `--keep_nvme_data` / `KEEP_NVME_DATA` | `false` | 调试时设 `true`;全矩阵务必保持默认,否则耗尽磁盘 |
 | 运行环境 | 通信重叠 | `OVERLAP_COMM` | `true` | 写入 `zero_optimization.overlap_comm` |
 | 运行环境 | 训练步数 | `STEPS` | `10` | |
-| 运行环境 | warmup 步数 | `WARMUP_STEPS` | `2` | |
+| 运行环境 | 学习率 warmup 步数 | `--warmup_steps` / `WARMUP_STEPS` | `1000` | DeepSpeed `WarmupLR` 的 optimizer-step 数,可大于短跑或 profile 的总步数 |
+| 运行环境 | 测量 warmup 步数 | `--measure_warmup_steps` / `MEASURE_WARMUP_STEPS` | `2` | 传给 `train.py`,只影响吞吐/显存统计窗口 |
 | 运行环境 | 序列长度 | `SEQ_LEN` | `4096` | |
 | 运行环境 | 数据集 | `DATASET_NAME` | `wikitext` | |
 | 运行环境 | 数据集加载比例(%) | `DATASET_PERCENTAGE` | `1.0` | 从 10.0 降为 1.0,见 §6.2 |

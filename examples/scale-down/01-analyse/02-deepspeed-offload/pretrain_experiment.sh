@@ -93,6 +93,14 @@ NUM_GPUS=4
 # stability/throughput comparison. Keep this low enough to avoid turning the
 # first update into NaN/Inf before the offload path is tested.
 LEARNING_RATE=${LEARNING_RATE:-1e-6}
+# Number of optimizer steps used to linearly warm the learning rate from zero
+# to LEARNING_RATE. This can exceed the short profiling run (which defaults to
+# 10 steps); the scheduler will simply remain in its warmup phase during the
+# profile.
+WARMUP_STEPS=${WARMUP_STEPS:-1000}
+# Number of initial optimizer steps excluded from throughput/memory metrics in
+# train.py. Keep this independent from the learning-rate schedule.
+MEASURE_WARMUP_STEPS=${MEASURE_WARMUP_STEPS:-2}
 # Shrunk layer count; only applied — and only tagged onto result folder names
 # as _<N>layer — when APPLY_MODEL_SHAPE_OVERRIDES=true (see pretrain.sh model
 # shape section). Passed explicitly to pretrain.sh.
@@ -135,6 +143,8 @@ Options use space-separated values where noted:
   --param_positions VALUE
   --per_gpu_batch_size VALUE
   --learning_rate VALUE
+  --warmup_steps VALUE
+  --measure_warmup_steps VALUE
   --num_gpus VALUE
   --num_layers VALUE
   --apply_model_shape_overrides true|false
@@ -155,7 +165,7 @@ EOF
 while [ "$#" -gt 0 ]; do
     case "$1" in
         --models|--micro_batch_sizes|--recompute_combos|--optimizer_strategies|--param_positions|\
-        --per_gpu_batch_size|--learning_rate|--num_gpus|--num_layers|--apply_model_shape_overrides|--moe_num_experts|--autoep_size)
+        --per_gpu_batch_size|--learning_rate|--warmup_steps|--measure_warmup_steps|--num_gpus|--num_layers|--apply_model_shape_overrides|--moe_num_experts|--autoep_size)
             if [ "$#" -lt 2 ]; then
                 echo "Missing value for $1" >&2
                 exit 2
@@ -168,6 +178,8 @@ while [ "$#" -gt 0 ]; do
                 --param_positions) PARAM_POSITIONS=$2 ;;
                 --per_gpu_batch_size) PER_GPU_BATCH_SIZE=$2 ;;
                 --learning_rate) LEARNING_RATE=$2 ;;
+                --warmup_steps) WARMUP_STEPS=$2 ;;
+                --measure_warmup_steps) MEASURE_WARMUP_STEPS=$2 ;;
                 --num_gpus) NUM_GPUS=$2 ;;
                 --num_layers) NUM_LAYERS=$2 ;;
                 --apply_model_shape_overrides) APPLY_MODEL_SHAPE_OVERRIDES=$2 ;;
@@ -238,6 +250,14 @@ fi
 if ! [[ "$LEARNING_RATE" =~ ^[0-9]+([.][0-9]+)?([eE][-+]?[0-9]+)?$ ]] || \
     ! awk -v lr="$LEARNING_RATE" 'BEGIN { exit !(lr + 0 > 0) }'; then
     echo "--learning_rate must be a positive finite decimal or scientific-notation value" >&2
+    exit 2
+fi
+if ! [[ "$WARMUP_STEPS" =~ ^[0-9]+$ ]] || [ "$WARMUP_STEPS" -lt 1 ]; then
+    echo "--warmup_steps must be a positive integer" >&2
+    exit 2
+fi
+if ! [[ "$MEASURE_WARMUP_STEPS" =~ ^[0-9]+$ ]]; then
+    echo "--measure_warmup_steps must be a non-negative integer" >&2
     exit 2
 fi
 if [ "$MOE_NUM_EXPERTS" -ne 64 ]; then
@@ -422,6 +442,15 @@ build_ds_config() {
     "gradient_accumulation_steps": $grad_accum,
     "bf16": { "enabled": true },
     "gradient_clipping": 1.0,
+    "scheduler": {
+        "type": "WarmupLR",
+        "params": {
+            "warmup_min_lr": 0.0,
+            "warmup_max_lr": $LEARNING_RATE,
+            "warmup_num_steps": $WARMUP_STEPS,
+            "warmup_type": "linear"
+        }
+    },
     "optimizer": {
         "type": "AdamW",
         "params": {
@@ -572,6 +601,7 @@ for MODEL in $MODELS; do
                         --num_gpus "$NUM_GPUS"
                         --num_layers "$NUM_LAYERS"
                         --per_gpu_batch_size "$PER_GPU_BATCH_SIZE"
+                        --warmup_steps "$MEASURE_WARMUP_STEPS"
                         --apply_model_shape_overrides "$APPLY_MODEL_SHAPE_OVERRIDES"
                     )
                     if [ "$TRAIN_MODE" = "autoep" ]; then
