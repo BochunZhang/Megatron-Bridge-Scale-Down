@@ -13,7 +13,6 @@
 """Text-only, randomly initialized Qwen3.5 FSDP3 training on mock data."""
 
 import argparse
-import inspect
 import os
 from pathlib import Path
 
@@ -39,7 +38,6 @@ def main() -> None:
         parser.error("sequence length is outside the requested CP matrix")
 
     import torch
-    from megatron.core.transformer.transformer_layer import TransformerLayer
     from transformers import AutoConfig
 
     from megatron.bridge import AutoBridge
@@ -49,8 +47,6 @@ def main() -> None:
     from megatron.bridge.training.mixed_precision import bf16_mixed
     from megatron.bridge.training.pretrain import pretrain
 
-    if args.profile == "nsys" and "layer {self.layer_number}" not in inspect.getsource(TransformerLayer.forward):
-        raise RuntimeError("Apply patches/megatron-layer-nvtx.patch to the active Megatron-LM checkout first")
     rank = int(os.environ["RANK"])
     world = int(os.environ["WORLD_SIZE"])
     if world < 2 or world % args.cp or args.global_batch_size % (args.micro_batch_size * (world // args.cp)):

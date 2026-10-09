@@ -10,7 +10,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Launch the 24 Qwen3.5 FSDP3 communication experiments, one at a time."""
+"""Launch the 72 Qwen3.5 FSDP3 communication experiments at GBS=32, one at a time."""
 
 import argparse
 import json
@@ -18,6 +18,7 @@ import logging
 import os
 import shlex
 import subprocess
+from datetime import datetime
 from pathlib import Path
 
 
@@ -30,6 +31,8 @@ MODELS = {
     "27b": "Qwen/Qwen3.5-27B",
 }
 SEQUENCES = {1: (4096, 8192, 32768, 65536), 4: (4096, 32768, 131072, 262144)}
+MICRO_BATCH_SIZES = (1, 2, 4)
+GLOBAL_BATCH_SIZE = 32
 
 
 def main() -> None:
@@ -43,19 +46,27 @@ def main() -> None:
     parser.add_argument("--node-rank", type=int, default=int(os.environ.get("NODE_RANK", "0")))
     parser.add_argument("--master-addr", default=os.environ.get("MASTER_ADDR"))
     parser.add_argument("--master-port", type=int, default=int(os.environ.get("MASTER_PORT", "29500")))
-    parser.add_argument("--micro-batch-size", type=int, default=1)
-    parser.add_argument("--num-microbatches", type=int, default=1)
+    parser.add_argument(
+        "--micro-batch-size", type=int, choices=MICRO_BATCH_SIZES, help="Select one MBS (default: all)"
+    )
     parser.add_argument("--train-iters", type=int, default=10)
     parser.add_argument("--profile-start", type=int, default=5)
     parser.add_argument("--profile-end", type=int, default=8)
     parser.add_argument("--profile", choices=("nsys", "none"), default="nsys")
     parser.add_argument("--communication-unit-size", type=int, help="FSDP prefetch/RS queue size in elements")
     parser.add_argument("--output-dir", type=Path, default=ROOT / "results/01-analyse/04-fsdp3-comm")
+    parser.add_argument("--run-date", default=datetime.now().strftime("%y%m%d-%H%M%S"), help="Run date: yymmdd-hhmmss")
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args()
-    for key in ("nproc_per_node", "nnodes", "micro_batch_size", "num_microbatches", "train_iters"):
+    for key in ("nproc_per_node", "nnodes", "train_iters"):
         if getattr(args, key) < 1:
             parser.error(f"{key} must be positive")
+    try:
+        run_date = datetime.strptime(args.run_date, "%y%m%d-%H%M%S")
+    except ValueError:
+        parser.error("run-date must use yymmdd-hhmmss")
+    if run_date.strftime("%y%m%d-%H%M%S") != args.run_date:
+        parser.error("run-date must use yymmdd-hhmmss")
     if not 0 <= args.node_rank < args.nnodes:
         parser.error("node-rank must be in [0, nnodes)")
     if args.nnodes > 1 and not args.master_addr:
@@ -66,16 +77,22 @@ def main() -> None:
         parser.error("communication-unit-size must be positive")
     world_size = args.nnodes * args.nproc_per_node
     cases = [
-        (model, cp, seq)
+        (model, cp, seq, mbs)
         for model in MODELS
         for cp, lengths in SEQUENCES.items()
         for seq in lengths
-        if args.model in ("all", model) and args.cp in (None, cp) and args.seq_length in (None, seq)
+        for mbs in MICRO_BATCH_SIZES
+        if args.model in ("all", model)
+        and args.cp in (None, cp)
+        and args.seq_length in (None, seq)
+        and args.micro_batch_size in (None, mbs)
     ]
     if not cases:
         parser.error("no case matches the requested CP/sequence-length matrix")
-    if world_size < 2 or any(world_size % cp for _, cp, _ in cases):
+    if world_size < 2 or any(world_size % cp for _, cp, _, _ in cases):
         parser.error("FSDP needs at least 2 GPUs; world size must be divisible by each selected CP")
+    if any(GLOBAL_BATCH_SIZE % (mbs * (world_size // cp)) for _, cp, _, mbs in cases):
+        parser.error("GBS=32 must be divisible by MBS * (world size / CP) for every selected case")
     env = os.environ.copy()
     env.setdefault("CUDA_DEVICE_MAX_CONNECTIONS", "32")
     env.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
@@ -83,9 +100,13 @@ def main() -> None:
     env["PYTHONPATH"] = os.pathsep.join(
         [str(ROOT / "src"), str(ROOT / "3rdparty/Megatron-LM"), env.get("PYTHONPATH", "")]
     )
-    for model, cp, seq in cases:
-        run_dir = args.output_dir.resolve() / f"{model}-cp{cp}-s{seq}" / f"node{args.node_rank}"
-        gbs = args.micro_batch_size * args.num_microbatches * (world_size // cp)
+    for model, cp, seq, mbs in cases:
+        case_name = (
+            f"model_{model}-fsdp_3-mbs_{mbs}-seq_{seq}-cp_{cp}-gbs_{GLOBAL_BATCH_SIZE}"
+            f"-gpus_{world_size}-profile_{args.profile}-date_{args.run_date}"
+        )
+        run_dir = args.output_dir.resolve() / case_name / f"node{args.node_rank}"
+        num_microbatches = GLOBAL_BATCH_SIZE // (mbs * (world_size // cp))
         command = ["uv", "run", "--no-sync", "python", "-m", "torch.distributed.run"]
         command += [f"--nproc_per_node={args.nproc_per_node}", f"--nnodes={args.nnodes}"]
         if args.nnodes == 1:
@@ -122,9 +143,9 @@ def main() -> None:
             "--seq-length",
             str(seq),
             "--micro-batch-size",
-            str(args.micro_batch_size),
+            str(mbs),
             "--global-batch-size",
-            str(gbs),
+            str(GLOBAL_BATCH_SIZE),
             "--train-iters",
             str(args.train_iters),
             "--profile",
@@ -139,14 +160,16 @@ def main() -> None:
         if args.communication_unit_size is not None:
             command += ["--communication-unit-size", str(args.communication_unit_size)]
         logger.info(
-            "model=%s cp=%d seq=%d layers=8 experts=%s dp=%d fsdp=%d gbs=%d\n%s",
+            "model=%s cp=%d seq=%d mbs=%d layers=8 experts=%s dp=%d fsdp=%d gbs=%d num_microbatches=%d\n%s",
             model,
             cp,
             seq,
+            mbs,
             "dense" if model == "27b" else 64,
             world_size // cp,
             world_size,
-            gbs,
+            GLOBAL_BATCH_SIZE,
+            num_microbatches,
             shlex.join(command),
         )
         if args.dry_run:
@@ -158,7 +181,9 @@ def main() -> None:
             model=MODELS[model],
             cp=cp,
             seq_length=seq,
-            global_batch_size=gbs,
+            micro_batch_size=mbs,
+            global_batch_size=GLOBAL_BATCH_SIZE,
+            num_microbatches=num_microbatches,
             world_size=world_size,
             command=command,
             cuda_device_max_connections=env["CUDA_DEVICE_MAX_CONNECTIONS"],

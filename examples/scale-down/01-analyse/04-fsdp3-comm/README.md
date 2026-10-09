@@ -19,16 +19,18 @@
 | 裁剪后 routed experts / top-k | 64 / 10 | 64 / 8 | dense |
 
 每四层为 `GDN, GDN, GDN, full attention`，共两个周期。MTP 关闭，shared expert 保留。
-每个模型执行以下 8 组，共 **24 次训练**。1k = 1024 tokens，sequence length 是 CP 切分前的全局长度。
+每个模型执行以下 8 组 CP / sequence length 配置，每组遍历 **MBS=1、2、4**，共 **72 次训练**。
+1k = 1024 tokens，sequence length 是 CP 切分前的全局长度。
 
 | CP | sequence length | 每个 CP rank 的 tokens |
 |---|---|---|
 | 1 | 4096, 8192, 32768, 65536 | 4096, 8192, 32768, 65536 |
 | 4 | 4096, 32768, 131072, 262144 | 1024, 8192, 32768, 65536 |
 
-固定 BF16 参数/计算、FP32 主参数/梯度/RS，TP=PP=EP=ETP=1。默认 4 GPUs、MBS=1、每步一个 microbatch。
-`GBS = MBS × num_microbatches × (world_size / CP)`，因此默认 CP=1 时 GBS=4，CP=4 时 GBS=1。
-比较的是固定本地 microbatch 数下的通信覆盖能力，跨 CP 的 GBS 并不相同。
+固定 BF16 参数/计算、FP32 主参数/梯度/RS，TP=PP=EP=ETP=1。默认 4 GPUs，固定 **GBS=32**。
+每步的 microbatch 数自动计算为 `num_microbatches = 32 / (MBS × (world_size / CP))`，必须为正整数。
+默认四卡时，CP=1 的 MBS=1、2、4 分别对应 8、4、2 个 microbatch；CP=4 时分别对应 32、16、8 个。
+因此跨 MBS 和 CP 配置保持相同 GBS，梯度累积次数随配置变化。
 Megatron FSDP 参数在 **DP×CP** 组分片，EP=1 时 expert 的分片组也覆盖全部 GPUs；CP=4、world=4 仍有四卡 AG/RS。
 
 关闭 activation recompute、CPU offload、CUDA graphs，避免它们改变计算量或掩盖逐层时间线。
@@ -39,45 +41,26 @@ Megatron FSDP 参数在 **DP×CP** 组分片，EP=1 时 expert 的分片组也�
 因此本实验不提供无效的 `false` 对照。可用 `--communication-unit-size N` 调整预取/RS 队列容量（单位为参数元素数），
 但这同时影响 AG 和 RS，不能作为单独关闭其中一个 overlap 的实验。默认使用 MCore 自身的容量计算。
 
-## NVTX 补丁
-
-在实际使用的 **Megatron-LM 仓库**中应用 [patches/megatron-layer-nvtx.patch](patches/megatron-layer-nvtx.patch)：
-
-```bash
-# 从 Bridge 仓库根目录执行。MEGATRON_LM_DIR 指向实际的 Megatron-LM checkout。
-git -C "$MEGATRON_LM_DIR" apply --check "$PWD/examples/scale-down/01-analyse/04-fsdp3-comm/patches/megatron-layer-nvtx.patch"
-git -C "$MEGATRON_LM_DIR" apply "$PWD/examples/scale-down/01-analyse/04-fsdp3-comm/patches/megatron-layer-nvtx.patch"
-```
-
-当前工作区的 Megatron-LM 已应用此补丁。补丁仅修改 `TransformerLayer.forward`，复用 MCore 的 NVTX 开关，
-并在 `finally` 中 pop。标注使用 MCore 的 **1-based 全局层号**，即 `layer 1` … `layer 8`。
-包含 GDN 和 full-attention 层；该范围是 CPU forward 调用范围，FSDP pre-forward hook 的 AG 可能在其之前。
-应结合 CUDA stream 和 GPU kernel 看等待/预取，不能把 CPU range 的时长直接当作 GPU 计算时长。
-`train.py` 在 nsys 模式会检查实际导入的 MCore 是否含此标注。
-
 ## 运行
 
 在已有可运行 Qwen3.5 的 Linux/CUDA Bridge 环境执行，需可用的 Transformer Engine、GDN 依赖和 `nsys`。
 仅获取 HF 配置，使用同词表大小的 NullTokenizer，无需下载模型权重。
-所有命令从 Bridge 仓库根目录运行；脚本自身也会定位根目录。
+以下命令从 Bridge 仓库根目录运行；Bash 启动脚本自身也会定位根目录，并自动设置结果目录和运行时间戳。
 
 ```bash
 # 无 GPU、无 HF 网络访问的矩阵检查
-uv run --no-sync python examples/scale-down/01-analyse/04-fsdp3-comm/benchmark_fsdp3.py --dry-run
+bash examples/scale-down/01-analyse/04-fsdp3-comm/benchmark_fsdp3.sh --dry-run
 
-# 全部 24 组，默认每个 rank 均采集 nsys
-uv run --no-sync python examples/scale-down/01-analyse/04-fsdp3-comm/benchmark_fsdp3.py \
-  --output-dir results/01-analyse/04-fsdp3-comm/run01
+# 全部 72 组，默认每个 rank 均采集 nsys
+bash examples/scale-down/01-analyse/04-fsdp3-comm/benchmark_fsdp3.sh
 
-# 单个配置；可使用更大的 GPU 数量，world size 必须整除 CP
-uv run --no-sync python examples/scale-down/01-analyse/04-fsdp3-comm/benchmark_fsdp3.py \
-  --model 397b --cp 4 --seq-length 131072 --nproc-per-node 8 \
-  --output-dir results/01-analyse/04-fsdp3-comm/run02
+# 单个配置；world size 必须是 CP 的整数倍，GBS 必须是 MBS × DP 的整数倍
+bash examples/scale-down/01-analyse/04-fsdp3-comm/benchmark_fsdp3.sh \
+  --model 397b --cp 4 --seq-length 131072 --micro-batch-size 2 --nproc-per-node 8
 
-# 相同配置关闭 profiler 测量干扰，输出目录必须不同
-uv run --no-sync python examples/scale-down/01-analyse/04-fsdp3-comm/benchmark_fsdp3.py \
-  --model 397b --cp 4 --seq-length 131072 --nproc-per-node 8 --profile none \
-  --output-dir results/01-analyse/04-fsdp3-comm/timing01
+# 相同配置关闭 profiler 测量干扰
+bash examples/scale-down/01-analyse/04-fsdp3-comm/benchmark_fsdp3.sh \
+  --model 397b --cp 4 --seq-length 131072 --micro-batch-size 2 --nproc-per-node 8 --profile none
 ```
 
 默认总计 10 步，先执行 5 步 warmup，再采集 3 步（Bridge 内部 step 5、6、7，对应日志 iteration 6–8）。
@@ -87,16 +70,25 @@ uv run --no-sync python examples/scale-down/01-analyse/04-fsdp3-comm/benchmark_f
 
 多节点：在每个节点上分别运行同一命令，设置共同的 `NNODES`、`MASTER_ADDR`、`MASTER_PORT` 和各自的 `NODE_RANK`；
 或使用等价的 CLI 参数。`--nproc-per-node` 指每节点 GPUs。
-启动器不申请集群资源，所有节点必须选择相同矩阵和同一个逻辑输出目录。一个 case 失败后应停止其他节点的作业。
+多节点启动时还需为所有节点设置相同的 `RUN_DATE`（格式为 `yymmdd-hhmmss`），将同一配置的各节点结果归入同一目录；
+单节点运行无需设置，Bash 脚本会自动生成。启动器不申请集群资源，所有节点必须选择相同矩阵。
+一个 case 失败后应停止其他节点的作业。
 没有设置通信网卡、账号、集群路径等环境特定参数。
 
-每组输出在 `<output-dir>/<model>-cp<cp>-s<seq>/node<rank>/`：
+结果自动保存在仓库下的 `results/01-analyse/04-fsdp3-comm/`，无需手动指定存储位置。
+每个配置使用 `{item}_{value}-{item}_{value}` 形式命名，最后追加 `date_{yymmdd-hhmmss}`，例如：
+
+```text
+results/01-analyse/04-fsdp3-comm/model_397b-fsdp_3-mbs_1-seq_4096-cp_1-gbs_32-gpus_4-profile_nsys-date_261009-123456/node0/
+```
+
+目录名中的 `gpus` 是全局 GPU 数。每次 Bash 启动使用一个时间戳，各配置的 `node<rank>/` 目录包含：
 
 - `launch.json`、`config.yaml`、`hf-text-config-rank*.json`：命令、运行配置与实际裁剪后的 HF 配置。
 - `train.log`：训练日志，运行时可另开终端 `tail -f`。
 - `profile-rank*.nsys-rep`、`.sqlite`、`.json`：每个 rank 的原始报告、SQL 数据库和统计。
 
-已有 case 目录会被拒绝，防止混入旧结果。训练或导出失败会报错，重试使用新的输出目录。
+已有 case 目录会被拒绝，防止混入旧结果。训练或导出失败会报错，重新启动会自动使用新的时间戳。
 
 ## SQL 分析与解释
 
@@ -135,6 +127,9 @@ uv run --no-sync python examples/scale-down/01-analyse/04-fsdp3-comm/analyse_nsy
 `communication_kernel_names` 中供检查。分类依赖 kernel 名中的 NCCL + AllGather/ReduceScatter，
 generic/SendRecv kernel 无法仅凭名字判断 collective 或张量归属；CP 等其他通信也可能混入同类 collective。
 需要结合 nsys 的 FSDP ranges、通信 stream、layer ranges 确认归因。
+`layer 1` … `layer 8` 使用 MCore 的 1-based 全局层号，涵盖 GDN 和 full-attention 层。
+这些 NVTX ranges 是 CPU forward 调用范围，FSDP pre-forward hook 的 AG 可能在其之前；
+应结合 CUDA stream 和 GPU kernel 看等待/预取，不能把 CPU range 的时长直接当作 GPU 计算时长。
 缺少 memcpy/memset 表时按没有记录到此类事件处理；若采集时关闭了对应 tracing，空闲率只适用于已记录的活动。
 
 判读时同时查看 `ag_rs_exposed_pct`、overlap 比例和未开启 profiler 时的 iteration time。
@@ -149,6 +144,6 @@ uv run --no-sync python -m pytest --confcutdir=tests/unit_tests/scripts/scale_do
   tests/unit_tests/scripts/scale_down/test_fsdp3_comm.py -q
 ```
 
-覆盖 24 组矩阵、非法配置、嵌套/并发区间、拷贝覆盖、AG/RS 交叠、进程间重复 correlation ID、
-NVTX 字符串两种存储方式、异步 GPU 尾部和 layer forward 异常路径。
+覆盖 72 组矩阵、固定 GBS 与梯度累积次数、非法配置、嵌套/并发区间、拷贝覆盖、AG/RS 交叠、
+进程间重复 correlation ID、NVTX 字符串两种存储方式和异步 GPU 尾部。
 这些是 CPU 验证；实际训练耗时、显存和 overlap 结论需要在 GPU 上运行后填写，当前未提供实测数值。
