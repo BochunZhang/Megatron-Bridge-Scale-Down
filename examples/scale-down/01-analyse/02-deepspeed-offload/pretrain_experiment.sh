@@ -124,6 +124,7 @@ NVME_MAX_IN_CPU=${NVME_MAX_IN_CPU:-0}
 KEEP_NVME_DATA=${KEEP_NVME_DATA:-false}
 PYTHON_BIN=${PYTHON_BIN:-python}
 DRY_RUN=false
+TEST_MODE=false
 PROFILE_MODE=none
 # Nsys capture is intentionally fixed to these training iterations. The
 # profiler starts before step 7 and stops after step 8, so both iterations are
@@ -158,6 +159,7 @@ Options use space-separated values where noted:
   --nvme_max_in_cpu VALUE
   --keep_nvme_data true|false
   --profile nsys
+  --test              Check updated Adam master parameters for NaN/Inf
   --dry_run
 EOF
 }
@@ -212,6 +214,10 @@ while [ "$#" -gt 0 ]; do
             fi
             PROFILE_MODE=$2
             shift 2
+            ;;
+        --test)
+            TEST_MODE=true
+            shift
             ;;
         --dry_run)
             DRY_RUN=true
@@ -604,6 +610,9 @@ for MODEL in $MODELS; do
                         --warmup_steps "$MEASURE_WARMUP_STEPS"
                         --apply_model_shape_overrides "$APPLY_MODEL_SHAPE_OVERRIDES"
                     )
+                    if [ "$TEST_MODE" = "true" ]; then
+                        PRETRAIN_ARGS+=(--test)
+                    fi
                     if [ "$TRAIN_MODE" = "autoep" ]; then
                         PRETRAIN_ARGS+=(--autoep_size "$AUTOEP_SIZE")
                         PRETRAIN_ARGS+=(--override "num_experts=$MOE_NUM_EXPERTS")

@@ -135,6 +135,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--log_interval", type=int, default=1)
     parser.add_argument("--seq_len", type=int, default=128)
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument(
+        "--test",
+        action="store_true",
+        help="Check Adam master parameters for NaN/Inf after each applied optimizer step (adds diagnostic overhead).",
+    )
     parser.add_argument("--dataset_name", default="wikitext")
     parser.add_argument("--dataset_percentage", type=float, default=10.0)
     parser.add_argument("--tokenizer_name", default=None)
@@ -477,6 +482,79 @@ def sync_cuda() -> None:
         torch.cuda.synchronize()
 
 
+@torch.no_grad()
+def check_updated_parameters(state: TrainingState, *, step: int, accum_idx: int) -> None:
+    """Check resident ZeRO-3 master weights after an applied optimizer step.
+
+    Args:
+        state: Training state containing the DeepSpeed engine and rank.
+        step: Zero-based training iteration.
+        accum_idx: Zero-based micro-batch index within the iteration.
+    """
+    # SuperOffload waits for its CPU worker in engine.step(). Finish any CUDA
+    # copies before inspecting the resulting master weights on CPU or GPU.
+    sync_cuda()
+    partitions = state.engine.optimizer.fp32_partitioned_groups_flat
+    local_failure = False
+    chunk_size = 1024 * 1024  # Bound temporary masks even for large subgroups.
+    if not partitions:
+        logger.error("Post-Adam parameter check: rank=%s has no master weight partitions", state.rank)
+        local_failure = True
+    for subgroup_id, parameter in enumerate(partitions):
+        flat = parameter.detach().view(-1)
+        if flat.numel() == 0:
+            # Optimizer NVMe swapping can release these tensors. Parameter
+            # NVMe offload with a CPU optimizer keeps the master weights here.
+            logger.error(
+                "Post-Adam parameter check cannot inspect an empty master partition: "
+                "rank=%s step=%s subgroup=%s; optimizer NVMe swapping is not supported by this check",
+                state.rank,
+                step,
+                subgroup_id,
+            )
+            local_failure = True
+            break
+        for offset in range(0, flat.numel(), chunk_size):
+            chunk = flat[offset : offset + chunk_size]
+            finite = torch.isfinite(chunk)
+            if finite.all().item():
+                continue
+            first_bad = offset + (~finite).nonzero(as_tuple=False)[0, 0].item()
+            logger.error(
+                "Non-finite post-Adam master parameter: rank=%s step=%s micro_step=%s "
+                "optimizer_step=%s subgroup=%s flat_index=%s value=%s dtype=%s device=%s",
+                state.rank,
+                step,
+                accum_idx,
+                state.engine.global_steps,
+                subgroup_id,
+                first_bad,
+                flat[first_bad].item(),
+                flat.dtype,
+                flat.device,
+            )
+            local_failure = True
+            break
+        if local_failure:
+            break
+
+    # Reduce an integer flag, not parameter values; all ranks must stop before
+    # entering the next training collective if any rank finds corrupt weights.
+    failed = torch.tensor(int(local_failure), dtype=torch.int32, device=state.engine.device)
+    torch.distributed.all_reduce(failed, op=torch.distributed.ReduceOp.MAX)
+    if failed.item():
+        logger.error("Post-Adam parameter check failed on at least one rank; stopping at step=%s", step)
+        sys.exit(3)
+    if state.rank == 0:
+        logger.info(
+            "Post-Adam parameter check passed: step=%s micro_step=%s optimizer_step=%s; "
+            "all ranks' master weights are finite",
+            step,
+            accum_idx,
+            state.engine.global_steps,
+        )
+
+
 def load_initial_weights(
     path: str | None,
     model: torch.nn.Module,
@@ -701,6 +779,11 @@ def train(args: argparse.Namespace, state: TrainingState) -> None:
             prof.start()
 
 
+    if args.test and state.rank == 0:
+        logger.warning(
+            "Post-Adam master parameter checks are enabled; iteration timings include diagnostic overhead."
+        )
+
     for step in range(args.steps):
         sync_cuda()
 
@@ -751,6 +834,9 @@ def train(args: argparse.Namespace, state: TrainingState) -> None:
                 profiler_handle.__exit__(None, None, None)
             else:
                 state.engine.step()
+
+            if args.test and state.engine.was_step_applied():
+                check_updated_parameters(state, step=step, accum_idx=accum_idx)
 
         sync_cuda()
         iter_time = time.time() - step_start

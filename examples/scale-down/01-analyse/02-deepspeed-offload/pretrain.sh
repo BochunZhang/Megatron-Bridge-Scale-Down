@@ -7,8 +7,8 @@
 # Usage:
 #   pretrain.sh --test_name <name> --model <model> --ds_config <path> \
 #       --recompute <none|act|act_cpu> --metrics_out <path> \
-#       --mode <autoep|zero3_leaf|dense> [--autoep_size <N>]
-#
+#       --mode <autoep|zero3_leaf|dense> [--autoep_size <N>] [--test]
+#   --test checks updated Adam master parameters for NaN/Inf (disabled by default).
 #   test_name        self-describing test ID (<strategy>__<recompute>__mbs<N>,
 #                    e.g. super_offload_0.9__recompute_act__mbs4), used for logging
 #   model            HF model name or path, e.g. Qwen/Qwen3.5-9B (dense) or
@@ -34,6 +34,7 @@ METRICS_OUT=""
 TRAIN_MODE=""
 AUTOEP_SIZE=""
 EXTRA_OVERRIDES=""
+TEST_MODE=false
 PROFILE_MODE=""
 PROFILE_STEP_START=""
 PROFILE_STEP_END=""
@@ -79,6 +80,10 @@ while [ "$#" -gt 0 ]; do
                 --profile_step_end) PROFILE_STEP_END=$2 ;;
             esac
             shift 2
+            ;;
+        --test)
+            TEST_MODE=true
+            shift
             ;;
         --profile)
             if [ "$#" -lt 2 ]; then
@@ -316,6 +321,9 @@ CMD+=(train.py
     --log_interval "$LOG_INTERVAL"
     --seed "$SEED"
     --metrics_out "$METRICS_OUT")
+if [ "$TEST_MODE" = "true" ]; then
+    CMD+=(--test)
+fi
 if [ "$TRAIN_MODE" = "autoep" ]; then
     CMD+=(--autoep_size "$AUTOEP_SIZE")
 fi
