@@ -483,22 +483,22 @@ def sync_cuda() -> None:
 
 
 @torch.no_grad()
-def check_updated_parameters(state: TrainingState, *, step: int, accum_idx: int) -> None:
-    """Check resident ZeRO-3 master weights after an applied optimizer step.
+def check_master_parameters(state: TrainingState, *, phase: str, step: int, accum_idx: int) -> None:
+    """Check resident ZeRO-3 master weights for non-finite values.
 
     Args:
         state: Training state containing the DeepSpeed engine and rank.
-        step: Zero-based training iteration.
+        phase: Checkpoint label used in diagnostic messages.
+        step: Zero-based training iteration, or ``-1`` before training starts.
         accum_idx: Zero-based micro-batch index within the iteration.
     """
-    # SuperOffload waits for its CPU worker in engine.step(). Finish any CUDA
-    # copies before inspecting the resulting master weights on CPU or GPU.
+    # Finish any CUDA copies before inspecting master weights on CPU or GPU.
     sync_cuda()
     partitions = state.engine.optimizer.fp32_partitioned_groups_flat
     local_failure = False
     chunk_size = 1024 * 1024  # Bound temporary masks even for large subgroups.
     if not partitions:
-        logger.error("Post-Adam parameter check: rank=%s has no master weight partitions", state.rank)
+        logger.error("%s master parameter check: rank=%s has no master weight partitions", phase, state.rank)
         local_failure = True
     for subgroup_id, parameter in enumerate(partitions):
         flat = parameter.detach().view(-1)
@@ -506,8 +506,9 @@ def check_updated_parameters(state: TrainingState, *, step: int, accum_idx: int)
             # Optimizer NVMe swapping can release these tensors. Parameter
             # NVMe offload with a CPU optimizer keeps the master weights here.
             logger.error(
-                "Post-Adam parameter check cannot inspect an empty master partition: "
+                "%s master parameter check cannot inspect an empty master partition: "
                 "rank=%s step=%s subgroup=%s; optimizer NVMe swapping is not supported by this check",
+                phase,
                 state.rank,
                 step,
                 subgroup_id,
@@ -521,8 +522,9 @@ def check_updated_parameters(state: TrainingState, *, step: int, accum_idx: int)
                 continue
             first_bad = offset + (~finite).nonzero(as_tuple=False)[0, 0].item()
             logger.error(
-                "Non-finite post-Adam master parameter: rank=%s step=%s micro_step=%s "
+                "Non-finite %s master parameter: rank=%s step=%s micro_step=%s "
                 "optimizer_step=%s subgroup=%s flat_index=%s value=%s dtype=%s device=%s",
+                phase,
                 state.rank,
                 step,
                 accum_idx,
@@ -543,15 +545,79 @@ def check_updated_parameters(state: TrainingState, *, step: int, accum_idx: int)
     failed = torch.tensor(int(local_failure), dtype=torch.int32, device=state.engine.device)
     torch.distributed.all_reduce(failed, op=torch.distributed.ReduceOp.MAX)
     if failed.item():
-        logger.error("Post-Adam parameter check failed on at least one rank; stopping at step=%s", step)
+        logger.error("%s master parameter check failed on at least one rank; stopping at step=%s", phase, step)
         sys.exit(3)
     if state.rank == 0:
         logger.info(
-            "Post-Adam parameter check passed: step=%s micro_step=%s optimizer_step=%s; "
+            "%s master parameter check passed: step=%s micro_step=%s optimizer_step=%s; "
             "all ranks' master weights are finite",
+            phase,
             step,
             accum_idx,
             state.engine.global_steps,
+        )
+
+
+@torch.no_grad()
+def check_optimizer_gradients(state: TrainingState, *, step: int, accum_idx: int) -> None:
+    """Check the ZeRO-3 master gradients immediately before an optimizer update.
+
+    DeepSpeed copies the reduced gradient partitions into
+    ``fp32_partitioned_groups_flat[i].grad``. This is the gradient buffer that
+    CPU Adam receives; ``model.parameters()`` may have ``grad=None`` after
+    ZeRO-3 has partitioned and released the original backward gradients.
+
+    Args:
+        state: Training state containing the DeepSpeed engine and rank.
+        step: Zero-based training iteration.
+        accum_idx: Zero-based micro-batch index within the iteration.
+    """
+    sync_cuda()
+    partitions = state.engine.optimizer.fp32_partitioned_groups_flat
+    local_failure = False
+    checked_gradients = 0
+    chunk_size = 1024 * 1024
+    for subgroup_id, master_param in enumerate(partitions):
+        grad = master_param.grad
+        if grad is None:
+            continue
+        checked_gradients += grad.numel()
+        flat = grad.detach().view(-1)
+        for offset in range(0, flat.numel(), chunk_size):
+            chunk = flat[offset : offset + chunk_size]
+            finite = torch.isfinite(chunk)
+            if finite.all().item():
+                continue
+            first_bad = offset + (~finite).nonzero(as_tuple=False)[0, 0].item()
+            logger.error(
+                "Non-finite optimizer gradient: rank=%s step=%s micro_step=%s subgroup=%s "
+                "flat_index=%s value=%s dtype=%s device=%s",
+                state.rank,
+                step,
+                accum_idx,
+                subgroup_id,
+                first_bad,
+                flat[first_bad].item(),
+                flat.dtype,
+                flat.device,
+            )
+            local_failure = True
+            break
+        if local_failure:
+            break
+
+    failed = torch.tensor(int(local_failure), dtype=torch.int32, device=state.engine.device)
+    torch.distributed.all_reduce(failed, op=torch.distributed.ReduceOp.MAX)
+    if failed.item():
+        logger.error("Optimizer gradient check failed on at least one rank; stopping at step=%s", step)
+        sys.exit(3)
+    if state.rank == 0:
+        logger.info(
+            "Optimizer gradient check passed: step=%s micro_step=%s checked_elements=%s; "
+            "all checked master gradients are finite",
+            step,
+            accum_idx,
+            checked_gradients,
         )
 
 
@@ -781,8 +847,10 @@ def train(args: argparse.Namespace, state: TrainingState) -> None:
 
     if args.test and state.rank == 0:
         logger.warning(
-            "Post-Adam master parameter checks are enabled; iteration timings include diagnostic overhead."
+            "Adam parameter and gradient checks are enabled; iteration timings include diagnostic overhead."
         )
+    if args.test:
+        check_master_parameters(state, phase="Initial", step=-1, accum_idx=-1)
 
     for step in range(args.steps):
         sync_cuda()
@@ -825,6 +893,9 @@ def train(args: argparse.Namespace, state: TrainingState) -> None:
                 state.engine.backward(loss)
                 profiler_handle.__exit__(None, None, None)
 
+            if args.test and state.engine.is_gradient_accumulation_boundary():
+                check_optimizer_gradients(state, step=step, accum_idx=accum_idx)
+
             msg = f"optimizer_step"
             profiler_handle = torch.autograd.profiler.record_function(msg)
 
@@ -836,7 +907,7 @@ def train(args: argparse.Namespace, state: TrainingState) -> None:
                 state.engine.step()
 
             if args.test and state.engine.was_step_applied():
-                check_updated_parameters(state, step=step, accum_idx=accum_idx)
+                check_master_parameters(state, phase="Post-Adam", step=step, accum_idx=accum_idx)
 
         sync_cuda()
         iter_time = time.time() - step_start
