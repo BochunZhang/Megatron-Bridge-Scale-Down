@@ -110,6 +110,22 @@ bash examples/scale-down/01-analyse/02-deepspeed-offload/pretrain_experiment.sh 
 
 启动前脚本会确认 `nvme_path` 可写、所在文件系统确实挂载自 `nvme_device`,并加载 DeepSpeed `async_io` op,任一预检失败都会直接退出而不产生半截结果。如果只想核对配置,可在上述命令后追加 `--dry_run`。
 
+### 3.5 `--test` 非有限值诊断
+
+在实验命令后追加 `--test` 开启诊断。报告写入每个 run 的 `metrics.csv` 所在目录；未开启时不执行这些检查。
+
+- 训练前检查全部驻留的 FP32 master weight 和 CPU/GPU 模型参数，生成 `non_finite_init_weight.json`、`non_finite_init_param.json`。初始化发现 NaN/Inf 只记录，继续训练。
+- 每轮更新后生成 `non_finite_loss.json`、`non_finite_gradient.json`、`non_finite_main_weight.json`、`non_finite_param.json`。四项检查和报告写入全部完成后，任意 rank 存在异常则所有 rank 以退出码 3 退出。
+- 梯度来自 `fp32_partitioned_groups_flat[subgroup].grad`，在 subgroup 更新后、DeepSpeed 释放梯度前扫描；不会读取 forward/backward 参数的 `.grad`。CPU Adam 的调用或 SuperOffload 的 worker 结果等待已在该扫描点之前完成，额外的 CUDA 同步只负责等待设备计算与拷贝。
+- loss 报告分别记录本轮每个 micro-batch 的本地 loss 和最后一个 micro-batch 经 all-reduce 后的 loss；这些值来自本轮更新前的 forward，不是用更新后参数重新执行 forward 得到的 loss。
+- 模型参数检查覆盖可访问的 `param.data` 和 `param.ds_tensor`。NVMe 中未驻留或仍在传输的分片会列入 `skipped`，不为诊断主动 swap-in。两份驻留副本分别计数，不代表去重后的模型元素数量。
+
+上述无 rank 后缀的 JSON 是全局计数和详情文件索引，`non_finite_<kind>.rank<N>.json` 保存每个 rank 的完整位置、值、计数以及检查覆盖范围。有限时也写报告，计数为零；每轮覆盖上一轮的四份报告，初始化报告保留不变。
+
+异常值以字符串 `NaN`、`+Inf`、`-Inf` 表示。`ranges` 完整记录所有异常 flat index，连续同值的位置压缩为从零开始的 `[start, end)` 区间，不截断。比较初始化与更新后的 master weight 时，使用同一 rank、`subgroup_id` 和 flat index。`parameter_layout` 给出原参数名、`ds_id`、`subgroup_offset`、`parameter_offset`、`valid_numel` 和 `padding_numel`：对于 subgroup 下标 `i`，先定位所在参数分片，再用 `parameter_offset + i - subgroup_offset` 得到原参数下标；若 `i - subgroup_offset >= valid_numel`，该位置属于 padding。padding 仍纳入异常计数和退出判定。
+
+诊断会扫描张量、同步设备并写 JSON，因此开启 `--test` 的吞吐量不能作为正式性能测量结果。
+
 ## 4. 配置维度
 
 | 维度 | 取值 | 对应配置 | 说明 |

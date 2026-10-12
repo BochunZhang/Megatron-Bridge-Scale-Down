@@ -8,7 +8,7 @@
 #   pretrain.sh --test_name <name> --model <model> --ds_config <path> \
 #       --recompute <none|act|act_cpu> --metrics_out <path> \
 #       --mode <autoep|zero3_leaf|dense> [--autoep_size <N>] [--test]
-#   --test checks updated Adam master parameters for NaN/Inf (disabled by default).
+#   --test diagnoses non-finite loss/gradients/weights/params and writes JSON reports (disabled by default).
 #   test_name        self-describing test ID (<strategy>__<recompute>__mbs<N>,
 #                    e.g. super_offload_0.9__recompute_act__mbs4), used for logging
 #   model            HF model name or path, e.g. Qwen/Qwen3.5-9B (dense) or

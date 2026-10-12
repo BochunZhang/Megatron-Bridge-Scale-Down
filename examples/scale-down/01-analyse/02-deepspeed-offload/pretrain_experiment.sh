@@ -159,7 +159,7 @@ Options use space-separated values where noted:
   --nvme_max_in_cpu VALUE
   --keep_nvme_data true|false
   --profile nsys
-  --test              Check updated Adam master parameters for NaN/Inf
+  --test              Diagnose non-finite loss/gradients/weights/params; write JSON reports
   --dry_run
 EOF
 }

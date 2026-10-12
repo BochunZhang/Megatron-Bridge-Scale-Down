@@ -53,6 +53,7 @@ import pickle
 import random
 import sys
 import time
+from collections.abc import Iterator
 from typing import Any, NamedTuple
 
 import numpy as np
@@ -138,7 +139,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--test",
         action="store_true",
-        help="Check Adam master parameters for NaN/Inf after each applied optimizer step (adds diagnostic overhead).",
+        help="Diagnose non-finite loss, master gradients, master weights and resident model parameters; write JSON beside metrics_out.",
     )
     parser.add_argument("--dataset_name", default="wikitext")
     parser.add_argument("--dataset_percentage", type=float, default=10.0)
@@ -483,142 +484,301 @@ def sync_cuda() -> None:
 
 
 @torch.no_grad()
-def check_master_parameters(state: TrainingState, *, phase: str, step: int, accum_idx: int) -> None:
-    """Check resident ZeRO-3 master weights for non-finite values.
-
-    Args:
-        state: Training state containing the DeepSpeed engine and rank.
-        phase: Checkpoint label used in diagnostic messages.
-        step: Zero-based training iteration, or ``-1`` before training starts.
-        accum_idx: Zero-based micro-batch index within the iteration.
-    """
-    # Finish any CUDA copies before inspecting master weights on CPU or GPU.
-    sync_cuda()
-    partitions = state.engine.optimizer.fp32_partitioned_groups_flat
-    local_failure = False
-    chunk_size = 1024 * 1024  # Bound temporary masks even for large subgroups.
-    if not partitions:
-        logger.error("%s master parameter check: rank=%s has no master weight partitions", phase, state.rank)
-        local_failure = True
-    for subgroup_id, parameter in enumerate(partitions):
-        flat = parameter.detach().view(-1)
-        if flat.numel() == 0:
-            # Optimizer NVMe swapping can release these tensors. Parameter
-            # NVMe offload with a CPU optimizer keeps the master weights here.
-            logger.error(
-                "%s master parameter check cannot inspect an empty master partition: "
-                "rank=%s step=%s subgroup=%s; optimizer NVMe swapping is not supported by this check",
-                phase,
-                state.rank,
-                step,
-                subgroup_id,
-            )
-            local_failure = True
-            break
-        for offset in range(0, flat.numel(), chunk_size):
-            chunk = flat[offset : offset + chunk_size]
-            finite = torch.isfinite(chunk)
-            if finite.all().item():
-                continue
-            first_bad = offset + (~finite).nonzero(as_tuple=False)[0, 0].item()
-            logger.error(
-                "Non-finite %s master parameter: rank=%s step=%s micro_step=%s "
-                "optimizer_step=%s subgroup=%s flat_index=%s value=%s dtype=%s device=%s",
-                phase,
-                state.rank,
-                step,
-                accum_idx,
-                state.engine.global_steps,
-                subgroup_id,
-                first_bad,
-                flat[first_bad].item(),
-                flat.dtype,
-                flat.device,
-            )
-            local_failure = True
-            break
-        if local_failure:
-            break
-
-    # Reduce an integer flag, not parameter values; all ranks must stop before
-    # entering the next training collective if any rank finds corrupt weights.
-    failed = torch.tensor(int(local_failure), dtype=torch.int32, device=state.engine.device)
-    torch.distributed.all_reduce(failed, op=torch.distributed.ReduceOp.MAX)
-    if failed.item():
-        logger.error("%s master parameter check failed on at least one rank; stopping at step=%s", phase, step)
-        sys.exit(3)
-    if state.rank == 0:
-        logger.info(
-            "%s master parameter check passed: step=%s micro_step=%s optimizer_step=%s; "
-            "all ranks' master weights are finite",
-            phase,
-            step,
-            accum_idx,
-            state.engine.global_steps,
-        )
-
-
-@torch.no_grad()
-def check_optimizer_gradients(state: TrainingState, *, step: int, accum_idx: int) -> None:
-    """Check the ZeRO-3 master gradients immediately before an optimizer update.
-
-    DeepSpeed copies the reduced gradient partitions into
-    ``fp32_partitioned_groups_flat[i].grad``. This is the gradient buffer that
-    CPU Adam receives; ``model.parameters()`` may have ``grad=None`` after
-    ZeRO-3 has partitioned and released the original backward gradients.
-
-    Args:
-        state: Training state containing the DeepSpeed engine and rank.
-        step: Zero-based training iteration.
-        accum_idx: Zero-based micro-batch index within the iteration.
-    """
-    sync_cuda()
-    partitions = state.engine.optimizer.fp32_partitioned_groups_flat
-    local_failure = False
-    checked_gradients = 0
-    chunk_size = 1024 * 1024
-    for subgroup_id, master_param in enumerate(partitions):
-        grad = master_param.grad
-        if grad is None:
+def _non_finite_tensor_report(tensor: torch.Tensor, *, chunk_size: int = 1024 * 1024) -> dict[str, Any]:
+    """Record every bad flat index, compressing consecutive equal values into ranges."""
+    flat = tensor.detach().reshape(-1)
+    counts = {"NaN": 0, "+Inf": 0, "-Inf": 0}
+    ranges_by_value = {value: [] for value in counts}
+    for offset in range(0, flat.numel(), chunk_size):
+        chunk = flat[offset : offset + chunk_size]
+        if torch.isfinite(chunk).all().item():
             continue
-        checked_gradients += grad.numel()
-        flat = grad.detach().view(-1)
-        for offset in range(0, flat.numel(), chunk_size):
-            chunk = flat[offset : offset + chunk_size]
-            finite = torch.isfinite(chunk)
-            if finite.all().item():
+        for value, predicate in (("NaN", torch.isnan), ("+Inf", torch.isposinf), ("-Inf", torch.isneginf)):
+            indices = predicate(chunk).nonzero(as_tuple=True)[0]
+            counts[value] += indices.numel()
+            if not indices.numel():
                 continue
-            first_bad = offset + (~finite).nonzero(as_tuple=False)[0, 0].item()
-            logger.error(
-                "Non-finite optimizer gradient: rank=%s step=%s micro_step=%s subgroup=%s "
-                "flat_index=%s value=%s dtype=%s device=%s",
-                state.rank,
-                step,
-                accum_idx,
-                subgroup_id,
-                first_bad,
-                flat[first_bad].item(),
-                flat.dtype,
-                flat.device,
-            )
-            local_failure = True
-            break
-        if local_failure:
-            break
+            breaks = (indices[1:] != indices[:-1] + 1).nonzero(as_tuple=True)[0] + 1
+            starts = torch.cat((indices[:1], indices[breaks])).cpu().tolist()
+            ends = torch.cat((indices[breaks - 1] + 1, indices[-1:] + 1)).cpu().tolist()
+            ranges = ranges_by_value[value]
+            for start, end in zip(starts, ends):
+                start, end = offset + start, offset + end
+                if ranges and ranges[-1]["end"] == start:
+                    ranges[-1]["end"] = end
+                else:
+                    ranges.append({"start": start, "end": end, "value": value})
+    return {
+        "shape": list(tensor.shape),
+        "dtype": str(tensor.dtype),
+        "device": str(tensor.device),
+        "numel": tensor.numel(),
+        "counts": counts,
+        "non_finite_count": sum(counts.values()),
+        "ranges": sorted(
+            (item for ranges in ranges_by_value.values() for item in ranges), key=lambda item: item["start"]
+        ),
+    }
 
-    failed = torch.tensor(int(local_failure), dtype=torch.int32, device=state.engine.device)
-    torch.distributed.all_reduce(failed, op=torch.distributed.ReduceOp.MAX)
-    if failed.item():
-        logger.error("Optimizer gradient check failed on at least one rank; stopping at step=%s", step)
-        sys.exit(3)
-    if state.rank == 0:
-        logger.info(
-            "Optimizer gradient check passed: step=%s micro_step=%s checked_elements=%s; "
-            "all checked master gradients are finite",
-            step,
-            accum_idx,
-            checked_gradients,
+
+class _NonFiniteDiagnostics:
+    """Collect local diagnostics without aborting inside an optimizer subgroup."""
+
+    def __init__(self, state: TrainingState, metrics_out: str) -> None:
+        self.state = state
+        self.optimizer = state.engine.optimizer
+        self.output_dir = os.path.dirname(os.path.abspath(metrics_out))
+        self.names = {id(param): name for name, param in state.engine.module.named_parameters()}
+        self.layouts = []
+        for group in self.optimizer.fp16_groups:
+            offset = 0
+            layout = []
+            for param in group:
+                entry = self._param_location(param)
+                entry["subgroup_offset"] = offset
+                layout.append(entry)
+                offset += entry["partition_numel"]
+            self.layouts.append(layout)
+        self.step = -1
+        self.gradient_report = self._new_report("gradient")
+        self.losses = []
+
+    def _param_location(self, param: torch.Tensor) -> dict[str, Any]:
+        numel = int(getattr(param, "ds_numel", param.numel()))
+        partition = getattr(param, "ds_tensor", None)
+        partition_numel = int(partition.ds_numel) if partition is not None else numel
+        partition_rank = self.optimizer._get_param_partition_rank(param) if partition is not None else 0
+        parameter_offset = partition_rank * partition_numel
+        valid_numel = max(0, min(partition_numel, numel - parameter_offset))
+        return {
+            "name": self.names[id(param)],
+            "ds_id": getattr(param, "ds_id", None),
+            "parameter_shape": list(getattr(param, "ds_shape", param.shape)),
+            "parameter_numel": numel,
+            "partition_rank": partition_rank,
+            "partition_numel": partition_numel,
+            "parameter_offset": parameter_offset,
+            "valid_numel": valid_numel,
+            "padding_numel": partition_numel - valid_numel,
+        }
+
+    def _new_report(self, kind: str) -> dict[str, Any]:
+        return {
+            "kind": kind,
+            "rank": self.state.rank,
+            "step": self.step,
+            "optimizer_step": self.state.engine.global_steps,
+            "counts": {"NaN": 0, "+Inf": 0, "-Inf": 0},
+            "non_finite_count": 0,
+            "checked_numel": 0,
+            "tensors": [],
+            "skipped": [],
+            "index_convention": "Zero-based flat indices; ranges are [start, end), without truncation. Counts include padding.",
+        }
+
+    def _add_tensor(self, report: dict[str, Any], tensor: torch.Tensor | None, **location: Any) -> None:
+        if tensor is None or tensor.numel() == 0:
+            report["skipped"].append({**location, "reason": "Tensor is absent or not materialized in CPU/GPU memory"})
+            return
+        entry = {**location, **_non_finite_tensor_report(tensor)}
+        report["tensors"].append(entry)
+        report["checked_numel"] += entry["numel"]
+        report["non_finite_count"] += entry["non_finite_count"]
+        for value, count in entry["counts"].items():
+            report["counts"][value] += count
+        if entry["non_finite_count"]:
+            logger.error(
+                "Non-finite %s: rank=%s step=%s source=%s subgroup=%s name=%s count=%s first=%s",
+                report["kind"],
+                self.state.rank,
+                self.step,
+                location.get("source"),
+                location.get("subgroup_id"),
+                location.get("name"),
+                entry["non_finite_count"],
+                entry["ranges"][0],
+            )
+
+    def _master_report(self, kind: str) -> dict[str, Any]:
+        report = self._new_report(kind)
+        for subgroup_id, master in enumerate(self.optimizer.fp32_partitioned_groups_flat):
+            self._add_tensor(
+                report,
+                master,
+                source="fp32_partitioned_groups_flat",
+                subgroup_id=subgroup_id,
+                parameter_layout=self.layouts[subgroup_id],
+            )
+        return report
+
+    def _param_report(self, kind: str) -> dict[str, Any]:
+        report = self._new_report(kind)
+        for param in self.state.engine.module.parameters():
+            location = self._param_location(param)
+            # An NVMe partition can retain a placeholder/stale data buffer. Its
+            # status, not just numel/device, determines whether it is readable.
+            partition = getattr(param, "ds_tensor", None)
+            if partition is not None:
+                status = getattr(getattr(partition, "status", None), "name", "AVAILABLE")
+                if status == "AVAILABLE":
+                    self._add_tensor(report, partition, source="param.ds_tensor", **location)
+                else:
+                    report["skipped"].append({**location, "source": "param.ds_tensor", "reason": status})
+            status = getattr(getattr(param, "ds_status", None), "name", "AVAILABLE")
+            if status == "AVAILABLE":
+                # A gathered full tensor may coexist with its local partition;
+                # record both copies separately, with their own index origin.
+                self._add_tensor(
+                    report,
+                    param.data,
+                    **{
+                        **location,
+                        "source": "param.data",
+                        "parameter_offset": 0,
+                        "valid_numel": location["parameter_numel"],
+                        "padding_numel": 0,
+                    },
+                )
+            else:
+                report["skipped"].append({**location, "source": "param.data", "reason": status})
+        return report
+
+    def _save_reports(self, reports: list[dict[str, Any]]) -> bool:
+        os.makedirs(self.output_dir, exist_ok=True)
+        local = {}
+        for report in reports:
+            kind = report["kind"]
+            report["optimizer_step"] = self.state.engine.global_steps
+            filename = f"non_finite_{kind}.rank{self.state.rank}.json"
+            with open(os.path.join(self.output_dir, filename), "w", encoding="utf-8") as stream:
+                json.dump(report, stream, indent=2, allow_nan=False)
+                stream.write("\n")
+            local[kind] = {
+                "rank": self.state.rank,
+                "counts": report["counts"],
+                "non_finite_count": report["non_finite_count"],
+                "checked_numel": report["checked_numel"],
+                "skipped_tensors": len(report["skipped"]),
+                "details_file": filename,
+            }
+        # Gather only small summaries: a corrupt multi-billion-parameter tensor
+        # can have far too many isolated bad positions to gather its full JSON.
+        distributed = torch.distributed.is_initialized()
+        ranks = [None] * torch.distributed.get_world_size() if distributed else [local]
+        if distributed:
+            torch.distributed.all_gather_object(ranks, local)
+        failed = False
+        for report in reports:
+            kind = report["kind"]
+            summaries = [rank[kind] for rank in ranks]
+            counts = {value: sum(rank["counts"][value] for rank in summaries) for value in report["counts"]}
+            total = sum(counts.values())
+            failed |= total > 0
+            if self.state.rank == 0:
+                filename = os.path.join(self.output_dir, f"non_finite_{kind}.json")
+                with open(filename, "w", encoding="utf-8") as stream:
+                    json.dump(
+                        {
+                            "kind": kind,
+                            "step": self.step,
+                            "optimizer_step": self.state.engine.global_steps,
+                            "counts": counts,
+                            "non_finite_count": total,
+                            "ranks": summaries,
+                            "count_scope": "Scanned buffers across ranks, including padding and any resident full/partition copies",
+                        },
+                        stream,
+                        indent=2,
+                        allow_nan=False,
+                    )
+                    stream.write("\n")
+                logger.info(
+                    "Non-finite diagnostics: kind=%s step=%s count=%s checked_numel=%s skipped_tensors=%s report=%s",
+                    kind,
+                    self.step,
+                    total,
+                    sum(rank["checked_numel"] for rank in summaries),
+                    sum(rank["skipped_tensors"] for rank in summaries),
+                    filename,
+                )
+        if distributed:
+            torch.distributed.barrier()  # Finish all four reports before any rank exits.
+        return failed
+
+    def check_initial(self) -> None:
+        """Write initial master/model parameter reports and always continue training."""
+        sync_cuda()
+        if self._save_reports([self._master_report("init_weight"), self._param_report("init_param")]):
+            logger.warning(
+                "Initial non-finite values recorded; continuing to the first optimizer update as requested."
+            )
+
+    def begin_step(self, step: int) -> None:
+        """Discard the previous iteration's diagnostics, retaining initialization files."""
+        self.step = step
+        self.gradient_report = self._new_report("gradient")
+        self.losses = []
+
+    @contextlib.contextmanager
+    def capture_optimizer_gradients(self) -> Iterator[None]:
+        """Inspect master.grad after each subgroup update, before DeepSpeed releases it."""
+        original = self.optimizer._release_sub_group
+        had_override = "_release_sub_group" in vars(self.optimizer)
+
+        def release_with_check(sub_group_id: int, timer_names: Any) -> Any:
+            # ZeroOffload's CPU Adam has returned here. SuperOffload has already
+            # joined its worker results before releasing a subgroup. CUDA sync
+            # only waits for the remaining GPU kernels/copies, not CPU workers.
+            sync_cuda()
+            self._add_tensor(
+                self.gradient_report,
+                self.optimizer.fp32_partitioned_groups_flat[sub_group_id].grad,
+                source="fp32_partitioned_groups_flat.grad",
+                subgroup_id=sub_group_id,
+                parameter_layout=self.layouts[sub_group_id],
+                observed_at="after_subgroup_update_before_gradient_release",
+            )
+            return original(sub_group_id, timer_names)
+
+        self.optimizer._release_sub_group = release_with_check
+        try:
+            yield
+        finally:
+            if had_override:
+                self.optimizer._release_sub_group = original
+            else:
+                del self.optimizer._release_sub_group
+
+    def finish_step(self, reduced_loss: float) -> None:
+        """Complete and write all four diagnostics, then exit collectively on any failure."""
+        sync_cuda()
+        loss_report = self._new_report("loss")
+        for accum_idx, loss in enumerate(self.losses):
+            self._add_tensor(loss_report, loss, source="local_loss_before_backward", micro_step=accum_idx)
+        self._add_tensor(
+            loss_report, torch.tensor(reduced_loss, dtype=torch.float64), source="reduced_last_micro_step_loss"
         )
+        captured = {
+            entry["subgroup_id"] for entry in self.gradient_report["tensors"] + self.gradient_report["skipped"]
+        }
+        for subgroup_id, master in enumerate(self.optimizer.fp32_partitioned_groups_flat):
+            if subgroup_id not in captured:
+                # Also diagnose skipped updates (e.g. overflow). A missing buffer
+                # is explicitly reported instead of claiming its gradients passed.
+                self._add_tensor(
+                    self.gradient_report,
+                    master.grad,
+                    source="fp32_partitioned_groups_flat.grad",
+                    subgroup_id=subgroup_id,
+                    parameter_layout=self.layouts[subgroup_id],
+                    observed_at="after_engine_step_without_subgroup_update",
+                )
+        reports = [loss_report, self.gradient_report, self._master_report("main_weight"), self._param_report("param")]
+        if self._save_reports(reports):
+            logger.error(
+                "All step=%s diagnostics written to %s; non-finite values found, stopping.", self.step, self.output_dir
+            )
+            sys.exit(3)
 
 
 def load_initial_weights(
@@ -845,12 +1005,11 @@ def train(args: argparse.Namespace, state: TrainingState) -> None:
             prof.start()
 
 
-    if args.test and state.rank == 0:
-        logger.warning(
-            "Adam parameter and gradient checks are enabled; iteration timings include diagnostic overhead."
-        )
-    if args.test:
-        check_master_parameters(state, phase="Initial", step=-1, accum_idx=-1)
+    diagnostics = _NonFiniteDiagnostics(state, args.metrics_out) if args.test else None
+    if diagnostics is not None:
+        if state.rank == 0:
+            logger.warning("Non-finite diagnostics enabled; iteration timings include diagnostic overhead.")
+        diagnostics.check_initial()
 
     for step in range(args.steps):
         sync_cuda()
@@ -867,6 +1026,8 @@ def train(args: argparse.Namespace, state: TrainingState) -> None:
 
         step_start = time.time()
         last_loss = None
+        if diagnostics is not None:
+            diagnostics.begin_step(step)
 
         for accum_idx in range(args.grad_accum):
             # act+cpu: forward and backward of a step must run inside the same
@@ -885,6 +1046,8 @@ def train(args: argparse.Namespace, state: TrainingState) -> None:
                 )
                 loss = outputs.loss
                 last_loss = loss.detach().clone()
+                if diagnostics is not None:
+                    diagnostics.losses.append(last_loss)
                 profiler_handle.__exit__(None, None, None)
 
                 msg = f"backward_step[{accum_idx}]"
@@ -893,21 +1056,15 @@ def train(args: argparse.Namespace, state: TrainingState) -> None:
                 state.engine.backward(loss)
                 profiler_handle.__exit__(None, None, None)
 
-            if args.test and state.engine.is_gradient_accumulation_boundary():
-                check_optimizer_gradients(state, step=step, accum_idx=accum_idx)
-
-            msg = f"optimizer_step"
-            profiler_handle = torch.autograd.profiler.record_function(msg)
-
-            if accum_idx == args.grad_accum - 1:
-                profiler_handle.__enter__()
-                state.engine.step()
-                profiler_handle.__exit__(None, None, None)
-            else:
-                state.engine.step()
-
-            if args.test and state.engine.was_step_applied():
-                check_master_parameters(state, phase="Post-Adam", step=step, accum_idx=accum_idx)
+            gradient_check = (
+                diagnostics.capture_optimizer_gradients() if diagnostics is not None else contextlib.nullcontext()
+            )
+            with gradient_check:
+                if accum_idx == args.grad_accum - 1:
+                    with torch.autograd.profiler.record_function("optimizer_step"):
+                        state.engine.step()
+                else:
+                    state.engine.step()
 
         sync_cuda()
         iter_time = time.time() - step_start
@@ -916,7 +1073,9 @@ def train(args: argparse.Namespace, state: TrainingState) -> None:
             state.dp_world_size,
             group=state.engine.data_parallel_group,
         )
-        if not math.isfinite(reduced_loss):
+        if diagnostics is not None:
+            diagnostics.finish_step(reduced_loss)
+        elif not math.isfinite(reduced_loss):
             if state.rank == 0:
                 logger.error("Non-finite loss at step %s: loss=%s", step, reduced_loss)
             sys.exit(3)
