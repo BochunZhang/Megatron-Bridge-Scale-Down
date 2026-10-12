@@ -150,7 +150,7 @@ bash examples/scale-down/01-analyse/02-deepspeed-offload/pretrain_experiment.sh 
 | --- | --- | --- |
 | offload 配置出现 NaN loss | GatedDeltaNet 初始化时 `log(0) = -inf`,CPU Adam 把 `-inf` 变成 NaN | 升级 transformers 到 >= 5.16.0 |
 | `param_nvme` + SuperOffload 报错 | SuperOffload 对 NVMe 参数卸载支持不完整 | §3.1 补丁 |
-| MoE + `param_nvme` backward 报 `param N already assigned swap buffer id M` | NVMe 预取未去重,同一参数在一次 `swap_in` 中出现两次 | §3.1 补丁(§6.3) |
+| MoE + `param_nvme` backward 报 `param N already assigned swap buffer id M` | NVMe 预取未去重,同一参数在一次 `swap_in` 中出现两次 | §3.1 补丁(§6.3),已验收 |
 
 ### 6.1 NaN loss:初始化 `-inf` 被 CPU Adam 变成 NaN
 
@@ -201,6 +201,8 @@ uv pip install --no-config --no-deps "transformers==5.12.1" "tokenizers==0.22.2"
 **为什么只有 MoE**:预取窗口按元素数限制为 `2 × numel_in_flight`。dense 每个 Linear 只有一个量级相近的参数,窗口通常只覆盖 1~2 个条目;MoE 层中巨大的 3D expert 张量在 in-flight 时会把窗口撑大,同时 router / shared expert 等小参数和多参数模块(leaf MoE block、`GroupedExperts`)让窗口内条目变多,重复出现的参数就容易同时落入窗口。
 
 **修复**:`patches/zero3_nvme_prefetch_dedup_override.patch` 在收集时按 `ds_id` 去重。参数一旦换入,在释放前对后续所有使用都有效,不改变语义。
+
+**验收**:2026-10-12 在开发机上应用该补丁后,原先报错的 MoE + `param_nvme` 测试已通过。
 
 ## 附录 A:其余配置项
 
