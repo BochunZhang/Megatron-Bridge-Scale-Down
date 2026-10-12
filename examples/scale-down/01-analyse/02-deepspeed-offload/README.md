@@ -28,6 +28,7 @@
 - ZeRO-3:`overlap_comm=true`(可用 `OVERLAP_COMM` 环境变量覆盖),`reduce_bucket_size = sub_group_size = 4e8`,所有 CPU/NVMe 卸载均 `pin_memory=true`;
 - SuperOffload:统一 `cpuadam_cores_perc=0.90`,`pretrain.sh` 检测到 ds_config 含 `super_offload` 时自动为 deepspeed launcher 追加 `--bind_cores_to_rank`;
 - 环境变量:`PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`(act+cpu 的 offload/restore 循环易产生碎片,`train.py` 缺失该项会拒绝启动),`DS_PIN_MEMORY_BACKEND=torch`(不能设为 `native`,否则 side-stream DMA 会 stall),另有 `TORCH_NCCL_AVOID_RECORD_STREAMS=1`、`NCCL_NVLS_ENABLE=0` 等由 `pretrain.sh` 统一导出;
+- 依赖版本:`transformers >= 5.16.0`(连同 `tokenizers >= 0.23.1`)。更早版本随机初始化 Qwen3.5 时可能产生 `-inf` 的 `A_log`,在 offload 配置下会导致 NaN,原因与升级方法见 §6.1;
 - 模型形状:按原生层数运行,`apply_model_shape_overrides` 被强制为 `false`(层数缩减仅保留给 Megatron 对比实验);
 - 观测:`wall_clock_breakdown=true`,用于拆分 fwd / bwd / optimizer step 耗时。
 
@@ -35,17 +36,24 @@
 
 ### 3.1 NVMe 测试补丁的开启与关闭
 
-`param_nvme` 与 SuperOffload 组合会触发 DeepSpeed 的兼容性缺陷(现象与根因见 §6.3),本目录提供一对可逆补丁,针对 DeepSpeed `c7cc64a90` 的 `deepspeed/runtime/superoffload/superoffload_stage3.py`:开启补丁用 `patches/superoffload_nvme_override.patch`(覆盖 SuperOffload 方法,复用 ZeRO-3 父类的 NVMe-safe 实现),关闭补丁用 `patches/superoffload_nvme_recovery.patch`(恢复原实现)。凡是矩阵中包含 `param_nvme` 且 optimizer 策略含 `super_offload_*` 的测试,运行前必须先开启补丁:
+`param_nvme` 与 SuperOffload 组合会触发 DeepSpeed 的兼容性缺陷(现象与根因见 §6.3)。本目录针对 DeepSpeed `c7cc64a90` 提供两个补丁,`apply_superoffload_nvme_patch.sh` 默认按顺序同时应用:
+
+| 补丁 | 修改文件 | 解决的问题 |
+| --- | --- | --- |
+| `patches/superoffload_nvme_override.patch` | `deepspeed/runtime/superoffload/superoffload_stage3.py` | CPU subgroup 的参数位于 NVMe 时没有 fp16 flat buffer,写回时报 `NoneType`;改为复用 ZeRO-3 父类的 NVMe-safe 实现 |
+| `patches/superoffload_nvme_fp32_device_override.patch` | `deepspeed/runtime/zero/stage3.py` | `ratio < 1` 时,GPU subgroup 的参数位于 NVMe 会把 FP32 master 建在 CPU,与 GPU 上的梯度设备不一致,`deepspeed.initialize()` 失败;改为让 FP32 master 跟随 `subgroup_to_device` |
+
+`super_offload_1.0` 只依赖第一个补丁,`ratio < 1` 两个都需要。凡是矩阵中包含 `param_nvme` 且 optimizer 策略含 `super_offload_*` 的测试,运行前必须先开启补丁:
 
 ```bash
-# 开启(应用 override 补丁)
+# 开启(依次应用两个补丁)
 bash examples/scale-down/01-analyse/02-deepspeed-offload/apply_superoffload_nvme_patch.sh
 
-# 关闭(恢复 DeepSpeed 原实现)
+# 关闭(按相反顺序反向应用两个补丁,逐字节恢复 DeepSpeed 原实现)
 bash examples/scale-down/01-analyse/02-deepspeed-offload/apply_superoffload_nvme_patch.sh --recovery
 ```
 
-脚本通过 `PYTHON_BIN` 对应的 Python 环境执行 `importlib.util.find_spec("deepspeed")` 自动定位 DeepSpeed 安装位置,默认使用当前环境的 `python`;如果训练使用另一套虚拟环境,用 `PYTHON_BIN=/path/to/venv/bin/python` 指定即可。打补丁优先使用 `git apply`,对没有 Git 元数据的 `site-packages` 父目录回退到 `patch`;补丁无法干净应用时直接报错,避免覆盖本地修改。应用后需确认训练进程实际导入的 DeepSpeed 路径就是被修改的路径。
+脚本通过 `PYTHON_BIN` 对应的 Python 环境执行 `importlib.util.find_spec("deepspeed")` 自动定位 DeepSpeed 安装位置,默认使用当前环境的 `python`;如果训练使用另一套虚拟环境,用 `PYTHON_BIN=/path/to/venv/bin/python` 指定即可。打补丁优先使用 `git apply`,对没有 Git 元数据的 `site-packages` 父目录回退到 `patch`。脚本先检查全部补丁再修改文件:已处于目标状态的补丁会跳过,所以重复执行是安全的,部分应用的状态也会被补齐;任一补丁既无法应用也不处于目标状态时直接报错,不修改任何文件。`--recovery` 直接反向应用上述两个补丁,不再使用 `patches/*_recovery.patch`:后者恢复出的是"原代码加注释",并非原文件,而且恢复后无法再次应用 override 补丁。应用后需确认训练进程实际导入的 DeepSpeed 路径就是被修改的路径。
 
 ### 3.2 单机串行运行(全部测试)
 
@@ -155,7 +163,7 @@ bash examples/scale-down/01-analyse/02-deepspeed-offload/pretrain_experiment.sh 
 
 | 字段 | 含义 |
 | --- | --- |
-| `step` / `loss` | 训练步与 loss;同 seed 下各组合 step 1 的 loss 应完全一致,step≥2 允许因 Adam 实现差异而分叉(见 §6.1) |
+| `step` / `loss` | 训练步与 loss;同 seed 下 `zero_3`、`zero_offload`、`super_offload_1.0` 前 3 个 step 的 loss 应一致(WarmupLR 使前两次更新 lr = 0,见 §6.1),之后允许因 Adam 实现差异出现微小分叉;`super_offload_0.9 / 0.75 / 0.1` 的 GPU subgroup 不受 warmup 控制,第 2 个 step 起即可能不同 |
 | `iter_time_sec` | 单 step 耗时,取 warmup 后窗口的稳态值 |
 | `global_tokens_per_sec` | 全局吞吐(tokens/s),跨配置比较的主指标 |
 | `gpu_peak_gigabytes` / `cpu_peak_gigabytes` | GPU / CPU 侧峰值内存占用 |
@@ -165,20 +173,76 @@ bash examples/scale-down/01-analyse/02-deepspeed-offload/pretrain_experiment.sh 
 
 ## 6. 实验记录
 
-### 6.1 Adam 实现差异与 non-finite 报错
+### 6.1 non-finite 报错:初始化 `-inf` 被 CPU Adam 变成 NaN
 
-**现象与排查**:部分测试出现 non-finite(NaN/Inf)报错。排查发现,DeepSpeed 初始化完成后第一轮(step 1)各配置的 loss 完全相等,但经过一轮 Adam 更新后,step 2 起的 loss 不再完全相等——各配置实际走的 optimizer 实现不同(GPU `torch.optim.AdamW` / `DeepSpeedCPUAdam` / SuperOffload 的 CPU worker + GPU backup AdamW),Adam 实现差异导致更新后的参数出现数值分歧,并随训练轨迹传播,部分情况下表现为 non-finite 报错。各配置的更新路径如下:
+**结论**:transformers < 5.16 随机初始化 Qwen3.5 时会产生 `-inf` 权重;`DeepSpeedCPUAdam` 的 weight decay 写法会把 `-inf` 变成 NaN,NaN 在下一次 forward 中扩散为 NaN loss。**升级 transformers 到 >= 5.16.0 后问题消失**,环境要求与升级方法见本节末尾。这与 learning rate、梯度路径和 Adam 实现之间的有限值差异都无关。
+
+**现象**(开启 §3.5 的 `--test`):
+
+| 配置 | 初始化(`init_weight` / `init_param`) | 一轮更新后(`main_weight` / `param`) | 结果 |
+| --- | --- | --- | --- |
+| `zero_3` | 1 个 `-inf` / 1 个 `-inf` | 1 个 `-inf` / 5 个 `-inf` | loss 有限,能继续训练(但并不健康,见下文) |
+| `zero_offload` | 1 个 `-inf` / 1 个 `-inf` | 1 个 NaN / 5 个 NaN | 下一轮 loss 为 NaN |
+| `super_offload_1.0` | 1 个 `-inf` / 1 个 `-inf` | 1 个 NaN / 5 个 NaN | 下一轮 loss 为 NaN |
+
+三组的初始化 `-inf` 位置相同(固定 `seed=42`),说明问题在 DeepSpeed 接管之前就已存在。
+
+**原因一:初始化产生 `-inf`**。Qwen3.5 的 GatedDeltaNet 用 `A_log = log(A)`、`A ~ U(0, 16)` 初始化。transformers 5.12.1 ~ 5.15.x 的下界是 `0`,5.16.0 起改为 `uniform_(0.01, 16)`,源码注释为 "Lower bound kept away from 0 so log(A) never becomes -inf"。本实验命中该问题还依赖另外两个条件:
+
+- `AutoModelForCausalLM.from_config` 按 `config.dtype`(Qwen3.5 为 bfloat16)临时设置默认 dtype,所以采样直接在 bf16 上进行;
+- PyTorch 修复 [#175988](https://github.com/pytorch/pytorch/pull/175988) 之前,CPU 上 bf16 的 `uniform_` 只有 8 位尾数,只能取 256 个离散值,取到 `0` 的概率约为 1/256。9B 模型约 24 个线性注意力层 × 32 个 head ≈ 768 个 `A_log` 元素,期望约 3 个 `-inf`,实际取决于 seed。
+
+**原因二:CPU Adam 把 `-inf` 变成 NaN**。`A_log = -inf` 时 `exp(A_log) = 0`,该元素梯度为 0,Adam 的 m、v 和更新项也都为 0。唯一的差别在 decoupled weight decay 的写法:
+
+| 实现 | weight decay 代码 | `param = -inf` 时 |
+| --- | --- | --- |
+| `torch.optim.AdamW`(`zero_3`) | `param.mul_(1 - lr * wd)` | `-inf × 1 = -inf` |
+| `DeepSpeedCPUAdam`(两种 offload,`csrc/adam/cpu_adam_impl.cpp` `Step_1` / `Step_AVX`) | `param += (-lr * wd) * param` | lr = 0 时 `(-0) × (-inf) = NaN`;lr > 0 时 `-inf + inf = NaN` |
+
+两种写法在有限值上数学等价,只是对 `±inf` 结果不同。只要 `weight_decay > 0`,CPU Adam 就会把 `±inf` 变成 NaN。SuperOffload 的 CPU worker 调用的是同一个内核,所以两种 offload 表现一致。可以用一行验证:`p = torch.tensor([-float("inf")]); print(p * (1 - 0.0 * 0.01), p + (-0.0 * 0.01) * p)`,输出 `-inf` 和 `nan`。
+
+**为什么 `zero_3` 没有报错**:`exp(-inf) = 0`,衰减门 `g = 0`,forward 仍为有限值,所以 loss 正常。但这个 head 的 `A_log` 梯度恒为 0,会一直停在 `-inf`,相当于一个永远不会学习的死 head。`zero_3` 只是没有暴露问题,并不健康。
+
+**为什么 `param` 从 1 个变成 5 个**:这是同一个值的多份副本,不是新的溢出。`A_log` 只有 32 个元素,低于 ZeRO-3 的 `stage3_param_persistence_threshold`(默认 `1e5`),属于 persistent 参数。step 结束时 `_post_step` 会把它 all-gather 到 4 个 rank,于是共有属主 rank 的 `param.ds_tensor` 1 份加 4 个 rank 的 `param.data` 各 1 份。初始化检查时 persistent 参数尚未 gather,所以只计到 1 个。master weight 只在属主 rank,始终是 1 个。
+
+**已排除的归因**:
+
+- **Adam 实现差异导致分叉**:不成立。WarmupLR 从 `warmup_min_lr=0` 开始,前两次 optimizer 更新的 lr 严格为 0,任何 Adam 实现都不会改变有限参数,所以 `zero_3`、`zero_offload`、`super_offload_1.0` 前 3 个 step 的 loss 应一致(`super_offload` 部分 offload 配置的例外见下表)。此前观察到的"两个异构实验 loss 曲线完全一致"正是这一效应。
+- **DeepSpeed FusedAdam 实现问题**:不成立。`zero_3` 改用 torch AdamW 后错误消失,原因是 torch AdamW 的 weight decay 写法保留了 `-inf`,而不是 FusedAdam 有 bug。
+- **fp32 → bf16 转换溢出**:不成立。bf16 与 fp32 同为 8 位指数,只有 |x| > 约 3.39e38 才会在转换时溢出;前两步 lr = 0,参数没有变化。
+
+各配置实际走的更新路径如下:
 
 | 配置 | 实际 optimizer | 更新路径 |
 | --- | --- | --- |
 | `zero_3` | `torch.optim.AdamW`(`torch_adam=true`) | GPU 上的 FP32 master partition + torch AdamW |
 | `zero_offload` | `DeepSpeedCPUAdam` | CPU 上的 FP32 master partition + CPUAdam |
 | `super_offload_1.0` | `DeepSpeedCPUAdam` | CPU worker 中更新,全部 subgroup 走 CPU |
-| `super_offload_0.9 / 0.75 / 0.1` | `DeepSpeedCPUAdam` + GPU `torch.optim.AdamW` backup | CPU subgroup 由 CPUAdam 更新,GPU subgroup 由 backup AdamW 更新(其超参从 CpuAdam 的配置派生,可能与 GPU 侧 AdamW 存在细微差异) |
+| `super_offload_0.9 / 0.75 / 0.1` | `DeepSpeedCPUAdam` + GPU `torch.optim.AdamW` backup | CPU subgroup 由 CPUAdam 更新,GPU subgroup 由 backup AdamW 更新。backup 的第一个 param group 在 ZeRO 初始化时按配置 lr 单独创建,不受 WarmupLR 控制,lr 固定为配置值(默认 `1e-6`);CPU subgroup 则从 0 开始 warmup,比较这几组结果时需注意 |
 
-**修正此前的归因**:此前把 non-finite 归因为 DeepSpeed FusedAdam 的实现问题(在 zero-3 中改用 torch AdamW 后错误曾消失),但后来观察到 zero_offload(走 `DeepSpeedCPUAdam`,与 FusedAdam 无关)也出现相同的 non-finite 问题,说明该归因不成立,应从其他角度继续排查。**尚未解释的现象**:观察到有两个异构(CPU+GPU 混合更新)的实验 loss 曲线完全一致,这与"实现不同必然分叉"的预期矛盾,暂时无法解释。
+**环境要求与升级方法**:
 
-**学习率与梯度裁剪**:早期实验将 learning rate 设为 `1e-3`,对随机初始化的模型来说过大,一次合法的首轮更新也可能直接把权重推到 NaN/Inf,在 offload 路径被测到之前就产生 non-finite。随后将默认值降到 `1e-4`仍不能排除首轮更新不稳定,因此稳定性排查阶段使用 `1e-6` 并启用全局梯度裁剪 `1.0`;学习率仍可用 `--learning_rate` 覆盖。现在 `pretrain_experiment.sh` 会用 `WarmupLR` 从 `0` 线性升到目标学习率,学习率 warmup 长度由 `--warmup_steps` / `WARMUP_STEPS` 控制,默认 `1000` 个 optimizer step;测量窗口单独由 `--measure_warmup_steps` / `MEASURE_WARMUP_STEPS` 控制。梯度裁剪只能限制有限的大梯度,不能修复已经包含 NaN/Inf 的梯度;正式从头预训练仍应根据总步数调整 warmup 长度与学习率曲线。
+- 依赖版本:`transformers >= 5.16.0`。transformers 5.16 起要求 `tokenizers >= 0.23.1`,因此两个包必须一起升级,其余依赖(huggingface-hub、safetensors 等)已满足要求,无需改动。
+- megatron-bridge 的 `pyproject.toml` 中 `[tool.uv] override-dependencies` 含 `tokenizers>=0.22.0,<0.23`。在项目目录下执行 `uv pip install` 时 uv 会读取这条 override,即使显式指定 `tokenizers==0.23.3` 也会被改回 0.22.x,需要加 `--no-config` 跳过项目配置。
+- 在实验使用的 venv 中按以下方式升级,只改动这两个包:
+
+```bash
+echo $VIRTUAL_ENV                                    # 确认是实验用的 venv
+uv pip freeze > /tmp/env_before.txt                  # 备份, 便于回滚
+uv pip install --no-config --no-deps --dry-run "transformers==5.17.0" "tokenizers==0.23.3"
+uv pip install --no-config --no-deps "transformers==5.17.0" "tokenizers==0.23.3"
+uv pip check --no-config
+uv pip freeze | diff /tmp/env_before.txt -           # 应只有 transformers 与 tokenizers 两行变化
+
+# 确认 A_log 初始化已修复
+grep -n "uniform_(0.01, 16)" "$(python -c 'import transformers, os; print(os.path.dirname(transformers.__file__))')/models/qwen3_5/modeling_qwen3_5.py"
+```
+
+- 回滚:`uv pip install --no-config --no-deps "transformers==5.12.1" "tokenizers==0.22.2"`。
+- 升级后不要在 megatron-bridge 目录下执行 `uv sync` 或不带 `--no-sync` 的 `uv run`,否则会按 `pyproject.toml`(`transformers<=5.12.1`、`tokenizers<0.23`)降回旧版本。`pretrain.sh` 直接调用已激活 venv 中的 `python` / `deepspeed`,不受影响。
+- `pyproject.toml` 中 tokenizers 上限是为了规避 CLIPTokenizer 的兼容问题(`RobertaProcessing` 的 `cls` 参数改名),本实验只使用 Qwen3.5 tokenizer,不涉及该问题。
+
+**学习率与梯度裁剪**:早期实验将 learning rate 设为 `1e-3`,对随机初始化的模型来说过大,一次合法的首轮更新也可能直接把权重推到 NaN/Inf。稳定性排查阶段因此使用 `1e-6` 并启用全局梯度裁剪 `1.0`;学习率仍可用 `--learning_rate` 覆盖。现在 `pretrain_experiment.sh` 会用 `WarmupLR` 从 `0` 线性升到目标学习率,学习率 warmup 长度由 `--warmup_steps` / `WARMUP_STEPS` 控制,默认 `1000` 个 optimizer step;测量窗口单独由 `--measure_warmup_steps` / `MEASURE_WARMUP_STEPS` 控制。注意:bf16 下 DeepSpeed 不做 overflow 检查;grad norm 为 NaN/Inf 时会被替换为 `-1`,裁剪系数被 clamp 为 1,相当于不裁剪。因此梯度裁剪只能限制有限的大梯度,无法拦截 NaN/Inf,也无法修复已经是 `-inf` 的权重。正式从头预训练仍应根据总步数调整 warmup 长度与学习率曲线。
 
 ### 6.2 加速测试
 
@@ -188,7 +252,7 @@ bash examples/scale-down/01-analyse/02-deepspeed-offload/pretrain_experiment.sh 
 
 **buffer slot 不足**:NVMe 参数卸载配置 `buffer_count = 15` 时会出现 buffer slot 不足的报错,该值不可下调,脚本默认 `NVME_BUFFER_COUNT=16`;同时默认 `buffer_size=4e8` 用于容纳当前 4-GPU Qwen3.5 矩阵的最大单参数分片,改变 GPU 数或模型后应通过 `--nvme_buffer_size` / `--nvme_buffer_count` 重新校准。
 
-**NVMe 与 SuperOffload 不兼容**:参数位置和 optimizer 主参数位置是两个独立维度,`offload_param.device="nvme"` 只决定低精度 parameter partition 的驻留位置,而 SuperOffload 的 `subgroup_to_device` 只会取 CPU 或 GPU、不会取 NVMe。启用 NVMe 参数卸载后,DeepSpeed 只为不超过 `max_in_cpu` 的参数建立 CPU flat buffer,超过预算的 subgroup 其 `fp16_partitioned_groups_flat[sub_group_id]` 为 `None`(数据实际驻留 NVMe,需由 swapper 按需换入换出),`max_in_cpu=0` 时大多数 subgroup 为 `None` 是预期行为。问题在于 SuperOffload Stage-3 的重载函数会直接把 main-weight 复制到 model-weight,并按 `subgroup_to_device` 判断 CPU/GPU 后无条件访问 `.data`,不会像 ZeRO-3 父类那样在 flat buffer 为 `None` 时走 `_partitioned_params_swap_out()`,于是在"参数位于 NVMe、optimizer subgroup 位于 CPU"的组合下触发 `AttributeError: 'NoneType' object has no attribute 'data'`。修复方式是增加一个 patch,让 SuperOffload 按照父类 ZeRO-3 / ZeRO-Offload 的 NVMe-safe 配置路径执行,即 §3.1 的 `patches/superoffload_nvme_override.patch`,默认应在所有含 `param_nvme + super_offload_*` 的测试前应用。
+**NVMe 与 SuperOffload 不兼容**:参数位置和 optimizer 主参数位置是两个独立维度,`offload_param.device="nvme"` 只决定低精度 parameter partition 的驻留位置,而 SuperOffload 的 `subgroup_to_device` 只会取 CPU 或 GPU、不会取 NVMe。启用 NVMe 参数卸载后,DeepSpeed 只为不超过 `max_in_cpu` 的参数建立 CPU flat buffer,超过预算的 subgroup 其 `fp16_partitioned_groups_flat[sub_group_id]` 为 `None`(数据实际驻留 NVMe,需由 swapper 按需换入换出),`max_in_cpu=0` 时大多数 subgroup 为 `None` 是预期行为。问题在于 SuperOffload Stage-3 的重载函数会直接把 main-weight 复制到 model-weight,并按 `subgroup_to_device` 判断 CPU/GPU 后无条件访问 `.data`,不会像 ZeRO-3 父类那样在 flat buffer 为 `None` 时走 `_partitioned_params_swap_out()`,于是在"参数位于 NVMe、optimizer subgroup 位于 CPU"的组合下触发 `AttributeError: 'NoneType' object has no attribute 'data'`。修复方式是增加一个 patch,让 SuperOffload 按照父类 ZeRO-3 / ZeRO-Offload 的 NVMe-safe 配置路径执行,即 §3.1 的 `patches/superoffload_nvme_override.patch`。此外,`ratio < 1` 时 GPU subgroup 若参数位于 NVMe,`stage3.py` 会把 FP32 master 建在 `self.device`(CPU)上,而梯度 buffer 按 `subgroup_to_device` 放在 GPU,PyTorch 赋值 `.grad` 时报 `attempting to assign a gradient with device type 'cuda' to a tensor with device type 'cpu'`;`patches/superoffload_nvme_fp32_device_override.patch` 让 FP32 master 跟随 subgroup 设备。两个补丁由 §3.1 的脚本一起应用,应在所有含 `param_nvme + super_offload_*` 的测试前开启。注意 subgroup 按 `i >= int((1 - ratio) * n)` 划为 CPU:9B 模型每个 rank 只有约 6~7 个 subgroup(`sub_group_size=4e8`),`ratio=0.9` 时 `int(0.1 * n) = 0`,实际全部在 CPU,与 `1.0` 等价;以运行时的 `engine.optimizer.subgroup_to_device` 为准。
 
 ## 附录 A:其余配置项
 

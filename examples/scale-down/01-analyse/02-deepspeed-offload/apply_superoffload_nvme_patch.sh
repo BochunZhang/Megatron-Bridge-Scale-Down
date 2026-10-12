@@ -19,13 +19,30 @@ SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 PYTHON_BIN=${PYTHON_BIN:-python}
 PATCH_MODE=override
 
+# Both patches are required for param_nvme + super_offload_*:
+# - superoffload_nvme_override.patch: CPU subgroups whose parameters live on
+#   NVMe have no fp16 flat buffer; reuse the ZeRO-3 parent swap-out path.
+# - superoffload_nvme_fp32_device_override.patch: with ratio < 1, GPU subgroups
+#   whose parameters live on NVMe must create their FP32 master on the GPU.
+# Recovery reverse-applies the same patches, restoring the original DeepSpeed
+# source byte for byte. Recovery runs in the opposite order.
+PATCH_FILES=(
+    "$SCRIPT_DIR/patches/superoffload_nvme_override.patch"
+    "$SCRIPT_DIR/patches/superoffload_nvme_fp32_device_override.patch"
+)
+
 usage() {
     cat <<'EOF'
 Usage: apply_superoffload_nvme_patch.sh [--recovery]
 
-Apply the NVMe-safe SuperOffload Stage-3 patch by default. Use --recovery to
-restore the original SuperOffload implementation. The DeepSpeed location is
-resolved from the Python interpreter selected by PYTHON_BIN.
+Apply both NVMe-safe SuperOffload patches by default:
+  patches/superoffload_nvme_override.patch
+  patches/superoffload_nvme_fp32_device_override.patch
+Use --recovery to reverse-apply them and restore the original DeepSpeed code.
+
+The DeepSpeed location is resolved from the Python interpreter selected by
+PYTHON_BIN. Patches already in the requested state are skipped; if any patch
+cannot be applied or reversed cleanly, nothing is modified.
 EOF
 }
 
@@ -73,32 +90,82 @@ PY
     die "cannot locate DeepSpeed with $PYTHON_BIN"
 fi
 
-TARGET_FILE="$DEEPSPEED_DIR/deepspeed/runtime/superoffload/superoffload_stage3.py"
-[[ -f "$TARGET_FILE" ]] || die "DeepSpeed source file not found: $TARGET_FILE"
-
-case "$PATCH_MODE" in
-    override)
-        PATCH_FILE="$SCRIPT_DIR/patches/superoffload_nvme_override.patch"
-        ;;
-    recovery)
-        PATCH_FILE="$SCRIPT_DIR/patches/superoffload_nvme_recovery.patch"
-        ;;
-    *)
-        die "unsupported patch mode: $PATCH_MODE"
-        ;;
-esac
-[[ -f "$PATCH_FILE" ]] || die "patch file not found: $PATCH_FILE"
+for patch_file in "${PATCH_FILES[@]}"; do
+    [[ -f "$patch_file" ]] || die "patch file not found: $patch_file"
+done
+for target in deepspeed/runtime/superoffload/superoffload_stage3.py deepspeed/runtime/zero/stage3.py; do
+    [[ -f "$DEEPSPEED_DIR/$target" ]] || die "DeepSpeed source file not found: $DEEPSPEED_DIR/$target"
+done
 
 if git -C "$DEEPSPEED_DIR" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
-    if ! git -C "$DEEPSPEED_DIR" apply --check "$PATCH_FILE"; then
-        die "patch does not apply cleanly; inspect local changes and DeepSpeed version"
-    fi
-    git -C "$DEEPSPEED_DIR" apply "$PATCH_FILE"
+    USE_GIT=true
 else
+    USE_GIT=false
     command -v patch >/dev/null 2>&1 || die "git or patch is required"
-    patch --dry-run --batch --forward -p1 -d "$DEEPSPEED_DIR" < "$PATCH_FILE" >/dev/null \
-        || die "patch does not apply cleanly; inspect local changes and DeepSpeed version"
-    patch --batch --forward -p1 -d "$DEEPSPEED_DIR" < "$PATCH_FILE"
 fi
 
-echo "DeepSpeed SuperOffload ${PATCH_MODE} patch applied: $TARGET_FILE"
+# run_patch <forward|reverse> <check|apply> <patch_file>
+run_patch() {
+    local direction=$1
+    local action=$2
+    local patch_file=$3
+    local reverse_args=()
+    if [[ "$direction" == reverse ]]; then
+        reverse_args=(-R)
+    else
+        # patch(1): refuse to treat an already-applied patch as a reversed one.
+        [[ "$USE_GIT" == true ]] || reverse_args=(--forward)
+    fi
+
+    if [[ "$USE_GIT" == true ]]; then
+        local check_args=()
+        [[ "$action" == check ]] && check_args=(--check)
+        git -C "$DEEPSPEED_DIR" apply ${check_args[@]+"${check_args[@]}"} ${reverse_args[@]+"${reverse_args[@]}"} "$patch_file"
+    else
+        local dry_run_args=()
+        [[ "$action" == check ]] && dry_run_args=(--dry-run)
+        # --force: never auto-reverse a patch that "looks reversed".
+        patch ${dry_run_args[@]+"${dry_run_args[@]}"} --force --silent ${reverse_args[@]+"${reverse_args[@]}"} -p1 -d "$DEEPSPEED_DIR" < "$patch_file"
+    fi
+}
+
+if [[ "$PATCH_MODE" == override ]]; then
+    wanted=forward
+    done_state=reverse
+    ordered_patches=("${PATCH_FILES[@]}")
+else
+    wanted=reverse
+    done_state=forward
+    ordered_patches=()
+    for ((i = ${#PATCH_FILES[@]} - 1; i >= 0; i--)); do
+        ordered_patches+=("${PATCH_FILES[i]}")
+    done
+fi
+
+# Phase 1: check every patch before touching any file.
+pending=()
+for patch_file in "${ordered_patches[@]}"; do
+    name=$(basename "$patch_file")
+    if run_patch "$wanted" check "$patch_file" >/dev/null 2>&1; then
+        pending+=("$patch_file")
+    elif run_patch "$done_state" check "$patch_file" >/dev/null 2>&1; then
+        echo "skip: $name is already in ${PATCH_MODE} state"
+    else
+        die "$name cannot be applied in ${PATCH_MODE} mode; inspect local changes and DeepSpeed version ($DEEPSPEED_DIR)"
+    fi
+done
+
+# Phase 2: apply; undo already-applied steps if a later one fails.
+applied=()
+for patch_file in ${pending[@]+"${pending[@]}"}; do
+    if ! run_patch "$wanted" apply "$patch_file"; then
+        for ((i = ${#applied[@]} - 1; i >= 0; i--)); do
+            run_patch "$done_state" apply "${applied[i]}" || true
+        done
+        die "failed to apply $(basename "$patch_file") in ${PATCH_MODE} mode; earlier steps were rolled back"
+    fi
+    applied+=("$patch_file")
+    echo "${PATCH_MODE}: $(basename "$patch_file")"
+done
+
+echo "DeepSpeed SuperOffload NVMe patches are in ${PATCH_MODE} state: $DEEPSPEED_DIR"
