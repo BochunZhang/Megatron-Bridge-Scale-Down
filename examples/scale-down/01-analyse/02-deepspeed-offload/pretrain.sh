@@ -161,7 +161,7 @@ BIND_CORES_TO_RANK=${BIND_CORES_TO_RANK:-auto}   # auto | true | false
 # train.py refuses to start without expandable_segments (ZeRO-3 + act+cpu
 # offload/restore cycles fragment the default allocator).
 
-# README §3.1: keep the default torch pinned-memory backend; native (mlock,
+# README §2: keep the default torch pinned-memory backend; native (mlock,
 # no cudaHostRegister) stalls side-stream DMA in act+cpu.
 export DS_PIN_MEMORY_BACKEND=${DS_PIN_MEMORY_BACKEND:-torch}
 
@@ -245,7 +245,7 @@ GLOBAL_BATCH_SIZE=$((MICRO_BATCH_SIZE * GRAD_ACCUM * NUM_GPUS))
 # --override KEY=VALUE options; e.g. --override num_experts=64 for
 # Qwen3.5-35B-A3B.
 # ---------------------------------------------------------------------------
-# Recompute axis (README §3.1): none | act | act+cpu
+# Recompute axis (README §4): none | act | act+cpu
 # ---------------------------------------------------------------------------
 case "$RECOMPUTE" in
     none)    ;;
