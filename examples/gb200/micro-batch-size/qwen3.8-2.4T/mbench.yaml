@@ -1,0 +1,80 @@
+# Qwen3.8 2.4T single-GPU module benchmark (mbench).
+#
+# `model` is passed verbatim to megatron.bridge GPTModelProvider, so every module
+# is built by the same Megatron spec functions training uses
+# (hybrid GatedDeltaNet / gated attention decoder, TE linears, TEGroupedMLP).
+# Parallel sizes are forced to 1 by the runner; `formal_expert_parallel_size`
+# only determines how many routed experts (and tokens) one EP rank holds.
+model:
+  transformer_impl: transformer_engine
+  num_layers: 92                       # 69 GatedDeltaNet + 23 gated attention (linear_attention_freq=4)
+  hidden_size: 8192
+  vocab_size: 248320
+  share_embeddings_and_output_weights: false
+  normalization: RMSNorm
+  layernorm_epsilon: 1.0e-6
+  layernorm_zero_centered_gamma: true
+  activation_func: silu
+  gated_linear_unit: true
+  add_bias_linear: false
+  add_qkv_bias: false
+  hidden_dropout: 0.0
+  attention_dropout: 0.0
+  init_method_std: 0.02
+  bias_activation_fusion: true
+  gradient_accumulation_fusion: true
+
+  # Gated (softmax) attention layers.
+  num_attention_heads: 64
+  num_query_groups: 4
+  kv_channels: 256
+  qk_layernorm: true
+  attention_output_gate: true
+  attention_softmax_in_fp32: true
+  attention_backend: auto              # AttnBackend name: auto | fused | flash | unfused | local
+  position_embedding_type: rope
+  rotary_percent: 0.25
+  rotary_base: 10000000
+  apply_rope_fusion: true
+
+  # GatedDeltaNet layers.
+  experimental_attention_variant: gated_delta_net
+  linear_attention_freq: 4
+  linear_conv_kernel_dim: 4
+  linear_num_key_heads: 16
+  linear_num_value_heads: 128
+  linear_key_head_dim: 128
+  linear_value_head_dim: 128
+
+  # MoE (every layer).
+  num_moe_experts: 512
+  moe_router_topk: 10
+  moe_ffn_hidden_size: 2048
+  moe_shared_expert_intermediate_size: 2048
+  moe_shared_expert_gate: true
+  moe_grouped_gemm: true
+  moe_router_dtype: fp32
+  moe_router_fusion: true
+  moe_router_pre_softmax: false
+  moe_router_load_balancing_type: global_aux_loss
+  moe_aux_loss_coeff: 0.001
+  moe_token_dispatcher_type: alltoall
+  moe_permute_fusion: true
+
+benchmark:
+  sequence_length: 4096
+  micro_batch_sizes: [1, 2, 4, 8]
+  dtype: bf16
+  modes: [fwd, fwdbwd]
+  formal_expert_parallel_size: 64      # 512 / 64 = 8 local experts per rank
+  expert_routings:
+    - {name: uniform}                  # every expert receives tokens * topk * EP / num_experts rows
+    - {name: multinomial, seed: 2026}  # uniform-probability multinomial sample; natural imbalance
+  seed: 2026
+
+timing:
+  pre_run_iters: 1        # ungated, untimed: autotuning / lazy init / allocator warmup (needs host syncs)
+  warmup_iters: 3         # gated, untimed, at the start of every round
+  profile_iters: 10       # timed iterations per case
+  max_iters_per_round: 13 # warmup + profile in one gated round; halved if the launch queue fills
+  gate_timeout_s: 20      # watchdog release; a fired round is discarded
