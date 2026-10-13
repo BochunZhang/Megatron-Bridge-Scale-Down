@@ -31,11 +31,16 @@ usage() {
 Usage: run_pretrain.sh [OPTIONS]
 
 Trains one configuration and writes results under
-<results-root>/<model>/<test-name>/<run-time>/.
+<results-root>/<experiment>/<model>-<model-type>/<test-name>/<run-time>/.
 
 Required:
     --model <id>                 Megatron model id, e.g. qwen35_text_35b_a3b
                                  or deepseek_v3.
+    --experiment <name>          Comparison this run belongs to; first directory
+                                 level under --results-root, e.g.
+                                 4gpu_expert_activation_offload_blocking.
+    --model-type <dense|expert>  Which side of the dense/expert comparison this
+                                 run belongs to; part of the result path.
     --run-name <name>            Run name, must start with "baseline" or
                                  "offload" so the analyser can pair cases.
     --offload <true|false>       Enable fine-grained activation offloading.
@@ -48,13 +53,19 @@ Offload options:
 Scale and parallelism:
     --gpu <4|16|32>              Total GPUs. GB200 uses four per node, so 16 and
                                  32 mean four and eight nodes (default: 4).
+                                 Multi-node runs read MASTER_ADDR, MASTER_PORT,
+                                 WORLD_SIZE (nodes) and RANK (node rank) from
+                                 the DLC environment.
+    --master-port <port>         Rendezvous port for this run (default:
+                                 MASTER_PORT + 1; MASTER_PORT itself serves the
+                                 batch-id exchange).
     --pp <n>                     Pipeline parallel size (default: 1).
     --ep <n>                     Expert parallel size (default: 1).
     --dispatcher <name>          default | alltoall | hybridep.
     --hybridep-num-sms <n>       Communication SMs for HybridEP (default: 32).
-    --sync-with-sm <true|false>  Read HybridEP per-expert token counts with an SM
-                                 copy and a host spin-wait instead of syncing the
-                                 compute stream (default: false).
+    --sync-with-sm <true|false>  Read the HybridEP padded token count with an SM
+                                 copy and a host spin-wait instead of .item()
+                                 (default: false). Only valid with hybridep.
     --sharding <fsdp1|none>      fsdp1 keeps the recipe's Megatron-FSDP optimizer
                                  sharding; none disables FSDP for a plain
                                  PP+EP+DP layout (default: fsdp1).
@@ -78,13 +89,17 @@ Profiling and output:
     --profile-step-start <n>     First profiled step (default: 7).
     --profile-step-end <n>       Last profiled step (default: 8).
     --results-root <path>        Result tree root.
-    --run-time <id>              Batch id; must be identical on every DLC node.
+    --run-time <id>              Batch id. When omitted on a multi-node run, node 0
+                                 generates it and shares it with every node so all
+                                 nodes write under the master's result directory.
     --dry-run                    Print the resolved run without launching.
     -h, --help                   Show this help.
 EOF
 }
 
 MODEL=""
+MODEL_TYPE=""
+EXPERIMENT=""
 DTYPE="bf16"
 RUN_NAME=""
 OFFLOAD=""
@@ -111,12 +126,16 @@ PROFILE_STEP_START=7
 PROFILE_STEP_END=8
 RESULTS_ROOT=""
 RUN_TIME=""
+RUN_PORT=""
 DRY_RUN=false
 GPU_MEMORY_TRACE_INTERVAL="${GPU_MEMORY_TRACE_INTERVAL:-1.0}"
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --model) MODEL="$2"; shift 2 ;;
+        --model-type) MODEL_TYPE="$2"; shift 2 ;;
+        --experiment) EXPERIMENT="$2"; shift 2 ;;
+        --master-port) RUN_PORT="$2"; shift 2 ;;
         --dtype) DTYPE="$2"; shift 2 ;;
         --run-name) RUN_NAME="$2"; shift 2 ;;
         --offload) OFFLOAD="$2"; shift 2 ;;
@@ -150,6 +169,8 @@ while [[ $# -gt 0 ]]; do
 done
 
 [[ -n "${MODEL}" ]] || die "--model is required"
+[[ "${EXPERIMENT}" =~ ^[A-Za-z0-9._-]+$ ]] || die "--experiment is required and must be a single path segment: ${EXPERIMENT}"
+case "${MODEL_TYPE}" in dense|expert) ;; *) die "--model-type must be dense or expert" ;; esac
 [[ -n "${RUN_NAME}" ]] || die "--run-name is required"
 [[ -n "${OFFLOAD}" ]] || die "--offload is required"
 case "${DTYPE}" in bf16|mxfp8) ;; *) die "--dtype must be bf16 or mxfp8" ;; esac
@@ -159,6 +180,8 @@ case "${SHARDING}" in fsdp1|none) ;; *) die "--sharding must be fsdp1 or none" ;
 case "${PROFILE}" in none|nsys|torch) ;; *) die "--profile must be none, nsys or torch" ;; esac
 case "${GPU_COUNT}" in 4|16|32) ;; *) die "--gpu must be 4, 16 or 32" ;; esac
 case "${DISPATCHER}" in default|alltoall|hybridep) ;; *) die "--dispatcher must be default, alltoall or hybridep" ;; esac
+[[ "${SYNC_WITH_SM}" == false || "${DISPATCHER}" == hybridep ]] \
+    || die "--sync-with-sm true requires --dispatcher hybridep"
 [[ "${RUN_NAME}" == baseline* || "${RUN_NAME}" == offload* ]] \
     || die "--run-name must start with baseline or offload: ${RUN_NAME}"
 if [[ "${OFFLOAD}" == true ]]; then
@@ -172,11 +195,13 @@ for name in MBS GBS SEQ_LENGTH TRAIN_ITERS PP EP GPU_COUNT; do
 done
 [[ "${WARMUP_STEPS}" =~ ^[0-9]+$ ]] || die "--warmup-steps must be a non-negative integer"
 (( TRAIN_ITERS >= 1 )) || die "--train-iters must be at least 1"
-(( GPUS_PER_NODE == 4 )) || die "GPUS_PER_NODE must stay 4 for GB200"
-NNODES=$(( GPU_COUNT / GPUS_PER_NODE ))
-(( NNODES * GPUS_PER_NODE == GPU_COUNT )) || die "--gpu must be a multiple of 4"
-DP=$(( GPU_COUNT / (PP * EP) ))
-(( DP >= 1 )) || die "PP*EP (${PP}x${EP}) exceeds --gpu ${GPU_COUNT}"
+(( GPU_COUNT % PP == 0 )) || die "--gpu ${GPU_COUNT} must be divisible by --pp ${PP}"
+# TP=CP=1, so DP = GPUs / PP. Expert parallelism folds into the DP group.
+DP=$(( GPU_COUNT / PP ))
+(( DP % EP == 0 )) || die "--ep ${EP} must divide DP ${DP} (= gpu / pp)"
+if [[ "${MODEL_TYPE}" == dense ]]; then
+    (( EP == 1 )) || die "dense models have no experts; use --ep 1"
+fi
 (( GBS % (MBS * DP) == 0 )) \
     || die "GBS ${GBS} must be divisible by MBS*DP = ${MBS}*${DP} = $((MBS * DP))"
 
@@ -185,39 +210,21 @@ if [[ "${PROFILE}" != none ]]; then
     (( PROFILE_STEP_END <= TRAIN_ITERS )) || die "--profile-step-end must be <= --train-iters"
 fi
 
-RECIPE_SUFFIX="$(dtype_recipe_suffix "${DTYPE}")"
+case "${DTYPE}" in
+    bf16) RECIPE_SUFFIX=bf16 ;;
+    mxfp8) RECIPE_SUFFIX=fp8mx ;;
+esac
 RECIPE="${MODEL}_pretrain_4gpu_gb200_${RECIPE_SUFFIX}_fsdp1_config"
-RESULTS_ROOT="${RESULTS_ROOT:-${REPO_ROOT}/results/01-analyse/01-fine-grained-offload/02-offload-on-dense-or-expert-model}"
-RUN_TIME="${RUN_TIME:-$(date +%Y%m%d-%H%M%S)}"
-IS_DEEPSEEK=false
-[[ "${MODEL}" == deepseek_v3 ]] && IS_DEEPSEEK=true
+RESULTS_ROOT="${RESULTS_ROOT:-${DEFAULT_RESULTS_ROOT}}"
+resolve_dist_env "${GPU_COUNT}" "${DRY_RUN}"
+sync_run_time "${DRY_RUN}"
+RUN_PORT="${RUN_PORT:-$(( MASTER_PORT + 1 ))}"
 
 # Result paths are shared by every node in a DLC job; the run name is part of the
 # test name so baseline and offload never overwrite each other.
 TEST_NAME="gpu_${GPU_COUNT}-${DTYPE}-pp_${PP}-ep_${EP}-mbs_${MBS}-gbs_${GBS}-${DISPATCHER}-${RUN_NAME}"
-MODEL_DIR_NAME="${MODEL}"
-if [[ "${IS_DEEPSEEK}" == true ]]; then
-    MODEL_DIR_NAME="${MODEL}-$( [[ "${RUN_NAME}" == baseline* ]] && printf dense || printf expert )"
-fi
-RESULT_DIR="${RESULTS_ROOT}/${MODEL_DIR_NAME}/${TEST_NAME}/${RUN_TIME}"
-MASTER_PORT="${MASTER_PORT:-29501}"
-if (( NNODES > 1 )); then
-    NODE_RANK="${NODE_RANK:-${RANK:-0}}"
-    MASTER_ADDR="${MASTER_ADDR:-${DLC_MASTER_ADDR:-}}"
-    # An explicitly local address is always wrong for a multi-node rendezvous, so
-    # reject it even during --dry-run; only the "no address at all" case is
-    # tolerated there, which keeps --dry-run usable on an arbitrary machine.
-    [[ "${MASTER_ADDR}" != "localhost" && "${MASTER_ADDR}" != "127.0.0.1" ]] \
-        || die "MASTER_ADDR must not be localhost for --gpu ${GPU_COUNT}"
-    if [[ "${DRY_RUN}" != true ]]; then
-        [[ -n "${MASTER_ADDR}" ]] || die "MASTER_ADDR must be the reachable rank-0 host for --gpu ${GPU_COUNT}"
-    fi
-    [[ "${NODE_RANK}" =~ ^[0-9]+$ ]] || die "NODE_RANK/RANK must be an integer: ${NODE_RANK}"
-    (( NODE_RANK < NNODES )) || die "NODE_RANK ${NODE_RANK} must be < ${NNODES}"
-else
-    NODE_RANK=0
-    MASTER_ADDR="${MASTER_ADDR:-localhost}"
-fi
+MODEL_DIR_NAME="${MODEL}-${MODEL_TYPE}"
+RESULT_DIR="${RESULTS_ROOT}/${EXPERIMENT}/${MODEL_DIR_NAME}/${TEST_NAME}/${RUN_TIME}"
 # Non-zero nodes keep node-local logs and traces in a subdirectory so the shared
 # result directory is not clobbered by concurrent writers.
 RUN_DIR="${RESULT_DIR}"
@@ -350,7 +357,7 @@ if (( NNODES == 1 )); then
         uv run --no-sync python -m torch.distributed.run
         --standalone
         --nproc_per_node="${GPUS_PER_NODE}"
-        --master_port="${MASTER_PORT}"
+        --master_port="${RUN_PORT}"
         --log_dir="${RUN_DIR}/rank_logs"
         --redirects=3 --tee=3
         "${TRAIN_ARGS[@]}"
@@ -361,14 +368,14 @@ else
         --nnodes="${NNODES}"
         --node_rank="${NODE_RANK}"
         --master_addr="${MASTER_ADDR}"
-        --master_port="${MASTER_PORT}"
+        --master_port="${RUN_PORT}"
         --log_dir="${RUN_DIR}/rank_logs"
         --redirects=3 --tee=3
     )
     COMMAND=(uv run --no-sync python -m torch.distributed.run "${DISTRIBUTED_ARGS[@]}" "${TRAIN_ARGS[@]}")
 fi
 if [[ "${PROFILE}" == nsys ]]; then
-    NSYS_NAME="${MODEL_DIR_NAME}/${TEST_NAME}/${RUN_TIME}"
+    NSYS_NAME="${EXPERIMENT}/${MODEL_DIR_NAME}/${TEST_NAME}/${RUN_TIME}"
     NSYS_NAME="${NSYS_NAME//\//-}"
     COMMAND=(
         nsys profile -s none -t cuda,nvtx
@@ -379,8 +386,8 @@ if [[ "${PROFILE}" == nsys ]]; then
     )
 fi
 
-log "resolved model=${MODEL} dtype=${DTYPE} recipe=${RECIPE}"
-log "resolved gpu=${GPU_COUNT} nnodes=${NNODES} node_rank=${NODE_RANK} pp=${PP} ep=${EP} dp=${DP}"
+log "resolved experiment=${EXPERIMENT} model=${MODEL} model_type=${MODEL_TYPE} dtype=${DTYPE} recipe=${RECIPE}"
+log "resolved gpu=${GPU_COUNT} nnodes=${NNODES} node_rank=${NODE_RANK} master=${MASTER_ADDR:-unset}:${RUN_PORT} pp=${PP} ep=${EP} dp=${DP}"
 log "resolved mbs=${MBS} gbs=${GBS} seq=${SEQ_LENGTH} iters=${TRAIN_ITERS} dispatcher=${DISPATCHER}"
 log "resolved offload=${OFFLOAD} offload_modules=${OFFLOAD_MODULES} sync_with_sm=${SYNC_WITH_SM}"
 log "resolved sharding=${SHARDING} profile=${PROFILE} result=${RESULT_DIR}"
@@ -400,18 +407,15 @@ export PYTORCH_CUDA_ALLOC_CONF="expandable_segments:True"
 export NCCL_DEBUG="WARN"
 export NCCL_GRAPH_REGISTER="0"
 export TOKENIZERS_PARALLELISM="false"
-if [[ "${DISPATCHER}" == hybridep || "${DISPATCHER}" == default ]]; then
-    # HybridEP dispatches within the NVLink domain; GB200 exposes four ranks per
-    # NVL domain in these runs, so the domain count must match or performance and
-    # sometimes correctness degrade.
-    export NUM_OF_HYBRID_EP_RANKS_PER_NVLINK_DOMAIN="${NUM_OF_HYBRID_EP_RANKS_PER_NVLINK_DOMAIN:-4}"
-fi
+# HybridEP detects how many EP ranks share one NVLink domain. Leave
+# NUM_OF_HYBRID_EP_RANKS_PER_NVLINK_DOMAIN unset unless the detection is wrong;
+# forcing 4 would route EP=8/16 traffic inside one NVL72 rack through RDMA.
 
 COMMAND_TEXT="${COMMAND[*]}"
 export COMMAND_TEXT
 if (( NODE_RANK == 0 )); then
     printf '%s\n' "${COMMAND_TEXT}" > "${RUN_DIR}/command.txt"
-    RUN_DIR="${RUN_DIR}" MODEL="${MODEL}" DTYPE="${DTYPE}" RECIPE="${RECIPE}" \
+    RUN_DIR="${RUN_DIR}" EXPERIMENT="${EXPERIMENT}" MODEL="${MODEL}" MODEL_TYPE="${MODEL_TYPE}" DTYPE="${DTYPE}" RECIPE="${RECIPE}" \
     TEST_NAME="${TEST_NAME}" RUN_NAME="${RUN_NAME}" RUN_TIME="${RUN_TIME}" \
     GPU_COUNT="${GPU_COUNT}" NNODES="${NNODES}" GPUS_PER_NODE="${GPUS_PER_NODE}" \
     PP="${PP}" EP="${EP}" DP="${DP}" MBS="${MBS}" GBS="${GBS}" SEQ_LENGTH="${SEQ_LENGTH}" \
@@ -424,7 +428,9 @@ if (( NODE_RANK == 0 )); then
 import json, os
 root = os.environ["RUN_DIR"]
 config = {
+    "experiment": os.environ["EXPERIMENT"],
     "model": os.environ["MODEL"],
+    "model_type": os.environ["MODEL_TYPE"],
     "dtype": os.environ["DTYPE"],
     "recipe": os.environ["RECIPE"],
     "run_name": os.environ["RUN_NAME"],

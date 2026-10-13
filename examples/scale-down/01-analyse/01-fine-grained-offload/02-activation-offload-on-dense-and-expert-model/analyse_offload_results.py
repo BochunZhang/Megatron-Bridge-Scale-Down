@@ -16,10 +16,15 @@
 """Compare selective activation offload against its baseline per run group.
 
 Reads every successful, non-profiled run under the results root, groups the runs
-by (model, dtype, gpu_count, pp, ep, gbs, mbs, dispatcher, sharding), and pairs
-each offload run with the baseline that shares its group. The grouping key
-includes the launch scale on purpose: a 4-GPU attribution run and a 32-GPU
-pipeline run must never be paired together just because both are "baseline".
+by (model, model_type, dtype, gpu_count, pp, ep, gbs, mbs, dispatcher, sharding,
+hybridep_sync_with_sm), and pairs each offload run with the baseline that shares
+its group. The grouping key includes the launch scale on purpose: a 4-GPU run and
+a 32-GPU pipeline run must never be paired just because both are "baseline".
+Groups without a baseline (for example the blocking A/B, which has none) are
+reported and skipped.
+
+Megatron prints throughput on the last global rank, so on multi-node runs the
+samples live in the last node's ``rank<N>/`` directory rather than on node 0.
 
 Reports:
     Summary  mean TFlops for every case in a group and the drop against baseline.
@@ -42,24 +47,19 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 REPO_ROOT = SCRIPT_DIR.parents[4]
 DEFAULT_RESULTS_ROOT = (
     REPO_ROOT
-    / "results/01-analyse/01-fine-grained-offload/02-offload-on-dense-or-expert-model"
+    / "results/scale-down/01-analyse/01-fine-grained-offload/02-activation-offload-on-dense-and-expert-model"
 )
 # One sample per logged training iteration; the analyser needs enough of them to
 # skip warmup and still average a stable window.
 MIN_SAMPLES = 10
 SAMPLES_TO_AVERAGE = 4
-REQUIRED_KEYS = ("model", "dtype", "gpu_count", "pp", "ep", "gbs", "mbs", "dispatcher", "sharding")
+REQUIRED_KEYS = ("experiment", "model", "model_type", "dtype", "gpu_count", "pp", "ep", "gbs", "mbs", "dispatcher", "sharding")
+# Optional keys default to these values when an older config.json lacks them.
+OPTIONAL_KEYS = {"hybridep_sync_with_sm": False}
+GROUP_KEYS = (*REQUIRED_KEYS, *OPTIONAL_KEYS)
 
 SUMMARY_FIELDS = (
-    "model",
-    "dtype",
-    "gpu_count",
-    "pp",
-    "ep",
-    "gbs",
-    "mbs",
-    "dispatcher",
-    "sharding",
+    *GROUP_KEYS,
     "case",
     "run_name",
     "mean TFlops/GPU",
@@ -79,7 +79,9 @@ class Run:
     @property
     def group(self) -> tuple:
         """Grouping key; every field here must match for a run to be paired."""
-        return tuple(self.config[key] for key in REQUIRED_KEYS)
+        return tuple(self.config[key] for key in REQUIRED_KEYS) + tuple(
+            self.config.get(key, default) for key, default in OPTIONAL_KEYS.items()
+        )
 
     @property
     def is_baseline(self) -> bool:
@@ -96,15 +98,26 @@ def read_json(path: Path) -> dict:
     return value
 
 
+def find_metrics(result_dir: Path) -> Path:
+    """Return the utilization file that actually holds samples.
+
+    Node 0 writes into ``result_dir``; other nodes write into ``result_dir/rank<N>``.
+    The last rank prints throughput, so pick the file with the most samples.
+    """
+    candidates = [result_dir / "gpu_utilization.json", *sorted(result_dir.glob("rank*/gpu_utilization.json"))]
+    existing = [path for path in candidates if path.exists()]
+    if not existing:
+        raise ValueError(f"no gpu_utilization.json under {result_dir}; the run did not log utilization")
+    return max(existing, key=lambda path: len(read_json(path)))
+
+
 def read_samples(result_dir: Path) -> tuple[float, tuple[float, ...]]:
     """Average the last few logged iterations of a run.
 
     Returns:
         The mean of the averaged window and the window itself.
     """
-    metrics_path = result_dir / "gpu_utilization.json"
-    if not metrics_path.exists():
-        raise ValueError(f"{metrics_path} is missing; the run did not log utilization")
+    metrics_path = find_metrics(result_dir)
     metrics = read_json(metrics_path)
     samples: list[tuple[int, float]] = []
     for raw_step, raw_value in metrics.items():
@@ -157,7 +170,9 @@ def build_summary(runs: list[Run]) -> list[dict]:
     for group, members in sorted(groups.items(), key=lambda item: str(item[0])):
         baselines = [run for run in members if run.is_baseline]
         if not baselines:
-            raise ValueError(f"group {group} has no baseline run; cannot compute a drop")
+            names = ", ".join(sorted(str(run.config["run_name"]) for run in members))
+            print(f"skipping group {group}: no baseline run (runs: {names})", file=sys.stderr)
+            continue
         # Prefer the newest baseline, but only pair runs that share a batch id when
         # the batch id is uniform, so a mixed-result-root sweep cannot silently mix
         # runs from different campaigns.
@@ -179,7 +194,7 @@ def build_summary(runs: list[Run]) -> list[dict]:
 
 
 def _row(group: tuple, run: Run, run_mean: float, drop: float) -> dict:
-    row = dict(zip(REQUIRED_KEYS, group))
+    row = dict(zip(GROUP_KEYS, group))
     row.update(
         {
             "case": "baseline" if run.is_baseline else "offload",
@@ -205,7 +220,7 @@ def write_samples_csv(runs: list[Run], output: Path) -> None:
     """Write the raw per-iteration samples behind each mean."""
     output.parent.mkdir(parents=True, exist_ok=True)
     fields = (
-        *REQUIRED_KEYS,
+        *GROUP_KEYS,
         "run_name",
         "run_time",
         *(f"iteration {index + 1} (TFlops)" for index in range(SAMPLES_TO_AVERAGE)),
@@ -217,7 +232,7 @@ def write_samples_csv(runs: list[Run], output: Path) -> None:
         writer.writeheader()
         for run in sorted(runs, key=lambda item: (str(item.group), str(item.config["run_name"]))):
             _, window = read_samples(run.result_dir)
-            row = dict(zip(REQUIRED_KEYS, run.group))
+            row = dict(zip(GROUP_KEYS, run.group))
             row["run_name"] = run.config["run_name"]
             row["run_time"] = run.run_time
             for index, value in enumerate(window):
@@ -248,6 +263,12 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="CSV sample path (default: <results-root>/offload-samples.csv)",
     )
+    parser.add_argument(
+        "--experiment",
+        default=None,
+        help="Analyse <results-root>/<experiment> only, e.g. 4gpu_expert_activation_offload_blocking; "
+        "reports are written into that directory",
+    )
     parser.add_argument("--model", default=None, help="Only analyse runs whose model matches")
     return parser
 
@@ -256,6 +277,8 @@ def main() -> int:
     """Write the comparison reports."""
     args = build_parser().parse_args()
     results_root = args.results_root.resolve()
+    if args.experiment is not None:
+        results_root = results_root / args.experiment
     if not results_root.exists():
         print(f"results root does not exist: {results_root}", file=sys.stderr)
         return 2
@@ -267,6 +290,9 @@ def main() -> int:
         return 1
 
     rows = build_summary(runs)
+    if not rows:
+        print("no group has both a baseline and an offload run", file=sys.stderr)
+        return 1
     summary_path = args.output or (results_root / "offload-summary.csv")
     samples_path = args.samples_output or (results_root / "offload-samples.csv")
     write_csv(rows, summary_path)
@@ -274,7 +300,7 @@ def main() -> int:
 
     for row in rows:
         print(
-            f"{row['model']} gpu={row['gpu_count']} pp={row['pp']} ep={row['ep']} "
+            f"[{row['experiment']}] {row['model']} ({row['model_type']}) gpu={row['gpu_count']} pp={row['pp']} ep={row['ep']} "
             f"mbs={row['mbs']} {row['dispatcher']} {row['run_name']}: "
             f"{row['mean TFlops/GPU']:.1f} TFlops/GPU "
             f"({row['vs baseline'] * 100:+.1f}% vs baseline)"
