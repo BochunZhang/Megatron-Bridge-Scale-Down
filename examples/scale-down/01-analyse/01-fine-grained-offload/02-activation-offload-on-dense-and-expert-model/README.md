@@ -184,7 +184,7 @@ bash $E/run_4gpu_compare_activation_offload_influence_on_dense_and_expert.sh --m
 
 ```bash
 # 只汇总一个实验，报告写进 <results-root>/<experiment>/
-uv run python $E/analyse_offload_results.py --experiment 16gpu_compare_activation_offload_influence_on_dense_and_expert
+uv run --no-sync python $E/analyse_offload_results.py --experiment 16gpu_compare_activation_offload_influence_on_dense_and_expert
 ```
 
 - 分组 key：`experiment, model, model_type, dtype, gpu_count, pp, ep, gbs, mbs, dispatcher, sharding,

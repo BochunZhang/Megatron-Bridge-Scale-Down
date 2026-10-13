@@ -287,7 +287,7 @@ finish_matrix() {
         return 1
     fi
     log "raw results: ${RESULTS_ROOT}/${EXPERIMENT} (run_time=${RUN_TIME})"
-    log "analyse with: uv run python ${EXPERIMENT_DIR}/analyse_offload_results.py --experiment ${EXPERIMENT}"
+    log "analyse with: uv run --no-sync python ${EXPERIMENT_DIR}/analyse_offload_results.py --experiment ${EXPERIMENT}"
 }
 
 # ---------------------------------------------------------------------------
