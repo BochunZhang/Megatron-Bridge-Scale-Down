@@ -155,6 +155,39 @@ print(run_time)
     [[ -n "${RUN_TIME}" ]] || die "received an empty RUN_TIME from the master node"
 }
 
+# Stage the HF config and tokenizer files on node-local disk. With every rank
+# reading tokenizer.json from the shared CPFS HF_HOME, a concurrent rewrite of
+# the cache blob fails json.load with "[Errno 116] Stale file handle". Each node
+# downloads the repos once (weights excluded) before the matrix starts, and
+# run_pretrain.sh then trains with HF_HOME=LOCAL_HF_HOME and HF_HUB_OFFLINE=1.
+#
+# Requires DRY_RUN. Exports LOCAL_HF_HOME (default /tmp/megatron-bridge-hf-home).
+stage_local_hf_home() {
+    export LOCAL_HF_HOME="${LOCAL_HF_HOME:-/tmp/megatron-bridge-hf-home}"
+    log "local hf home: ${LOCAL_HF_HOME} repos=[$*]"
+    if [[ "${DRY_RUN}" == true ]]; then
+        return
+    fi
+    mkdir -p "${LOCAL_HF_HOME}"
+    HF_HOME="${LOCAL_HF_HOME}" HF_HUB_OFFLINE=0 uv run --no-sync python -c '
+import sys
+import time
+
+from huggingface_hub import snapshot_download
+
+for repo in sys.argv[1:]:
+    for attempt in range(1, 4):
+        try:
+            snapshot_download(repo, ignore_patterns=["*.safetensors", "*.bin", "*.pt", "*.pth", "*.gguf"])
+            break
+        except Exception as exc:
+            if attempt == 3:
+                sys.exit(f"could not stage {repo}: {exc}")
+            print(f"retrying {repo} after attempt {attempt} failed: {exc}", flush=True)
+            time.sleep(10 * attempt)
+' "$@" || die "could not stage the HF config and tokenizer files in ${LOCAL_HF_HOME}"
+}
+
 # ---------------------------------------------------------------------------
 # Experiment definitions
 # ---------------------------------------------------------------------------

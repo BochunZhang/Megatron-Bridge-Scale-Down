@@ -58,6 +58,7 @@ if [[ "${DTYPE}" != bf16 && ",${MODEL_TYPES}," == *",expert,"* ]]; then
     die "Qwen3.5-122B-A10B only has a bf16 recipe; use --dtype bf16 or --model-type dense"
 fi
 setup_matrix 32
+stage_local_hf_home Qwen/Qwen3.5-27B Qwen/Qwen3.5-122B-A10B
 
 for mbs in "${MBS_VALUES[@]}"; do
     for model_type in "${MODEL_TYPE_VALUES[@]}"; do

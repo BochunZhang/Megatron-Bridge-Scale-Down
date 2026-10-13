@@ -58,6 +58,7 @@ PROFILE=none
 parse_matrix_args "$@"
 [[ "${MODEL_FAMILY}" == qwen ]] || die "the 16-GPU comparison uses Qwen3.5 models only"
 setup_matrix 16
+stage_local_hf_home Qwen/Qwen3.5-9B-Base Qwen/Qwen3.5-35B-A3B-Base
 
 for mbs in "${MBS_VALUES[@]}"; do
     for model_type in "${MODEL_TYPE_VALUES[@]}"; do

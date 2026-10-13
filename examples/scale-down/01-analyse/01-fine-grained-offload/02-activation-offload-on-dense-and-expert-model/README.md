@@ -11,8 +11,8 @@ expert 上分别带来多少吞吐损失，损失来自哪里，以及在更大�
 1. **offload 本身的代价**：排除 HybridEP 的 host 同步之后，开启 selective offload 还会掉多少吞吐。
 2. **损失来源归因**：dense 和 expert 的下降分别来自 offload 的 D2H/H2D 拷贝，还是来自 MoE 的
    dispatch/combine 同步点，还是 attention 部分的 offload。
-3. **规模上是否值得**：小规模（4 卡）归因，中规模（16 卡）沿 Qwen3.5 上限测，大规模（32 卡）
-   用 PP 作为对照。
+3. **规模上是否值得**：小规模（4 卡）归因，8 卡用 16 卡的 expert 模型减半 expert 数量做中间点，
+   中规模（16 卡）沿 Qwen3.5 上限测，大规模（32 卡）用 PP 作为对照。
 
 ## 2. 前提：HybridEP 的 host 同步
 
@@ -72,6 +72,7 @@ DeepSeek 的 attention 组额外包含 `qkv_linear`。Qwen3.5 的 GatedDeltaNet 
 | --- | --- | --- | --- | --- |
 | `run_4gpu_expert_activation_offload_blocking.sh` | 1 节点 × 4 卡 | Qwen3.5-35B-A3B 裁剪 | EP=4，HybridEP | `offload-attn-mlp` × {blocking, sync-sm}，MBS=1，nsys |
 | `run_4gpu_compare_activation_offload_influence_on_dense_and_expert.sh` | 1 节点 × 4 卡 | Qwen3.5-9B / 35B-A3B 裁剪 | dense EP=1；expert EP=4 | 3 case × MBS{1,2} × {dense, expert} |
+| `run_8gpu_compare_activation_offload_influence_on_dense_and_expert.sh` | 2 节点 × 4 卡 | Qwen3.5-9B 完整 / 35B-A3B 128 expert | PP=1；dense EP=1；expert EP=8 | 3 case × MBS{1,2} × {dense, expert}，GBS=64 |
 | `run_16gpu_compare_activation_offload_influence_on_dense_and_expert.sh` | 4 节点 × 4 卡 | Qwen3.5-9B / 35B-A3B 完整 | PP=1；dense EP=1；expert EP=16 | 3 case × MBS{1,2} × {dense, expert}，GBS=128 |
 | `run_32gpu_compare_activation_offload_influence_on_dense_and_expert.sh` | 8 节点 × 4 卡 | Qwen3.5-27B / 122B-A10B 完整 | PP=4；dense EP=1；expert EP=8 | 3 case × MBS{1} × {dense, expert}，GBS=128 |
 
@@ -86,18 +87,26 @@ DeepSeek 的 attention 组额外包含 `qkv_linear`。Qwen3.5 的 GatedDeltaNet 
 
 两个 Qwen 模型裁到同一深度，hidden size 保持原值（9B 为 4096，35B-A3B 为 2048）。
 
-### 16/32 卡模型与显存估算
+### 8/16/32 卡模型与显存估算
 
 估算按 bf16 参数 + fp32 梯度（FSDP1 不分片）+ fp32 Adam（按 EDP 分片）+ 无 recompute 的
 activation（1F1B 下 stage 0 保留 PP 个 microbatch）+ fp32 logits，GB200 每卡约 186 GB：
 
 | 规模 | 模型 | 并行 | MBS=1 | MBS=2 |
 | --- | --- | --- | --- | --- |
+| 8 卡 | Qwen3.5-9B | PP1 EP1 DP8 | ≈ 101 GB | ≈ 133 GB |
+| 8 卡 | Qwen3.5-35B-A3B（128 expert） | PP1 EP8 EDP1 | ≈ 89 GB | ≈ 122 GB |
 | 16 卡 | Qwen3.5-9B | PP1 EP1 DP16 | ≈ 94 GB | ≈ 126 GB |
 | 16 卡 | Qwen3.5-35B-A3B | PP1 EP16 EDP1 | ≈ 87 GB | ≈ 120 GB |
 | 32 卡 | Qwen3.5-27B | PP4 EP1 DP8 | ≈ 124 GB | ≈ 180 GB（stage 0），大概率 OOM |
 | 32 卡 | Qwen3.5-122B-A10B | PP4 EP8 EDP1 | ≈ 137 GB | ≈ 180 GB（stage 0），大概率 OOM |
 
+- 8 卡 expert 沿用 16 卡的 35B-A3B（40 层 + MTP、top-k 8 不变），只把 `num_moe_experts` 从 256 减到
+  128，EP=8 下每卡仍是 16 个 expert，expert 参数、梯度、Adam 与 16 卡相同；只有约 2.5B 非 expert 参数的
+  Adam 从 /16 变成 /8（+≈2 GB）。
+- 8 卡 dense 仍用完整 Qwen3.5-9B：DP 从 16 降到 8 只让 Adam 分片从 ≈6.75 GB 增加到 ≈13.5 GB，
+  静态约 68 GB，MBS=2 也有约 50 GB 余量，不需要换更小的 Qwen3.5 模型。
+- GBS 保持每个 DP rank 8 条样本（4 卡 32、8 卡 64、16 卡 128）。
 - 16 卡、PP=1 能放下的最大 Qwen3.5 dense / MoE 分别是 9B 和 35B-A3B；27B（≈184 GB 静态）和
   122B-A10B（≈175 GB 静态）不开 PP 放不下。
 - 32 卡默认只测 MBS=1；`--mbs 1,2` 可以尝试 MBS=2，OOM 时以 MBS=1 结果为准。
@@ -116,6 +125,11 @@ activation（1F1B 下 stage 0 保留 PP 个 microbatch）+ fp32 logits，GB200 �
 - 每个 case 用独立的 rendezvous 端口（`MASTER_PORT+1`、`+2`…），避免上一个 case 的端口
   未释放。
 - `--results-root` 必须是所有节点可见的共享存储。
+- **HF 缓存放在节点本地（仅 8/16/32 卡）**：所有 rank 同时从共享 CPFS 的 `HF_HOME` 读
+  `tokenizer.json` 时，若缓存 blob 被并发改写，会报 `OSError: [Errno 116] Stale file handle`。
+  因此 wrapper 在矩阵开始前，每个节点把用到的 HF 仓库（不含权重）下载一次到
+  `LOCAL_HF_HOME`（默认 `/tmp/megatron-bridge-hf-home`，可导出覆盖），训练时使用
+  `HF_HOME=$LOCAL_HF_HOME` 和 `HF_HUB_OFFLINE=1`。4 卡脚本仍使用共享的 `.cache/huggingface`。
 - `NUM_OF_HYBRID_EP_RANKS_PER_NVLINK_DOMAIN` 默认不设置，由 HybridEP 自动检测；只有检测错误
   时才手动导出。
 
@@ -124,7 +138,10 @@ activation（1F1B 下 stage 0 保留 PP 个 microbatch）+ fp32 logits，GB200 �
 ```bash
 E=examples/scale-down/01-analyse/01-fine-grained-offload/02-activation-offload-on-dense-and-expert-model
 
-# 4 个 DLC 任务，各 4 节点
+# 8 卡：1 个 DLC 任务，2 节点
+bash $E/run_8gpu_compare_activation_offload_influence_on_dense_and_expert.sh
+
+# 16 卡：4 个 DLC 任务，各 4 节点
 bash $E/run_16gpu_compare_activation_offload_influence_on_dense_and_expert.sh --mbs 1 --model-type dense
 bash $E/run_16gpu_compare_activation_offload_influence_on_dense_and_expert.sh --mbs 1 --model-type expert
 bash $E/run_16gpu_compare_activation_offload_influence_on_dense_and_expert.sh --mbs 2 --model-type dense
@@ -168,6 +185,7 @@ bash $E/run_4gpu_compare_activation_offload_influence_on_dense_and_expert.sh --m
 | --- | --- | --- |
 | `4gpu_expert_activation_offload_blocking` | `run_4gpu_expert_activation_offload_blocking.sh` | `--sync-with-sm` 是否消除 HybridEP `.item()` 阻塞 |
 | `4gpu_compare_activation_offload_influence_on_dense_and_expert` | `run_4gpu_compare_…sh` | 小规模裁剪模型下 offload 对 dense / expert 的影响 |
+| `8gpu_compare_activation_offload_influence_on_dense_and_expert` | `run_8gpu_compare_…sh` | 完整 9B / 128 expert 的 35B-A3B、FSDP1、EP=8 下的影响 |
 | `16gpu_compare_activation_offload_influence_on_dense_and_expert` | `run_16gpu_compare_…sh` | 完整模型、FSDP1、EP=16 下的影响 |
 | `32gpu_compare_activation_offload_influence_on_dense_and_expert` | `run_32gpu_compare_…sh` | 完整模型、FSDP1、PP=4、EP=8 下的影响 |
 

@@ -51,8 +51,8 @@ Offload options:
     --dtype <bf16|mxfp8>         Training precision (default: bf16).
 
 Scale and parallelism:
-    --gpu <4|16|32>              Total GPUs. GB200 uses four per node, so 16 and
-                                 32 mean four and eight nodes (default: 4).
+    --gpu <4|8|16|32>            Total GPUs. GB200 uses four per node, so 8, 16
+                                 and 32 mean two, four and eight nodes (default: 4).
                                  Multi-node runs read MASTER_ADDR, MASTER_PORT,
                                  WORLD_SIZE (nodes) and RANK (node rank) from
                                  the DLC environment.
@@ -178,7 +178,7 @@ case "${OFFLOAD}" in true|false) ;; *) die "--offload must be true or false" ;; 
 case "${SYNC_WITH_SM}" in true|false) ;; *) die "--sync-with-sm must be true or false" ;; esac
 case "${SHARDING}" in fsdp1|none) ;; *) die "--sharding must be fsdp1 or none" ;; esac
 case "${PROFILE}" in none|nsys|torch) ;; *) die "--profile must be none, nsys or torch" ;; esac
-case "${GPU_COUNT}" in 4|16|32) ;; *) die "--gpu must be 4, 16 or 32" ;; esac
+case "${GPU_COUNT}" in 4|8|16|32) ;; *) die "--gpu must be 4, 8, 16 or 32" ;; esac
 case "${DISPATCHER}" in default|alltoall|hybridep) ;; *) die "--dispatcher must be default, alltoall or hybridep" ;; esac
 [[ "${SYNC_WITH_SM}" == false || "${DISPATCHER}" == hybridep ]] \
     || die "--sync-with-sm true requires --dispatcher hybridep"
@@ -399,7 +399,13 @@ if [[ "${DRY_RUN}" == true ]]; then
 fi
 
 mkdir -p "${RUN_DIR}/memory" "${RUN_DIR}/profile" "${RUN_DIR}/gpu_memory" "${RUN_DIR}/rank_logs"
-export HF_HOME="${REPO_ROOT}/.cache/huggingface"
+if [[ -n "${LOCAL_HF_HOME:-}" ]]; then
+    # Staged by stage_local_hf_home on this node; never touch the shared cache.
+    export HF_HOME="${LOCAL_HF_HOME}"
+    export HF_HUB_OFFLINE="1"
+else
+    export HF_HOME="${REPO_ROOT}/.cache/huggingface"
+fi
 export UV_CACHE_DIR="${REPO_ROOT}/.cache/uv"
 export NEMO_HOME="${REPO_ROOT}/.cache/nemo"
 export NVTE_CPU_OFFLOAD_V1="1"
