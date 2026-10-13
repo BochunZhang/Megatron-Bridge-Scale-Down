@@ -23,6 +23,13 @@ Run the same command on every node (DLC style). For each algorithm a fresh torch
 is started, because NCCL_ALGO is fixed when a communicator is created. Node 0 merges the
 results into compare.md.
 
+Output: results/gb200/nvls-collective/gpu-num-<nnodes*gpus-per-node>/run-<NN> in this repo.
+Node 0 takes the next free run-NN and hands it to the other nodes over a TCPStore on
+MASTER_ADDR:<master-port - 1>, so the repo must be on storage every node can see.
+
+Gloo/NCCL bootstrap interface: eth0 for a single 4-GPU node (DSW), bond1 for more than
+4 GPUs (DLC), checked against `ip -o -4 addr show up`. An exported GLOO_SOCKET_IFNAME wins.
+
 Usage:
   run_nvls_collective_benchmark.sh [options]
 
@@ -45,7 +52,6 @@ Options:
   --symm-kernel KERNEL    For the symm pass: default, ag or rs (pins NCCL_SYM_KERNEL)
   --nsys                  One Nsight Systems report per rank per case (capture range = timed trials);
                           node 0 then exports them to SQLite and writes nsys_kernels.md
-  --output-dir DIR        Shared output dir (default: results/gb200/nvls-collective/<YYMMDD-HHMMSS>)
   --dry-run               Print commands only
   -h, --help              Show this help
 
@@ -53,9 +59,8 @@ Examples:
   # One tray (4 GPUs): smoke test.
   bash examples/gb200/nvls-collective/run_nvls_collective_benchmark.sh --sizes-mib 64 --trials 2
 
-  # Eight trays in one NVL72 domain (32 GPUs); run on every node with the same --output-dir.
-  bash examples/gb200/nvls-collective/run_nvls_collective_benchmark.sh \
-    --nnodes 8 --output-dir /shared/results/gb200/nvls-collective/run01
+  # Eight trays in one NVL72 domain (32 GPUs); run the same command on every node.
+  bash examples/gb200/nvls-collective/run_nvls_collective_benchmark.sh --nnodes 8
 USAGE
 }
 
@@ -88,7 +93,6 @@ iters="20"
 trials="5"
 symm_kernel="default"
 nsys_enabled=false
-output_dir=""
 dry_run=false
 
 while [[ $# -gt 0 ]]; do
@@ -110,7 +114,6 @@ while [[ $# -gt 0 ]]; do
         --trials) need_value "$@"; trials="$2"; shift 2 ;;
         --symm-kernel) need_value "$@"; symm_kernel="$2"; shift 2 ;;
         --nsys) nsys_enabled=true; shift ;;
-        --output-dir) need_value "$@"; output_dir="$2"; shift 2 ;;
         --dry-run) dry_run=true; shift ;;
         -h|--help) usage; exit 0 ;;
         *) die "unknown option: $1 (see --help)" ;;
@@ -152,7 +155,53 @@ if [[ -n "${NCCL_ALGO:-}" || -n "${NCCL_NVLS_ENABLE:-}" ]]; then
     echo "WARNING: NCCL_ALGO / NCCL_NVLS_ENABLE from the environment are overridden per algorithm" >&2
 fi
 
-output_dir="${output_dir:-${repo_root}/results/gb200/nvls-collective/$(date +%y%m%d-%H%M%S)}"
+(( master_port > 1 )) || die "--master-port must be > 1 (master-port - 1 hosts the run-dir handshake)"
+
+# Pick the bootstrap interface from `ip addr`: DSW (one 4-GPU node) uses eth0, DLC (more than
+# 4 GPUs) uses bond1. Only interfaces that are up and carry an IPv4 address qualify.
+select_ifname() {
+    local preferred=eth0 other=bond1 available
+    if (( world_size > 4 )); then
+        preferred=bond1
+        other=eth0
+    fi
+    if ! command -v ip >/dev/null; then
+        $dry_run || die "the ip command is required to choose GLOO_SOCKET_IFNAME"
+        echo "WARNING: ip not found; dry-run assumes ${preferred}" >&2
+        echo "$preferred"
+        return
+    fi
+    available="$(ip -o -4 addr show up | awk '{print $2}' | sort -u | tr '\n' ' ')"
+    if [[ " $available" == *" ${preferred} "* ]]; then
+        echo "$preferred"
+    elif [[ " $available" == *" ${other} "* ]]; then
+        echo "WARNING: ${preferred} has no IPv4 address; falling back to ${other} (up: ${available})" >&2
+        echo "$other"
+    else
+        die "neither ${preferred} nor ${other} is up with an IPv4 address (up: ${available:-none})"
+    fi
+}
+if [[ -n "${GLOO_SOCKET_IFNAME:-}" ]]; then
+    gloo_ifname="$GLOO_SOCKET_IFNAME"
+    echo "GLOO_SOCKET_IFNAME=${gloo_ifname} taken from the environment" >&2
+else
+    gloo_ifname="$(select_ifname)"
+fi
+# NCCL bootstraps over the same network; keep an explicitly exported value.
+nccl_socket_ifname="${NCCL_SOCKET_IFNAME:-$gloo_ifname}"
+
+results_root="${repo_root}/results/gb200/nvls-collective"
+run_dir_args=(
+    --root "$results_root" --world-size "$world_size"
+    --nnodes "$nnodes" --node-rank "$node_rank"
+    --master-addr "$master_addr" --port "$(( master_port - 1 ))"
+)
+if $dry_run; then
+    output_dir="$(python3 "${script_dir}/run_dir.py" "${run_dir_args[@]}" --dry-run)"
+else
+    output_dir="$(uv run --no-sync python "${script_dir}/run_dir.py" "${run_dir_args[@]}")"
+fi
+[[ -n "$output_dir" ]] || die "could not resolve the output directory"
 
 bench_args=(
     --group-sizes "$group_sizes"
@@ -193,7 +242,7 @@ run() {
 }
 
 echo "world_size=${world_size} nnodes=${nnodes} node_rank=${node_rank} group_sizes=${group_sizes}" \
-    "split_totals=${split_totals:-none} output_dir=${output_dir}" >&2
+    "split_totals=${split_totals:-none} ifname=${gloo_ifname} output_dir=${output_dir}" >&2
 $dry_run || mkdir -p "$output_dir"
 
 for index in "${!algo_list[@]}"; do
@@ -217,6 +266,8 @@ for index in "${!algo_list[@]}"; do
         NCCL_DEBUG=INFO
         NCCL_DEBUG_SUBSYS="$debug_subsys"
         NCCL_DEBUG_FILE="${algo_dir}/nccl-%h-%p.log"
+        GLOO_SOCKET_IFNAME="$gloo_ifname"
+        NCCL_SOCKET_IFNAME="$nccl_socket_ifname"
     )
     [[ -n "$win_enable" ]] && algo_env+=(NCCL_WIN_ENABLE="$win_enable")
     [[ -n "$win_enable" && -n "$symm_kernel_env" ]] && algo_env+=(NCCL_SYM_KERNEL="$symm_kernel_env")
@@ -229,7 +280,7 @@ for index in "${!algo_list[@]}"; do
         nsys_dir="${algo_dir}/nsys"
         $dry_run || mkdir -p "$nsys_dir"
         if ! $dry_run && compgen -G "${nsys_dir}/*.nsys-rep" >/dev/null; then
-            die "${nsys_dir} already contains Nsight reports; use a fresh --output-dir"
+            die "${nsys_dir} already contains Nsight reports; ${output_dir} was not a fresh run directory"
         fi
         # Each worker gets its own nsys session. Only the timed trials of each case are captured
         # (cudaProfilerStart/Stop in the benchmark); "repeat" writes one report per case. The case

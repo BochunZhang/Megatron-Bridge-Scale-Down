@@ -94,30 +94,54 @@ bash examples/gb200/nvls-collective/run_nvls_collective_benchmark.sh \
 一个 NVL72 domain 内 8 个 tray（32 卡，每 tray 4 卡）跑完整矩阵，**每台节点执行同一条命令**：
 
 ```bash
-bash examples/gb200/nvls-collective/run_nvls_collective_benchmark.sh \
-  --nnodes 8 --master-addr <node0-ip> \
-  --output-dir /shared/results/gb200/nvls-collective/run01
+bash examples/gb200/nvls-collective/run_nvls_collective_benchmark.sh --nnodes 8
 ```
+
+DLC 会注入 `MASTER_ADDR` 和 `RANK`/`NODE_RANK`，所以不用再传 `--master-addr`、`--node-rank`；
+其他环境手动加上这两个参数。
 
 单独把对称内存那一档和 ring 对比（2.28.9 下只在单托盘 4 卡有意义）：
 
 ```bash
 bash examples/gb200/nvls-collective/run_nvls_collective_benchmark.sh \
-  --algos ring,symm --group-sizes 4 --sizes-mib 16,64,256,1024 \
-  --output-dir /shared/results/gb200/nvls-collective/symm-vs-ring-4gpu
+  --algos ring,symm --group-sizes 4 --sizes-mib 16,64,256,1024
 ```
 
 16 卡（4 节点 × 4 卡）时只看问题 3：
 
 ```bash
 bash examples/gb200/nvls-collective/run_nvls_collective_benchmark.sh \
-  --nnodes 4 --master-addr <node0-ip> \
-  --group-sizes 8 --split-totals 16 --split-layouts contiguous,interleaved \
-  --output-dir /shared/results/gb200/nvls-collective/split16
+  --nnodes 4 --group-sizes 8 --split-totals 16 --split-layouts contiguous,interleaved
 ```
 
 `--group-sizes` 默认取 4/8/16/32 中不超过 `nnodes × gpus-per-node` 的部分，`--split-totals`
-默认在 ≥16 卡时取 16，否则不跑 split。`--dry-run` 只打印命令，不要求 GPU、torch 或输出目录。
+默认在 ≥16 卡时取 16，否则不跑 split。`--dry-run` 只打印命令和将要使用的输出目录，不创建目录，
+也不要求 GPU 或 torch。
+
+### 输出目录（不需要指定）
+
+固定为仓库内 `results/gb200/nvls-collective/gpu-num-<总卡数>/run-<NN>`，`NN` 是该卡数下已有
+`run-*` 的最大编号加一（`run-01`、`run-02`…，不回填空号）。由 [`run_dir.py`](run_dir.py) 决定：
+
+1. node 0 用 `mkdir` 原子地占下下一个 `run-NN`（同时启动的两个 job 不会拿到同一个），并写一个
+   `.node0` 标记文件。
+2. 多节点时 node 0 在 `MASTER_ADDR:<master-port − 1>`（默认 29610）起一个 `TCPStore`，把路径发给
+   其他节点，并等所有节点确认收到后才继续。不能让每个节点各自扫描目录：晚启动的节点会看到 node 0
+   刚建好的 `run-01`，于是自己选 `run-02`。
+3. 其他节点检查能否看到 `.node0`，看不到说明仓库不在共享存储上，直接报错退出。
+
+### 网络接口（GLOO_SOCKET_IFNAME）
+
+launcher 读取 `ip -o -4 addr show up`，只认处于 up 且有 IPv4 地址的接口：
+
+| 场景 | 判定 | 优先 | 优先接口不可用时 |
+| --- | --- | --- | --- |
+| DSW | 总卡数 ≤ 4 | `eth0` | 退到 `bond1` 并打警告 |
+| DLC | 总卡数 > 4 | `bond1` | 退到 `eth0` 并打警告 |
+
+两个都没有就报错退出。选中的接口同时设给 `GLOO_SOCKET_IFNAME` 和 `NCCL_SOCKET_IFNAME`
+（NCCL 的 bootstrap 也走 TCP）。如果启动前已经 export 了 `GLOO_SOCKET_IFNAME` 或
+`NCCL_SOCKET_IFNAME`，以导出的值为准。
 launcher 固定打开 `NCCL_DEBUG_SUBSYS=INIT,ENV,TUNING`：`Algo ... proto ...` 和
 `[Symmetric] ... Kernel ...` 都是 `INFO(NCCL_TUNING, ...)`，只在 comm rank 0 上打印；程序从每个
 进程的 `NCCL_DEBUG_FILE` 按偏移增量读取，把 init 行归到对应的 communicator、把内核行归到对应
@@ -127,8 +151,7 @@ case，结果写进 JSONL。这是逐 case 证明实际内核的唯一依据，�
 
 ```bash
 bash examples/gb200/nvls-collective/run_nvls_collective_benchmark.sh \
-  --group-sizes 4 --sizes-mib 64,256 --trials 3 --nsys \
-  --output-dir /shared/results/gb200/nvls-collective/trace01
+  --group-sizes 4 --sizes-mib 64,256 --trials 3 --nsys
 ```
 
 `--nsys` 用 `torchrun --no-python` 给**每个 worker** 套一个 `nsys profile`：
@@ -161,7 +184,8 @@ Slurm 分配内也能用，`--master-addr` 取第一个节点。
 里的两条查询。也可以手动跑：
 
 ```bash
-uv run --no-sync python examples/gb200/nvls-collective/analyse_nsys.py --output-dir <dir>
+uv run --no-sync python examples/gb200/nvls-collective/analyse_nsys.py \
+  --output-dir results/gb200/nvls-collective/gpu-num-4/run-01
 # 或者对单份报告直接用 sqlite3：
 nsys export --type=sqlite --output=rank0.1.sqlite rank0.1.nsys-rep
 sqlite3 -header -csv rank0.1.sqlite < examples/gb200/nvls-collective/nsys_collective_kernels.sql
@@ -231,12 +255,40 @@ communicator 而别的 rank 继续入队，所以这里测的是 GPU 侧 kernel 
 ## 输出与验收
 
 ```text
-<output-dir>/
-  ring/{results.jsonl,metadata.json,torchrun-node0.log,nccl-*.log}
-  nvls/{results.jsonl,metadata.json,...}
-  symm/{results.jsonl,metadata.json,...}      # window 注册的对称内存路径
-  compare.md
+results/gb200/nvls-collective/gpu-num-<W>/run-<NN>/
+  .node0                                       # node 0 建目录时写入，用于检查共享存储
+  ring/
+    results.jsonl  metadata.json               # 只由全局 rank 0 写
+    torchrun-node<k>.log                       # 每个节点一份
+    nccl-<host>-<pid>.log                      # 每个进程一份
+    nsys/{rank<R>*.nsys-rep, index.tsv, kernels.csv}   # 仅 --nsys
+  nvls/ ...
+  symm/ ...                                    # window 注册的对称内存路径
+  compare.md                                   # node 0 合并三个 results.jsonl
+  nsys_kernels.md                              # 仅 --nsys，node 0 用 SQL 汇总
 ```
+
+### 多节点数据怎么汇到同一个文件
+
+所有节点写同一个 run 目录（上面的 TCPStore 握手保证路径一致），但**结果文件只有一个写入者**：
+
+1. torchrun 用默认的 static rendezvous，全局 rank = `node_rank × gpus_per_node + local_rank`
+   （`torch/distributed/run.py` 把 `rdzv_configs["rank"]` 设为 `node_rank`，
+   `elastic/agent/server/api.py` 里 `base_global_rank = group_rank * local_world_size`），
+   所以全局 rank 0 一定在 node 0 上。
+2. 每个 case 结束时，所有 rank 通过 Gloo 默认组执行 `dist.all_gather_object`，把各自的 trial 计时、
+   校验结果和从本进程 NCCL 日志读到的内核证据交给 rank 0。TUNING 行只在每个 communicator 的
+   rank 0 上打印，比如 split 的 B 组在全局 rank 8 上，也是靠这一步汇到 rank 0。
+3. rank 0 计算统计量，**追加**到 `<algo>/results.jsonl`；`metadata.json`、`nsys/index.tsv` 也只由
+   rank 0 写。其他 rank 不写这些文件，所以不存在多节点并发写同一文件的问题。
+4. 每个进程只写自己名字的文件：`nccl-<host>-<pid>.log`、`nsys/rank<R>*.nsys-rep`
+   （`R` 是 torchrun 设置的全局 `RANK`），以及每个节点的 `torchrun-node<k>.log`。
+5. 三个实现是三次独立的 torchrun，结果在 `ring/`、`nvls/`、`symm/` 三个 `results.jsonl` 里。
+   node 0 的 torchrun 只有在 rank 0 退出后才返回，而 rank 0 退出前已经写完 `results.jsonl`，
+   所以随后执行的 `collective_metrics.py` 读到的是完整数据，合并成一份 `compare.md`；合并时会
+   检查每个文件里的 `algo` 与目录一致。
+6. `--nsys` 时，各节点的 nsys 报告可能比 node 0 晚落盘，`analyse_nsys.py` 会等到报告数达到
+   `world_size × case 数` 且文件大小不再变化（最多 300 秒）后，再逐份导出 SQLite 汇总。
 
 `results.jsonl` 每行一个 case：`scenario`、`phase`、`total_ranks`、`layout`、`group_index`、
 `workload`、`group_size`、`ranks`、`size_bytes`、`makespan_ms`、`ag_ms`/`rs_ms`、`host_bound`、
@@ -265,7 +317,8 @@ NVLink 拓扑的映射。已有输出目录会报 `FileExistsError`，重复实�
 uv run --no-sync python -m pytest \
   --confcutdir=tests/unit_tests/examples \
   tests/unit_tests/examples/test_gb200_nvls_collective.py \
-  tests/unit_tests/examples/test_gb200_nvls_analyse_nsys.py -q
+  tests/unit_tests/examples/test_gb200_nvls_analyse_nsys.py \
+  tests/unit_tests/examples/test_gb200_nvls_run_dir.py -q
 bash -n examples/gb200/nvls-collective/run_nvls_collective_benchmark.sh
 uv run --no-sync ruff check examples/gb200/nvls-collective
 ```
