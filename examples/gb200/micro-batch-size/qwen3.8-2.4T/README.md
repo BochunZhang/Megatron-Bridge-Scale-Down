@@ -132,6 +132,9 @@ examples/gb200/micro-batch-size/qwen3.8-2.4T/run_all_benchmarks.sh --scope GEMM 
 
 # 长序列（k = 1024，也可直接写 token 数）：结果写入 seq16k/、seq64k/、seq256k/ …
 examples/gb200/micro-batch-size/qwen3.8-2.4T/run_all_benchmarks.sh --seq 16k
+
+# 多个序列长度一次跑完（空格或逗号分隔），含小于 1k 的 token 数
+examples/gb200/micro-batch-size/qwen3.8-2.4T/run_all_benchmarks.sh --seq "256,1k" --scope GEMM
 examples/gb200/micro-batch-size/qwen3.8-2.4T/run_all_benchmarks.sh --seq 256k --scope "GEMM GatedDeltaNet" --micro-batch-sizes 1
 
 # 单个 scope、单个 case（底层入口）

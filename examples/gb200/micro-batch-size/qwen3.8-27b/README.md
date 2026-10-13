@@ -64,6 +64,9 @@ examples/gb200/micro-batch-size/qwen3.8-27b/run_all_benchmarks.sh --seq 256k --m
 # 加 nsys trace + SQL 交叉校验列；同时跑 GDN / attention 模块
 examples/gb200/micro-batch-size/qwen3.8-27b/run_all_benchmarks.sh --nsys --scope "GEMM GatedDeltaNet GatedAttention"
 
+# 多个序列长度一次跑完（空格或逗号分隔），含小于 1k 的 token 数
+examples/gb200/micro-batch-size/qwen3.8-27b/run_all_benchmarks.sh --seq "256,1k" --scope GEMM
+
 # 重新整理某个序列长度的 CSV
 examples/gb200/micro-batch-size/qwen3.8-27b/build_csv.sh --seq 16k
 ```

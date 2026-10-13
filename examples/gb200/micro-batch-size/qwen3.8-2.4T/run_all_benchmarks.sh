@@ -19,9 +19,10 @@
 #                         [--seq 4k] [--nsys] [--micro-batch-sizes 1,2,4,8] [--device N]
 #
 # --scope takes a space- or comma-separated list (case-insensitive); default: all scopes.
-# --seq   sequence length: 4k (default), 16k, 64k, 256k, ... or a token count.
-#         Results go to $RESULTS_ROOT/seq<len>/ (e.g. seq4k, seq256k); cases that do not
-#         fit in GPU memory are kept in the CSV with status=oom.
+# --seq   sequence length(s), space- or comma-separated: 4k (default), 256, 1k, 16k, 256k,
+#         ... or a token count; e.g. --seq "256,1k,4k,16k" runs each length in turn.
+#         Results go to $RESULTS_ROOT/seq<len>/ (e.g. seq256, seq4k, seq256k); cases that do
+#         not fit in GPU memory are kept in the CSV with status=oom.
 set -euo pipefail
 source "$(dirname "${BASH_SOURCE[0]}")/_env.sh"
 
@@ -37,12 +38,18 @@ while [[ $# -gt 0 ]]; do
     *) echo "unknown argument: $1" >&2; exit 2 ;;
   esac
 done
-SEQ_TOKENS="$(mbench_seq_tokens "$SEQ")"
-OUTPUT_DIR="$RESULTS_ROOT/seq$(mbench_seq_tag "$SEQ_TOKENS")"
-
+read -r -a SEQ_LIST <<< "${SEQ//,/ }"
 read -r -a SCOPE_LIST <<< "${SCOPES//,/ }"
-for scope in "${SCOPE_LIST[@]}"; do
-  "$BENCHMARK_ROOT/run_mbench.sh" --config "$CONFIG" --scope "$scope" --output-dir "$OUTPUT_DIR" \
-    --seq "$SEQ_TOKENS" ${PASS_ARGS[@]+"${PASS_ARGS[@]}"}
+SEQ_TOKENS_LIST=()
+for seq in "${SEQ_LIST[@]}"; do
+  SEQ_TOKENS_LIST+=("$(mbench_seq_tokens "$seq")")  # validate every length before running any
 done
-"$SCRIPT_DIR/build_csv.sh" --seq "$SEQ_TOKENS"
+
+for seq_tokens in "${SEQ_TOKENS_LIST[@]}"; do
+  OUTPUT_DIR="$RESULTS_ROOT/seq$(mbench_seq_tag "$seq_tokens")"
+  for scope in "${SCOPE_LIST[@]}"; do
+    "$BENCHMARK_ROOT/run_mbench.sh" --config "$CONFIG" --scope "$scope" --output-dir "$OUTPUT_DIR" \
+      --seq "$seq_tokens" ${PASS_ARGS[@]+"${PASS_ARGS[@]}"}
+  done
+  "$SCRIPT_DIR/build_csv.sh" --seq "$seq_tokens"
+done
