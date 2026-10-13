@@ -217,6 +217,7 @@ esac
 RECIPE="${MODEL}_pretrain_4gpu_gb200_${RECIPE_SUFFIX}_fsdp1_config"
 RESULTS_ROOT="${RESULTS_ROOT:-${DEFAULT_RESULTS_ROOT}}"
 resolve_dist_env "${GPU_COUNT}" "${DRY_RUN}"
+resolve_gloo_ifname
 sync_run_time "${DRY_RUN}"
 RUN_PORT="${RUN_PORT:-$(( MASTER_PORT + 1 ))}"
 

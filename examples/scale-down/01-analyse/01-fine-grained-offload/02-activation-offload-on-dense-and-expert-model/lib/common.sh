@@ -64,6 +64,43 @@ resolve_dist_env() {
     fi
 }
 
+# Fix Gloo's bootstrap interface. A stale GLOO_SOCKET_IFNAME inherited from the
+# environment (for example bond1 on a single-node DSW) aborts process-group
+# creation with "Unable to find address for: <ifname>", because Gloo resolves
+# the name against the local interfaces. Select from `ip addr` instead: a single
+# 4-GPU node uses eth0, multi-node DLC uses bond1. An exported GLOO_SOCKET_IFNAME
+# is honored only when the interface actually carries an IPv4 address here; an
+# unusable value is replaced instead of being passed through to Gloo.
+#
+# Requires NNODES. Exports GLOO_SOCKET_IFNAME.
+resolve_gloo_ifname() {
+    local preferred=eth0 fallback=bond1 available
+    if (( NNODES > 1 )); then
+        preferred=bond1
+        fallback=eth0
+    fi
+    if ! command -v ip >/dev/null; then
+        die "the ip command is required to select GLOO_SOCKET_IFNAME; export it explicitly"
+    fi
+    available="$(ip -o -4 addr show up | awk '{print $2}' | sort -u | tr '\n' ' ')"
+    if [[ -n "${GLOO_SOCKET_IFNAME:-}" ]]; then
+        if [[ " ${available} " == *" ${GLOO_SOCKET_IFNAME} "* ]]; then
+            log "gloo interface: ${GLOO_SOCKET_IFNAME} (from the environment)"
+            return
+        fi
+        log "warning: GLOO_SOCKET_IFNAME=${GLOO_SOCKET_IFNAME} has no IPv4 address; overriding it"
+    fi
+    if [[ " ${available} " == *" ${preferred} "* ]]; then
+        export GLOO_SOCKET_IFNAME="${preferred}"
+    elif [[ " ${available} " == *" ${fallback} "* ]]; then
+        log "warning: ${preferred} has no IPv4 address; using ${fallback} (up: ${available})"
+        export GLOO_SOCKET_IFNAME="${fallback}"
+    else
+        die "neither ${preferred} nor ${fallback} is up with an IPv4 address (up: ${available:-none})"
+    fi
+    log "gloo interface: ${GLOO_SOCKET_IFNAME}"
+}
+
 # Agree on one batch id (RUN_TIME) across all nodes so every node writes into
 # the master's result directory. Node 0 generates the id and serves it from a
 # TCPStore on MASTER_ADDR:MASTER_PORT; the other nodes block until they read
