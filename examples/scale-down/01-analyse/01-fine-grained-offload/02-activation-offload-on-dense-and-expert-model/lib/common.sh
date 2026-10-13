@@ -20,7 +20,7 @@ LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 EXPERIMENT_DIR="$(cd "${LIB_DIR}/.." && pwd)"
 GPU_MONITOR="${REPO_ROOT}/scripts/scale-down/nvidia-smi/check_gpu.py"
 GPU_UTIL_EXPORTER="${REPO_ROOT}/scripts/scale-down/analyse/export_gpu_utilization.py"
-DEFAULT_RESULTS_ROOT="${REPO_ROOT}/results/scale-down/01-analyse/01-fine-grained-offload/02-activation-offload-on-dense-and-expert-model"
+DEFAULT_RESULTS_ROOT="${REPO_ROOT}/results/01-analyse/01-fine-grained-offload/02-activation-offload-on-dense-and-expert-model"
 GPUS_PER_NODE=4
 
 log() {

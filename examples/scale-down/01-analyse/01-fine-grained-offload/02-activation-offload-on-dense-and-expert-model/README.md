@@ -161,7 +161,7 @@ bash $E/run_4gpu_compare_activation_offload_influence_on_dense_and_expert.sh --m
 ## 6. 结果结构与汇总
 
 默认 `<results-root>` 是
-`results/scale-down/01-analyse/01-fine-grained-offload/02-activation-offload-on-dense-and-expert-model`。
+`results/01-analyse/01-fine-grained-offload/02-activation-offload-on-dense-and-expert-model`。
 一级目录是实验名，即脚本名去掉 `run_` 前缀，标明这批结果回答的是哪个问题：
 
 | 一级目录 | 对应脚本 | 回答的问题 |

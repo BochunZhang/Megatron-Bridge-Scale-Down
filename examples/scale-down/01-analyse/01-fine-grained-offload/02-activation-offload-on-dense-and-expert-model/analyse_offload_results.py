@@ -47,7 +47,7 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 REPO_ROOT = SCRIPT_DIR.parents[4]
 DEFAULT_RESULTS_ROOT = (
     REPO_ROOT
-    / "results/scale-down/01-analyse/01-fine-grained-offload/02-activation-offload-on-dense-and-expert-model"
+    / "results/01-analyse/01-fine-grained-offload/02-activation-offload-on-dense-and-expert-model"
 )
 # One sample per logged training iteration; the analyser needs enough of them to
 # skip warmup and still average a stable window.
