@@ -7,7 +7,7 @@ import pytest
 
 
 REPO_ROOT = Path(__file__).resolve().parents[4]
-EXAMPLE_DIR = REPO_ROOT / "examples/scale-down/01-analyse/01-fine-grained-offload/02-offload-on-dense-or-expert-model"
+EXAMPLE_DIR = REPO_ROOT / "examples/scale-down/01-analyse/01-fine-grained-offload/02-activation-offload-on-dense-and-expert-model-outdate-01"
 BENCHMARK_SCRIPT = EXAMPLE_DIR / "benchmark_mlp_offload.sh"
 COLLECTOR_SCRIPT = EXAMPLE_DIR / "collect_mlp_offload_results.mjs"
 

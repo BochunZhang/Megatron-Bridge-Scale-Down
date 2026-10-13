@@ -64,7 +64,7 @@ bash examples/gb200/env-info/check_dlc_node_environment.sh
 以下变量需要由 DLC job 的公共环境注入。`RUN_TIME` 必须在提交任务前生成一次，然后传给全部 8 个 worker；不能让每个 worker 各自执行 `date`。
 
 ```bash
-export EXPERIMENT_DIR=/shared/megatron-bridge/examples/scale-down/01-analyse/01-fine-grained-offload/02-offload-on-dense-or-expert-model
+export EXPERIMENT_DIR=/shared/megatron-bridge/examples/scale-down/01-analyse/01-fine-grained-offload/02-activation-offload-on-dense-and-expert-model-outdate-01
 export RESULTS_ROOT=/shared/megatron-bridge/results/scale-down/01-fine-grained-offload/02-offload-on-dense-or-expert-model
 export RUN_TIME="20261005-32gpu-001"  # DLC 提交端生成一次，并传给全部 worker
 export MASTER_ADDR="rank-0-worker-hostname-or-ip"  # 替换为实际可达地址
