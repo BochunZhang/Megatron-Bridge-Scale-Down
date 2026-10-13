@@ -15,10 +15,12 @@
 #
 # Run one mbench scope in its own process, optionally under Nsight Systems.
 #
-#   run_mbench.sh --config CONFIG --scope {GEMM|GatedDeltaNet|GatedAttention|MLP|Experts} \
-#                 --output-dir DIR [--nsys] [--micro-batch-sizes 1,2] [--cases a,b] [--device N]
+#   run_mbench.sh --config CONFIG --scope {GEMM|GatedDeltaNet|GatedAttention|MLP|Experts|GemmSweep} \
+#                 --output-dir DIR [--nsys] [--micro-batch-sizes 1,2] [--seq 16k] [--cases a,b] [--device N]
 #
-# Results go to DIR/<category>/ (gemm, gated_delta_net, gated_attention, mlp, experts).
+# --seq overrides benchmark.sequence_length (4k, 16k, 64k, 256k, ... or a token count);
+# GemmSweep ignores --seq and --micro-batch-sizes.
+# Results go to DIR/<category>/ (gemm, gated_delta_net, gated_attention, mlp, experts, gemm_sweep).
 # With --nsys the trace is written to DIR/nsys/<category>.nsys-rep and exported
 # to DIR/nsys/<category>.sqlite for mbench.build_csv.
 set -euo pipefail
@@ -35,12 +37,12 @@ while [[ $# -gt 0 ]]; do
     --scope) SCOPE="$2"; shift 2 ;;
     --output-dir) OUTPUT_DIR="$2"; shift 2 ;;
     --nsys) USE_NSYS=1; shift ;;
-    --micro-batch-sizes|--cases|--device) EXTRA_ARGS+=("$1" "$2"); shift 2 ;;
+    --micro-batch-sizes|--seq|--cases|--device) EXTRA_ARGS+=("$1" "$2"); shift 2 ;;
     *) echo "unknown argument: $1" >&2; exit 2 ;;
   esac
 done
 if [[ -z "$CONFIG" || -z "$SCOPE" || -z "$OUTPUT_DIR" ]]; then
-  echo "usage: $0 --config CONFIG --scope SCOPE --output-dir DIR [--nsys] [--micro-batch-sizes LIST] [--cases LIST] [--device N]" >&2
+  echo "usage: $0 --config CONFIG --scope SCOPE --output-dir DIR [--nsys] [--micro-batch-sizes LIST] [--seq LEN] [--cases LIST] [--device N]" >&2
   exit 2
 fi
 # Must match mbench.run.SCOPES.
@@ -50,7 +52,8 @@ case "$(echo "$SCOPE" | tr '[:upper:]' '[:lower:]')" in
   gatedattention|gated_attention) CATEGORY=gated_attention ;;
   mlp) CATEGORY=mlp ;;
   experts) CATEGORY=experts ;;
-  *) echo "unknown scope: $SCOPE (expected GEMM, GatedDeltaNet, GatedAttention, MLP or Experts)" >&2; exit 2 ;;
+  gemmsweep|gemm_sweep) CATEGORY=gemm_sweep ;;
+  *) echo "unknown scope: $SCOPE (expected GEMM, GatedDeltaNet, GatedAttention, MLP, Experts or GemmSweep)" >&2; exit 2 ;;
 esac
 
 export PYTHONPATH="$BENCHMARK_ROOT${PYTHONPATH:+:$PYTHONPATH}"

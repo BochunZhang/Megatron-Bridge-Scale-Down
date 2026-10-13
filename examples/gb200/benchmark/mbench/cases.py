@@ -16,7 +16,8 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Iterator
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from typing import Any
 
 import numpy as np
 import torch
@@ -33,23 +34,25 @@ class BenchContext:
     """Everything a category needs to build its cases.
 
     Attributes:
-        modules: Lazily built Megatron modules.
-        sequence_length: Tokens per sample.
+        modules: Lazily built Megatron modules; ``None`` for model-free scopes (GemmSweep).
+        sequence_length: Tokens per sample; ``None`` for model-free scopes.
         dtype: Activation dtype.
-        formal_expert_parallel_size: EP size of the real training layout.
+        formal_expert_parallel_size: EP size of the real training layout; ``None`` for dense models.
         expert_routings: Routing distributions for the routed-expert cases.
         seed: Seed for inputs and routing histograms.
         case_filter: Case names to run; ``None`` runs all. Categories must not build
             modules for filtered-out cases.
+        settings: The config section named after the category (e.g. ``gemm_sweep``), if any.
     """
 
-    modules: MegatronModules
-    sequence_length: int
+    modules: MegatronModules | None
+    sequence_length: int | None
     dtype: torch.dtype
-    formal_expert_parallel_size: int
+    formal_expert_parallel_size: int | None
     expert_routings: list[dict[str, ParamValue]]
     seed: int
     case_filter: frozenset[str] | None
+    settings: dict[str, Any] = field(default_factory=dict)
 
     def wants(self, name: str) -> bool:
         """Whether case ``name`` is selected."""

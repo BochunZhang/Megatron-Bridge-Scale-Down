@@ -25,4 +25,6 @@ if [[ -d "$REPO_ROOT/../flash-linear-attention" ]]; then
   PYTHONPATH="$REPO_ROOT/../flash-linear-attention:$PYTHONPATH"
 fi
 export PYTHONPATH SCRIPT_DIR REPO_ROOT BENCHMARK_ROOT CONFIG RESULTS_ROOT
+# shellcheck source=../../benchmark/seq.sh
+source "$BENCHMARK_ROOT/seq.sh"
 cd "$REPO_ROOT"

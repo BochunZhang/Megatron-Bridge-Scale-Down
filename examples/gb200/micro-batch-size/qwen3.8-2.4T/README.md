@@ -1,7 +1,7 @@
 # Qwen3.8 2.4T：GB200 单卡算子 / 模块效率测试（micro-batch-size 扫描）
 
 目标：在单张 GB200 上，用 **Megatron 训练时实际执行的模块与 kernel**，测量 Qwen3.8 2.4T 各类
-计算在不同 micro-batch size（`tokens = 4096 × mbs`）下的耗时与 TFLOP/s。计时屏蔽 CPU 开销，
+计算在不同 micro-batch size / 序列长度（`tokens = seq × mbs`，默认 seq = 4096）下的耗时与 TFLOP/s。计时屏蔽 CPU 开销，
 不使用 CUDA Graph。
 
 测量框架（计时协议、Nsys 校验、CSV 列定义）见
@@ -12,8 +12,8 @@
 | 文件 | 作用 |
 | --- | --- |
 | `mbench.yaml` | 模型结构（`GPTModelProvider` 字段）、扫描范围、计时参数 |
-| `run_all_benchmarks.sh` | 依次运行各 scope（每个 scope 一个进程），最后生成 CSV；支持 `--scope`、`--nsys` |
-| `build_csv.sh` | 只重新生成 CSV（`results/.../csv/<category>.csv`） |
+| `run_all_benchmarks.sh` | 依次运行各 scope（每个 scope 一个进程），最后生成 CSV；支持 `--seq`、`--scope`、`--nsys` |
+| `build_csv.sh` | 只重新生成某个序列长度的 CSV（`results/.../seq<len>/csv/<category>.csv`） |
 | `_env.sh` | 路径与 `PYTHONPATH`（含同级 `flash-linear-attention` checkout，若存在） |
 
 ## 2. 模型配置与假设
@@ -27,7 +27,7 @@
 | MoE | 512 experts，top-10，expert FFN 2048，shared expert FFN 2048 + sigmoid gate，router fp32、`global_aux_loss` |
 | 词表 | 248320（不共享 embedding） |
 | 精度 | BF16 参数与激活，fp32 `main_grad`，`gradient_accumulation_fusion: true` |
-| 序列 / mbs | 4096；mbs = 1, 2, 4, 8 |
+| 序列 / mbs | 默认 4096（`--seq` 可改为 16k / 64k / 256k …）；mbs = 1, 2, 4, 8 |
 | 并行假设 | TP = CP = 1，正式 EP = 64：每 rank 8 个本地 expert |
 
 说明：
@@ -130,14 +130,18 @@ examples/gb200/micro-batch-size/qwen3.8-2.4T/run_all_benchmarks.sh --nsys
 examples/gb200/micro-batch-size/qwen3.8-2.4T/run_all_benchmarks.sh --scope "GatedDeltaNet GatedAttention"
 examples/gb200/micro-batch-size/qwen3.8-2.4T/run_all_benchmarks.sh --scope GEMM --micro-batch-sizes 1,8
 
+# 长序列（k = 1024，也可直接写 token 数）：结果写入 seq16k/、seq64k/、seq256k/ …
+examples/gb200/micro-batch-size/qwen3.8-2.4T/run_all_benchmarks.sh --seq 16k
+examples/gb200/micro-batch-size/qwen3.8-2.4T/run_all_benchmarks.sh --seq 256k --scope "GEMM GatedDeltaNet" --micro-batch-sizes 1
+
 # 单个 scope、单个 case（底层入口）
 examples/gb200/benchmark/run_mbench.sh \
   --config examples/gb200/micro-batch-size/qwen3.8-2.4T/mbench.yaml \
-  --scope GatedAttention --cases core_attention \
-  --output-dir results/gb200/micro-batch-size/qwen3.8_2.4T --nsys
+  --scope GatedAttention --cases core_attention --seq 64k \
+  --output-dir results/gb200/micro-batch-size/qwen3.8_2.4T/seq64k --nsys
 
-# 重新整理 CSV
-examples/gb200/micro-batch-size/qwen3.8-2.4T/build_csv.sh
+# 重新整理某个序列长度的 CSV（默认 4k）
+examples/gb200/micro-batch-size/qwen3.8-2.4T/build_csv.sh --seq 64k
 ```
 
 要求：仓库 `uv` 环境（PyTorch、Transformer Engine、megatron-core、flash-linear-attention、numpy、PyYAML）；
@@ -146,11 +150,14 @@ examples/gb200/micro-batch-size/qwen3.8-2.4T/build_csv.sh
 ## 6. 输出
 
 ```
-results/gb200/micro-batch-size/qwen3.8_2.4T/
+results/gb200/micro-batch-size/qwen3.8_2.4T/seq<len>/     例如 seq4k、seq16k、seq256k
   gemm/ gated_delta_net/ gated_attention/ mlp/ experts/   每个 (case, mbs, mode) 一个 JSON
   nsys/<category>.nsys-rep / .sqlite                       仅 --nsys
   csv/gemm.csv  csv/gated_delta_net.csv  csv/gated_attention.csv  csv/mlp.csv  csv/experts.csv
 ```
+
+长序列 × 大 mbs 的组合可能超出单卡显存（例如 256k × mbs 8 的 LM head 输出就超过 1 TB）：这类 case
+不会中断整个 scope，而是写一条 `status: oom` 的记录，在 CSV 中保留该行、计时列为空。
 
 整模型单次迭代的计算时间可以用 `gemm.csv` 中的单层耗时 × 出现次数加权求和来估算。
 

@@ -5,20 +5,30 @@
 用 `cuStreamWaitValue32` 闸门 + CUDA Event 测量纯 GPU 时间，并可选用 Nsight Systems + SQL 交叉校验。
 不使用 CUDA Graph。
 
-模型相关的配置与启动脚本放在各自目录，例如
-[`examples/gb200/micro-batch-size/qwen3.8-2.4T/`](../micro-batch-size/qwen3.8-2.4T/README.md)。
+模型相关的配置与启动脚本放在各自目录：
+
+| 目录 | 内容 |
+| --- | --- |
+| [`micro-batch-size/qwen3.8-2.4T/`](../micro-batch-size/qwen3.8-2.4T/README.md) | Qwen3.8 2.4T（GDN/attention 混合 + MoE），全部 5 个模型 scope |
+| [`micro-batch-size/qwen3.8-27b/`](../micro-batch-size/qwen3.8-27b/README.md) | Qwen3.8 27B（GDN/attention 混合 + dense MLP），默认只跑 `GEMM` |
+| [`gemm-shape-sweep/`](../gemm-shape-sweep/README.md) | 与模型无关的 GEMM 形状扫描（`GemmSweep`：方阵、细长、少行、短/长规约、等 FLOPs） |
+
+模型 scope 都支持 `--seq`（默认取 YAML 的 `benchmark.sequence_length`，可写 `4k`、`16k`、`64k`、
+`256k` 或 token 数，k = 1024）。模型启动脚本把不同序列长度的结果写到 `<results>/seq<len>/`。
 
 ## 目录
 
 | 路径 | 作用 |
 | --- | --- |
-| `run_mbench.sh` | 以独立进程运行一个 scope（`--scope GEMM\|GatedDeltaNet\|GatedAttention\|MLP\|Experts`）；`--nsys` 时套 `nsys profile` 并导出 SQLite |
+| `run_mbench.sh` | 以独立进程运行一个 scope（`--scope GEMM\|GatedDeltaNet\|GatedAttention\|MLP\|Experts\|GemmSweep`，可加 `--seq`）；`--nsys` 时套 `nsys profile` 并导出 SQLite |
+| `seq.sh` | 启动脚本共用的 `--seq` 解析（`4k` → 4096 → 目录名 `seq4k`） |
 | `mbench/run.py` | 读取 YAML、构建 Megatron 模块、逐个 case 计时、写 JSON；`SCOPES` 定义 scope 名与结果目录的对应关系 |
 | `mbench/megatron_setup.py` | 单 rank 进程组 + `GPTModelProvider` + 用训练同款 spec 构建模块；挂 `main_grad` 与 DDP 反向 hook |
 | `mbench/gate.py` / `gate_watchdog.py` | `cuStreamWaitValue32` 闸门与看门狗进程 |
 | `mbench/timing.py` | 轮次（round）计时协议 |
 | `mbench/cases.py` | case 描述、FLOPs、EP 路由下本地 expert 的 token 数 |
-| `mbench/categories/{gemm,gated_delta_net,gated_attention,mlp,experts}.py` | 五个 scope 的 case 定义 |
+| `mbench/categories/{gemm,gated_delta_net,gated_attention,mlp,experts}.py` | 五个模型 scope 的 case 定义（`gemm` 按模型是 MoE 还是 dense 选择 case） |
+| `mbench/categories/gemm_sweep.py` | `GemmSweep`：按 YAML `gemm_sweep.families` 生成纯 `F.linear` GEMM，不需要 `model` 段 |
 | `mbench/build_csv.py` | JSON → 每个 scope 一个 CSV；有 SQLite 时追加 `nsys_*` 列 |
 
 ## 模块来源（保证与训练一致）
@@ -28,7 +38,8 @@
 - 层 spec：`get_transformer_layer_with_experimental_attention_variant_spec(config)`，即 Qwen3.5/3.8
   Bridge 训练所用的 `transformer_layer_spec`。GDN 层与 attention 层分别取第一个对应层号的 spec，
   `build_module(...)` 构建；MoE 的 router / experts / shared experts 取自同一层 spec 中的
-  `MoESubmodules`。MTP `eh_proj` 与 LM head 按 `MultiTokenPredictionLayer` / `GPTModel`
+  `MoESubmodules`；dense 模型（未设置 `num_moe_experts`）的 `MLP` 按 `TransformerLayer` 的方式由层 spec
+  的 `mlp` builder 构建（`linear_fc1` 融合 pre-MLP RMSNorm）。MTP `eh_proj` 与 LM head 按 `MultiTokenPredictionLayer` / `GPTModel`
   的构造参数构建（BF16 下 LM head 为 `tensor_parallel.ColumnParallelLinear`）。
 - 反向：每个参数分配 fp32 `main_grad`、`grad_added_to_main_grad`，并在 `AccumulateGrad`
   节点上挂与 Megatron DDP `_make_backward_post_hook` 相同逻辑的 hook。因此 TE 层走
@@ -84,8 +95,9 @@ Nsys 追踪本身对 GPU 有少量开销，正式数字以 `event_*` 为准，`n
 
 | 列 | 含义 |
 | --- | --- |
-| `case`, `megatron_module`, `micro_batch_size`, `mode` | 用例标识与被执行的 Megatron 类 |
-| 参数列 | 每个 scope 不同：GEMM 的 `m,k,n,groups,rows_per_group`；attention 的头数/head_dim；GDN 的头数/维度；experts 的 rows/路由等 |
+| `case`, `megatron_module`, `micro_batch_size`, `sequence_length`, `mode` | 用例标识与被执行的 Megatron 类；`GemmSweep` 的 `micro_batch_size` 固定为 1、`sequence_length` 为空 |
+| 参数列 | 每个 scope 不同：GEMM 的 `m,k,n,groups,rows_per_group`；attention 的头数/head_dim；GDN 的头数/维度；experts 的 rows/路由；GemmSweep 的 `family,m,k,n,arithmetic_intensity,operand_mib` 等 |
+| `status` | `ok`，或 `oom`（该 case 超出显存，计时列为空；长 `--seq` / 大 mbs 时出现，不会中断整个 scope） |
 | `flops`, `tflops_median` | 该迭代的模型 FLOPs（`flops_scope` 说明范围）与按中位时间计算的 TFLOP/s |
 | `event_{median,mean,min,p90,max,std}_ms`, `samples` | CUDA Event 单次迭代时间统计 |
 | `gated`, `iters_per_round`, `discarded_rounds` | 计时是否在闸门下完成、实际轮大小、丢弃轮数 |
@@ -96,5 +108,6 @@ Nsys 追踪本身对 GPU 有少量开销，正式数字以 `event_*` 为准，`n
 
 1. 新建 `examples/gb200/micro-batch-size/<model>/mbench.yaml`（`model` 段为 `GPTModelProvider` 字段）。
 2. 复制该目录下的 `_env.sh`、`run_all_benchmarks.sh`、`build_csv.sh`，修改 `RESULTS_ROOT`。
-3. 结构不同于 GDN/attention 混合 + MoE 的模型需要在 `mbench/categories/` 中新增 case 定义，
-   并在 `mbench/run.py` 的 `SCOPES` 与 `run_mbench.sh` 的 scope 映射中注册。
+3. GDN/attention 混合 + MoE（如 2.4T）与 GDN/attention 混合 + dense MLP（如 27B）都已支持；
+   其他结构需要在 `mbench/categories/` 中新增 case 定义，并在 `mbench/run.py` 的 `SCOPES`
+   与 `run_mbench.sh` 的 scope 映射中注册（不需要模型的 scope 还要加入 `MODEL_FREE_SCOPES`）。

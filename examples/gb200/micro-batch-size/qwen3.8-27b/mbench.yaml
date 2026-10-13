@@ -1,0 +1,65 @@
+# Qwen3.8 27B (dense) single-GPU GEMM benchmark (mbench).
+#
+# The project's Qwen3.8 27B recipes build the model from the Qwen/Qwen3.5-27B text
+# config (src/megatron/bridge/recipes/qwen/gb200/qwen35.py), so the fields below are
+# that architecture: hybrid GatedDeltaNet / gated attention decoder with a dense
+# SwiGLU MLP in every layer (no MoE).
+#
+# `model` is passed verbatim to megatron.bridge GPTModelProvider, so every module
+# is built by the same Megatron spec functions training uses. Parallel sizes are
+# forced to 1 by the runner.
+model:
+  transformer_impl: transformer_engine
+  num_layers: 64                       # 48 GatedDeltaNet + 16 gated attention (linear_attention_freq=4)
+  hidden_size: 5120
+  ffn_hidden_size: 17408               # dense SwiGLU MLP: fc1 5120 -> 2x17408, fc2 17408 -> 5120
+  vocab_size: 248320
+  share_embeddings_and_output_weights: false
+  normalization: RMSNorm
+  layernorm_epsilon: 1.0e-6
+  layernorm_zero_centered_gamma: true
+  activation_func: silu
+  gated_linear_unit: true
+  add_bias_linear: false
+  add_qkv_bias: false
+  hidden_dropout: 0.0
+  attention_dropout: 0.0
+  init_method_std: 0.02
+  bias_activation_fusion: true
+  gradient_accumulation_fusion: true
+
+  # Gated (softmax) attention layers.
+  num_attention_heads: 24
+  num_query_groups: 4
+  kv_channels: 256
+  qk_layernorm: true
+  attention_output_gate: true
+  attention_softmax_in_fp32: true
+  attention_backend: auto              # AttnBackend name: auto | fused | flash | unfused | local
+  position_embedding_type: rope
+  rotary_percent: 0.25
+  rotary_base: 10000000
+  apply_rope_fusion: true
+
+  # GatedDeltaNet layers.
+  experimental_attention_variant: gated_delta_net
+  linear_attention_freq: 4
+  linear_conv_kernel_dim: 4
+  linear_num_key_heads: 16
+  linear_num_value_heads: 48
+  linear_key_head_dim: 128
+  linear_value_head_dim: 128
+
+benchmark:
+  sequence_length: 4096                # overridden by run_all_benchmarks.sh --seq
+  micro_batch_sizes: [1, 2, 4, 8]
+  dtype: bf16
+  modes: [fwd, fwdbwd]
+  seed: 2026
+
+timing:
+  pre_run_iters: 1        # ungated, untimed: autotuning / lazy init / allocator warmup (needs host syncs)
+  warmup_iters: 3         # gated, untimed, at the start of every round
+  profile_iters: 10       # timed iterations per case
+  max_iters_per_round: 13 # warmup + profile in one gated round; halved if the launch queue fills
+  gate_timeout_s: 20      # watchdog release; a fired round is discarded

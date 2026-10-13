@@ -15,11 +15,16 @@
 
 Usage::
 
-    python -m mbench.run --config mbench.yaml --scope GatedDeltaNet --output-dir results/...
+    python -m mbench.run --config mbench.yaml --scope GatedDeltaNet --output-dir results/... [--seq 16k]
 
-Scopes: GEMM, GatedDeltaNet, GatedAttention, MLP, Experts (case-insensitive).
+Scopes: GEMM, GatedDeltaNet, GatedAttention, MLP, Experts, GemmSweep (case-insensitive).
 Writes one JSON record per (case, mbs, mode) to ``<output-dir>/<category>/`` where
-``<category>`` is the scope's directory name (gemm, gated_delta_net, ...).
+``<category>`` is the scope's directory name (gemm, gated_delta_net, ...). A case that
+runs out of GPU memory (long ``--seq`` / large mbs) gets a record with ``status: oom``
+and the scope continues.
+
+GemmSweep needs no ``model`` section: it times plain ``F.linear`` GEMMs over the
+shape families of the config's ``gemm_sweep`` section.
 """
 
 from __future__ import annotations
@@ -29,6 +34,7 @@ import gc
 import json
 import logging
 import platform
+import re
 from importlib import metadata
 from pathlib import Path
 from typing import Any
@@ -37,7 +43,7 @@ import torch
 import yaml
 
 from mbench.cases import BenchCase, BenchContext, CaseFactory
-from mbench.categories import experts, gated_attention, gated_delta_net, gemm, mlp
+from mbench.categories import experts, gated_attention, gated_delta_net, gemm, gemm_sweep, mlp
 from mbench.gate import LaunchGate
 from mbench.megatron_setup import MegatronModules, build_provider, init_single_rank, resolve_dtype
 from mbench.timing import TimingConfig, make_step, measure, nvtx_label
@@ -51,7 +57,11 @@ SCOPES: dict[str, tuple[str, CaseFactory]] = {
     "GatedAttention": (gated_attention.CATEGORY, gated_attention.iter_cases),
     "MLP": (mlp.CATEGORY, mlp.iter_cases),
     "Experts": (experts.CATEGORY, experts.iter_cases),
+    "GemmSweep": (gemm_sweep.CATEGORY, gemm_sweep.iter_cases),
 }
+# Scopes that build no Megatron module and therefore need no ``model`` config section.
+MODEL_FREE_SCOPES = frozenset({"GemmSweep"})
+_SEQUENCE_LENGTH = re.compile(r"(?P<count>[1-9][0-9]*)(?P<unit>[km]?)")
 
 
 def resolve_scope(name: str) -> str:
@@ -61,6 +71,17 @@ def resolve_scope(name: str) -> str:
         if name.lower() in {scope.lower(), category}:
             return scope
     raise ValueError(f"unknown scope {name!r}; expected one of {list(SCOPES)}")
+
+
+def parse_sequence_length(value: str) -> int:
+    """Parse ``4k`` / ``16K`` / ``256k`` / ``1m`` / ``4096`` into tokens (k = 1024, m = 1024**2)."""
+
+    match = _SEQUENCE_LENGTH.fullmatch(value.strip().lower())
+    if match is None:
+        raise argparse.ArgumentTypeError(
+            f"invalid sequence length {value!r}; expected e.g. 4k, 16k, 64k, 256k or 4096"
+        )
+    return int(match["count"]) * {"": 1, "k": 1024, "m": 1024**2}[match["unit"]]
 
 
 def _package_version(name: str) -> str | None:
@@ -96,10 +117,55 @@ def _gpu_telemetry() -> dict[str, float | None]:
     return readings
 
 
+def _record_path(output_dir: Path, case: BenchCase) -> Path:
+    return output_dir / f"{case.name}.mbs{case.micro_batch_size}.{case.mode}.json"
+
+
+def _base_record(case: BenchCase, *, category: str, sequence_length: int | None) -> dict[str, Any]:
+    return {
+        "category": category,
+        "case": case.name,
+        "megatron_module": case.megatron_module,
+        "micro_batch_size": case.micro_batch_size,
+        "sequence_length": sequence_length,
+        "mode": case.mode,
+        "params": case.params,
+        "flops": case.flops,
+    }
+
+
+def _write_oom_record(
+    case: BenchCase,
+    *,
+    category: str,
+    sequence_length: int | None,
+    output_dir: Path,
+    environment: dict[str, Any],
+    error: torch.cuda.OutOfMemoryError,
+) -> None:
+    """Record a case that does not fit in GPU memory so the CSV shows it instead of dropping it."""
+
+    record = {
+        **_base_record(case, category=category, sequence_length=sequence_length),
+        "status": "oom",
+        "error": str(error).splitlines()[0],
+        "environment": environment,
+    }
+    _record_path(output_dir, case).write_text(json.dumps(record, indent=2, sort_keys=True), encoding="utf-8")
+    LOGGER.warning(
+        "%s/%s mbs=%d %s: out of GPU memory, recorded as status=oom",
+        category,
+        case.name,
+        case.micro_batch_size,
+        case.mode,
+    )
+
+
 def _run_case(
     case: BenchCase,
     *,
     category: str,
+    sequence_length: int | None,
     timing: TimingConfig,
     gate: LaunchGate,
     round_sizes: dict[str, int],
@@ -128,13 +194,8 @@ def _run_case(
     summary = result.summary()
     tflops = None if case.flops is None else case.flops / (summary["median_ms"] * 1e-3) / 1e12
     record = {
-        "category": category,
-        "case": case.name,
-        "megatron_module": case.megatron_module,
-        "micro_batch_size": case.micro_batch_size,
-        "mode": case.mode,
-        "params": case.params,
-        "flops": case.flops,
+        **_base_record(case, category=category, sequence_length=sequence_length),
+        "status": "ok",
         "tflops_median": tflops,
         "timing": {
             **summary,
@@ -150,8 +211,7 @@ def _run_case(
         "telemetry": _gpu_telemetry(),
         "environment": environment,
     }
-    path = output_dir / f"{case.name}.mbs{case.micro_batch_size}.{case.mode}.json"
-    path.write_text(json.dumps(record, indent=2, sort_keys=True), encoding="utf-8")
+    _record_path(output_dir, case).write_text(json.dumps(record, indent=2, sort_keys=True), encoding="utf-8")
     LOGGER.info(
         "%s/%s mbs=%d %s: median %.4f ms (p90 %.4f, n=%d, gated=%s)%s",
         category,
@@ -174,21 +234,27 @@ def main() -> None:
     parser.add_argument("--scope", type=resolve_scope, required=True, help=f"one of {list(SCOPES)}")
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--micro-batch-sizes", type=str, default=None, help="comma list overriding the config")
+    parser.add_argument(
+        "--seq",
+        type=parse_sequence_length,
+        default=None,
+        help="sequence length overriding benchmark.sequence_length, e.g. 4k, 16k, 64k, 256k or 4096",
+    )
     parser.add_argument("--cases", type=str, default=None, help="comma list of case names to run (default: all)")
     parser.add_argument("--device", type=int, default=0)
     args = parser.parse_args()
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
     category, iter_cases = SCOPES[args.scope]
+    model_free = args.scope in MODEL_FREE_SCOPES
 
     config = yaml.safe_load(args.config.read_text(encoding="utf-8"))
     bench = config["benchmark"]
     timing_section = config["timing"]
     dtype = resolve_dtype(bench["dtype"])
-    micro_batch_sizes = (
-        [int(value) for value in args.micro_batch_sizes.split(",")]
-        if args.micro_batch_sizes
-        else [int(value) for value in bench["micro_batch_sizes"]]
-    )
+    if args.micro_batch_sizes:
+        micro_batch_sizes = [int(value) for value in args.micro_batch_sizes.split(",")]
+    else:
+        micro_batch_sizes = [int(value) for value in bench.get("micro_batch_sizes", [1])]
     modes = [str(mode) for mode in bench["modes"]]
     timing = TimingConfig(
         pre_run_iters=int(timing_section["pre_run_iters"]),
@@ -198,19 +264,33 @@ def main() -> None:
     )
 
     pg_collection = init_single_rank(device_index=args.device, seed=int(bench["seed"]))
-    provider = build_provider(config["model"], sequence_length=int(bench["sequence_length"]), dtype=dtype)
-    expert_parallel_size = int(bench["formal_expert_parallel_size"])
-    if provider.num_moe_experts % expert_parallel_size:
-        raise ValueError("num_moe_experts must be divisible by formal_expert_parallel_size")
-    modules = MegatronModules(provider, pg_collection, local_experts=provider.num_moe_experts // expert_parallel_size)
+    modules: MegatronModules | None = None
+    sequence_length: int | None = None
+    expert_parallel_size: int | None = None
+    if model_free:
+        if args.seq is not None or args.micro_batch_sizes:
+            LOGGER.warning("%s takes its shapes from the config; --seq / --micro-batch-sizes are ignored", args.scope)
+    else:
+        if "model" not in config:
+            raise ValueError(f"scope {args.scope} needs a 'model' section in {args.config}")
+        sequence_length = args.seq if args.seq is not None else int(bench["sequence_length"])
+        provider = build_provider(config["model"], sequence_length=sequence_length, dtype=dtype)
+        local_experts = None
+        if provider.num_moe_experts:
+            expert_parallel_size = int(bench["formal_expert_parallel_size"])
+            if provider.num_moe_experts % expert_parallel_size:
+                raise ValueError("num_moe_experts must be divisible by formal_expert_parallel_size")
+            local_experts = provider.num_moe_experts // expert_parallel_size
+        modules = MegatronModules(provider, pg_collection, local_experts=local_experts)
     context = BenchContext(
         modules=modules,
-        sequence_length=int(bench["sequence_length"]),
+        sequence_length=sequence_length,
         dtype=dtype,
         formal_expert_parallel_size=expert_parallel_size,
-        expert_routings=list(bench["expert_routings"]),
+        expert_routings=list(bench.get("expert_routings", [])),
         seed=int(bench["seed"]),
         case_filter=None if args.cases is None else frozenset(args.cases.split(",")),
+        settings=dict(config.get(category) or {}),
     )
     output_dir = args.output_dir / category
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -222,15 +302,26 @@ def main() -> None:
             if not context.wants(case.name):
                 continue
             torch.manual_seed(int(bench["seed"]))
-            _run_case(
-                case,
-                category=category,
-                timing=timing,
-                gate=gate,
-                round_sizes=round_sizes,
-                output_dir=output_dir,
-                environment=environment,
-            )
+            try:
+                _run_case(
+                    case,
+                    category=category,
+                    sequence_length=sequence_length,
+                    timing=timing,
+                    gate=gate,
+                    round_sizes=round_sizes,
+                    output_dir=output_dir,
+                    environment=environment,
+                )
+            except torch.cuda.OutOfMemoryError as error:
+                _write_oom_record(
+                    case,
+                    category=category,
+                    sequence_length=sequence_length,
+                    output_dir=output_dir,
+                    environment=environment,
+                    error=error,
+                )
             gc.collect()
             torch.cuda.empty_cache()
     finally:

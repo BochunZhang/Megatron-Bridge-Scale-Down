@@ -131,15 +131,17 @@ def _make_backward_post_hook(param: torch.nn.Parameter):
 
 
 class MegatronModules:
-    """Lazily built Megatron modules of one hybrid GDN/attention + MoE decoder.
+    """Lazily built Megatron modules of one hybrid GDN/attention decoder with MoE or dense MLP layers.
 
     Args:
         config: Finalized provider (Megatron ``TransformerConfig``).
         pg_collection: Single-rank process groups.
-        local_experts: Routed experts per rank under the formal EP layout.
+        local_experts: Routed experts per rank under the formal EP layout; ``None`` for dense models.
     """
 
-    def __init__(self, config: GPTModelProvider, pg_collection: ProcessGroupCollection, *, local_experts: int) -> None:
+    def __init__(
+        self, config: GPTModelProvider, pg_collection: ProcessGroupCollection, *, local_experts: int | None
+    ) -> None:
         self.config = config
         self.pg_collection = pg_collection
         self.local_experts = local_experts
@@ -165,6 +167,12 @@ class MegatronModules:
             accumulator.register_hook(_make_backward_post_hook(param))
             self._grad_accumulators.append(accumulator)
         return module
+
+    @property
+    def is_moe(self) -> bool:
+        """Whether the decoder layers use MoE (otherwise a dense ``MLP``)."""
+
+        return bool(self.config.num_moe_experts)
 
     def _moe_submodules(self) -> Any:
         builder = self._layer_specs[self.gdn_layer_number - 1].submodules.mlp
@@ -222,6 +230,15 @@ class MegatronModules:
                 config=self.config, pg_collection=self.pg_collection, gate=self.config.moe_shared_expert_gate
             )
         )
+
+    @cached_property
+    def dense_mlp(self) -> torch.nn.Module:
+        """Dense ``MLP`` (fused-norm ``linear_fc1``, ``linear_fc2``), built the way ``TransformerLayer`` builds it."""
+
+        if self.is_moe:
+            raise ValueError("dense_mlp is only defined for models without num_moe_experts")
+        builder = self._layer_specs[self.gdn_layer_number - 1].submodules.mlp
+        return self._prepare(builder(config=self.config, pg_collection=self.pg_collection, is_mtp_layer=False))
 
     @cached_property
     def mtp_eh_proj(self) -> torch.nn.Module:

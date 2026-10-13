@@ -1,0 +1,64 @@
+# GEMM shape sweep on one GB200 (mbench scope GemmSweep).
+#
+# Every case is one BF16 F.linear: Y[M, N] = X[M, K] @ W[N, K]^T (the cuBLAS "TN"
+# GEMM every Linear forward runs). `fwdbwd` adds the dgrad (NN) and wgrad (NT) GEMMs.
+# No model section: shapes come from `gemm_sweep.families`. Each family uses one of
+#   square: [S, ...]                  -> M = N = K = S
+#   m: [...], k: [...], n: [...]      -> Cartesian product
+#   shapes: [[M, K, N], ...]          -> explicit list
+# Case names are <family>_m<M>_k<K>_n<N>; family names must be unique.
+benchmark:
+  dtype: bf16
+  modes: [fwd]             # add fwdbwd to also time the dgrad / wgrad layouts
+  seed: 2026
+
+gemm_sweep:
+  families:
+    # Uniform (square) matrices across scales: launch-bound -> wave-quantized -> compute-bound.
+    - name: square
+      square: [256, 512, 1024, 2048, 3072, 4096, 6144, 8192, 12288, 16384, 24576, 32768]
+
+    # Tall-skinny output: many rows, narrow N (router / gate / small-vocab heads).
+    - name: tall_skinny
+      m: [65536]
+      k: [8192]
+      n: [16, 64, 128, 256, 512, 1024, 2048, 4096]
+
+    # Short-wide: few rows against a large weight (decode, tiny expert groups, small mbs).
+    - name: small_m
+      m: [16, 32, 64, 128, 256, 512, 1024, 2048, 4096]
+      k: [8192]
+      n: [8192]
+
+    # Thin reduction: large output tile, short K (outer-product-like, little reuse per byte).
+    - name: thin_k
+      m: [16384]
+      k: [64, 128, 256, 512, 1024, 2048, 4096]
+      n: [16384]
+
+    # Deep reduction: small output, very long K (wgrad-like, few output tiles to fill 148 SMs).
+    - name: deep_k
+      m: [2048]
+      k: [8192, 32768, 131072, 524288]
+      n: [2048]
+
+    # Same FLOPs (2 * 2^39) with different aspect ratios: isolates shape from scale.
+    - name: iso_flops
+      shapes:
+        - [131072, 4096, 1024]
+        - [65536, 8192, 1024]
+        - [32768, 8192, 2048]
+        - [16384, 8192, 4096]
+        - [8192, 8192, 8192]
+        - [4096, 8192, 16384]
+        - [2048, 8192, 32768]
+        - [1024, 8192, 65536]
+        - [8192, 1024, 65536]
+        - [8192, 65536, 1024]
+
+timing:
+  pre_run_iters: 1        # ungated, untimed: cuBLAS heuristics / allocator warmup
+  warmup_iters: 3         # gated, untimed, at the start of every round
+  profile_iters: 10       # timed iterations per case
+  max_iters_per_round: 13 # warmup + profile in one gated round; halved if the launch queue fills
+  gate_timeout_s: 20      # watchdog release; a fired round is discarded

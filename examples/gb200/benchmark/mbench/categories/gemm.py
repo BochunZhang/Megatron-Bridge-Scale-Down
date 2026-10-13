@@ -11,7 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Every linear layer of the model, executed through the Megatron module that owns it."""
+"""Every linear layer of the model (MoE or dense), executed through the Megatron module that owns it."""
 
 from __future__ import annotations
 
@@ -93,7 +93,11 @@ def _grouped_case(
 
 
 def iter_cases(ctx: BenchContext, micro_batch_sizes: list[int], modes: list[str]) -> Iterator[BenchCase]:
-    """Yield GEMM cases in (layer, mbs, mode) order."""
+    """Yield GEMM cases in (layer, mbs, mode) order.
+
+    MoE models get router / shared-expert / routed-expert GEMMs; dense models get the
+    dense ``MLP`` ``mlp_fc1`` / ``mlp_fc2`` instead.
+    """
 
     modules = ctx.modules
     config = modules.config
@@ -112,7 +116,8 @@ def iter_cases(ctx: BenchContext, micro_batch_sizes: list[int], modes: list[str]
         spec["extra"] = {**spec["extra"], "fused_input_norm": config.normalization}
         return spec
 
-    dense_layers: list[tuple[str, str, Callable[[], dict[str, object]]]] = [
+    LayerEntry = tuple[str, str, Callable[[], dict[str, object]]]
+    dense_layers: list[LayerEntry] = [
         (
             "gdn_in_proj",
             "TELayerNormColumnParallelLinear",
@@ -125,28 +130,48 @@ def iter_cases(ctx: BenchContext, micro_batch_sizes: list[int], modes: list[str]
             lambda: te_norm_linear(modules.attention.linear_qkv),
         ),
         ("attention_linear_proj", "TERowParallelLinear", lambda: te_linear(modules.attention.linear_proj)),
-        (
-            "router_gating",
-            "TopKRouter.gating (router_gating_linear)",
-            lambda: {
-                "in_features": config.hidden_size,
-                "out_features": config.num_moe_experts,
-                "call": modules.router.gating,
-                "extra": {"compute_dtype": config.moe_router_dtype or dtype_name, "fused_wgrad_accumulation": False},
-            },
-        ),
-        ("shared_expert_fc1", "TEColumnParallelLinear", lambda: te_linear(modules.shared_experts.linear_fc1)),
-        ("shared_expert_fc2", "TERowParallelLinear", lambda: te_linear(modules.shared_experts.linear_fc2)),
-        (
-            "shared_expert_gate",
-            "SharedExpertMLP.gate_weight (F.linear)",
-            lambda: {
-                "in_features": config.hidden_size,
-                "out_features": modules.shared_experts.gate_weight.shape[0],
-                "call": lambda hidden: F.linear(hidden, modules.shared_experts.gate_weight),
-                "extra": {"compute_dtype": dtype_name, "fused_wgrad_accumulation": False},
-            },
-        ),
+    ]
+    if modules.is_moe:
+        dense_layers.append(
+            (
+                "router_gating",
+                "TopKRouter.gating (router_gating_linear)",
+                lambda: {
+                    "in_features": config.hidden_size,
+                    "out_features": config.num_moe_experts,
+                    "call": modules.router.gating,
+                    "extra": {
+                        "compute_dtype": config.moe_router_dtype or dtype_name,
+                        "fused_wgrad_accumulation": False,
+                    },
+                },
+            )
+        )
+        if config.moe_shared_expert_intermediate_size:
+            dense_layers += [
+                ("shared_expert_fc1", "TEColumnParallelLinear", lambda: te_linear(modules.shared_experts.linear_fc1)),
+                ("shared_expert_fc2", "TERowParallelLinear", lambda: te_linear(modules.shared_experts.linear_fc2)),
+            ]
+            if config.moe_shared_expert_gate:
+                dense_layers.append(
+                    (
+                        "shared_expert_gate",
+                        "SharedExpertMLP.gate_weight (F.linear)",
+                        lambda: {
+                            "in_features": config.hidden_size,
+                            "out_features": modules.shared_experts.gate_weight.shape[0],
+                            "call": lambda hidden: F.linear(hidden, modules.shared_experts.gate_weight),
+                            "extra": {"compute_dtype": dtype_name, "fused_wgrad_accumulation": False},
+                        },
+                    )
+                )
+    else:
+        # Dense MLP layer (fc1 carries the fused pre-MLP RMSNorm, like gdn_in_proj).
+        dense_layers += [
+            ("mlp_fc1", "TELayerNormColumnParallelLinear", lambda: te_norm_linear(modules.dense_mlp.linear_fc1)),
+            ("mlp_fc2", "TERowParallelLinear", lambda: te_linear(modules.dense_mlp.linear_fc2)),
+        ]
+    dense_layers += [
         ("mtp_eh_proj", "TEColumnParallelLinear", lambda: te_linear(modules.mtp_eh_proj)),
         (
             "output_layer",
@@ -177,6 +202,8 @@ def iter_cases(ctx: BenchContext, micro_batch_sizes: list[int], modes: list[str]
                     extra=spec["extra"],
                 )
 
+    if not modules.is_moe:
+        return
     for name, megatron_module, fc in (
         ("routed_expert_fc1", "TEColumnParallelGroupedLinear", "linear_fc1"),
         ("routed_expert_fc2", "TERowParallelGroupedLinear", "linear_fc2"),

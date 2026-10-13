@@ -33,6 +33,9 @@ For every category directory ``<input-dir>/<category>/*.json`` this writes
   first-start-to-last-end span, the interval union (GPU busy time) and the plain
   sum of the activity durations of one iteration.
 Only rounds accepted by the timer (listed in the JSON) are used.
+
+Cases recorded with ``status: oom`` (did not fit in GPU memory) keep their row with
+empty timing columns.
 """
 
 from __future__ import annotations
@@ -63,9 +66,11 @@ _BASE_COLUMNS = [
     "case",
     "megatron_module",
     "micro_batch_size",
+    "sequence_length",
     "mode",
 ]
 _RESULT_COLUMNS = [
+    "status",
     "flops",
     "event_median_ms",
     "event_mean_ms",
@@ -208,7 +213,7 @@ def nsys_columns(
     sum_ms: list[float] = []
     counts: list[int] = []
     kernel_time: dict[str, int] = defaultdict(int)
-    for round_info in record["rounds"]:
+    for round_info in record.get("rounds", []):
         key = (
             record["category"],
             record["case"],
@@ -238,7 +243,7 @@ def nsys_columns(
     top = sorted(kernel_time.items(), key=lambda item: item[1], reverse=True)[:5]
     iter_median = statistics.median(iter_ms)
     union_median = statistics.median(union_ms)
-    event_median = record["timing"]["median_ms"]
+    event_median = record.get("timing", {}).get("median_ms")
     return {
         "nsys_samples": len(iter_ms),
         "nsys_iter_median_ms": iter_median,
@@ -254,28 +259,31 @@ def nsys_columns(
 
 
 def _row(record: dict[str, Any]) -> dict[str, Any]:
-    timing = record["timing"]
+    # OOM records carry no timing; records written before the status field are successful runs.
+    timing = record.get("timing", {})
     telemetry = record.get("telemetry", {})
     return {
         "category": record["category"],
         "case": record["case"],
         "megatron_module": record["megatron_module"],
         "micro_batch_size": record["micro_batch_size"],
+        "sequence_length": record.get("sequence_length"),
         "mode": record["mode"],
         **record["params"],
+        "status": record.get("status", "ok"),
         "flops": record["flops"],
-        "event_median_ms": timing["median_ms"],
-        "event_mean_ms": timing["mean_ms"],
-        "event_min_ms": timing["min_ms"],
-        "event_p90_ms": timing["p90_ms"],
-        "event_max_ms": timing["max_ms"],
-        "event_std_ms": timing["std_ms"],
-        "samples": timing["samples"],
-        "tflops_median": record["tflops_median"],
-        "gated": timing["gated"],
-        "iters_per_round": timing["iters_per_round"],
-        "discarded_rounds": timing["discarded_rounds"],
-        "peak_memory_gib": record["peak_memory_gib"],
+        "event_median_ms": timing.get("median_ms"),
+        "event_mean_ms": timing.get("mean_ms"),
+        "event_min_ms": timing.get("min_ms"),
+        "event_p90_ms": timing.get("p90_ms"),
+        "event_max_ms": timing.get("max_ms"),
+        "event_std_ms": timing.get("std_ms"),
+        "samples": timing.get("samples"),
+        "tflops_median": record.get("tflops_median"),
+        "gated": timing.get("gated"),
+        "iters_per_round": timing.get("iters_per_round"),
+        "discarded_rounds": timing.get("discarded_rounds"),
+        "peak_memory_gib": record.get("peak_memory_gib"),
         "sm_clock_mhz": telemetry.get("sm_clock_mhz"),
         "power_w": telemetry.get("power_w"),
     }
