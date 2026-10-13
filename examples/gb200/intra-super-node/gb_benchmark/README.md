@@ -133,6 +133,7 @@ unset CUDA_VISIBLE_DEVICES
 ./run_gb200.sh                 # relay 套件：两条中转路径 + 读/写分段 + NVLink baseline + staged pinned/direct（GPU0→GPU1/GPU3）及 D2H/H2D 分段
 ./run_gb200.sh --suite full    # 另外跑 host/device/memcpy/latency/pingpong 矩阵和线程/block 扩展
 ./run_gb200.sh -- --hbm-backend managed   # 驱动为 CDMM 模式、HBM 不是 NUMA 节点时使用
+./run_gb200.sh --no-probe      # 跳过开头的 hbm_probe
 
 # 单独运行某项
 ./build/gb_benchmark topo
@@ -150,10 +151,14 @@ unset CUDA_VISIBLE_DEVICES
 - 若 cgroup 的 `cpuset.mems` 不包含 GPU 的 NUMA 节点，同样会被 placement 检查发现。
 - 驱动没有报告 HBM NUMA 节点时，用 `--hbm-numa g=node` 手动指定，或改用 `--hbm-backend managed`。
 
-## HBM 访问方式探针（先跑这个）
+## HBM 访问方式探针（run_gb200.sh 会先跑）
 
 relay 和 `host` 的结果只有在 CPU 能**原地** load/store HBM 时才有意义，也就是访问时页不能被迁走。
-`hbm_probe` 对每种分配方式逐一检查这一点。它不依赖 libnuma，用 `make probe` 编译：
+`hbm_probe` 对每种分配方式逐一检查这一点。它不依赖 libnuma，`make` 会一起编译（单独编译用 `make probe`）。
+
+`run_gb200.sh` 在跑测试之前，会对源 GPU 和所有目的 GPU（默认 0,1,2,3）各跑一次 probe，结果写在运行目录的
+`hbm_probe/` 下，每项判定汇总成 `summary.txt` 开头的 `[probe] gpu<g> <method>: <verdict>` 行。probe 失败只记入
+`failed cases`，不会中断后面的测试；`--no-probe` 可以跳过。也可以单独运行：
 
 ```bash
 ./run_hbm_probe.sh --gpus 0,2     # 结果在 results/gb200/intra-super-node/hbm_probe-YYMMDD-HHMMSS/
@@ -192,6 +197,7 @@ relay 和 `host` 的结果只有在 CPU 能**原地** load/store HBM 时才有�
 
 ```text
 env.txt  topology.json  topology.log  summary.txt
+hbm_probe/{env.txt,probe-gpu<g>.log,probe-gpu<g>.json}
 gpu0_to_gpu1/{relay,baseline_memcpy,baseline_sm_copy,staged}/{result.json,benchmark.log}
 gpu0_to_gpu2/...
 gpu0_to_gpu3/staged/...

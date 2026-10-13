@@ -13,16 +13,19 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../../../.." && pwd)"
 BIN="${HBM_PROBE_BIN:-$SCRIPT_DIR/build/hbm_probe}"
 OUT_ROOT="$REPO_ROOT/results/gb200/intra-super-node"
+RUN_DIR=""
 GPUS=""
 PROBE_ARGS=()
 
 usage() {
-  echo "usage: $0 [--gpus 0,2] [--out-root DIR] [-- hbm_probe options, e.g. --bytes 1G --methods numa,vmm]"
+  echo "usage: $0 [--gpus 0,2] [--out-root DIR | --out-dir DIR] [-- hbm_probe options, e.g. --bytes 1G --methods numa,vmm]"
+  echo "  --out-dir writes into DIR itself instead of a new OUT_ROOT/hbm_probe-<ts> (used by run_gb200.sh)"
 }
 while (($#)); do
   case "$1" in
     --gpus) GPUS=$2; shift 2 ;;
     --out-root) OUT_ROOT=$2; shift 2 ;;
+    --out-dir) RUN_DIR=$2; shift 2 ;;
     --) shift; PROBE_ARGS=("$@"); break ;;
     -h|--help) usage; exit 0 ;;
     *) echo "unknown argument: $1" >&2; usage >&2; exit 2 ;;
@@ -34,7 +37,7 @@ if [[ ! -x "$BIN" ]]; then
 fi
 [[ -n "${CUDA_VISIBLE_DEVICES:-}" ]] && echo "[warn] CUDA_VISIBLE_DEVICES=$CUDA_VISIBLE_DEVICES" >&2
 
-RUN_DIR="$OUT_ROOT/hbm_probe-$(date +%y%m%d-%H%M%S)"
+[[ -n "$RUN_DIR" ]] || RUN_DIR="$OUT_ROOT/hbm_probe-$(date +%y%m%d-%H%M%S)"
 mkdir -p "$RUN_DIR"
 
 section() { printf '\n##### %s\n' "$*"; }

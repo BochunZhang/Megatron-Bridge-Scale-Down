@@ -3,6 +3,9 @@
 # SPDX-License-Identifier: Apache-2.0
 #
 # Runs gb_benchmark on one GB200 compute tray (2 Grace CPUs + 4 B200 GPUs).
+#   First runs hbm_probe (run_hbm_probe.sh) on every GPU the suite uses, into <run dir>/hbm_probe/: it tells whether
+#   CPU threads load/store HBM in place for each allocation method, which decides whether the relay/host numbers
+#   are C2C bandwidth. Skip it with --no-probe.
 #   --suite relay (default): CPU-relayed GPU->GPU copies (GPU0->GPU1, GPU0->GPU2), their read/write legs,
 #                            the direct GPU->GPU baselines, and copies of cudaMalloc data through a CPU
 #                            (GPU0->GPU1, GPU0->GPU3), staged in pinned memory or CPU-relayed via registers.
@@ -22,13 +25,14 @@ DST_GPUS=1,2
 STAGED_DST_GPUS=1,3
 STAGED_CHUNKS=4M,16M,64M,256M
 OUT_ROOT="$REPO_ROOT/results/gb200/intra-super-node"
+PROBE=1
 EXTRA=()
 
 usage() {
   cat <<EOF
 usage: $0 [--suite relay|full] [--bytes 4G] [--iters 10] [--warmup 2] [--src-gpu 0] [--dst-gpus 1,2]
           [--staged-dst-gpus 1,3] [--staged-chunks 4M,16M,64M,256M]
-          [--out-root DIR] [-- extra gb_benchmark options, e.g. --hbm-backend managed --hbm-numa 0=2,1=10]
+          [--no-probe] [--out-root DIR] [-- extra gb_benchmark options, e.g. --hbm-backend managed --hbm-numa 0=2,1=10]
 Binary: \$GB_BENCHMARK_BIN or $SCRIPT_DIR/build/gb_benchmark
 EOF
 }
@@ -43,6 +47,7 @@ while (($#)); do
     --dst-gpus) DST_GPUS=$2; shift 2 ;;
     --staged-dst-gpus) STAGED_DST_GPUS=$2; shift 2 ;;
     --staged-chunks) STAGED_CHUNKS=$2; shift 2 ;;
+    --no-probe) PROBE=0; shift ;;
     --out-root) OUT_ROOT=$2; shift 2 ;;
     --) shift; EXTRA=("$@"); break ;;
     -h|--help) usage; exit 0 ;;
@@ -86,6 +91,13 @@ run() {
 
 KERNELS=ldp_stp,ldnp_stnp,memcpy
 S=$SRC_GPU
+
+# hbm_probe on the source and every destination GPU; a probe failure is recorded but does not stop the suite.
+if ((PROBE)); then
+  PROBE_GPUS=$(printf '%s\n' "$S" ${DST_GPUS//,/ } ${STAGED_DST_GPUS//,/ } | sort -nu | paste -sd, -)
+  echo "=== hbm_probe: gpus $PROBE_GPUS"
+  "$SCRIPT_DIR/run_hbm_probe.sh" --gpus "$PROBE_GPUS" --out-dir "$RUN_DIR/hbm_probe" || FAILED+=("hbm_probe")
+fi
 run "legs/read_hbm$S" host --op read --src "hbm$S" --cpu-nodes all --kernels "$KERNELS" "${COMMON[@]}"
 for D in ${DST_GPUS//,/ }; do
   P="gpu${S}_to_gpu${D}"
@@ -125,8 +137,17 @@ if [[ "$SUITE" == full ]]; then
   run pingpong pingpong --flags 'cpu*,hbm*'
 fi
 
-grep -h -E '^\[(relay|staged|host|device|memcpy|latency|pingpong|skip|warn|error)\]' \
-  "$RUN_DIR"/topology.log $(find "$RUN_DIR" -name benchmark.log | sort) >"$RUN_DIR/summary.txt" || true
+{
+  # One line per probe verdict: [probe] gpu<g> <method>: <verdict>
+  for f in "$RUN_DIR"/hbm_probe/probe-gpu*.log; do
+    [[ -f "$f" ]] || continue
+    g=$(basename "$f" .log)
+    g=${g#probe-}
+    awk -v g="$g" '/^=== /{m=$2; sub(/:$/, "", m)} /verdict: |unavailable: |UNAVAILABLE: /{sub(/^ +/, ""); sub(/^verdict: /, ""); sub(/^unavailable: /, "UNAVAILABLE: "); print "[probe] " g " " m ": " $0}' "$f"
+  done
+  grep -h -E '^\[(relay|staged|host|device|memcpy|latency|pingpong|skip|warn|error)\]' \
+    "$RUN_DIR"/topology.log $(find "$RUN_DIR" -name benchmark.log | sort) || true
+} >"$RUN_DIR/summary.txt"
 echo "results: $RUN_DIR (summary.txt, */result.json)"
 if ((${#FAILED[@]})); then
   echo "failed cases: ${FAILED[*]}" >&2
