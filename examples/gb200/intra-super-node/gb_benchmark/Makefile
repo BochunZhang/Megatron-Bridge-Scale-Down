@@ -21,11 +21,20 @@ NVCC_FLAGS += -ccbin aarch64-linux-gnu-g++ --target-directory sbsa-linux
 LDLIBS := -L/usr/lib/aarch64-linux-gnu $(LDLIBS)
 endif
 
-SRCS := $(wildcard src/*.cu src/*.cuh src/*.hpp)
+SRCS := $(wildcard src/*.cuh src/*.hpp)
 
-$(BUILD_DIR)/gb_benchmark: $(SRCS)
+.PHONY: all probe
+all: $(BUILD_DIR)/gb_benchmark $(BUILD_DIR)/hbm_probe
+probe: $(BUILD_DIR)/hbm_probe
+
+$(BUILD_DIR)/gb_benchmark: src/main.cu $(SRCS)
 	@mkdir -p $(BUILD_DIR)
 	$(NVCC) $(NVCC_FLAGS) -o $@ src/main.cu $(LDLIBS)
+
+# hbm_probe does not need libnuma (raw mbind/get_mempolicy syscalls, sysfs topology).
+$(BUILD_DIR)/hbm_probe: src/hbm_probe.cu $(SRCS)
+	@mkdir -p $(BUILD_DIR)
+	$(NVCC) $(NVCC_FLAGS) -o $@ src/hbm_probe.cu
 
 .PHONY: clean
 clean:

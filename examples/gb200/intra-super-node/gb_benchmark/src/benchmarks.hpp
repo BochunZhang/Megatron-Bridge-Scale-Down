@@ -517,6 +517,255 @@ inline std::vector<std::string> run_memcpy(const Topology& topo, const MemcpyOpt
   return results;
 }
 
+// ---------------------------------------------------------------- staged
+
+struct StagedOptions {
+  int src_gpu = 0;
+  std::vector<int> dst_gpus;
+  std::vector<std::string> cpu_specs;
+  std::vector<std::string> modes;
+  std::vector<size_t> chunks;
+  int slots = 2;
+  std::vector<std::string> threads;
+  std::vector<HostKernel> kernels;
+  Common c;
+};
+
+inline StagedOptions parse_staged(const Args& a) {
+  StagedOptions o;
+  o.src_gpu = a.get_int("src-gpu", 0);
+  for (const std::string& d : split(a.get("dst-gpus", "1,3"), ',')) o.dst_gpus.push_back(static_cast<int>(parse_int(d, "--dst-gpus")));
+  o.cpu_specs = split(a.get("cpu-nodes", "src,dst"), ',');
+  o.modes = split(a.get("modes", "pinned,direct"), ',');
+  for (const std::string& m : o.modes) {
+    if (m != "pinned" && m != "direct") fail("--modes entries must be pinned or direct, got '" + m + "'");
+  }
+  if (o.modes.empty()) fail("--modes is empty");
+  for (const std::string& s : split(a.get("chunk", "64M"), ',')) {
+    const size_t n = parse_size(s);
+    if (n % kLine != 0) fail("--chunk entries must be multiples of 64");
+    o.chunks.push_back(n);
+  }
+  if (o.chunks.empty()) fail("--chunk is empty");
+  o.slots = a.get_int("slots", 2);
+  if (o.slots < 1) fail("--slots must be >= 1");
+  o.threads = split(a.get("threads", "all"), ',');
+  o.kernels = parse_kernels(a.get("kernels", "ldp_stp"));
+  o.c = parse_common(a, "4GiB", 10, 2, true);
+  return o;
+}
+
+// Chunk k: cudaMemcpyAsync src -> staging slot k % slots on a stream of the source GPU (D2H), then
+// staging slot -> dst on a stream of the destination GPU (H2D). A slot is reused only after the H2D that last read
+// it has finished, so up to `slots` chunks are in flight and D2H of one chunk overlaps H2D of the previous one.
+class StagedPipeline {
+ public:
+  StagedPipeline(int src_gpu, int dst_gpu, int slots)
+      : src_gpu_(src_gpu), dst_gpu_(dst_gpu), d2h_done_(slots), h2d_done_(slots) {
+    GB_CHECK_CUDA(cudaSetDevice(src_gpu_));
+    GB_CHECK_CUDA(cudaStreamCreateWithFlags(&src_stream_, cudaStreamNonBlocking));
+    for (cudaEvent_t& e : d2h_done_) GB_CHECK_CUDA(cudaEventCreateWithFlags(&e, cudaEventDisableTiming));
+    GB_CHECK_CUDA(cudaSetDevice(dst_gpu_));
+    GB_CHECK_CUDA(cudaStreamCreateWithFlags(&dst_stream_, cudaStreamNonBlocking));
+    for (cudaEvent_t& e : h2d_done_) GB_CHECK_CUDA(cudaEventCreateWithFlags(&e, cudaEventDisableTiming));
+  }
+  ~StagedPipeline() {
+    for (cudaEvent_t e : d2h_done_) cudaEventDestroy(e);
+    for (cudaEvent_t e : h2d_done_) cudaEventDestroy(e);
+    cudaStreamDestroy(src_stream_);
+    cudaStreamDestroy(dst_stream_);
+  }
+  StagedPipeline(const StagedPipeline&) = delete;
+  StagedPipeline& operator=(const StagedPipeline&) = delete;
+
+  struct Timing {
+    double ms = 0;          // wall time of one full transfer
+    double enqueue_ms = 0;  // time spent issuing the copies; close to `ms` means the host, not the link, limits
+  };
+
+  // The streams belong to different GPUs, so CUDA events cannot time the transfer; host wall time is used instead.
+  Timing run(const uint8_t* src, uint8_t* staging, uint8_t* dst, size_t bytes, size_t chunk) {
+    const size_t slots = d2h_done_.size();
+    const uint64_t t0 = now_ns();
+    for (size_t k = 0, off = 0; off < bytes; ++k, off += chunk) {
+      const size_t n = std::min(chunk, bytes - off);
+      const size_t slot = k % slots;
+      uint8_t* stage = staging + slot * chunk;
+      GB_CHECK_CUDA(cudaSetDevice(src_gpu_));
+      if (k >= slots) GB_CHECK_CUDA(cudaStreamWaitEvent(src_stream_, h2d_done_[slot], 0));
+      GB_CHECK_CUDA(cudaMemcpyAsync(stage, src + off, n, cudaMemcpyDefault, src_stream_));
+      GB_CHECK_CUDA(cudaEventRecord(d2h_done_[slot], src_stream_));
+      GB_CHECK_CUDA(cudaSetDevice(dst_gpu_));
+      GB_CHECK_CUDA(cudaStreamWaitEvent(dst_stream_, d2h_done_[slot], 0));
+      GB_CHECK_CUDA(cudaMemcpyAsync(dst + off, stage, n, cudaMemcpyDefault, dst_stream_));
+      GB_CHECK_CUDA(cudaEventRecord(h2d_done_[slot], dst_stream_));
+    }
+    const uint64_t t_enqueued = now_ns();
+    GB_CHECK_CUDA(cudaStreamSynchronize(src_stream_));
+    GB_CHECK_CUDA(cudaStreamSynchronize(dst_stream_));
+    const uint64_t t1 = now_ns();
+    return {static_cast<double>(t1 - t0) / 1e6, static_cast<double>(t_enqueued - t0) / 1e6};
+  }
+
+ private:
+  int src_gpu_;
+  int dst_gpu_;
+  cudaStream_t src_stream_ = nullptr;
+  cudaStream_t dst_stream_ = nullptr;
+  std::vector<cudaEvent_t> d2h_done_;
+  std::vector<cudaEvent_t> h2d_done_;
+};
+
+// cudaMalloc on GPU src -> cudaMalloc on GPU dst through a CPU, two modes:
+//   pinned: copy engines move the data through pinned LPDDR of the CPU (chunked D2H then H2D; staged in CPU memory)
+//   direct: CPU threads load from src and store to dst through registers (nothing staged in CPU memory); needs CPU
+//           load/store access to cudaMalloc memory, otherwise the case is skipped with the fault that was caught
+inline std::vector<std::string> run_staged(const Topology& topo, const StagedOptions& o) {
+  std::vector<std::string> results;
+  const GpuInfo& sg = topo.gpu(o.src_gpu);
+  PoolSet pools(topo);
+  BufferCache srcs(topo, pools, o.c.bytes, o.c.backend, kSrcSeed);
+  BufferCache dsts(topo, pools, o.c.bytes, o.c.backend, kDstSeed);
+  const bool run_pinned = std::find(o.modes.begin(), o.modes.end(), "pinned") != o.modes.end();
+  const bool run_direct = std::find(o.modes.begin(), o.modes.end(), "direct") != o.modes.end();
+  Buffer& src = srcs.get(parse_target("cuda" + std::to_string(o.src_gpu), topo));
+  for (int dst_gpu : o.dst_gpus) {
+    if (dst_gpu == o.src_gpu) fail("--dst-gpus must not contain the source GPU");
+    const GpuInfo& dg = topo.gpu(dst_gpu);
+    Buffer& dst = dsts.get(parse_target("cuda" + std::to_string(dst_gpu), topo));
+    const bool same_cpu = sg.cpu_index >= 0 && sg.cpu_index == dg.cpu_index;
+    const std::string s = "gpu" + std::to_string(o.src_gpu);
+    const std::string d = "gpu" + std::to_string(dst_gpu);
+
+    std::vector<int> cpu_nodes;
+    for (const std::string& spec : o.cpu_specs) {
+      int cpu = -1;
+      if (spec == "src") {
+        cpu = sg.cpu_index;
+      } else if (spec == "dst") {
+        cpu = dg.cpu_index;
+      } else {
+        cpu = static_cast<int>(parse_int(spec, "--cpu-nodes"));
+      }
+      topo.cpu(cpu);
+      if (std::find(cpu_nodes.begin(), cpu_nodes.end(), cpu) == cpu_nodes.end()) cpu_nodes.push_back(cpu);
+    }
+
+    // direct mode needs CPU load/store on cudaMalloc pointers; probe one word of each buffer (faults are caught).
+    std::string direct_problem;
+    if (run_direct) {
+      uint64_t word = 0;
+      std::string fault = cpu_touch(reinterpret_cast<uint64_t*>(src.data()), &word);
+      if (!fault.empty()) {
+        direct_problem = "CPU cannot load/store cudaMalloc memory of " + s + " (" + fault + ")";
+      } else if (word != pattern_word(0, kSrcSeed)) {
+        direct_problem = "CPU load of " + s + " cudaMalloc memory returned an unexpected value";
+      } else if (!(fault = cpu_touch(reinterpret_cast<uint64_t*>(dst.data()), &word)).empty()) {
+        direct_problem = "CPU cannot load/store cudaMalloc memory of " + d + " (" + fault + ")";
+      }
+    }
+
+    for (int cpu : cpu_nodes) {
+      const std::string role = cpu == sg.cpu_index ? (same_cpu ? "shared" : "src_attached")
+                               : cpu == dg.cpu_index ? "dst_attached"
+                                                     : "other";
+      const std::string path = s + " cuda -D2H-> pinned" + std::to_string(cpu) + " -H2D-> " + d + " cuda";
+      if (run_pinned) {
+        for (size_t chunk : o.chunks) {
+          const size_t stage_bytes = std::min(chunk, o.c.bytes) * static_cast<size_t>(o.slots);
+          Buffer staging(topo, parse_target("pinned" + std::to_string(cpu), topo), stage_bytes, o.c.backend);
+          fill_buffer(staging, pools, kPoisonSeed);  // pages are bound by numa_alloc_onnode; checked below
+          staging.check_placement();
+          StagedPipeline pipe(o.src_gpu, dst_gpu, o.slots);
+          if (o.c.verify) fill_buffer(dst, pools, kPoisonSeed);
+          std::vector<double> ms;
+          std::vector<double> enqueue_ms;
+          for (int i = 0; i < o.c.warmup + o.c.iters; ++i) {
+            const StagedPipeline::Timing t = pipe.run(src.data(), staging.data(), dst.data(), o.c.bytes, chunk);
+            if (i >= o.c.warmup) {
+              ms.push_back(t.ms);
+              enqueue_ms.push_back(t.enqueue_ms);
+            }
+          }
+          long long mismatches = -1;
+          if (o.c.verify) mismatches = static_cast<long long>(count_mismatch(dst, pools, o.c.bytes, kSrcSeed));
+          const Stats bw = summarize(to_gbps(ms, o.c.bytes, 1));
+          const std::string label = s + "->" + d + " via pinned" + std::to_string(cpu) + " [chunk " +
+                                    format_bytes(chunk) + ", " + std::to_string(o.slots) + " slots]";
+          JsonObject j;
+          j.str("benchmark", "staged")
+              .str("label", label)
+              .str("mode", "pinned")
+              .boolean("staged_in_cpu_memory", true)
+              .integer("src_gpu", o.src_gpu)
+              .integer("dst_gpu", dst_gpu)
+              .str("path", path)
+              .str("path_class", same_cpu ? "same_cpu" : "cross_cpu")
+              .str("staging_cpu", "cpu" + std::to_string(cpu))
+              .str("staging_cpu_role", role)
+              .boolean("d2h_crosses_cpu", cpu != sg.cpu_index)
+              .boolean("h2d_crosses_cpu", cpu != dg.cpu_index)
+              .integer("chunk_bytes", static_cast<long long>(chunk))
+              .integer("slots", o.slots)
+              .raw("src", src.to_json())
+              .raw("staging", staging.to_json())
+              .raw("dst", dst.to_json())
+              .merge(common_json(o.c))
+              .raw("times_ms", json_numbers(ms))
+              .raw("enqueue_ms", json_numbers(enqueue_ms))
+              .raw("payload_gb_s", json_stats(bw))
+              .raw("verify", verify_json(o.c.verify, mismatches));
+          // Single line like print_bandwidth, without its read+write column (each byte crosses C2C twice here).
+          std::printf("[staged] %s: median %.2f GB/s (min %.2f, max %.2f)", label.c_str(), bw.median, bw.min, bw.max);
+          if (o.c.verify) std::printf(", verify %s", mismatches == 0 ? "ok" : "FAILED");
+          std::printf("\n");
+          std::fflush(stdout);
+          if (o.c.verify && mismatches != 0) {
+            std::fprintf(stderr, "[error] %s: %lld mismatched 64-bit words after the copy\n", label.c_str(), mismatches);
+          }
+          const double enqueue_share = summarize(enqueue_ms).median / summarize(ms).median;
+          if (enqueue_share > 0.9) {
+            std::fprintf(stderr,
+                         "[warn] %s: issuing the copies took %.0f%% of the transfer time; bandwidth is host-bound, use a "
+                         "larger --chunk\n",
+                         label.c_str(), 100 * enqueue_share);
+          }
+          results.push_back(j.dump());
+        }
+      }
+      if (run_direct) {
+        // CPU threads load 64 B from GPU src cudaMalloc memory into registers and store them straight into GPU dst
+        // cudaMalloc memory; no CPU-memory buffer. cudaMalloc pages cannot migrate, so the data never leaves HBM.
+        const std::string label = s + "->" + d + " via cpu" + std::to_string(cpu) + " (direct)";
+        if (!direct_problem.empty()) {
+          results.push_back(skipped("staged", label, direct_problem));
+        } else {
+          for (HostKernel kernel : o.kernels) {
+            for (const std::string& tspec : o.threads) {
+              const size_t n = resolve_threads(tspec, pools.get(cpu).size());
+              if (n == 0) {
+                results.push_back(skipped("staged", label, "not enough allowed CPUs on cpu" + std::to_string(cpu)));
+                continue;
+              }
+              JsonObject extra;
+              extra.str("mode", "direct")
+                  .boolean("staged_in_cpu_memory", false)
+                  .integer("src_gpu", o.src_gpu)
+                  .integer("dst_gpu", dst_gpu)
+                  .str("path", s + " cuda -C2C-> cpu" + std::to_string(cpu) + " registers -C2C-> " + d + " cuda")
+                  .str("path_class", same_cpu ? "same_cpu" : "cross_cpu")
+                  .str("copy_cpu_role", role);
+              results.push_back(
+                  host_case(topo, pools, cpu, n, HostOp::Copy, kernel, &src, &dst, o.c, "staged", label, extra));
+            }
+          }
+        }
+      }
+    }
+  }
+  return results;
+}
+
 // ================================================================ latency and ping-pong
 
 // cpu<i>[.k] = k-th allowed CPU of CPU node i (default 0); gpu<g> = a single GPU thread.

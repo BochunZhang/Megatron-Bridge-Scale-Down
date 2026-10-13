@@ -31,6 +31,12 @@ Commands:
   relay     GPU src HBM -> CPU threads (registers only) -> GPU dst HBM.
               --src-gpu 0  --dst-gpus 1,2  --cpu-nodes src,dst (src|dst|<i>)
               --threads all (all|N, list)  --kernels ldp_stp (ldp_stp,ldnp_stnp,memcpy)
+  staged    cudaMalloc on GPU src -> a CPU -> cudaMalloc on GPU dst.
+              --src-gpu 0  --dst-gpus 1,3  --cpu-nodes src,dst (src|dst|<i>)  --modes pinned,direct
+            pinned: chunked cudaMemcpyAsync through pinned LPDDR of the CPU (D2H on the src GPU stream, H2D on the
+                    dst GPU stream, pipelined through a ring of staging slots).  --chunk 64M (list)  --slots 2
+            direct: CPU threads copy src -> registers -> dst, nothing staged in CPU memory; skipped if the CPU
+                    cannot load/store cudaMalloc memory.  --threads all  --kernels ldp_stp
   host      CPU-thread read/write/copy.
               --op read|write|copy  --src <targets>  --dst <targets>  --cpu-nodes all|<i,...>
               --threads all  --kernels ldp_stp
@@ -98,6 +104,10 @@ int main(int argc, char** argv) {
       const auto o = gb::parse_relay(args);
       args.finish();
       results = gb::run_relay(topo, o);
+    } else if (command == "staged") {
+      const auto o = gb::parse_staged(args);
+      args.finish();
+      results = gb::run_staged(topo, o);
     } else if (command == "host") {
       const auto o = gb::parse_host(args, topo);
       args.finish();

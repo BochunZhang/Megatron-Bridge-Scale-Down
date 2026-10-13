@@ -40,12 +40,44 @@ GPU1 ─C2C─┘            └─C2C─ GPU3
 
 两种都测，用 `copy_cpu_role` 区分。
 
+### `staged`：cudaMalloc 数据经 CPU 中转
+
+relay 的源和目的必须是 CPU 能直接 load/store 的内存。`staged` 的源和目的都是 `cudaMalloc`，用 `--modes` 选两种中转方式：
+
+```text
+pinned: GPU0 cudaMalloc ─D2H(C2C)→ pinned<cpu> LPDDR ─H2D(C2C)→ GPU1/GPU3 cudaMalloc   （数据落 CPU 内存）
+direct: GPU0 cudaMalloc ─C2C→ CPU 线程寄存器 ─C2C→ GPU1/GPU3 cudaMalloc               （数据不落 CPU 内存）
+```
+
+**pinned**（GPU copy engine 搬运）：
+
+- 数据按 `--chunk` 分块，在 `--slots` 个中转槽之间轮转。D2H 在源 GPU 的 stream 上发起，H2D 在目的 GPU 的 stream 上发起，
+  用 event 串起来，所以一块的 D2H 和上一块的 H2D 可以重叠。
+- 中转内存用 `numa_alloc_onnode` + `cudaHostRegister` 分配在所选 CPU 上，`staging.placement` 检查页确实在该节点。
+- 两个 stream 属于不同 GPU，CUDA event 无法跨 GPU 计时，所以用主机墙钟计时：从第一次发起拷贝到两个 stream 都同步完成。
+  `enqueue_ms` 记录发起所有拷贝用了多久，接近总时间时会打印 `[warn] ... host-bound`，说明 chunk 太小。
+- 每个字节过两次 C2C，所以只报 payload 带宽，不报 read+write。
+
+**direct**（CPU 线程搬运）：
+
+- 和 relay 用同一套 `ldp_stp` / `ldnp_stnp` / `memcpy` 拷贝内核：每个线程每次从源 cudaMalloc 读 64 B 到寄存器，
+  直接写到目的 cudaMalloc，没有 CPU 内存缓冲。`--threads`、`--kernels` 含义同 relay。
+- cudaMalloc 的页不会迁移，所以只要 CPU 能访问，数据就一直在 HBM 里，不存在 relay 那样被迁到 LPDDR 的问题。
+- 前提是 CPU 能 load/store cudaMalloc 指针。运行前对源和目的各读写一个字（SIGSEGV/SIGBUS 会被捕获），
+  不能访问时这个 case 记为 `[skip] staged ... CPU cannot load/store cudaMalloc memory`，进程不会崩溃。
+  结果应与 `hbm_probe --methods cudamalloc` 的判定一致。
+- 源和目的的 pattern/poison 由 GPU 写入，校验也由目的 GPU 完成，CPU 只在计时区间内访问这两块内存。
+
+两种模式的记录都带 `mode` 和 `staged_in_cpu_memory` 字段。默认测 GPU0→GPU1（same_cpu）和 GPU0→GPU3（cross_cpu），
+中转 CPU 分别取源 GPU 和目的 GPU 所挂的 CPU（pinned 用 `staging_cpu_role`，direct 用 `copy_cpu_role`）。
+
 ## 测试点及与 gh_benchmark 的对应
 
 | 命令 | 测什么 | 来自 gh_benchmark |
 | --- | --- | --- |
 | `topo` | CPU/GPU/NUMA 拓扑、HBM NUMA 节点、GPU 所属 CPU、P2P 能力、NUMA distance | `print_device_props`、`constants.hpp`/`memory.hpp` 里写死的 NUMA 编号 |
 | `relay` | GPU HBM → CPU 线程 → GPU HBM | 新增，基于 `copy_test_host_template` / `thread_copy_function` |
+| `staged` | GPU cudaMalloc → CPU → GPU cudaMalloc：经 pinned 内存分块流水（pinned），或 CPU 线程经寄存器直接搬运（direct） | 新增 |
 | `host` | CPU 线程对 `cpu*`/`hbm*` 的读、写、拷贝，可指定线程数 | `run_{read,write,copy}_tests_host`、HOST SCALABILITY |
 | `device` | GPU kernel 对任意目标的读、写、拷贝，可指定 block 数 | `run_{read,write,copy}_tests_device`、DEVICE SCALABILITY |
 | `memcpy` | `cudaMemcpyAsync` 在各类分配之间的矩阵 | `run_cuda_memcpy_heatmap_tests` |
@@ -98,7 +130,7 @@ NATIVE_X86=1 ./build_cross_in_docker.sh  # 另外生成 build-x86/gb_benchmark�
 
 ```bash
 unset CUDA_VISIBLE_DEVICES
-./run_gb200.sh                 # relay 套件：两条中转路径 + 读/写分段 + NVLink baseline
+./run_gb200.sh                 # relay 套件：两条中转路径 + 读/写分段 + NVLink baseline + staged pinned/direct（GPU0→GPU1/GPU3）及 D2H/H2D 分段
 ./run_gb200.sh --suite full    # 另外跑 host/device/memcpy/latency/pingpong 矩阵和线程/block 扩展
 ./run_gb200.sh -- --hbm-backend managed   # 驱动为 CDMM 模式、HBM 不是 NUMA 节点时使用
 
@@ -107,6 +139,8 @@ unset CUDA_VISIBLE_DEVICES
 ./build/gb_benchmark relay --src-gpu 0 --dst-gpus 1,2 --cpu-nodes src,dst \
   --kernels ldp_stp,ldnp_stnp,memcpy --bytes 4G \
   --out ../../../../results/gb200/intra-super-node/relay-$(date +%y%m%d-%H%M%S).json
+./build/gb_benchmark staged --src-gpu 0 --dst-gpus 1,3 --cpu-nodes src,dst --modes pinned,direct \
+  --chunk 4M,16M,64M,256M --slots 2 --kernels ldp_stp,ldnp_stnp,memcpy
 ./build/gb_benchmark --help
 ```
 
@@ -116,15 +150,52 @@ unset CUDA_VISIBLE_DEVICES
 - 若 cgroup 的 `cpuset.mems` 不包含 GPU 的 NUMA 节点，同样会被 placement 检查发现。
 - 驱动没有报告 HBM NUMA 节点时，用 `--hbm-numa g=node` 手动指定，或改用 `--hbm-backend managed`。
 
+## HBM 访问方式探针（先跑这个）
+
+relay 和 `host` 的结果只有在 CPU 能**原地** load/store HBM 时才有意义，也就是访问时页不能被迁走。
+`hbm_probe` 对每种分配方式逐一检查这一点。它不依赖 libnuma，用 `make probe` 编译：
+
+```bash
+./run_hbm_probe.sh --gpus 0,2     # 结果在 results/gb200/intra-super-node/hbm_probe-YYMMDD-HHMMSS/
+```
+
+| 方法 | 分配方式 |
+| --- | --- |
+| `numa` | `mmap` + `mbind` 到 GPU 的 HBM NUMA 节点。要求驱动把 HBM 作为 NUMA 节点上线 |
+| `managed` | `cudaMallocManaged` + PreferredLocation=GPU + AccessedBy=CPU，即 `--hbm-backend managed` |
+| `managed_noadvise` | `cudaMallocManaged`，prefetch 到 GPU，不加 advise |
+| `cudamalloc` | `cudaMalloc`，CPU 直接解引用设备指针 |
+| `vmm` | `cuMemCreate`（location=DEVICE），再尝试 `cuMemSetAccess`（HOST / HOST_NUMA） |
+
+每种方法按以下步骤测：
+
+1. GPU 写入 pattern，测 GPU 读带宽，此时页在 HBM；
+2. CPU 读写一个字，SIGSEGV/SIGBUS 会被捕获并记录；
+3. 由 GPU 所挂的 CPU 读，再测 GPU 读；
+4. 由另一个 CPU 读，再由所挂的 CPU 写，最后测 GPU 读。
+
+判定结果：
+
+| 判定 | 含义 |
+| --- | --- |
+| `IN PLACE` | CPU 访问前后 GPU 读带宽都在 HBM 水平，CPU 侧数字就是 C2C 带宽 |
+| `MIGRATES` | CPU 访问后 GPU 首轮读带宽骤降，或 CPU 首轮明显慢于稳态，说明页被迁移 |
+| `CPU CANNOT ACCESS` | CPU 无法访问这块内存 |
+| `UNAVAILABLE` | 该方法在本机无法分配 |
+
+`env.txt` 记录驱动寻址模式（`nvidia-smi -q` 中的 Addressing Mode）、哪些 NUMA 节点有内存、
+`/proc/driver/nvidia/params`、进程的 `Mems_allowed` 和 seccomp 状态，用来判断上面的结果从何而来。
+
 ## 结果
 
 `run_gb200.sh` 把结果写到 `results/gb200/intra-super-node/YYMMDD-HHMMSS/`：
 
 ```text
 env.txt  topology.json  topology.log  summary.txt
-gpu0_to_gpu1/{relay,baseline_memcpy,baseline_sm_copy}/{result.json,benchmark.log}
+gpu0_to_gpu1/{relay,baseline_memcpy,baseline_sm_copy,staged}/{result.json,benchmark.log}
 gpu0_to_gpu2/...
-legs/{read_hbm0,write_hbm1,write_hbm2}/...
+gpu0_to_gpu3/staged/...
+legs/{read_hbm0,write_hbm1,write_hbm2,d2h_cuda0,h2d_cuda1,h2d_cuda3}/...
 ```
 
 每个 `result.json` 包含完整拓扑和 `results` 数组，每个测试 case 一条记录。主要字段：
@@ -143,6 +214,8 @@ legs/{read_hbm0,write_hbm1,write_hbm2}/...
 - relay 带宽受两段中较慢的一段限制：读源 HBM（`legs/read_hbm0`）和写目的 HBM（`legs/write_hbm<d>`）。分段测试在每个 CPU 上都跑了一遍，可以直接对比。
 - 跨 CPU 时，比较 `src_attached` 和 `dst_attached` 两个结果，可以看出 CPU0↔CPU1 链路分别承载读和写时的差异。
 - `baseline_memcpy`（copy engine）和 `baseline_sm_copy`（SM 拷贝）是同一对 GPU 之间直接走 NVLink 的参考值。
+- staged pinned 模式的带宽受 D2H（`legs/d2h_cuda0`）和 H2D（`legs/h2d_cuda<d>`）中较慢的一段限制，两段都对每个 CPU 的 pinned
+  内存测过。pinned 明显低于较慢的那一段，说明流水没有重叠好，可以增大 `--chunk` 或 `--slots`。
 
 ## 验证状态
 
@@ -152,3 +225,4 @@ legs/{read_hbm0,write_hbm1,write_hbm2}/...
 | x86_64 双路主机（无 GPU）上的 host 逻辑 | 通过。拓扑发现，跨 NUMA 的 host copy/read/write，latency，CPU pingpong；校验 0 mismatch，placement `ok`，错误路径都检查过 |
 | aarch64 二进制在 qemu-user 下 | 通过。`ldp_stp`、`ldnp_stnp`、`memcpy` 三种拷贝的校验都是 0 mismatch |
 | GPU 相关路径 | **未验证**：HBM 分配、relay、device、memcpy、GPU latency/pingpong，以及所有性能数值，需要在 GB200 上运行 |
+| `staged`（pinned / direct） | **未编译、未运行**：2026-10-13 新增，写代码的机器上没有 nvcc，需要在 GB200 上 `make` 后验证 |

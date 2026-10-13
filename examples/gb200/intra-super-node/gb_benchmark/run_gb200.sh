@@ -4,7 +4,8 @@
 #
 # Runs gb_benchmark on one GB200 compute tray (2 Grace CPUs + 4 B200 GPUs).
 #   --suite relay (default): CPU-relayed GPU->GPU copies (GPU0->GPU1, GPU0->GPU2), their read/write legs,
-#                            and the direct GPU->GPU baselines.
+#                            the direct GPU->GPU baselines, and copies of cudaMalloc data through a CPU
+#                            (GPU0->GPU1, GPU0->GPU3), staged in pinned memory or CPU-relayed via registers.
 #   --suite full:            relay + the gh_benchmark-style matrices (host, device, memcpy, latency,
 #                            ping-pong, thread/block scaling). Takes much longer.
 set -euo pipefail
@@ -18,12 +19,15 @@ ITERS=10
 WARMUP=2
 SRC_GPU=0
 DST_GPUS=1,2
+STAGED_DST_GPUS=1,3
+STAGED_CHUNKS=4M,16M,64M,256M
 OUT_ROOT="$REPO_ROOT/results/gb200/intra-super-node"
 EXTRA=()
 
 usage() {
   cat <<EOF
 usage: $0 [--suite relay|full] [--bytes 4G] [--iters 10] [--warmup 2] [--src-gpu 0] [--dst-gpus 1,2]
+          [--staged-dst-gpus 1,3] [--staged-chunks 4M,16M,64M,256M]
           [--out-root DIR] [-- extra gb_benchmark options, e.g. --hbm-backend managed --hbm-numa 0=2,1=10]
 Binary: \$GB_BENCHMARK_BIN or $SCRIPT_DIR/build/gb_benchmark
 EOF
@@ -37,6 +41,8 @@ while (($#)); do
     --warmup) WARMUP=$2; shift 2 ;;
     --src-gpu) SRC_GPU=$2; shift 2 ;;
     --dst-gpus) DST_GPUS=$2; shift 2 ;;
+    --staged-dst-gpus) STAGED_DST_GPUS=$2; shift 2 ;;
+    --staged-chunks) STAGED_CHUNKS=$2; shift 2 ;;
     --out-root) OUT_ROOT=$2; shift 2 ;;
     --) shift; EXTRA=("$@"); break ;;
     -h|--help) usage; exit 0 ;;
@@ -91,6 +97,17 @@ for D in ${DST_GPUS//,/ }; do
   run "$P/baseline_sm_copy" device --gpu "$S" --op copy --src "cuda$S" --dst "cuda$D" "${COMMON[@]}"
 done
 
+# cudaMalloc data through a CPU, GPU S -> GPU D:
+#   pinned: GPU S -D2H-> pinned<cpu> -H2D-> GPU D (copy engines, chunked, staged in CPU memory)
+#   direct: CPU threads load from GPU S and store to GPU D through registers (skipped if CPUs cannot access cudaMalloc)
+# Legs: D2H from GPU S and H2D into each GPU D, against the pinned memory of every CPU.
+run "legs/d2h_cuda$S" memcpy --gpu "$S" --src "cuda$S" --dst 'pinned*' "${COMMON[@]}"
+for D in ${STAGED_DST_GPUS//,/ }; do
+  run "gpu${S}_to_gpu${D}/staged" staged --src-gpu "$S" --dst-gpus "$D" --cpu-nodes src,dst --chunk "$STAGED_CHUNKS" \
+    --modes pinned,direct --kernels "$KERNELS" "${COMMON[@]}"
+  run "legs/h2d_cuda$D" memcpy --gpu "$D" --src 'pinned*' --dst "cuda$D" "${COMMON[@]}"
+done
+
 if [[ "$SUITE" == full ]]; then
   run scaling/relay_threads relay --src-gpu "$S" --dst-gpus "$DST_GPUS" --cpu-nodes src,dst \
     --threads 1,2,4,8,16,24,32,48,64,all "${COMMON[@]}"
@@ -108,7 +125,7 @@ if [[ "$SUITE" == full ]]; then
   run pingpong pingpong --flags 'cpu*,hbm*'
 fi
 
-grep -h -E '^\[(relay|host|device|memcpy|latency|pingpong|skip|warn|error)\]' \
+grep -h -E '^\[(relay|staged|host|device|memcpy|latency|pingpong|skip|warn|error)\]' \
   "$RUN_DIR"/topology.log $(find "$RUN_DIR" -name benchmark.log | sort) >"$RUN_DIR/summary.txt" || true
 echo "results: $RUN_DIR (summary.txt, */result.json)"
 if ((${#FAILED[@]})); then

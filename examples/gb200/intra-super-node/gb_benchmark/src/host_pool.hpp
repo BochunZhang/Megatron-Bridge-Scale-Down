@@ -13,6 +13,8 @@
 
 #include <pthread.h>
 #include <sched.h>
+#include <setjmp.h>
+#include <signal.h>
 
 #include <condition_variable>
 #include <functional>
@@ -24,6 +26,44 @@
 namespace gb {
 
 constexpr size_t kLine = 64;
+
+// ---------------------------------------------------------------- CPU access probe
+
+inline sigjmp_buf g_fault_jump;
+inline volatile sig_atomic_t g_fault_probing = 0;
+
+inline void on_probe_fault(int sig) {
+  if (g_fault_probing) siglongjmp(g_fault_jump, sig);
+  signal(sig, SIG_DFL);
+  raise(sig);
+}
+
+// Loads and stores back one word from the calling thread. Returns "" on success, otherwise the signal that the
+// access raised (e.g. a CPU dereferencing GPU memory that is not mapped for it).
+inline std::string cpu_touch(uint64_t* p, uint64_t* loaded) {
+  struct sigaction sa = {};
+  struct sigaction old_segv = {};
+  struct sigaction old_bus = {};
+  sa.sa_handler = on_probe_fault;
+  sigemptyset(&sa.sa_mask);
+  sigaction(SIGSEGV, &sa, &old_segv);
+  sigaction(SIGBUS, &sa, &old_bus);
+  std::string result;
+  const int sig = sigsetjmp(g_fault_jump, 1);
+  if (sig == 0) {
+    g_fault_probing = 1;
+    volatile uint64_t* vp = p;
+    const uint64_t v = *vp;
+    *vp = v;
+    *loaded = v;
+  } else {
+    result = sig == SIGSEGV ? "SIGSEGV" : "SIGBUS";
+  }
+  g_fault_probing = 0;
+  sigaction(SIGSEGV, &old_segv, nullptr);
+  sigaction(SIGBUS, &old_bus, nullptr);
+  return result;
+}
 
 enum class HostOp { Read, Write, Copy };
 
