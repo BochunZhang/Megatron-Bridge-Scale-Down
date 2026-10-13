@@ -24,6 +24,7 @@ PROFILE_START="5"
 PROFILE_END="8"
 NUM_LAYERS=""
 NUM_EXPERTS=""
+EXPERT_PARALLEL=""
 MOE_LAYER_FREQ=""
 LINEAR_ATTENTION_FREQ=""
 MTP_NUM_LAYERS=""
@@ -36,6 +37,7 @@ MASTER_PORT="${MASTER_PORT:-29501}"
 RUN_DATE="${RUN_DATE:-$(date +%y%m%d-%H%M%S)}"
 RUN_NAME=""
 DRY_RUN=false
+RESUME=false
 EXTRA_OVERRIDES=()
 
 usage() {
@@ -49,6 +51,8 @@ Options:
   --train-iters N                Training iterations (default: 10)
   --num-layers N                 Crop transformer layers for this case
   --num-experts N                Crop routed experts for a MoE case
+  --ep N                         Expert parallel size (default: 4 for MoE,
+                                 1 for dense; dense models only accept 1)
   --moe-layer-freq VALUE         Override model.moe_layer_freq
   --linear-attention-freq VALUE  Override model.linear_attention_freq
   --mtp-num-layers N             Override model.mtp_num_layers
@@ -67,6 +71,8 @@ Options:
   --run-name NAME                Optional human-readable case name
   --results-root PATH            Result root
   --override KEY=VALUE           Additional run_recipe.py override (repeatable)
+  --resume                       Skip a completed case; archive a failed or
+                                 incomplete result and rerun it
   --dry-run                      Print the resolved command and exit
 USAGE
 }
@@ -84,6 +90,7 @@ while [[ $# -gt 0 ]]; do
         --train-iters) need_value "$@"; TRAIN_ITERS="$2"; shift 2;;
         --num-layers) need_value "$@"; NUM_LAYERS="$2"; shift 2;;
         --num-experts) need_value "$@"; NUM_EXPERTS="$2"; shift 2;;
+        --ep|--expert-parallel) need_value "$@"; EXPERT_PARALLEL="$2"; shift 2;;
         --moe-layer-freq) need_value "$@"; MOE_LAYER_FREQ="$2"; shift 2;;
         --linear-attention-freq) need_value "$@"; LINEAR_ATTENTION_FREQ="$2"; shift 2;;
         --mtp-num-layers) need_value "$@"; MTP_NUM_LAYERS="$2"; shift 2;;
@@ -101,6 +108,7 @@ while [[ $# -gt 0 ]]; do
         --run-name) need_value "$@"; RUN_NAME="$2"; shift 2;;
         --results-root) need_value "$@"; RESULTS_ROOT="$2"; shift 2;;
         --override) need_value "$@"; EXTRA_OVERRIDES+=("$2"); shift 2;;
+        --resume) RESUME=true; shift;;
         --dry-run) DRY_RUN=true; shift;;
         -h|--help) usage; exit 0;;
         *) echo "Unknown option: $1" >&2; usage >&2; exit 2;;
@@ -124,6 +132,7 @@ NNODES="${NNODES:-$((GPU_COUNT / GPUS_PER_NODE))}"
 [[ "${NNODES}" =~ ^[1-9][0-9]*$ ]] || { echo "nnodes must be positive" >&2; exit 2; }
 (( NNODES * GPUS_PER_NODE == GPU_COUNT && NODE_RANK < NNODES )) || { echo "invalid node topology" >&2; exit 2; }
 (( GPU_COUNT % CONTEXT_PARALLEL == 0 )) || { echo "world size must be divisible by context parallel size" >&2; exit 2; }
+(( SEQ_LENGTH % (2 * CONTEXT_PARALLEL) == 0 )) || { echo "seq-length must be divisible by 2*cp" >&2; exit 2; }
 (( GLOBAL_BATCH_SIZE % (MICRO_BATCH_SIZE * (GPU_COUNT / CONTEXT_PARALLEL)) == 0 )) || { echo "global batch size is not divisible by MBS*DP" >&2; exit 2; }
 (( TRAIN_ITERS > 0 )) || { echo "train-iters must be positive" >&2; exit 2; }
 if [[ "${PROFILE}" == nsys ]] && ! (( PROFILE_START < PROFILE_END && PROFILE_END < TRAIN_ITERS )); then
@@ -136,13 +145,26 @@ else
 fi
 if [[ -n "${NUM_LAYERS}" ]] && ! [[ "${NUM_LAYERS}" =~ ^[1-9][0-9]*$ ]]; then echo "num-layers must be positive" >&2; exit 2; fi
 if [[ -n "${NUM_EXPERTS}" ]] && ! [[ "${NUM_EXPERTS}" =~ ^[1-9][0-9]*$ ]]; then echo "num-experts must be positive" >&2; exit 2; fi
+# MoE cases always use expert parallelism; the EP group folds onto the same
+# GPUs as the DP x CP mesh, so EP only needs to divide the world size.
+if [[ "${MODEL}" == 27b ]]; then
+    EXPERT_PARALLEL="${EXPERT_PARALLEL:-1}"
+    [[ "${EXPERT_PARALLEL}" == 1 ]] || { echo "dense model 27b only supports --ep 1" >&2; exit 2; }
+else
+    EXPERT_PARALLEL="${EXPERT_PARALLEL:-4}"
+    [[ "${EXPERT_PARALLEL}" =~ ^[1-9][0-9]*$ ]] || { echo "ep must be a positive integer" >&2; exit 2; }
+    (( GPU_COUNT % EXPERT_PARALLEL == 0 )) || { echo "world size must be divisible by ep" >&2; exit 2; }
+    if [[ -n "${NUM_EXPERTS}" ]]; then
+        (( NUM_EXPERTS % EXPERT_PARALLEL == 0 )) || { echo "num-experts must be divisible by ep" >&2; exit 2; }
+    fi
+fi
 
 case "${MODEL}" in
     397b) MODEL_ID=Qwen/Qwen3.5-397B-A17B;;
     122b) MODEL_ID=Qwen/Qwen3.5-122B-A10B;;
     27b) MODEL_ID=Qwen/Qwen3.5-27B;;
 esac
-CASE_NAME="model_${MODEL}-fsdp_3-mbs_${MICRO_BATCH_SIZE}-seq_${SEQ_LENGTH}-cp_${CONTEXT_PARALLEL}-gbs_${GLOBAL_BATCH_SIZE}-gpus_${GPU_COUNT}-profile_${PROFILE}-date_${RUN_DATE}"
+CASE_NAME="model_${MODEL}-fsdp_3-mbs_${MICRO_BATCH_SIZE}-seq_${SEQ_LENGTH}-cp_${CONTEXT_PARALLEL}-ep_${EXPERT_PARALLEL}-gbs_${GLOBAL_BATCH_SIZE}-gpus_${GPU_COUNT}-profile_${PROFILE}-date_${RUN_DATE}"
 RESULT_DIR="${RESULTS_ROOT}/${CASE_NAME}/node${NODE_RANK}"
 NUM_MICROBATCHES=$((GLOBAL_BATCH_SIZE / (MICRO_BATCH_SIZE * (GPU_COUNT / CONTEXT_PARALLEL))))
 
@@ -171,7 +193,7 @@ OVERRIDES=(
     "scheduler.lr_warmup_iters=1" "scheduler.lr_decay_iters=${TRAIN_ITERS}"
     "validation.eval_iters=0" "validation.eval_interval=0"
     "model.context_parallel_size=${CONTEXT_PARALLEL}" "model.tensor_model_parallel_size=1" "model.pipeline_model_parallel_size=1"
-    "model.expert_tensor_parallel_size=1" "model.sequence_parallel=false"
+    "model.expert_model_parallel_size=${EXPERT_PARALLEL}" "model.expert_tensor_parallel_size=1" "model.sequence_parallel=false"
     "model.cp_comm_type=p2p" "model.mtp_num_layers=0" "model.linear_attention_freq=4"
     "model.recompute_granularity=null" "model.recompute_method=null" "model.recompute_num_layers=null"
     "model.recompute_modules=[]" "model.fine_grained_activation_offloading=false" "model.offload_modules=[]"
@@ -179,6 +201,10 @@ OVERRIDES=(
     "dist.use_megatron_fsdp=true" "ddp.use_megatron_fsdp=true" "ddp.use_distributed_optimizer=true"
     "ddp.data_parallel_sharding_strategy=optim_grads_params" "ddp.average_in_collective=false"
     "ddp.overlap_grad_reduce=true" "ddp.overlap_param_gather=true" "ddp.grad_reduce_in_fp32=true"
+    # The recipe pins comm_overlap.overlap_*=false, and CommOverlapConfig.setup()
+    # copies those values back into ddp at runtime. Override both layers so
+    # FSDP3 keeps parameter prefetch and asynchronous reduce-scatter enabled.
+    "comm_overlap.overlap_grad_reduce=true" "comm_overlap.overlap_param_gather=true"
     "checkpoint.ckpt_format=fsdp_dtensor" "checkpoint.save=null" "checkpoint.load=null"
     "logger.log_interval=1" "logger.tensorboard_dir=null" "logger.save_config_filepath=${RESULT_DIR}/config.yaml"
     "profiling.use_nsys_profiler=$([[ "${PROFILE}" == nsys ]] && echo true || echo false)"
@@ -219,20 +245,29 @@ fi
 COMMAND+=("${WORKER[@]}" "${TRAIN_ARGS[@]}")
 
 if [[ "${DRY_RUN}" == true ]]; then
-    printf 'model=%s recipe=%s dtype=%s seq=%s cp=%s mbs=%s gbs=%s gpus=%s num_microbatches=%s numa=%s\n' "${MODEL}" "${RECIPE}" "${DTYPE}" "${SEQ_LENGTH}" "${CONTEXT_PARALLEL}" "${MICRO_BATCH_SIZE}" "${GLOBAL_BATCH_SIZE}" "${GPU_COUNT}" "${NUM_MICROBATCHES}" "${NUMA_MODE}" >&2
+    printf 'model=%s recipe=%s dtype=%s seq=%s cp=%s ep=%s mbs=%s gbs=%s gpus=%s num_microbatches=%s numa=%s\n' "${MODEL}" "${RECIPE}" "${DTYPE}" "${SEQ_LENGTH}" "${CONTEXT_PARALLEL}" "${EXPERT_PARALLEL}" "${MICRO_BATCH_SIZE}" "${GLOBAL_BATCH_SIZE}" "${GPU_COUNT}" "${NUM_MICROBATCHES}" "${NUMA_MODE}" >&2
     printf 'GLOO_SOCKET_IFNAME=%s\ncommand:' "${GLOO_SOCKET_IFNAME:-<unset>}" >&2
     printf ' %q' "${COMMAND[@]}" >&2; printf '\n' >&2
     exit 0
 fi
+if [[ -e "${RESULT_DIR}/launch.json" ]]; then
+    [[ "${RESUME}" == true ]] || { echo "result already exists: ${RESULT_DIR} (use --resume)" >&2; exit 2; }
+    if grep -qx 'status=0' "${RESULT_DIR}/run_info.txt" 2>/dev/null; then
+        echo "skip completed case: ${RESULT_DIR}" >&2
+        exit 0
+    fi
+    ARCHIVE_DIR="${RESULT_DIR}.attempt-$(date +%y%m%d-%H%M%S)"
+    mv "${RESULT_DIR}" "${ARCHIVE_DIR}"
+    echo "archived incomplete or failed attempt: ${ARCHIVE_DIR}" >&2
+fi
 mkdir -p "${RESULT_DIR}"
-[[ ! -e "${RESULT_DIR}/launch.json" ]] || { echo "result already exists: ${RESULT_DIR}" >&2; exit 2; }
 printf 'command:' >"${RESULT_DIR}/command.txt"
 printf ' %q' "${COMMAND[@]}" >>"${RESULT_DIR}/command.txt"
 printf '\n' >>"${RESULT_DIR}/command.txt"
 cat >"${RESULT_DIR}/launch.json" <<JSON
-{"model":"${MODEL_ID}","recipe":"${RECIPE}","run_name":"${RUN_NAME}","dtype":"${DTYPE}","fsdp":3,"seq_length":${SEQ_LENGTH},"context_parallel_size":${CONTEXT_PARALLEL},"micro_batch_size":${MICRO_BATCH_SIZE},"global_batch_size":${GLOBAL_BATCH_SIZE},"num_microbatches":${NUM_MICROBATCHES},"gpu_count":${GPU_COUNT},"nnodes":${NNODES},"node_rank":${NODE_RANK},"numa_mode":"${NUMA_MODE}","run_date":"${RUN_DATE}"}
+{"model":"${MODEL_ID}","recipe":"${RECIPE}","run_name":"${RUN_NAME}","dtype":"${DTYPE}","fsdp":3,"seq_length":${SEQ_LENGTH},"context_parallel_size":${CONTEXT_PARALLEL},"expert_model_parallel_size":${EXPERT_PARALLEL},"micro_batch_size":${MICRO_BATCH_SIZE},"global_batch_size":${GLOBAL_BATCH_SIZE},"num_microbatches":${NUM_MICROBATCHES},"gpu_count":${GPU_COUNT},"nnodes":${NNODES},"node_rank":${NODE_RANK},"numa_mode":"${NUMA_MODE}","run_date":"${RUN_DATE}"}
 JSON
-printf 'model=%s dtype=%s seq=%s cp=%s mbs=%s gbs=%s gpus=%s num_microbatches=%s numa=%s\n' "${MODEL}" "${DTYPE}" "${SEQ_LENGTH}" "${CONTEXT_PARALLEL}" "${MICRO_BATCH_SIZE}" "${GLOBAL_BATCH_SIZE}" "${GPU_COUNT}" "${NUM_MICROBATCHES}" "${NUMA_MODE}" | tee "${RESULT_DIR}/run_info.txt"
+printf 'model=%s dtype=%s seq=%s cp=%s ep=%s mbs=%s gbs=%s gpus=%s num_microbatches=%s numa=%s\n' "${MODEL}" "${DTYPE}" "${SEQ_LENGTH}" "${CONTEXT_PARALLEL}" "${EXPERT_PARALLEL}" "${MICRO_BATCH_SIZE}" "${GLOBAL_BATCH_SIZE}" "${GPU_COUNT}" "${NUM_MICROBATCHES}" "${NUMA_MODE}" | tee "${RESULT_DIR}/run_info.txt"
 set +e
 "${COMMAND[@]}" 2>&1 | tee "${RESULT_DIR}/train.log"
 STATUS=${PIPESTATUS[0]}
