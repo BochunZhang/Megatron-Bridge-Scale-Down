@@ -345,6 +345,15 @@ def _connect(groups: list[CollectiveGroup], rank: int) -> None:
         torch.distributed.barrier()
 
 
+def _nccl_backend(pg: dist.ProcessGroup) -> dist.ProcessGroupNCCL:
+    """Return the ``ProcessGroupNCCL`` behind ``pg``.
+
+    ``dist.new_group`` returns the generic ``ProcessGroup`` wrapper; ``mem_allocator``,
+    ``register_mem_pool`` and ``deregister_mem_pool`` are bound only on the NCCL backend.
+    """
+    return pg._get_backend(torch.device("cuda"))
+
+
 def _register_pool(group: CollectiveGroup, pool: torch.cuda.MemPool | None) -> None:
     """Register every segment of ``pool`` on both communicators as a symmetric window.
 
@@ -357,8 +366,7 @@ def _register_pool(group: CollectiveGroup, pool: torch.cuda.MemPool | None) -> N
         return
     torch.cuda.synchronize()
     for pg in (group.ag_pg, group.rs_pg):
-        # register_mem_pool is a ProcessGroupNCCL method; the Gloo default group has no windows.
-        pg.register_mem_pool(pool, symm=True)  # type: ignore[attr-defined]
+        _nccl_backend(pg).register_mem_pool(pool, symm=True)
     torch.cuda.synchronize()
 
 
@@ -385,8 +393,7 @@ def _make_buffers(group: CollectiveGroup, rank: int, size_bytes: int, dtype: tor
     index = group.ranks.index(rank)
     pool = None
     if symm:
-        backend = group.ag_pg._get_backend(torch.device("cuda"))  # type: ignore[union-attr]
-        pool = torch.cuda.MemPool(backend.mem_allocator)
+        pool = torch.cuda.MemPool(_nccl_backend(group.ag_pg).mem_allocator)
     with torch.cuda.use_mem_pool(pool) if pool else contextlib.nullcontext():
         return Buffers(
             # AG chunk k must equal k + 1; RS input is 1 on even and 2 on odd group ranks so every
@@ -511,7 +518,7 @@ def _deregister_pool(group: CollectiveGroup, pool: torch.cuda.MemPool | None) ->
         return
     torch.cuda.synchronize()
     for pg in (group.ag_pg, group.rs_pg):
-        pg.deregister_mem_pool(pool)  # type: ignore[attr-defined]
+        _nccl_backend(pg).deregister_mem_pool(pool)
     torch.cuda.synchronize()
 
 

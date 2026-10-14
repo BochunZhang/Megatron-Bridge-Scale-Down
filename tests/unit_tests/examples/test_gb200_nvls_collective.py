@@ -567,3 +567,45 @@ def test_capture_windows_number_cases_and_close_every_range(monkeypatch):
     assert calls == [step.format("a") for step in window] + [step.format("b") for step in window]
     start, end = captures.window_unix
     assert start <= end
+
+
+class _FakeNcclBackend:
+    def __init__(self, calls):
+        self.calls = calls
+
+    def register_mem_pool(self, pool, symm=False):
+        self.calls.append(("register", self, pool, symm))
+
+    def deregister_mem_pool(self, pool):
+        self.calls.append(("deregister", self, pool))
+
+
+class _FakeProcessGroup:
+    """Mirrors ``torch._C._distributed_c10d.ProcessGroup``: no window methods of its own."""
+
+    def __init__(self, backend):
+        self.backend = backend
+
+    def _get_backend(self, device):
+        assert device == "cuda"
+        return self.backend
+
+
+@pytest.mark.unit
+def test_pool_registration_goes_through_the_nccl_backend(monkeypatch):
+    monkeypatch.setattr(benchmark.torch, "device", lambda kind: kind, raising=False)
+    monkeypatch.setattr(benchmark.torch.cuda, "synchronize", lambda: None, raising=False)
+    calls = []
+    ag, rs = _FakeNcclBackend(calls), _FakeNcclBackend(calls)
+    group = benchmark.CollectiveGroup(
+        name="single4", ranks=[0, 1, 2, 3], ag_pg=_FakeProcessGroup(ag), rs_pg=_FakeProcessGroup(rs)
+    )
+    pool = object()
+    benchmark._register_pool(group, pool)
+    benchmark._deregister_pool(group, pool)
+    assert calls == [
+        ("register", ag, pool, True),
+        ("register", rs, pool, True),
+        ("deregister", ag, pool),
+        ("deregister", rs, pool),
+    ]
