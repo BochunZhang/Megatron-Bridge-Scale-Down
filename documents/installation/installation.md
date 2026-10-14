@@ -260,3 +260,18 @@ pip install deepspeed
 注意:
 - 限制 MAX_JOBS 和 NVCC_THREADS, 否则并行编译会占满全部 CPU, 导致设备卡死和 OOM, 但是报错与 OOM 无关, 很难 debug
 - 限制架构, 减少编译耗时
+
+
+## 6. transformers 升级
+
+```
+uv pip install --dry-run "transformers==5.17.0"
+uv pip install --no-config --no-deps "tokenizers==0.23.3"
+```
+
+GatedDeltaNet 的 A_log = log(A), 其中 A ~ U(0, 16). 只要采样恰好得到 0, 就会出现 log(0) = −inf.
+
+DeepSpeed 的 CPU Adam 对 inf 的处理存在问题, 会扩散为 Nan, 导致报错.
+
+- v5.12.1 – v5.15.0	里面 uniform_(0, 16), bf16 下有约 1/256 的概率采到 0，log(0) 得到 −inf
+- v5.16.0 及以后, uniform_(0.01, 16), 已修复
