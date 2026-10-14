@@ -403,7 +403,7 @@ def _verify(group: CollectiveGroup, buffers: Buffers, ops: tuple[str, ...]) -> b
     ok = True
     if "ag" in ops:
         expected = torch.arange(1, group.size + 1, device="cuda", dtype=torch.float32)
-        ok &= bool(torch.equal(buffers.ag_out.view(group.size, -1).float(), expected[:, None].expand(group.size, -1)))
+        ok &= bool(torch.all(buffers.ag_out.view(group.size, -1).float() == expected[:, None]).item())
     if "rs" in ops:
         expected_sum = group.size + group.size // 2
         ok &= bool(torch.all(buffers.rs_out.float() == expected_sum).item())
