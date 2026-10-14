@@ -120,15 +120,20 @@ bash examples/gb200/nvls-collective/run_nvls_collective_benchmark.sh \
 
 ### 输出目录（不需要指定）
 
-固定为仓库内 `results/gb200/nvls-collective/gpu-num-<总卡数>/run-<NN>`，`NN` 是该卡数下已有
-`run-*` 的最大编号加一（`run-01`、`run-02`…，不回填空号）。由 [`run_dir.py`](run_dir.py) 决定：
+固定为仓库内 `results/gb200/nvls-collective/gpu-num-<总卡数>/<yymmdd-hhmmss>`，时间戳由
+[`scripts/scale-down/common/run_timestamp_and_logs.sh`](../../scripts/scale-down/common/run_timestamp_and_logs.sh)
+的 `resolve_run_time` 给出——**和 scale-down 实验脚本用的是同一个 run id**：
 
-1. node 0 用 `mkdir` 原子地占下下一个 `run-NN`（同时启动的两个 job 不会拿到同一个），并写一个
-   `.node0` 标记文件。
-2. 多节点时 node 0 在 `MASTER_ADDR:<master-port − 1>`（默认 29610）起一个 `TCPStore`，把路径发给
-   其他节点，并等所有节点确认收到后才继续。不能让每个节点各自扫描目录：晚启动的节点会看到 node 0
-   刚建好的 `run-01`，于是自己选 `run-02`。
-3. 其他节点检查能否看到 `.node0`，看不到说明仓库不在共享存储上，直接报错退出。
+1. 单节点（`--nnodes 1`）直接用本机时钟打一个戳，不需要握手。
+2. 多节点时 node 0 打戳后在 `MASTER_ADDR:MASTER_PORT`（launcher 设为 `master-port − 1`，默认
+   29610）起一个 `TCPStore`，其他节点阻塞直到读到同一个值，node 0 等所有节点确认后才继续。
+   各节点自己格式化 `date` 会把一次逻辑运行散到几个时间戳里，因为 fan-out 要几分钟。
+3. 时间戳天然唯一，不需要扫描目录，所以同一次实验重跑会落到新目录；要写进指定 id 就
+   `export RUN_TIME=<id>`（`--dry-run` 也走本机时钟，不握手）。
+
+握手是纯 CPU 的，必须在任何 CUDA context 建立之前完成；它经 Gloo 引导，所以 `GLOO_SOCKET_IFNAME`
+要先定好（见下节）。launcher 只复用 `resolve_run_time` 这一个函数，不调 `setup_log_dir`，所以日志
+仍然写在 `<output_dir>/<algo>/` 下，也不会生成 `node.json`。
 
 ### 网络接口（GLOO_SOCKET_IFNAME）
 
@@ -255,8 +260,7 @@ communicator 而别的 rank 继续入队，所以这里测的是 GPU 侧 kernel 
 ## 输出与验收
 
 ```text
-results/gb200/nvls-collective/gpu-num-<W>/run-<NN>/
-  .node0                                       # node 0 建目录时写入，用于检查共享存储
+results/gb200/nvls-collective/gpu-num-<W>/<yymmdd-hhmmss>/
   ring/
     results.jsonl  metadata.json               # 只由全局 rank 0 写
     torchrun-node<k>.log                       # 每个节点一份
@@ -317,9 +321,9 @@ NVLink 拓扑的映射。已有输出目录会报 `FileExistsError`，重复实�
 uv run --no-sync python -m pytest \
   --confcutdir=tests/unit_tests/examples \
   tests/unit_tests/examples/test_gb200_nvls_collective.py \
-  tests/unit_tests/examples/test_gb200_nvls_analyse_nsys.py \
-  tests/unit_tests/examples/test_gb200_nvls_run_dir.py -q
+  tests/unit_tests/examples/test_gb200_nvls_analyse_nsys.py -q
 bash -n examples/gb200/nvls-collective/run_nvls_collective_benchmark.sh
+bash examples/gb200/nvls-collective/run_nvls_collective_benchmark.sh --dry-run
 uv run --no-sync ruff check examples/gb200/nvls-collective
 ```
 

@@ -23,9 +23,10 @@ Run the same command on every node (DLC style). For each algorithm a fresh torch
 is started, because NCCL_ALGO is fixed when a communicator is created. Node 0 merges the
 results into compare.md.
 
-Output: results/gb200/nvls-collective/gpu-num-<nnodes*gpus-per-node>/run-<NN> in this repo.
-Node 0 takes the next free run-NN and hands it to the other nodes over a TCPStore on
-MASTER_ADDR:<master-port - 1>, so the repo must be on storage every node can see.
+Output: results/gb200/nvls-collective/gpu-num-<nnodes*gpus-per-node>/<yymmdd-hhmmss> in this
+repo. Node 0 stamps the id and hands it to the other nodes through the run_timestamp_and_logs
+helper (TCPStore on MASTER_ADDR:<master-port - 1>), so the repo must be on storage every node
+can see. An exported RUN_TIME pins it, which is what a re-run of one comparison needs.
 
 Gloo/NCCL bootstrap interface: eth0 for a single 4-GPU node (DSW), bond1 for more than
 4 GPUs (DLC), checked against `ip -o -4 addr show up`. An exported GLOO_SOCKET_IFNAME wins.
@@ -76,6 +77,15 @@ need_value() {
 script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 repo_root="$(cd -- "${script_dir}/../../.." && pwd)"
 
+# Run id and log helpers shared by the scale-down experiment scripts. resolve_run_time is the
+# single source of the run directory name; sourcing only defines functions. log/warn are defined
+# here first so the helper keeps these versions and its status line goes to stderr, and die
+# (above) keeps the ERROR: prefix this script already uses.
+log() { printf '%s\n' "$*" >&2; }
+warn() { printf 'warning: %s\n' "$*" >&2; }
+# shellcheck source=../../../scripts/scale-down/common/run_timestamp_and_logs.sh
+source "${repo_root}/scripts/scale-down/common/run_timestamp_and_logs.sh"
+
 nnodes="${NNODES:-1}"
 node_rank="${NODE_RANK:-${RANK:-0}}"
 master_addr="${MASTER_ADDR:-${DLC_MASTER_ADDR:-127.0.0.1}}"
@@ -93,7 +103,7 @@ iters="20"
 trials="5"
 symm_kernel="default"
 nsys_enabled=false
-dry_run=false
+DRY_RUN=false
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -114,7 +124,7 @@ while [[ $# -gt 0 ]]; do
         --trials) need_value "$@"; trials="$2"; shift 2 ;;
         --symm-kernel) need_value "$@"; symm_kernel="$2"; shift 2 ;;
         --nsys) nsys_enabled=true; shift ;;
-        --dry-run) dry_run=true; shift ;;
+        --dry-run) DRY_RUN=true; shift ;;
         -h|--help) usage; exit 0 ;;
         *) die "unknown option: $1 (see --help)" ;;
     esac
@@ -166,7 +176,7 @@ select_ifname() {
         other=eth0
     fi
     if ! command -v ip >/dev/null; then
-        $dry_run || die "the ip command is required to choose GLOO_SOCKET_IFNAME"
+        $DRY_RUN || die "the ip command is required to choose GLOO_SOCKET_IFNAME"
         echo "WARNING: ip not found; dry-run assumes ${preferred}" >&2
         echo "$preferred"
         return
@@ -191,17 +201,21 @@ fi
 nccl_socket_ifname="${NCCL_SOCKET_IFNAME:-$gloo_ifname}"
 
 results_root="${repo_root}/results/gb200/nvls-collective"
-run_dir_args=(
-    --root "$results_root" --world-size "$world_size"
-    --nnodes "$nnodes" --node-rank "$node_rank"
-    --master-addr "$master_addr" --port "$(( master_port - 1 ))"
-)
-if $dry_run; then
-    output_dir="$(python3 "${script_dir}/run_dir.py" "${run_dir_args[@]}" --dry-run)"
-else
-    output_dir="$(uv run --no-sync python "${script_dir}/run_dir.py" "${run_dir_args[@]}")"
-fi
-[[ -n "$output_dir" ]] || die "could not resolve the output directory"
+# One batch id for the whole job: node 0 stamps it and publishes it on MASTER_PORT, the other
+# nodes block until they read the same value. resolve_run_time needs GLOO_SOCKET_IFNAME (the
+# store bootstraps through Gloo) and reads NNODES/NODE_RANK/MASTER_ADDR/MASTER_PORT from the
+# environment, so hand it the values this script resolved. MASTER_PORT keeps master-port - 1,
+# which the algorithm jobs (master-port + i) leave free.
+export MASTER_ADDR="$master_addr"
+export MASTER_PORT="$(( master_port - 1 ))"
+export NNODES="$nnodes"
+export NODE_RANK="$node_rank"
+export GLOO_SOCKET_IFNAME="$gloo_ifname"
+resolve_run_time "$DRY_RUN"
+# <yymmdd-hhmmss> keeps each job's directory unique without scanning the tree, so a re-run of
+# the same comparison gets a new one; export RUN_TIME to write into a specific id instead.
+output_dir="${results_root}/gpu-num-${world_size}/${RUN_TIME}"
+[[ -n "$RUN_TIME" ]] || die "could not resolve the run id"
 
 bench_args=(
     --group-sizes "$group_sizes"
@@ -226,14 +240,14 @@ bench_args+=(--symm-kernel "$symm_kernel")
 debug_subsys="INIT,ENV,TUNING"
 if $nsys_enabled; then
     bench_args+=(--nsys)
-    if ! $dry_run; then
+    if ! $DRY_RUN; then
         command -v nsys >/dev/null || die "nsys is required when --nsys is enabled"
         nsys --version >&2
     fi
 fi
 
 run() {
-    if $dry_run; then
+    if $DRY_RUN; then
         printf '%q ' "$@"
         printf '\n'
     else
@@ -243,12 +257,12 @@ run() {
 
 echo "world_size=${world_size} nnodes=${nnodes} node_rank=${node_rank} group_sizes=${group_sizes}" \
     "split_totals=${split_totals:-none} ifname=${gloo_ifname} output_dir=${output_dir}" >&2
-$dry_run || mkdir -p "$output_dir"
+$DRY_RUN || mkdir -p "$output_dir"
 
 for index in "${!algo_list[@]}"; do
     algo="${algo_list[$index]}"
     algo_dir="${output_dir}/${algo}"
-    $dry_run || mkdir -p "$algo_dir"
+    $DRY_RUN || mkdir -p "$algo_dir"
     case "$algo" in
         nvls) nccl_algo="NVLS"; nvls_enable=1; win_enable="" ;;
         ring) nccl_algo="Ring"; nvls_enable=0; win_enable="" ;;
@@ -278,8 +292,8 @@ for index in "${!algo_list[@]}"; do
     torchrun_extra=()
     if $nsys_enabled; then
         nsys_dir="${algo_dir}/nsys"
-        $dry_run || mkdir -p "$nsys_dir"
-        if ! $dry_run && compgen -G "${nsys_dir}/*.nsys-rep" >/dev/null; then
+        $DRY_RUN || mkdir -p "$nsys_dir"
+        if ! $DRY_RUN && compgen -G "${nsys_dir}/*.nsys-rep" >/dev/null; then
             die "${nsys_dir} already contains Nsight reports; ${output_dir} was not a fresh run directory"
         fi
         # Each worker gets its own nsys session. Only the timed trials of each case are captured
@@ -299,7 +313,7 @@ for index in "${!algo_list[@]}"; do
             python "${script_dir}/nvls_collective_benchmark.py"
         )
         algo_env+=(NSYS_TMPDIR="${NSYS_TMPDIR:-${nsys_dir}/.tmp}")
-        $dry_run || mkdir -p "${NSYS_TMPDIR:-${nsys_dir}/.tmp}"
+        $DRY_RUN || mkdir -p "${NSYS_TMPDIR:-${nsys_dir}/.tmp}"
     fi
 
     echo "=== algo=${algo} (${algo_env[*]})" >&2
@@ -313,9 +327,9 @@ for index in "${!algo_list[@]}"; do
         ${torchrun_extra[@]+"${torchrun_extra[@]}"} \
         "${worker[@]}" \
         --algo "$algo" --output-dir "$algo_dir" "${bench_args[@]}" \
-        2>&1 | { $dry_run && cat || tee "${algo_dir}/torchrun-node${node_rank}.log"; }
+        2>&1 | { $DRY_RUN && cat || tee "${algo_dir}/torchrun-node${node_rank}.log"; }
 
-    if $nsys_enabled && ! $dry_run; then
+    if $nsys_enabled && ! $DRY_RUN; then
         compgen -G "${nsys_dir}/rank*.nsys-rep" >/dev/null \
             || die "nsys wrote no report under ${nsys_dir}; inspect ${algo_dir}/torchrun-node${node_rank}.log"
     fi
