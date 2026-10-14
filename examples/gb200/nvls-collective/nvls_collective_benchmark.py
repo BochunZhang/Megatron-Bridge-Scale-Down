@@ -333,7 +333,7 @@ def _connect(groups: list[CollectiveGroup], rank: int) -> None:
     one communicator at a time, with a device sync in between.
     """
     for group in groups:
-        if group.contains(rank):
+        if rank in group.ranks:
             index = group.ranks.index(rank)
             shard = torch.full((1024,), float(index), device="cuda")
             gathered = torch.empty(1024 * group.size, device="cuda")
