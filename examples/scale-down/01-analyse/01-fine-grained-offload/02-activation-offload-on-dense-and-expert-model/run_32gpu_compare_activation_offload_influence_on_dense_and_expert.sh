@@ -15,6 +15,13 @@
 #
 # Compare baseline / offload-mlp / offload-attn-mlp on complete Qwen3.5 dense
 # and expert models with PP=4 across eight DLC nodes (32 GPUs).
+#
+# Unlike the 4/8/16-GPU matrices, this one runs with --sharding none instead of
+# Megatron-FSDP. Megatron-FSDP builds its DP-TP device mesh from the global
+# world size while dp_cp is a per-pipeline-stage group, so its mesh helpers only
+# balance when PP=1; at PP=4 the launch dies in _get_dp_tp_mesh with
+# "Shape mismatch, 32 != 8" before the first step. --sharding none keeps the
+# same PP=4/EP/DP layout on the distributed optimizer.
 
 set -euo pipefail
 
@@ -26,9 +33,13 @@ usage() {
     cat <<EOF
 Usage: run_32gpu_compare_activation_offload_influence_on_dense_and_expert.sh [OPTIONS]
 
-DLC, 8 nodes x 4 GPUs, FSDP1, PP=4, complete models (no cropping):
+DLC, 8 nodes x 4 GPUs, DDP (--sharding none), PP=4, complete models (no cropping):
   dense   Qwen3.5-27B        PP=4, EP=1 (DP=8)
   expert  Qwen3.5-122B-A10B  PP=4, EP=8 (DP=8, EDP=1), HybridEP
+
+Megatron-FSDP is not used here: its device-mesh helpers assume PP=1, so the
+32-GPU PP=4 layout fails at setup. Megatron-FSDP remains active in the 4/8/16
+GPU matrices, which are all PP=1.
 
 Defaults: --mbs 1 --model-type dense,expert
           --case baseline,offload-mlp,offload-attn-mlp --gbs 128
@@ -65,10 +76,12 @@ for mbs in "${MBS_VALUES[@]}"; do
         for case_name in "${CASE_VALUES[@]}"; do
             modules="$(offload_modules "${case_name}" "${model_type}" qwen)"
             if [[ "${model_type}" == dense ]]; then
-                run_case 32 4 1 default qwen35_text_27b dense "${case_name}" "${modules}" "${mbs}" false
+                run_case 32 4 1 default qwen35_text_27b dense "${case_name}" "${modules}" "${mbs}" false \
+                    --sharding none
             else
                 run_case 32 4 8 hybridep qwen35_text_122b_a10b expert "${case_name}" "${modules}" "${mbs}" \
-                    "${SYNC_WITH_SM}"
+                    "${SYNC_WITH_SM}" \
+                    --sharding none
             fi
         done
     done

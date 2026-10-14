@@ -46,8 +46,12 @@ expert 那部分额外下降。只有把它替换掉，剩下的差值才是真�
 
 ## 3. offload 与 recompute 策略
 
-所有 case 都使用 FSDP1（Megatron-FSDP，`data_parallel_sharding_strategy=optim`），**不开 recompute**，
-只用 fine-grained activation offload。baseline 与 offload case 的唯一区别是 offload 开关与模块列表：
+4/8/16 卡用 FSDP1（Megatron-FSDP，`data_parallel_sharding_strategy=optim`），32 卡改用 DDP
+（`--sharding none`，Megatron 分布式优化器）——Megatron-FSDP 的 device mesh helper 从全局
+world size 推导，而 `dp_cp` 是 per-pipeline-stage 组，只在 PP=1 时自洽，PP=4 会在
+`_get_dp_tp_mesh` 里直接抛 `Shape mismatch, 32 != 8`。两者都是 ZeRO-1，模型状态占用基本持平。
+**所有档位都不开 recompute**，只用 fine-grained activation offload。baseline 与 offload case
+的唯一区别是 offload 开关与模块列表：
 
 | 固定配置 | 值 |
 | --- | --- |
@@ -89,7 +93,7 @@ DeepSeek 的 attention 组额外包含 `qkv_linear`。Qwen3.5 的 GatedDeltaNet 
 
 ### 8/16/32 卡模型与显存估算
 
-估算按 bf16 参数 + fp32 梯度（FSDP1 不分片）+ fp32 Adam（按 EDP 分片）+ 无 recompute 的
+估算按 bf16 参数 + fp32 梯度（ZeRO-1 不分片参数和梯度）+ fp32 Adam（按 EDP 分片）+ 无 recompute 的
 activation（1F1B 下 stage 0 保留 PP 个 microbatch）+ fp32 logits，GB200 每卡约 186 GB：
 
 | 规模 | 模型 | 并行 | MBS=1 | MBS=2 |
@@ -187,7 +191,7 @@ bash $E/run_4gpu_compare_activation_offload_influence_on_dense_and_expert.sh --m
 | `4gpu_compare_activation_offload_influence_on_dense_and_expert` | `run_4gpu_compare_…sh` | 小规模裁剪模型下 offload 对 dense / expert 的影响 |
 | `8gpu_compare_activation_offload_influence_on_dense_and_expert` | `run_8gpu_compare_…sh` | 完整 9B / 128 expert 的 35B-A3B、FSDP1、EP=8 下的影响 |
 | `16gpu_compare_activation_offload_influence_on_dense_and_expert` | `run_16gpu_compare_…sh` | 完整模型、FSDP1、EP=16 下的影响 |
-| `32gpu_compare_activation_offload_influence_on_dense_and_expert` | `run_32gpu_compare_…sh` | 完整模型、FSDP1、PP=4、EP=8 下的影响 |
+| `32gpu_compare_activation_offload_influence_on_dense_and_expert` | `run_32gpu_compare_…sh` | 完整模型、DDP、PP=4、EP=8 下的影响 |
 
 ```text
 <results-root>/<experiment>/<model>-<dense|expert>/gpu_<n>-<dtype>-pp_<p>-ep_<e>-mbs_<m>-gbs_<g>-<dispatcher>-<run-name>/<run-time>/
@@ -221,7 +225,10 @@ uv run --no-sync python $E/analyse_offload_results.py --experiment 16gpu_compare
 ## 8. 已知限制
 
 - SM copy 依赖 Triton，不能与 CUDA graph capture 同时使用；本目录所有 case 都是 `cuda_graph_impl=none`。
-- 仓库内没有同时使用 Megatron-FSDP 与 PP>1 的 recipe，32 卡组是首次组合，失败时先排查这一点。
+- **Megatron-FSDP 与 PP>1 不兼容**：32 卡组是首次组合，已在 setup 阶段确认失败——`_get_dp_tp_mesh`
+  用全局 `world_size` 展开 device mesh，但 `dp_cp` 是 per-pipeline-stage 组，PP=4 时报
+  `EinopsError: Shape mismatch, 32 != 8`。因此 32 卡组固定传 `--sharding none` 走 DDP；若将来
+  上游修好 mesh helper，可以去掉这个参数恢复 FSDP。
 - Qwen3.5-122B-A10B 只有 bf16 recipe，32 卡 expert 不支持 `--dtype mxfp8`。
 - recipe 会通过 `AutoConfig.from_pretrained` 读取 HF 配置，DLC 节点需要能访问 HF 或已缓存配置。
 - 多机 nsys 只采集全局 rank 0–3（`profiling.profile_ranks=[0,1,2,3]`）。
