@@ -72,7 +72,10 @@ def test_4gpu_compare_covers_three_cases_two_mbs_and_both_model_types() -> None:
             }
     dense = [line for line in lines if "type=dense " in line]
     assert all("model=qwen35_text_9b" in line and "ep=1 " in line and "sync_sm=false" in line for line in dense)
-    assert all("--num-layers 16 --mtp-num-layers 0" in line for line in dense)
+    # The 16-layer crop must override linear_attention_freq too: the Qwen3.5 HF
+    # config carries a 32-entry layer_types list, which MCore rejects against a
+    # 16-layer model.
+    assert all("--num-layers 16 --linear-attention-freq 4 --mtp-num-layers 0" in line for line in dense)
     expert = [line for line in lines if "type=expert " in line]
     assert all("ep=4 " in line and "dispatcher=hybridep" in line and "sync_sm=true" in line for line in expert)
 

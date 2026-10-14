@@ -60,7 +60,7 @@ for mbs in "${MBS_VALUES[@]}"; do
             modules="$(offload_modules "${case_name}" "${model_type}" "${MODEL_FAMILY}")"
             if [[ "${MODEL_FAMILY}" == qwen && "${model_type}" == dense ]]; then
                 run_case 4 1 1 default qwen35_text_9b dense "${case_name}" "${modules}" "${mbs}" false \
-                    --num-layers 16 --mtp-num-layers 0
+                    --num-layers 16 --linear-attention-freq 4 --mtp-num-layers 0
             elif [[ "${MODEL_FAMILY}" == qwen ]]; then
                 run_case 4 1 4 hybridep qwen35_text_35b_a3b expert "${case_name}" "${modules}" "${mbs}" \
                     "${SYNC_WITH_SM}" \
