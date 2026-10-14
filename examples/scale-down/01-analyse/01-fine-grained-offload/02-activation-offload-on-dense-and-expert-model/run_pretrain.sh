@@ -48,7 +48,7 @@ Required:
 Offload options:
     --offload-modules <list>     Hydra list such as [mlp_norm,moe_act]. Required
                                  when --offload is true.
-    --dtype <bf16|mxfp8>         Training precision (default: bf16).
+    --dtype <bf16|mxfp8>         Training precision (default: mxfp8).
 
 Scale and parallelism:
     --gpu <4|8|16|32>            Total GPUs. GB200 uses four per node, so 8, 16
@@ -100,7 +100,7 @@ EOF
 MODEL=""
 MODEL_TYPE=""
 EXPERIMENT=""
-DTYPE="bf16"
+DTYPE="mxfp8"
 RUN_NAME=""
 OFFLOAD=""
 OFFLOAD_MODULES=""

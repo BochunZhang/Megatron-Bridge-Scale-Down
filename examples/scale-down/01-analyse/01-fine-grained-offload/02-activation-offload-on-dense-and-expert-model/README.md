@@ -74,7 +74,7 @@ DeepSeek 的 attention 组额外包含 `qkv_linear`。Qwen3.5 的 GatedDeltaNet 
 
 | 脚本 | 规模 | 模型 | 并行 | 默认矩阵 |
 | --- | --- | --- | --- | --- |
-| `run_4gpu_expert_activation_offload_blocking.sh` | 1 节点 × 4 卡 | Qwen3.5-35B-A3B 裁剪 | EP=4，HybridEP | `offload-attn-mlp` × {blocking, sync-sm}，MBS=1，nsys |
+| `run_4gpu_expert_activation_offload_blocking.sh` | 1 节点 × 4 卡 | Qwen3.5-35B-A3B 裁剪；`--model-family deepseek` 时为 DeepSeek-V3 裁剪 | EP=4，HybridEP | `offload-attn-mlp` × {blocking, sync-sm}，MBS=1，nsys |
 | `run_4gpu_compare_activation_offload_influence_on_dense_and_expert.sh` | 1 节点 × 4 卡 | Qwen3.5-9B / 35B-A3B 裁剪 | dense EP=1；expert EP=4 | 3 case × MBS{1,2} × {dense, expert} |
 | `run_8gpu_compare_activation_offload_influence_on_dense_and_expert.sh` | 2 节点 × 4 卡 | Qwen3.5-9B 完整 / 35B-A3B 128 expert | PP=1；dense EP=1；expert EP=8 | 3 case × MBS{1,2} × {dense, expert}，GBS=64 |
 | `run_16gpu_compare_activation_offload_influence_on_dense_and_expert.sh` | 4 节点 × 4 卡 | Qwen3.5-9B / 35B-A3B 完整 | PP=1；dense EP=1；expert EP=16 | 3 case × MBS{1,2} × {dense, expert}，GBS=128 |
@@ -160,6 +160,7 @@ bash $E/run_32gpu_compare_activation_offload_influence_on_dense_and_expert.sh --
 ```bash
 # 人工核验 .item() 阻塞是否消失（nsys）
 bash $E/run_4gpu_expert_activation_offload_blocking.sh
+bash $E/run_4gpu_expert_activation_offload_blocking.sh --model-family deepseek
 
 # dense / expert 对比
 bash $E/run_4gpu_compare_activation_offload_influence_on_dense_and_expert.sh
@@ -168,6 +169,7 @@ bash $E/run_4gpu_compare_activation_offload_influence_on_dense_and_expert.sh --m
 
 所有脚本都支持 `--dry-run`，先确认矩阵再启动。共同参数：`--mbs`、`--model-type`、`--case`、
 `--dtype`、`--gbs`、`--train-iters`、`--sync-with-sm`、`--profile`、`--results-root`、`--run-time`。
+`--dtype` 默认 `mxfp8`（32 卡脚本除外，默认 `bf16`），用 `--dtype bf16` 覆盖。
 
 ### blocking 核验看什么
 
@@ -229,6 +231,6 @@ uv run --no-sync python $E/analyse_offload_results.py --experiment 16gpu_compare
   用全局 `world_size` 展开 device mesh，但 `dp_cp` 是 per-pipeline-stage 组，PP=4 时报
   `EinopsError: Shape mismatch, 32 != 8`。因此 32 卡组固定传 `--sharding none` 走 DDP；若将来
   上游修好 mesh helper，可以去掉这个参数恢复 FSDP。
-- Qwen3.5-122B-A10B 只有 bf16 recipe，32 卡 expert 不支持 `--dtype mxfp8`。
+- Qwen3.5-122B-A10B 只有 bf16 recipe，因此 32 卡脚本默认 `bf16`，expert 不支持 `--dtype mxfp8`。
 - recipe 会通过 `AutoConfig.from_pretrained` 读取 HF 配置，DLC 节点需要能访问 HF 或已缓存配置。
 - 多机 nsys 只采集全局 rank 0–3（`profiling.profile_ranks=[0,1,2,3]`）。

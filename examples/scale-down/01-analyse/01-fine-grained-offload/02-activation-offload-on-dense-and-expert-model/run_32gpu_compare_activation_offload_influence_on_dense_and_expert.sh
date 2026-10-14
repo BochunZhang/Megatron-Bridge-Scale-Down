@@ -48,7 +48,8 @@ Defaults: --mbs 1 --model-type dense,expert
 MBS=2 is not in the default matrix: with 1F1B, pipeline stage 0 keeps four
 microbatches of activations, which puts both models at roughly 180 GB/GPU for
 the baseline. Add --mbs 1,2 to try it; an OOM there is expected.
-Qwen3.5-122B-A10B only has a bf16 recipe, so --dtype mxfp8 is rejected.
+Qwen3.5-122B-A10B only has a bf16 recipe, so this script defaults to
+--dtype bf16 and rejects --dtype mxfp8 unless --model-type is dense.
 
 Every worker runs the same command; MASTER_ADDR, MASTER_PORT, WORLD_SIZE and
 RANK come from DLC.
@@ -63,6 +64,8 @@ CASES=baseline,offload-mlp,offload-attn-mlp
 GBS=128
 SYNC_WITH_SM=true
 PROFILE=none
+# The other wrappers default to mxfp8; the 122B expert has no fp8mx recipe.
+DTYPE="${DTYPE:-bf16}"
 parse_matrix_args "$@"
 [[ "${MODEL_FAMILY}" == qwen ]] || die "the 32-GPU comparison uses Qwen3.5 models only"
 if [[ "${DTYPE}" != bf16 && ",${MODEL_TYPES}," == *",expert,"* ]]; then

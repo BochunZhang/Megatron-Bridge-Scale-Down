@@ -58,6 +58,21 @@ def test_blocking_check_runs_the_same_case_with_and_without_sm_sync() -> None:
 
 
 @pytest.mark.unit
+def test_blocking_check_supports_the_deepseek_expert_proxy() -> None:
+    lines = _matrix(BLOCKING, "--model-family", "deepseek")
+
+    assert len(lines) == 2
+    assert all("model=deepseek_v3 type=expert gpu=4 pp=1 ep=4" in line for line in lines)
+    assert all("dispatcher=hybridep" in line and "profile=nsys" in line for line in lines)
+    assert all(
+        "modules=[mlp_norm,expert_fc1,moe_act,attn_norm,qkv_linear,core_attn,attn_proj]" in line for line in lines
+    )
+    assert "run=offload-attn-mlp-blocking" in lines[0] and "sync_sm=false" in lines[0]
+    assert "run=offload-attn-mlp-sync-sm" in lines[1] and "sync_sm=true" in lines[1]
+    assert all("extra=[--num-layers 4 --num-experts 32 --moe-layer-freq [1,1,1,1]]" in line for line in lines)
+
+
+@pytest.mark.unit
 def test_4gpu_compare_covers_three_cases_two_mbs_and_both_model_types() -> None:
     lines = _matrix(COMPARE_4GPU)
 
@@ -157,6 +172,34 @@ def test_32gpu_compare_uses_pp4_ep8_and_defaults_to_mbs1() -> None:
     assert all(
         "model=qwen35_text_122b_a10b" in line and "ep=8 " in line for line in lines if "type=expert " in line
     )
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    "script",
+    [BLOCKING, COMPARE_4GPU, COMPARE_8GPU, COMPARE_16GPU],
+    ids=lambda path: path.stem,
+)
+def test_wrapper_defaults_to_mxfp8_and_accepts_a_bf16_override(script: Path) -> None:
+    default = _run(script, "--dry-run", "--mbs", "1")
+    assert default.returncode == 0, default.stderr
+    assert " dtype=mxfp8" in default.stdout
+    assert "_fp8mx_fsdp1_config" in default.stdout
+    assert "_bf16_fsdp1_config" not in default.stdout
+
+    override = _run(script, "--dry-run", "--mbs", "1", "--dtype", "bf16")
+    assert override.returncode == 0, override.stderr
+    assert " dtype=bf16" in override.stdout
+    assert "_bf16_fsdp1_config" in override.stdout
+    assert "_fp8mx_fsdp1_config" not in override.stdout
+
+
+@pytest.mark.unit
+def test_32gpu_compare_defaults_to_bf16_for_the_122b_expert() -> None:
+    result = _run(COMPARE_32GPU, "--dry-run", "--mbs", "1")
+    assert result.returncode == 0, result.stderr
+    assert " dtype=bf16" in result.stdout
+    assert "_fp8mx_fsdp1_config" not in result.stdout
 
 
 @pytest.mark.unit
@@ -331,3 +374,13 @@ def test_run_pretrain_requires_an_experiment_name() -> None:
     )
     assert result.returncode == 2
     assert "--experiment is required" in result.stderr
+
+
+@pytest.mark.unit
+def test_run_pretrain_defaults_to_the_mxfp8_recipe() -> None:
+    result = _run(
+        RUN_SCRIPT, "--experiment", "manual_check", "--model", "qwen35_text_9b", "--model-type", "dense",
+        "--run-name", "baseline", "--offload", "false", "--dry-run",
+    )
+    assert result.returncode == 0, result.stderr
+    assert "dtype=mxfp8 recipe=qwen35_text_9b_pretrain_4gpu_gb200_fp8mx_fsdp1_config" in result.stdout

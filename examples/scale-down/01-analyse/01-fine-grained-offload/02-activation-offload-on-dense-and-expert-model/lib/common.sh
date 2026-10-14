@@ -231,7 +231,7 @@ COMMON_USAGE='Common options:
     --mbs <list>              Comma-separated micro batch sizes, e.g. "1" or "1,2".
     --model-type <list>       Comma-separated subset of dense,expert.
     --case <list>             Comma-separated subset of baseline,offload-mlp,offload-attn-mlp.
-    --dtype <bf16|mxfp8>      Training precision (default: bf16).
+    --dtype <bf16|mxfp8>      Training precision (default: mxfp8).
     --gbs <n>                 Global batch size; must divide by MBS * (GPUs / PP).
     --train-iters <n>         Iterations per run (default: 10).
     --sync-with-sm <bool>     Replace the HybridEP .item() with an SM copy on expert runs.
@@ -244,9 +244,10 @@ COMMON_USAGE='Common options:
 Use --mbs, --model-type and --case to split one matrix across several DLC jobs.'
 
 # Parse the options shared by every wrapper script. The caller sets defaults
-# for MBS_LIST, MODEL_TYPES, CASES, GBS, SYNC_WITH_SM and PROFILE first.
+# for MBS_LIST, MODEL_TYPES, CASES, GBS, SYNC_WITH_SM and PROFILE first, and may
+# preset DTYPE to change the mxfp8 default.
 parse_matrix_args() {
-    DTYPE="${DTYPE:-bf16}"
+    DTYPE="${DTYPE:-mxfp8}"
     MODEL_FAMILY="${MODEL_FAMILY:-qwen}"
     TRAIN_ITERS="${TRAIN_ITERS:-10}"
     RESULTS_ROOT="${RESULTS_ROOT:-${DEFAULT_RESULTS_ROOT}}"
