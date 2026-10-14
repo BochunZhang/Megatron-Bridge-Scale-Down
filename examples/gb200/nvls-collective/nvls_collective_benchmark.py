@@ -19,8 +19,8 @@ communicator is created and the symmetric-memory path needs its own buffer regis
 
 * ``ring`` / ``nvls``: ``NCCL_ALGO`` is forced and payload buffers are plain device memory.
 * ``symm``: ``NCCL_WIN_ENABLE`` / ``NCCL_SYM_KERNEL`` are forced, ``NCCL_ALGO`` is left
-  unset, and every buffer is allocated inside a ``torch.cuda.MemPool`` registered as a
-  ``NCCL_WIN_COLL_SYMMETRIC`` window. NCCL then dispatches to its symmetric kernels
+  unset, and every buffer is allocated inside a ``torch.cuda.MemPool`` backed by
+  ``ncclMemAlloc`` and registered as a ``NCCL_WIN_COLL_SYMMETRIC`` window. NCCL then dispatches to its symmetric kernels
   (``AllGather_STMC`` / ``ReduceScatter_LDMC`` on a NVLink domain), which are unrelated to
   the classic ring and NVLS collectives.
 
@@ -368,6 +368,14 @@ def _make_buffers(group: CollectiveGroup, rank: int, size_bytes: int, dtype: tor
     For the symmetric path every buffer must live in a ``torch.cuda.MemPool`` that has been
     registered on the communicator as an ``NCCL_WIN_COLL_SYMMETRIC`` window; NCCL only
     dispatches to its symmetric kernels for windows with that flag.
+
+    The pool must allocate through ``ncclMemAlloc``. NCCL shares and multicast-binds only the
+    single cuMem allocation that contains the window base (``cuMemGetAddressRange`` +
+    ``cuMemRetainAllocationHandle`` in ``dev_runtime.cc``). A default pool under
+    ``expandable_segments`` builds one segment out of many cuMem handles, so registration
+    succeeds but everything past the first handle is never mapped to peers, and the
+    symmetric collective silently returns wrong data. A pool with its own allocator never
+    uses expandable segments.
     """
     elem = torch.empty((), dtype=dtype).element_size()
     if size_bytes % (group.size * elem):
@@ -375,7 +383,10 @@ def _make_buffers(group: CollectiveGroup, rank: int, size_bytes: int, dtype: tor
     numel = size_bytes // elem
     shard = numel // group.size
     index = group.ranks.index(rank)
-    pool = torch.cuda.MemPool() if symm else None
+    pool = None
+    if symm:
+        backend = group.ag_pg._get_backend(torch.device("cuda"))  # type: ignore[union-attr]
+        pool = torch.cuda.MemPool(backend.mem_allocator)
     with torch.cuda.use_mem_pool(pool) if pool else contextlib.nullcontext():
         return Buffers(
             # AG chunk k must equal k + 1; RS input is 1 on even and 2 on odd group ranks so every

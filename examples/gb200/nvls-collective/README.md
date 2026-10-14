@@ -58,6 +58,12 @@ symm 的实现细节（都按 2.28.9 源码确认）：
   （`src/scheduler/symmetric_sched.cc:36`）。torch 侧就是 `pg.register_mem_pool(pool, symm=True)`
   → `ncclCommWindowRegister(..., NCCL_WIN_COLL_SYMMETRIC)`（`NCCLUtils.cpp:503`），所以负载
   buffer 必须分配在 `torch.cuda.MemPool()` 里，本程序对 `--algo symm` 就是这样分配的。
+- 这个 MemPool 必须用 NCCL 的分配器：`torch.cuda.MemPool(backend.mem_allocator)`（走 `ncclMemAlloc`）。
+  NCCL 注册 window 时只按 window 起始地址取**一个** cuMem allocation（`cuMemGetAddressRange` +
+  `cuMemRetainAllocationHandle`，`dev_runtime.cc`），只把这一段映射给 peer、绑定到 multicast。
+  默认 `torch.cuda.MemPool()` 在 `expandable_segments:True` 下一个 segment 由多个 cuMem handle 拼成，
+  注册不报错，但第一个 handle 之后的内容 peer 看不到，symmetric AG/RS 静默写错，表现为
+  `wrong result on ranks [...]`；不开 expandable segments 时则是 `cudaMalloc` 内存，注册直接失败。
 - 注册是**集合操作**：`ncclDevrWindowRegisterInGroup` 结尾有 `bootstrapBarrier`
   （`dev_runtime.cc`），所以每个 size 都要先全组注册、用完再 `deregister_mem_pool` 才能释放内存。
 - 实现范围：`ncclSymkImplemented` 里 AllGather 恒可；ReduceScatter 只支持 sum + 浮点
