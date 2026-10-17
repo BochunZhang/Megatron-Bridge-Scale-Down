@@ -144,7 +144,7 @@ inline std::vector<int> parsePositiveInts(const std::string& text) {
 
 ////////////////////////////////////////////////////////////////////////////////
 // Workloads, scenarios and names (collective_metrics.py: WORKLOADS, SPLIT_PARTS, scenario_name,
-// case_name, rank_file).
+// case_name, case_dir_name, rank_file).
 
 inline const std::vector<std::string>& workloads() {
   // "ar" is always standalone: AllReduce is never mixed with AG or RS traffic.
@@ -229,10 +229,20 @@ inline std::string scenarioName(const std::string& scenario, int totalRanks, con
   throw std::invalid_argument("unknown scenario '" + scenario + "' with layout '" + layout + "'");
 }
 
-// One test, e.g. split-n16-contiguous-AB-concurrent_ag+rs_bf16_1024MiB. The name is the case
-// directory, the stem of every per-rank file in it, and (prefixed with the impl) the outer NVTX
-// range of the case's nsys report. The cross part takes kCrossWorkload, every other case one of
-// workloads(). sizeMiB is the full tensor: AG output / RS input.
+// Spelled-out workloads for case directory and report names (collective_metrics.py: WORKLOAD_NAMES).
+inline std::string workloadName(const std::string& workload) {
+  if (workload == "ag") return "all_gather";
+  if (workload == "rs") return "reduce_scatter";
+  if (workload == "ar") return "all_reduce";
+  if (workload == "ag+rs") return "all_gather+reduce_scatter";
+  if (workload == kCrossWorkload) return "all_gather_A+reduce_scatter_B";
+  throw std::invalid_argument("unknown workload '" + workload + "'");
+}
+
+// One test, e.g. all_gather+reduce_scatter-1024MiB-bf16-split-n16-contiguous-AB-concurrent.
+// Prefixed with the impl (caseDirName) it is the case directory and the stem of every per-rank
+// file in it; <impl>/<case> is the outer NVTX range of the case's nsys report. The cross part
+// takes kCrossWorkload, every other case one of workloads(). sizeMiB is the full tensor.
 inline std::string caseName(const std::string& scenario, const std::string& part, const std::string& workload,
                             const std::string& dtype, size_t sizeMiB) {
   if (!part.empty() && std::find(splitParts().begin(), splitParts().end(), part) == splitParts().end()) {
@@ -242,17 +252,21 @@ inline std::string caseName(const std::string& scenario, const std::string& part
     throw std::invalid_argument("workload " + kCrossWorkload + " belongs to part " + kCrossPart + " only");
   }
   if (workload != kCrossWorkload) workloadOps(workload);
-  std::string prefix = part.empty() ? scenario : scenario + "-" + part;
-  return prefix + "_" + workload + "_" + dtype + "_" + std::to_string(sizeMiB) + "MiB";
+  std::string suffix = part.empty() ? scenario : scenario + "-" + part;
+  return workloadName(workload) + "-" + std::to_string(sizeMiB) + "MiB-" + dtype + "-" + suffix;
 }
 
-// Per-rank file name <impl>_<name>_rank<RR><suffix>, zero-padded so files sort by rank.
+// The case directory, e.g. tma-all_gather-1024MiB-bf16-single-n16: impl first, so a directory or
+// report copied out of the run still says what it measured.
+inline std::string caseDirName(const std::string& impl, const std::string& name) { return impl + "-" + name; }
+
+// Per-rank file name <impl>-<name>.rank_<RR><suffix>, zero-padded so files sort by rank.
 inline std::string rankFile(const std::string& impl, const std::string& name, int rank, int worldSize,
                             const std::string& suffix) {
   int width = std::max<int>(2, int(std::to_string(std::max(worldSize - 1, 0)).size()));
   char buf[32];
   std::snprintf(buf, sizeof(buf), "%0*d", width, rank);
-  return impl + "_" + name + "_rank" + buf + suffix;
+  return caseDirName(impl, name) + ".rank_" + buf + suffix;
 }
 
 // Full-tensor payload rate: AG output bytes, RS input bytes or AR input bytes per second.

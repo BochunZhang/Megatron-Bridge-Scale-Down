@@ -22,7 +22,10 @@ Benchmark NCCL 2.32.3 all-gather / reduce-scatter on GB200 with a C++ program (n
 Run the same command on every node (DLC style). Each node starts one nvls_collective_bench
 process per GPU; NCCL bootstraps through NCCL_COMM_ID=<master-addr>:<port>. One pass per
 implementation, because NCCL reads NCCL_NVLS_ENABLE and the CE multicast threshold once per
-process. Node 0 merges the passes into compare.md.
+process. After the last pass node 0 runs analyse_results.sh (compare.md and, with --nsys,
+nsys_kernels.md); a failure there is only a warning, so a finished benchmark is never lost to its
+post-processing. Re-run it by hand with:
+  bash examples/gb200/nvls-collective-cpp/analyse_results.sh --output-dir <run dir>
 
 Implementations (the kernel is pinned per call with ncclCollConfig_t, forceAlgSelection=1):
   ring    AG / RS algSelection=RING, plain cudaMalloc buffers
@@ -35,8 +38,10 @@ Implementations (the kernel is pinned per call with ncclCollConfig_t, forceAlgSe
 
 Output: results/gb200/nvls-collective-cpp/gpu-num-<nnodes*gpus-per-node>/<yyyymmdd-hhmmss>, one
 <impl>/ per pass, laid out like ../nvls-collective: results.jsonl, metadata.json, nccl-raw/,
-comm/ and per test <impl>/cases/<case>/ (e.g. tma/cases/single-n4_ag_bf16_1024MiB/) with every
-member rank's NCCL log of that test, case.json and, with --nsys, <impl>_<case>_rank<RR>.nsys-rep.
+comm/ and per test <impl>/cases/<impl>-<case>/ (e.g.
+symmetric-tma/cases/symmetric-tma-all_gather-1024MiB-bf16-single-n4/) with every member rank's
+NCCL log <impl>-<case>.rank_<RR>.nccl.log, case.json and, with --nsys,
+<impl>-<case>.rank_<RR>.nsys-rep.
 A test fails unless NCCL's TUNING log shows the pinned implementation for every launch.
 Node 0 builds the binaries first, then stamps the run id and hands it to the other nodes
 (run_timestamp_and_logs helper, TCPStore on MASTER_ADDR:<master-port - 1>), so the repo must
@@ -67,8 +72,8 @@ Options:
   --cuda-home DIR         CUDA toolkit (default: CUDA_HOME or /usr/local/cuda)
   --no-build              Use the existing build/ binaries
   --nsys                  One Nsight Systems report per rank per case (capture range = timed trials);
-                          node 0 then files them under cases/ and writes nsys_kernels.md
-                          (../nvls-collective/analyse_nsys.py, Python standard library only)
+                          node 0 files them under cases/ after each pass, then writes
+                          nsys_kernels.md (../nvls-collective/analyse_nsys.py, stdlib only)
   --dry-run               Print commands only
   -h, --help              Show this help
 
@@ -279,7 +284,7 @@ trap 'kill_ranks' INT TERM
 for index in "${!impl_list[@]}"; do
     impl="${impl_list[$index]}"
     impl_dir="${output_dir}/${impl}"
-    # Whole-process NCCL logs; the benchmark copies each test's slice into <impl>/cases/<case>/.
+    # Whole-process NCCL logs; the benchmark copies each test's slice into <impl>/cases/<impl>-<case>/.
     nccl_raw_dir="${impl_dir}/nccl-raw"
     node_log="${impl_dir}/bench-node${node_rank}.log"
     $DRY_RUN || mkdir -p "$nccl_raw_dir"
@@ -329,8 +334,8 @@ for index in "${!impl_list[@]}"; do
         cmd=("$bench" --impl "$impl" --output-dir "$impl_dir" "${bench_args[@]}")
         if $nsys_enabled; then
             # Each process gets its own nsys session. Only the timed trials of each case are
-            # captured (cudaProfilerStart/Stop in the benchmark); "repeat" writes one report per
-            # case. analyse_nsys.py files each report under its case by the outer NVTX label.
+            # captured (cudaProfilerStart/Stop in the benchmark); "repeat" writes rank<R>.<K> for
+            # the K-th case, which analyse_nsys.py files under cases/ through nsys/index.tsv.
             cmd=(nsys profile --trace=cuda,nvtx --sample=none --cpuctxsw=none
                 --capture-range=cudaProfilerApi --capture-range-end=repeat --force-overwrite=false
                 --output="${nsys_dir}/rank%q{RANK}" "${cmd[@]}")
@@ -363,17 +368,17 @@ for index in "${!impl_list[@]}"; do
         compgen -G "${nsys_dir}/rank*.nsys-rep" >/dev/null \
             || die "nsys wrote no report under ${nsys_dir}; inspect ${node_log}"
     fi
+    if $nsys_enabled && (( node_rank == 0 )); then
+        # Rename this pass's reports into cases/<impl>-<case>/ now, so a later pass that fails
+        # leaves them labelled. Only renames (no export); waits for the other nodes' reports.
+        run uv run --no-sync python "${script_dir}/../nvls-collective/analyse_nsys.py" --output-dir "$output_dir" \
+            --algo "$impl" --file-only \
+            || warn "filing ${impl} nsys reports failed; analyse_results.sh retries it"
+    fi
 done
 
 if (( node_rank == 0 )); then
-    report_args=()
-    for impl in "${impl_list[@]}"; do
-        report_args+=(--input "${impl}=${output_dir}/${impl}/results.jsonl")
-    done
-    run "$report" "${report_args[@]}" --output "${output_dir}/compare.md"
-    if $nsys_enabled; then
-        # nsys export --type sqlite on every rank's report, file it under cases/<case>/ and run
-        # ../nvls-collective/nsys_collective_kernels.sql. Waits for the other nodes' reports first.
-        run uv run --no-sync python "${script_dir}/../nvls-collective/analyse_nsys.py" --output-dir "$output_dir"
-    fi
+    run bash "${script_dir}/analyse_results.sh" --output-dir "$output_dir" --report-bin "$report" \
+        || warn "post-processing failed; the measurements are in ${output_dir}. Retry with:" \
+            "bash ${script_dir}/analyse_results.sh --output-dir ${output_dir}"
 fi

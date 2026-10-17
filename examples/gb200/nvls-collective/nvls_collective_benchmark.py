@@ -31,8 +31,9 @@ communicator is created and the symmetric-memory path needs its own buffer regis
 Every launch is checked against NCCL's own TUNING log on comm rank 0: a case fails unless
 each op ran exactly warmup + trials * iters times, with the expected shard size, on the
 family's implementation (``Ring/*``, ``NVLS/*`` or a symmetric kernel; never ``CopyEngine``).
-Each case gets ``<output-dir>/cases/<case>/`` holding every member rank's slice of its NCCL
-log, ``case.json`` and, after ``analyse_nsys.py``, the case's nsys reports.
+Each case gets ``<output-dir>/cases/<algo>-<case>/`` (e.g. ``cases/nvls-all_reduce-1024MiB-bf16-single-n16/``)
+holding every member rank's slice of its NCCL log, ``case.json`` and, once filed by
+``analyse_nsys.py``, the case's nsys reports ``<algo>-<case>.rank_<RR>.nsys-rep``.
 
 Scenarios (all inside one torchrun job; ranks outside a group wait at a Gloo barrier):
 
@@ -80,6 +81,7 @@ from collective_metrics import (
     SPLIT_LAYOUTS,
     WORKLOADS,
     alg_bandwidth_gb_s,
+    case_dir_name,
     case_name,
     op_bus_bandwidth_gb_s,
     per_rank_bytes,
@@ -875,7 +877,7 @@ def run_case(
     Every group of a concurrent case runs the same workload except the cross case, where group A
     all-gathers while group B reduce-scatters. All of them start at the scenario's start gate.
 
-    Everything about the case lands in ``<output-dir>/cases/<case>/``: each member rank's slice
+    Everything about the case lands in ``<output-dir>/cases/<algo>-<case>/``: each member rank's slice
     of its NCCL debug log, rank 0's ``case.json`` and, after ``analyse_nsys.py``, the nsys reports.
     The case fails on every rank if the result is wrong or if comm rank 0 of any group logged a
     launch that is not the implementation this pass measures.
@@ -888,7 +890,7 @@ def run_case(
     group = topology.mine
     ops = group_ops[group.name] if group else ()
     gate = topology.gate
-    case_dir = args.output_dir / "cases" / case
+    case_dir = args.output_dir / "cases" / case_dir_name(args.algo, case)
     label = f"{args.algo}/{case}"
     probe: dict[str, object] = dict(topology.comm_info)
     buffers = _make_buffers(group, rank, size_bytes, DTYPES[args.dtype], symm=args.algo == "symm") if group else None

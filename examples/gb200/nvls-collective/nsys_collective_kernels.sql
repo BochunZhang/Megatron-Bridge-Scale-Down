@@ -15,7 +15,7 @@
 -- All-gather / reduce-scatter / all-reduce kernel cost from one `nsys export --type sqlite` report.
 --
 -- Every report written by `run_nvls_collective_benchmark.sh --nsys` holds one case of one rank:
--- an outer NVTX range named like "symm/single-n4_ag+rs_bf16_256MiB" around NVTX ranges "trial0".."trialN".
+-- an outer NVTX range named like "symm/all_gather+reduce_scatter-256MiB-bf16-single-n4" around NVTX ranges "trial0".."trialN".
 -- Warmup, buffer allocation and window registration happen outside the capture window.
 --
 -- A kernel belongs to a trial when the CUDA runtime call that launched it (joined on
@@ -36,7 +36,7 @@
 --
 -- Run: sqlite3 -header -csv report.sqlite < nsys_collective_kernels.sql
 -- The first result set is per (trial, op, kernel); the second is per trial AG/RS overlap; the third
--- is the case label analyse_nsys.py uses to file the report under <algo>/cases/<case>/.
+-- is the case label analyse_nsys.py checks against the <algo>/cases/<algo>-<case>/ the report was filed in.
 
 -- name: kernels
 WITH
@@ -47,7 +47,7 @@ ranges AS (
     WHERE n.end IS NOT NULL
 ),
 cases AS (
-    SELECT start, end, pid, name AS label FROM ranges WHERE name LIKE '%/%MiB'
+    SELECT start, end, pid, name AS label FROM ranges WHERE name LIKE '%/%MiB-%'
 ),
 trials AS (
     SELECT c.label, t.name AS trial, t.start, t.end, t.pid
@@ -106,7 +106,7 @@ ranges AS (
     WHERE n.end IS NOT NULL
 ),
 cases AS (
-    SELECT start, end, pid, name AS label FROM ranges WHERE name LIKE '%/%MiB'
+    SELECT start, end, pid, name AS label FROM ranges WHERE name LIKE '%/%MiB-%'
 ),
 trials AS (
     SELECT c.label, t.name AS trial, t.start, t.end, t.pid
@@ -149,4 +149,4 @@ ORDER BY a.label, a.trial;
 SELECT DISTINCT COALESCE(n.text, s.value) AS label
 FROM NVTX_EVENTS AS n
 LEFT JOIN StringIds AS s ON s.id = n.textId
-WHERE n.end IS NOT NULL AND COALESCE(n.text, s.value) LIKE '%/%MiB';
+WHERE n.end IS NOT NULL AND COALESCE(n.text, s.value) LIKE '%/%MiB-%';

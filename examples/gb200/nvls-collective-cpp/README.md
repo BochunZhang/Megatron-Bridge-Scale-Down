@@ -127,10 +127,14 @@ NCCL 自己通过 `NCCL_COMM_ID=<master-addr>:<master-port + i>` 建 bootstrap�
 `--nsys` 给每个进程套 `nsys profile --capture-range=cudaProfilerApi --capture-range-end=repeat
 --output=<impl>/nsys/rank%q{RANK}`。每个 case 一个 `cudaProfilerStart/Stop` 窗口，只包住计时 trial；
 **所有 rank 对每个 case 都开窗口**，最外层 NVTX range 是 `<impl>/<case>`，内层 `trial0..N`；rank 0 写
-`<impl>/nsys/index.tsv`。跑完后 node 0 执行 [`../nvls-collective/analyse_nsys.py`](../nvls-collective/analyse_nsys.py)
-（只用 Python 标准库，与测量无关）：按 NVTX 标签把报告和 SQLite 导出挪到
-`<impl>/cases/<case>/<impl>_<case>_rank<RR>.{nsys-rep,sqlite}`，再跑
-[`nsys_collective_kernels.sql`](../nvls-collective/nsys_collective_kernels.sql) 写 `nsys_kernels.md`。
+`<impl>/nsys/index.tsv`。每个 pass 跑完，node 0 执行
+[`../nvls-collective/analyse_nsys.py`](../nvls-collective/analyse_nsys.py) `--algo <impl> --file-only`
+（只用 Python 标准库，与测量无关），按 `index.tsv` 把 `rank<R>.<K>.nsys-rep` 改名挪到
+`<impl>/cases/<impl>-<case>/<impl>-<case>.rank_<RR>.nsys-rep`。所有 pass 跑完后 node 0 执行
+[`analyse_results.sh`](analyse_results.sh)：`build/collective_report` 写 `compare.md`，再导出 SQLite、核对每份
+报告的 NVTX 标签、跑 [`nsys_collective_kernels.sql`](../nvls-collective/nsys_collective_kernels.sql) 写
+`nsys_kernels.md`。后处理失败只打印 warning 和重跑命令，不影响 benchmark 的退出码；手动重跑：
+`bash examples/gb200/nvls-collective-cpp/analyse_results.sh --output-dir <run dir>`。
 CE AllGather 是 memcpy，不是 kernel，所以 `ce`/`ce-uc` 在 SQL 表里只有 RS 的 kernel 时间。
 `--nsys` 的数字带 `profiled=true`，只用来看 trace，结论表用不带 `--nsys` 的那次。
 
@@ -211,24 +215,25 @@ results/gb200/nvls-collective-cpp/gpu-num-<W>/<yyyymmdd-hhmmss>/
     results.jsonl  metadata.json               # 只由全局 rank 0 写，schema 与 ../nvls-collective 相同
     bench-node<k>.log                          # 每个节点一份（该节点所有 rank 的 stdout/stderr）
     nccl-raw/nccl-<host>-<pid>.log             # 每个进程一份，整个进程的原始 NCCL 日志
-    comm/<impl>_<scenario>_rank<RR>.nccl.log   # 每个 scenario 的 communicator 建立/连接/销毁日志
-    cases/<case>/                              # 每个测试一个目录
+    comm/<impl>-<scenario>.rank_<RR>.nccl.log  # 每个 scenario 的 communicator 建立/连接/销毁日志
+    cases/<impl>-<case>/                       # 每个测试一个目录，如 nvls-all_gather-1024MiB-bf16-single-n4/
       case.json                                # rank 0：该 case 的结果记录，或实现校验失败的原因
-      <impl>_<case>_rank<RR>.nccl.log          # 每个参与 rank：本 case 期间的 NCCL 日志切片
-      <impl>_<case>_rank<RR>.nsys-rep / .sqlite  # 仅 --nsys，analyse_nsys.py 归档
+      <impl>-<case>.rank_<RR>.nccl.log         # 每个参与 rank：本 case 期间的 NCCL 日志切片
+      <impl>-<case>.rank_<RR>.nsys-rep / .sqlite  # 仅 --nsys，每个 pass 后归档 / 分析时导出
     nsys/{index.tsv, kernels.csv}              # 仅 --nsys
   compare.md                                   # node 0 合并所有 results.jsonl
   nsys_kernels.md                              # 仅 --nsys
 ```
 
 命名与 `../nvls-collective/collective_metrics.py` 相同（`bench_core.h` 的 `scenarioName` / `caseName` /
-`rankFile`）：
+`caseDirName` / `rankFile`）：
 
 | 项 | 格式 | 例子 |
 | --- | --- | --- |
 | scenario | `single-n<n>` / `split-n<T>-<layout>` | `single-n16`、`split-n16-contiguous` |
-| case | `<scenario>[-<part>]_<workload>_<dtype>_<size>MiB`，part 为 `AB-concurrent`/`AB-cross`；cross 的 workload 固定为 `agA-rsB` | `single-n4_ag_bf16_1024MiB`、`split-n16-contiguous-AB-cross_agA-rsB_bf16_1024MiB` |
-| 每 rank 文件 | `<impl>_<case>_rank<RR><suffix>`，rank 补零到至少两位 | `tma_single-n4_ag_bf16_1024MiB_rank03.nccl.log` |
+| case | `<workload>-<size>MiB-<dtype>-<scenario>[-<part>]`，workload 写全称（cross 为 `all_gather_A+reduce_scatter_B`），part 为 `AB-concurrent`/`AB-cross` | `all_gather-1024MiB-bf16-single-n4`、`all_gather_A+reduce_scatter_B-1024MiB-bf16-split-n16-contiguous-AB-cross` |
+| case 目录 | `<impl>-<case>` | `symmetric-tma-all_gather-1024MiB-bf16-single-n4` |
+| 每 rank 文件 | `<impl>-<case>.rank_<RR><suffix>`，rank 补零到至少两位 | `symmetric-tma-all_gather-1024MiB-bf16-single-n4.rank_03.nccl.log` |
 
 `results.jsonl` 每行一个 (case, 组)：`algo`（= impl）、`scenario`、`phase`（single 为 isolated，split 为 concurrent / cross）、
 `total_ranks`、`layout`、`group_index`、`case`/`case_dir`、`workload`、`group_size`、`ranks`、`size_bytes`、

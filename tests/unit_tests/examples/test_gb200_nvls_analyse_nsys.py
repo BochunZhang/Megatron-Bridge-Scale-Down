@@ -17,6 +17,8 @@
 The schema mirrors the subset of the Nsight Systems export the queries use. Fixtures are
 built so every expected number can be checked by hand, including the rows the SQL must drop:
 warmup kernels launched before the capture window and the ``torch.cuda._sleep`` delay kernel.
+Raw reports are named like nsys names them (``rank<R>.<K>.nsys-rep``) and filed through
+``nsys/index.tsv``.
 """
 
 import importlib.util
@@ -38,7 +40,8 @@ _SPEC.loader.exec_module(analyse)
 
 AG = "ncclDevKernel_AllGather_RING_LL"
 AR = "ncclDevKernel_AllReduce_Sum_bf16_RING_LL"
-CASE = "single-n2_ag+rs_bf16_64MiB"
+CASE = "all_gather+reduce_scatter-64MiB-bf16-single-n2"
+IDLE_CASE = "all_gather-64MiB-bf16-single-n2"
 RS = "ncclDevKernel_ReduceScatter_Sum_bf16_RING_LL"
 SCHEMA = """
 CREATE TABLE StringIds(id INTEGER PRIMARY KEY, value TEXT);
@@ -94,20 +97,45 @@ def _make_report(path: Path, *, label: str, trials: list[list[tuple[str, int, in
     db.close()
 
 
+def _make_idle_report(path: Path, *, label: str) -> None:
+    """A rank that sat the case out: only its NVTX case range, no CUDA activity tables at all."""
+    db = sqlite3.connect(path)
+    db.executescript(
+        "CREATE TABLE StringIds(id INTEGER PRIMARY KEY, value TEXT);"
+        "CREATE TABLE NVTX_EVENTS(start INT, end INT, text TEXT, textId INT, globalTid INT, eventType INT);"
+    )
+    db.execute("INSERT INTO NVTX_EVENTS VALUES (10, 20, ?, NULL, 7, 59)", (label,))
+    db.commit()
+    db.close()
+
+
+def _write_index(nsys_dir: Path, labels: list[str]) -> None:
+    rows = "".join(f"{i}\t{label}\tsingle\tisolated\t0\t1\n" for i, label in enumerate(labels, start=1))
+    (nsys_dir / "index.tsv").write_text(
+        "capture_index\tlabel\tscenario\tphase\tstart_unix\tend_unix\n" + rows, encoding="utf-8"
+    )
+
+
+def _stamp_export(report: Path) -> None:
+    stamp = report.stat().st_mtime + 10  # newer export -> no nsys needed
+    os.utime(report.with_suffix(".sqlite"), (stamp, stamp))
+
+
 def _make_run(
-    tmp_path: Path, *, per_rank_trials: dict[int, list[list[tuple[str, int, int, int]]]], iters: int
+    tmp_path: Path,
+    *,
+    per_rank_trials: dict[int, list[list[tuple[str, int, int, int]]]],
+    iters: int,
+    algo: str = "symm",
 ) -> Path:
-    label = f"symm/{CASE}"
-    algo_dir = tmp_path / "symm"
+    label = f"{algo}/{CASE}"
+    algo_dir = tmp_path / algo
     nsys_dir = algo_dir / "nsys"
     nsys_dir.mkdir(parents=True)
     (algo_dir / "metadata.json").write_text(json.dumps({"world_size": len(per_rank_trials)}), encoding="utf-8")
-    (nsys_dir / "index.tsv").write_text(
-        f"capture_index\tlabel\tscenario\tphase\tstart_unix\tend_unix\n1\t{label}\tsingle\tisolated\t0\t1\n",
-        encoding="utf-8",
-    )
+    _write_index(nsys_dir, [label])
     record = {
-        "algo": "symm",
+        "algo": algo,
         "scenario": "single",
         "phase": "isolated",
         "group_name": "single2",
@@ -123,16 +151,13 @@ def _make_run(
     for rank, trials in per_rank_trials.items():
         report = nsys_dir / f"rank{rank}.1.nsys-rep"
         report.write_bytes(b"placeholder")
-        sqlite_path = report.with_suffix(".sqlite")
-        _make_report(sqlite_path, label=label, trials=trials, pid=4000 + rank)
-        stamp = report.stat().st_mtime + 10  # newer export -> no nsys needed
-        os.utime(sqlite_path, (stamp, stamp))
+        _make_report(report.with_suffix(".sqlite"), label=label, trials=trials, pid=4000 + rank)
+        _stamp_export(report)
     return tmp_path
 
 
-def _query(path: Path):
-    queries = analyse.load_queries()
-    return analyse.query_report(path, queries, algo="symm", rank=0)
+def _query(path: Path, label: str):
+    return analyse.query_report(path, analyse.load_queries(), algo="symm", rank=0, label=label)
 
 
 @pytest.mark.unit
@@ -141,28 +166,46 @@ def test_sql_file_defines_every_query():
 
 
 @pytest.mark.unit
-def test_label_query_reads_the_case_range_and_ignores_trials(tmp_path):
+def test_query_accepts_the_case_range_it_was_filed_under_and_ignores_trials(tmp_path):
     path = tmp_path / "r.sqlite"
-    _make_report(path, label=f"ring/{CASE}", trials=[[(AG, 20, 30, 1030)], [(AG, 20, 30, 1030)]])
-    assert analyse.report_label(path, analyse.load_queries()) == f"ring/{CASE}"
+    _make_report(path, label=f"symm/{CASE}", trials=[[(AG, 20, 30, 1030)], [(AG, 20, 30, 1030)]])
+    kernels, _ = _query(path, f"symm/{CASE}")
+    assert {row.label for row in kernels} == {f"symm/{CASE}"}
 
 
 @pytest.mark.unit
-def test_label_query_refuses_a_report_without_a_case(tmp_path):
+def test_query_refuses_a_report_filed_under_another_case(tmp_path):
+    path = tmp_path / "r.sqlite"
+    _make_report(path, label=f"symm/{CASE}", trials=[[(AG, 20, 30, 1030)]])
+    with pytest.raises(RuntimeError, match="filed as symm/other"):
+        _query(path, "symm/other")
+
+
+@pytest.mark.unit
+def test_query_refuses_a_report_without_a_case(tmp_path):
     path = tmp_path / "r.sqlite"
     db = sqlite3.connect(path)
     db.executescript(SCHEMA)
     db.close()
-    with pytest.raises(RuntimeError, match="expected one case label"):
-        analyse.report_label(path, analyse.load_queries())
+    with pytest.raises(RuntimeError, match=r"case NVTX ranges are \[\]"):
+        _query(path, f"symm/{CASE}")
+
+
+@pytest.mark.unit
+def test_report_of_a_rank_that_sat_the_case_out_has_no_kernel_tables_and_no_rows(tmp_path):
+    # Regression: a rank outside every group launches no kernel in its window, so nsys exports
+    # no CUPTI_ACTIVITY_KIND_KERNEL table; that used to abort the whole analysis.
+    path = tmp_path / "r.sqlite"
+    _make_idle_report(path, label=f"symm/{IDLE_CASE}")
+    assert _query(path, f"symm/{IDLE_CASE}") == ([], {})
 
 
 @pytest.mark.unit
 def test_kernels_query_keeps_only_collectives_launched_inside_trials(tmp_path):
     path = tmp_path / "r.sqlite"
-    label = "ring/single-n8_ag_bf16_16MiB"
+    label = "ring/all_gather-16MiB-bf16-single-n8"
     _make_report(path, label=label, trials=[[(AG, 20, 30, 1030), (AG, 25, 1030, 2030)]])
-    kernels, overlap = _query(path)
+    kernels, overlap = _query(path, label)
     assert len(kernels) == 1
     row = kernels[0]
     assert (row.label, row.trial, row.op, row.kernel) == (label, "trial0", "ag", AG)
@@ -178,9 +221,9 @@ def test_overlap_query_measures_ag_rs_intersection(tmp_path):
         [(AG, 20, 100, 1100), (RS, 21, 600, 1600)],  # 500 ns overlap
         [(AG, 20, 100, 1100), (RS, 21, 1100, 2100)],  # back to back, no overlap
     ]
-    label = "nvls/single-n8_ag+rs_bf16_64MiB"
+    label = "nvls/all_gather+reduce_scatter-64MiB-bf16-single-n8"
     _make_report(path, label=label, trials=trials)
-    kernels, overlap = _query(path)
+    kernels, overlap = _query(path, label)
     assert {(row.trial, row.op) for row in kernels} == {
         ("trial0", "ag"),
         ("trial0", "rs"),
@@ -197,19 +240,20 @@ def test_schema_check_names_the_missing_table(tmp_path):
     db.executescript("CREATE TABLE StringIds(id INTEGER PRIMARY KEY, value TEXT);")
     db.close()
     with pytest.raises(RuntimeError, match="NVTX_EVENTS is missing"):
-        _query(path)
+        _query(path, f"symm/{CASE}")
 
 
 @pytest.mark.unit
-@pytest.mark.parametrize(("name", "rank"), [("rank0.1.nsys-rep", 0), ("rank12.nsys-rep", 12), ("rank3_2.nsys-rep", 3)])
-def test_report_rank_reads_the_launcher_prefix(name, rank):
-    assert analyse.report_rank(Path(name)) == rank
+@pytest.mark.parametrize(("name", "expected"), [("rank0.1.nsys-rep", (0, 1)), ("rank12.176.nsys-rep", (12, 176))])
+def test_raw_capture_reads_the_launcher_rank_and_the_nsys_capture_number(name, expected):
+    assert analyse.raw_capture(Path(name)) == expected
 
 
 @pytest.mark.unit
-def test_report_rank_rejects_unrelated_files():
-    with pytest.raises(ValueError, match="cannot read a rank"):
-        analyse.report_rank(Path("profile.nsys-rep"))
+@pytest.mark.parametrize("name", ["profile.nsys-rep", "rank12.nsys-rep", "rank3_2.nsys-rep"])
+def test_raw_capture_rejects_names_without_a_capture_number(name):
+    with pytest.raises(ValueError, match="cannot read a rank and capture index"):
+        analyse.raw_capture(Path(name))
 
 
 @pytest.mark.unit
@@ -230,7 +274,7 @@ def test_summary_takes_slowest_rank_then_median_over_trials(tmp_path):
     csv_lines = (run / "symm" / "nsys" / "kernels.csv").read_text(encoding="utf-8").splitlines()
     assert csv_lines[0].startswith("algo,rank,report,label,trial,op,kernel")
     assert len(csv_lines) == 1 + 2 * 3 * 2  # header + ranks × trials × ops
-    assert csv_lines[1].split(",")[2] == f"symm_{CASE}_rank00"
+    assert csv_lines[1].split(",")[2] == f"symm-{CASE}.rank_00"
 
 
 @pytest.mark.unit
@@ -238,12 +282,12 @@ def test_reports_are_filed_under_their_case_and_reused_on_a_second_run(tmp_path)
     trial = [(AG, 20, 100, 1100), (RS, 21, 600, 1600)]
     run = _make_run(tmp_path, per_rank_trials={0: [trial], 1: [trial]}, iters=1)
     analyse.main(["--output-dir", str(run), "--wait-seconds", "0"])
-    case_dir = run / "symm" / "cases" / CASE
+    case_dir = run / "symm" / "cases" / f"symm-{CASE}"
     assert sorted(path.name for path in case_dir.iterdir()) == [
-        f"symm_{CASE}_rank00.nsys-rep",
-        f"symm_{CASE}_rank00.sqlite",
-        f"symm_{CASE}_rank01.nsys-rep",
-        f"symm_{CASE}_rank01.sqlite",
+        f"symm-{CASE}.rank_00.nsys-rep",
+        f"symm-{CASE}.rank_00.sqlite",
+        f"symm-{CASE}.rank_01.nsys-rep",
+        f"symm-{CASE}.rank_01.sqlite",
     ]
     assert not list((run / "symm" / "nsys").glob("rank*"))
     first = (run / "nsys_kernels.md").read_text(encoding="utf-8")
@@ -253,23 +297,99 @@ def test_reports_are_filed_under_their_case_and_reused_on_a_second_run(tmp_path)
 
 
 @pytest.mark.unit
-def test_filing_refuses_a_report_of_another_algorithm(tmp_path):
+def test_filing_refuses_an_index_label_of_another_algorithm(tmp_path):
     run = _make_run(tmp_path, per_rank_trials={0: [[(AG, 20, 100, 1100)]]}, iters=1)
-    nsys_dir = run / "symm" / "nsys"
-    report = nsys_dir / "rank0.1.nsys-rep"
-    report.with_suffix(".sqlite").unlink()
-    _make_report(report.with_suffix(".sqlite"), label=f"ring/{CASE}", trials=[[(AG, 20, 100, 1100)]])
-    stamp = report.stat().st_mtime + 20
-    os.utime(report.with_suffix(".sqlite"), (stamp, stamp))
+    report = run / "symm" / "nsys" / "rank0.1.nsys-rep"
     with pytest.raises(RuntimeError, match="does not name a symm case"):
-        analyse.file_reports(run / "symm", [report], analyse.load_queries(), nsys_bin="nsys", world_size=1)
+        analyse.file_reports(run / "symm", [report], [f"ring/{CASE}"], world_size=1)
+
+
+@pytest.mark.unit
+def test_filing_refuses_a_capture_missing_from_the_index(tmp_path):
+    run = _make_run(tmp_path, per_rank_trials={0: [[(AG, 20, 100, 1100)]]}, iters=1)
+    report = run / "symm" / "nsys" / "rank0.2.nsys-rep"
+    report.write_bytes(b"x")
+    with pytest.raises(RuntimeError, match="capture 2 is not in nsys/index.tsv"):
+        analyse.file_reports(run / "symm", [report], [f"symm/{CASE}"], world_size=1)
+
+
+@pytest.mark.unit
+def test_filing_maps_the_nsys_capture_number_to_the_index_even_when_files_arrive_late(tmp_path):
+    algo_dir = tmp_path / "nvls"
+    nsys_dir = algo_dir / "nsys"
+    nsys_dir.mkdir(parents=True)
+    labels = ["nvls/all_gather-16MiB-bf16-single-n4", "nvls/all_reduce-1024MiB-bf16-single-n4"]
+    # Capture 2 of rank 1 is filed first (capture 1 has not landed yet); it must not shift to capture 1.
+    late = nsys_dir / "rank1.2.nsys-rep"
+    late.write_bytes(b"x")
+    (filed,) = analyse.file_reports(algo_dir, [late], labels, world_size=4)
+    assert filed == (
+        algo_dir
+        / "cases"
+        / "nvls-all_reduce-1024MiB-bf16-single-n4"
+        / "nvls-all_reduce-1024MiB-bf16-single-n4.rank_01.nsys-rep"
+    )
+    assert analyse.filed_label("nvls", filed) == labels[1]
 
 
 @pytest.mark.unit
 def test_filed_rank_reads_the_padded_suffix():
-    assert analyse.filed_rank(Path(f"symm_{CASE}_rank07.nsys-rep")) == 7
+    assert analyse.filed_rank(Path(f"symm-{CASE}.rank_07.nsys-rep")) == 7
     with pytest.raises(ValueError, match="filed report"):
         analyse.filed_rank(Path("rank0.1.nsys-rep"))
+
+
+@pytest.mark.unit
+def test_filed_label_strips_the_algorithm_prefix_of_hyphenated_impls():
+    report = Path("cases/symmetric-tma-all_gather-64MiB-bf16-single-n4/x.rank_00.nsys-rep")
+    assert analyse.filed_label("symmetric-tma", report) == "symmetric-tma/all_gather-64MiB-bf16-single-n4"
+    with pytest.raises(ValueError, match="does not start with"):
+        analyse.filed_label("nvls", report)
+
+
+@pytest.mark.unit
+def test_a_rank_outside_the_case_is_filed_and_skipped_instead_of_failing_the_analysis(tmp_path):
+    trial = [(AG, 20, 100, 1100), (RS, 21, 600, 1600)]
+    run = _make_run(tmp_path, per_rank_trials={0: [trial], 1: [trial], 2: [trial]}, iters=1)
+    # Rank 2 is outside the 2-rank group: its report has the case range but no kernel tables.
+    report = run / "symm" / "nsys" / "rank2.1.nsys-rep"
+    report.with_suffix(".sqlite").unlink()
+    _make_idle_report(report.with_suffix(".sqlite"), label=f"symm/{CASE}")
+    _stamp_export(report)
+    analyse.main(["--output-dir", str(run), "--wait-seconds", "0"])
+    assert (run / "symm" / "cases" / f"symm-{CASE}" / f"symm-{CASE}.rank_02.nsys-rep").exists()
+    rows = [
+        line for line in (run / "nsys_kernels.md").read_text(encoding="utf-8").splitlines() if line.startswith("|")
+    ]
+    assert len(rows) == 3  # header, separator, the one case
+
+
+@pytest.mark.unit
+def test_file_only_renames_one_pass_without_exporting(tmp_path):
+    trial = [(AG, 20, 100, 1100)]
+    run = _make_run(tmp_path, per_rank_trials={0: [trial], 1: [trial]}, iters=1)
+    _make_run(tmp_path, per_rank_trials={0: [trial], 1: [trial]}, iters=1, algo="ring")
+    for report in (run / "symm" / "nsys").glob("rank*.nsys-rep"):
+        report.with_suffix(".sqlite").unlink()  # an export would need nsys; filing must not
+    analyse.main(["--output-dir", str(run), "--algo", "symm", "--file-only", "--wait-seconds", "0"])
+    assert sorted(p.name for p in (run / "symm" / "cases" / f"symm-{CASE}").iterdir()) == [
+        f"symm-{CASE}.rank_00.nsys-rep",
+        f"symm-{CASE}.rank_01.nsys-rep",
+    ]
+    assert len(list((run / "ring" / "nsys").glob("rank*.nsys-rep"))) == 2  # --algo leaves other passes alone
+    assert not (run / "nsys_kernels.md").exists()
+
+
+@pytest.mark.unit
+def test_one_failing_pass_does_not_stop_the_others(tmp_path):
+    trial = [(AG, 20, 100, 1100), (RS, 21, 600, 1600)]
+    run = _make_run(tmp_path, per_rank_trials={0: [trial]}, iters=1)
+    _make_run(tmp_path, per_rank_trials={0: [trial]}, iters=1, algo="ring")
+    (run / "ring" / "metadata.json").unlink()
+    with pytest.raises(RuntimeError, match="nsys analysis failed for ring"):
+        analyse.main(["--output-dir", str(run), "--wait-seconds", "0"])
+    report = (run / "nsys_kernels.md").read_text(encoding="utf-8")
+    assert "| symm" in report and "| ring" not in report
 
 
 @pytest.mark.unit
@@ -336,7 +456,7 @@ def test_algo_order_puts_torch_families_first_then_cpp_impls_by_name():
 @pytest.mark.unit
 def test_kernels_query_classifies_all_reduce_and_the_gate_stays_outside_trials(tmp_path):
     path = tmp_path / "r.sqlite"
-    label = "nvls/single-n8_ar_bf16_64MiB"
+    label = "nvls/all_reduce-64MiB-bf16-single-n8"
     _make_report(path, label=label, trials=[[(AR, 20, 100, 1100), (AR, 25, 1100, 2100)]])
     # The torch benchmark launches its start gate (an AllReduce) before the trial range opens.
     db = sqlite3.connect(path)
@@ -344,7 +464,7 @@ def test_kernels_query_classifies_all_reduce_and_the_gate_stays_outside_trials(t
     db.execute("INSERT INTO CUPTI_ACTIVITY_KIND_KERNEL VALUES (10006, 10010, 0, 3, 999, ?, 5, 0)", (4242 << 24,))
     db.commit()
     db.close()
-    kernels, overlap = _query(path)
+    kernels, overlap = _query(path, label)
     assert [(row.trial, row.op, row.kernel, row.kernels, row.busy_ns) for row in kernels] == [
         ("trial0", "ar", AR, 2, 2000)
     ]

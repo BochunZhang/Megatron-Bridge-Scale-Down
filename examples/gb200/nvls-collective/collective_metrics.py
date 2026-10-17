@@ -51,6 +51,14 @@ SPLIT_PARTS = (CONCURRENT_PART, CROSS_PART)
 CROSS_WORKLOAD = "agA-rsB"
 CROSS_GROUP_WORKLOADS = ("ag", "rs")  # per split group, A then B
 NCCL_ALGO_ENV = {"ring": "Ring", "nvls": "NVLS", "symm": None}
+# Spelled-out workloads for case directory and report names.
+WORKLOAD_NAMES = {
+    "ag": "all_gather",
+    "rs": "reduce_scatter",
+    "ar": "all_reduce",
+    "ag+rs": "all_gather+reduce_scatter",
+    CROSS_WORKLOAD: "all_gather_A+reduce_scatter_B",
+}
 
 
 def workload_ops(workload: str) -> tuple[str, ...]:
@@ -91,12 +99,12 @@ def scenario_name(scenario: str, *, total_ranks: int, layout: str | None = None)
 
 
 def case_name(scenario: str, *, part: str | None, workload: str, dtype: str, size_mib: int) -> str:
-    """Name one test, e.g. ``split-n16-contiguous-AB-concurrent_ag+rs_bf16_1024MiB``.
+    """Name one test, e.g. ``all_gather+reduce_scatter-1024MiB-bf16-split-n16-contiguous-AB-concurrent``.
 
-    The name is the case directory, the stem of every per-rank file in it, and (prefixed with
-    the algorithm) the outer NVTX range of the case's nsys report, so it must stay a single
-    path component. ``size_mib`` is the full tensor: AG output / RS input / AR input. The cross part takes
-    ``CROSS_WORKLOAD`` (``agA-rsB``), every other case one of ``WORKLOADS``.
+    Prefixed with the algorithm (``case_dir_name``) it is the case directory and the stem of every
+    per-rank file in it; ``<algo>/<case>`` is the outer NVTX range of the case's nsys report.
+    It must stay a single path component. ``size_mib`` is the full tensor: AG output / RS input /
+    AR input. The cross part takes ``CROSS_WORKLOAD`` (``agA-rsB``), every other case one of ``WORKLOADS``.
     """
     if part is not None and part not in SPLIT_PARTS:
         raise ValueError(f"unknown split part {part!r}; expected one of {SPLIT_PARTS}")
@@ -104,14 +112,20 @@ def case_name(scenario: str, *, part: str | None, workload: str, dtype: str, siz
         raise ValueError(f"workload {CROSS_WORKLOAD!r} belongs to part {CROSS_PART!r} only, got {part!r}/{workload!r}")
     if workload != CROSS_WORKLOAD:
         workload_ops(workload)
-    prefix = scenario if part is None else f"{scenario}-{part}"
-    return f"{prefix}_{workload}_{dtype}_{size_mib}MiB"
+    suffix = scenario if part is None else f"{scenario}-{part}"
+    return f"{WORKLOAD_NAMES[workload]}-{size_mib}MiB-{dtype}-{suffix}"
+
+
+def case_dir_name(algo: str, case: str) -> str:
+    """The case directory, e.g. ``nvls-all_reduce-1024MiB-bf16-single-n16``: algorithm first,
+    so a directory or report copied out of the run still says what it measured."""
+    return f"{algo}-{case}"
 
 
 def rank_file(algo: str, name: str, *, rank: int, world_size: int, suffix: str) -> str:
-    """Per-rank file name ``<algo>_<name>_rank<RR><suffix>``, zero-padded so files sort by rank."""
+    """Per-rank file name ``<algo>-<name>.rank_<RR><suffix>``, zero-padded so files sort by rank."""
     width = max(2, len(str(world_size - 1)))
-    return f"{algo}_{name}_rank{rank:0{width}d}{suffix}"
+    return f"{case_dir_name(algo, name)}.rank_{rank:0{width}d}{suffix}"
 
 
 def alg_bandwidth_gb_s(*, total_bytes: int, seconds: float) -> float:

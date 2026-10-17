@@ -38,8 +38,8 @@
 // concurrency = min(T_A, T_B) / max(T_A, T_B) relies on.
 //
 // Output (same layout as ../nvls-collective): <output-dir>/results.jsonl and metadata.json from
-// world rank 0, comm/<impl>_<scenario>_rank<RR>.nccl.log, and per test cases/<case>/ with
-// case.json and every member rank's <impl>_<case>_rank<RR>.nccl.log; with --nsys also
+// world rank 0, comm/<impl>-<scenario>.rank_<RR>.nccl.log, and per test cases/<impl>-<case>/ with
+// case.json and every member rank's <impl>-<case>.rank_<RR>.nccl.log; with --nsys also
 // nsys/index.tsv.
 
 #include <cuda_bf16.h>
@@ -475,7 +475,7 @@ struct Scenario {
   std::vector<int> gateRanks;  // sorted union of the groups
   ncclComm_t gate = nullptr;   // null on ranks outside the scenario
   float* gateBuf = nullptr;
-  fs::path commLog;            // comm/<impl>_<scenario>_rank<RR>.nccl.log on member ranks
+  fs::path commLog;            // comm/<impl>-<scenario>.rank_<RR>.nccl.log on member ranks
 
   bool gateRank0(int rank) const { return !gateRanks.empty() && gateRanks.front() == rank; }
 };
@@ -813,8 +813,8 @@ struct CaseSpec {
 
 // Run the active groups of `s` at the same time, all starting at the scenario's start gate.
 // Returns one results.jsonl record per active group on world rank 0, nothing elsewhere.
-// Everything about the case lands in cases/<case>/: each member rank's slice of its NCCL log and
-// rank 0's case.json. Fails on every rank together if any rank computed a wrong result or comm
+// Everything about the case lands in cases/<impl>-<case>/: each member rank's slice of its NCCL
+// log and rank 0's case.json. Fails on every rank together if any rank computed a wrong result or comm
 // rank 0 of any group logged a launch that is not the implementation this pass measures.
 static std::vector<JsonObject> runCase(CaseContext& ctx, const Scenario& s, const CaseSpec& spec) {
   const Options& o = ctx.o;
@@ -822,7 +822,7 @@ static std::vector<JsonObject> runCase(CaseContext& ctx, const Scenario& s, cons
   World& world = ctx.world;
   std::string name = caseName(s.name, spec.part, spec.caseWorkload, o.dtype, spec.sizeBytes / kBytesPerMiB);
   std::string label = std::string(impl.name) + "/" + name;
-  fs::path caseDir = fs::path(o.outputDir) / "cases" / name;
+  fs::path caseDir = fs::path(o.outputDir) / "cases" / caseDirName(impl.name, name);
 
   const Group* mine = nullptr;
   int groupIndex = -1;
@@ -1019,7 +1019,7 @@ static std::vector<JsonObject> runCase(CaseContext& ctx, const Scenario& s, cons
     r.set("layout", s.layout.empty() ? kNull : jStr(s.layout));
     r.set("group_index", jInt(long(g)));
     r.set("case", jStr(name));
-    r.set("case_dir", jStr("cases/" + name));
+    r.set("case_dir", jStr("cases/" + caseDirName(impl.name, name)));
     r.set("group_name", jStr(group.name));
     r.set("group_size", jInt(n));
     r.set("ranks", jInts(group.ranks));

@@ -255,12 +255,17 @@ nsys profile --trace=cuda,nvtx --sample=none --cpuctxsw=none \
   `repeat` 让 nsys 每个窗口写一份独立报告，所以**每个测试 × 每个 rank 一份 trace**。
 - **所有 rank 对每个 case 都开窗口**，包括该 case 闲置的 rank（如 single-n8 时的 rank 8..31），
   这样各 rank 的第 k 份报告都对应同一个 case。
-- 报告里最外层 NVTX range 是 case 标签 `<algo>/<case>`（如 `symm/single-n4_ag+rs_bf16_256MiB`），
+- 报告里最外层 NVTX range 是 case 标签 `<algo>/<case>`（如 `symm/all_gather+reduce_scatter-256MiB-bf16-single-n4`），
   内层是 `trial0..N`，在 start gate **之后**才打开：gate 本身是 AllReduce，放进 trial range 会被当成
   `ar` 的 kernel；`<algo>/nsys/index.tsv` 按采集顺序列出 `capture_index、label、scenario、phase、start_unix、end_unix`。
-- nsys 不同版本给 repeat 报告编号的文件名格式不一定相同，所以不靠文件名：`analyse_nsys.py` 读每份报告的
-  NVTX 标签，把它和 SQLite 导出一起挪到 `<algo>/cases/<case>/<algo>_<case>_rank<RR>.{nsys-rep,sqlite}`，
-  和该 case 的 NCCL 日志放在一起。重复运行会直接用已归档的报告。
+- nsys 把第 K 个窗口写成 `<algo>/nsys/rank<R>.<K>.nsys-rep`。**每个 pass 跑完**，node 0 就执行
+  `analyse_nsys.py --algo <algo> --file-only`：按 `index.tsv` 的第 K 行把报告改名挪到
+  `<algo>/cases/<algo>-<case>/<algo>-<case>.rank_<RR>.nsys-rep`（如
+  `nvls/cases/nvls-all_reduce-1024MiB-bf16-single-n16/nvls-all_reduce-1024MiB-bf16-single-n16.rank_01.nsys-rep`），
+  和该 case 的 NCCL 日志放在一起。归档只改名、不导出，所以很快；后面的 pass 失败也不会留下一堆
+  `rank<R>.<K>` 的报告。分析时再核对每份报告的外层 NVTX 标签和它所在的目录一致，编号对不上会报错。
+- 闲置 rank 的窗口里没有任何 CUDA kernel（它只在 Gloo barrier 上等），nsys 导出的 SQLite 就没有
+  `CUPTI_ACTIVITY_KIND_KERNEL` 表。这类报告照常归档，分析时视为“没有 kernel”跳过。
 - `--nsys` 跑出的数字带 `profiled=true`，`compare.md` 顶部会标注；trace 只用来看内核名、两条
   stream 是否真的重叠、两个 8 组是否同时在跑，**结论表必须用不带 `--nsys` 的那次**。
 
@@ -270,13 +275,22 @@ Slurm 分配内也能用，`--master-addr` 取第一个节点。
 
 ### 用 SQL 查 AG / RS / AR 的 kernel 开销
 
-`--nsys` 跑完后 node 0 自动执行 [`analyse_nsys.py`](analyse_nsys.py)：等其他节点的报告落盘，对每份
+所有 pass 跑完后，node 0 执行 [`analyse_results.sh`](analyse_results.sh)：先用 `collective_metrics.py`
+写 `compare.md`，再（仅 `--nsys`）执行 [`analyse_nsys.py`](analyse_nsys.py)：归档剩下的报告，对每份
 报告跑 `nsys export --type sqlite`，再执行 [`nsys_collective_kernels.sql`](nsys_collective_kernels.sql)
-里的查询（`label` 用来归档，`kernels`、`overlap` 用来统计）。也可以手动跑：
+里的查询（`label` 用来核对归档，`kernels`、`overlap` 用来统计）。
+
+后处理和测量是分开的：`analyse_results.sh` 失败时 launcher 只打印 warning 和重跑命令，退出码仍由
+benchmark 本身决定，已经跑完的测量不会因为后处理出错而作废。任何一步失败，后面的步骤照样执行；
+`analyse_nsys.py` 里某个 pass 出错也不影响其他 pass 写进 `nsys_kernels.md`，最后以非零退出码报告。
+手动重跑（已归档的报告和 SQLite 导出会复用）：
 
 ```bash
-uv run --no-sync python examples/gb200/nvls-collective/analyse_nsys.py \
+bash examples/gb200/nvls-collective/analyse_results.sh \
   --output-dir results/gb200/nvls-collective/gpu-num-4/run-01
+# 只做 nsys 这一步，或者只归档某个 pass：
+uv run --no-sync python examples/gb200/nvls-collective/analyse_nsys.py \
+  --output-dir results/gb200/nvls-collective/gpu-num-4/run-01 [--algo nvls --file-only]
 # 或者对单份报告直接用 sqlite3：
 nsys export --type=sqlite --output=rank0.1.sqlite rank0.1.nsys-rep
 sqlite3 -header -csv rank0.1.sqlite < examples/gb200/nvls-collective/nsys_collective_kernels.sql
@@ -286,7 +300,7 @@ sqlite3 -header -csv rank0.1.sqlite < examples/gb200/nvls-collective/nsys_collec
 
 | 步骤 | 表 | 规则 |
 | --- | --- | --- |
-| 找 case 和 trial | `NVTX_EVENTS` + `StringIds` | 外层 range 名形如 `symm/single-n4_ag+rs_bf16_256MiB`，内层为 `trial0..N`；`text` 与 `textId` 两种导出格式都支持 |
+| 找 case 和 trial | `NVTX_EVENTS` + `StringIds` | 外层 range 名形如 `symm/all_gather+reduce_scatter-256MiB-bf16-single-n4`，内层为 `trial0..N`；`text` 与 `textId` 两种导出格式都支持 |
 | kernel → 发射它的 API | `CUPTI_ACTIVITY_KIND_KERNEL` ⋈ `CUPTI_ACTIVITY_KIND_RUNTIME` | `correlationId` 相同且同一进程（`globalTid >> 24`） |
 | kernel → trial | 上面两者 | **发射时刻**落在 trial 的 NVTX range 内（与 `mbench/build_csv.py` 相同），不看 GPU 何时执行 |
 | 只保留集合通信 | `StringIds.value` | 名字以 `nccl` 开头且含 `AllGather` / `ReduceScatter` / `AllReduce`，分别记为 `ag`/`rs`/`ar`；`_sleep` 延迟 kernel、warmup、trial range 外的 start gate 都被排除 |
@@ -399,12 +413,12 @@ results/gb200/nvls-collective/gpu-num-<W>/<yyyymmdd-hhmmss>/
     results.jsonl  metadata.json               # 只由全局 rank 0 写
     torchrun-node<k>.log                       # 每个节点一份
     nccl-raw/nccl-<host>-<pid>.log             # 每个进程一份，整个进程的原始 NCCL 日志
-    comm/ring_<scenario>_rank<RR>.nccl.log     # 每个 scenario 的 communicator 建立/连接/销毁日志
-    cases/<case>/                              # 每个测试一个目录
+    comm/ring-<scenario>.rank_<RR>.nccl.log    # 每个 scenario 的 communicator 建立/连接/销毁日志
+    cases/ring-<case>/                         # 每个测试一个目录，如 ring-all_reduce-1024MiB-bf16-single-n16/
       case.json                                # rank 0：该 case 的结果记录，或实现校验失败的原因
-      ring_<case>_rank<RR>.nccl.log            # 每个参与 rank：本 case 期间的 NCCL 日志切片
-      ring_<case>_rank<RR>.nsys-rep / .sqlite  # 仅 --nsys，analyse_nsys.py 归档
-    nsys/{index.tsv, kernels.csv}              # 仅 --nsys
+      ring-<case>.rank_<RR>.nccl.log           # 每个参与 rank：本 case 期间的 NCCL 日志切片
+      ring-<case>.rank_<RR>.nsys-rep / .sqlite # 仅 --nsys，每个 pass 后归档 / 分析时导出
+    nsys/{index.tsv, kernels.csv}              # 仅 --nsys；归档前的 rank<R>.<K>.nsys-rep 也在这里
   nvls/ ...
   symm/ ...                                    # window 注册的对称内存路径
   compare.md                                   # node 0 合并三个 results.jsonl
@@ -416,8 +430,9 @@ results/gb200/nvls-collective/gpu-num-<W>/<yyyymmdd-hhmmss>/
 | 项 | 格式 | 例子 |
 | --- | --- | --- |
 | scenario | `single-n<n>` / `split-n<T>-<layout>` | `single-n16`、`split-n16-contiguous` |
-| case | `<scenario>[-<part>]_<workload>_<dtype>_<size>MiB`，part 为 `AB-concurrent`/`AB-cross`；cross 的 workload 固定为 `agA-rsB` | `single-n16_ag_bf16_1024MiB`、`split-n16-contiguous-AB-concurrent_ag+rs_bf16_256MiB`、`split-n16-contiguous-AB-cross_agA-rsB_bf16_1024MiB` |
-| 每 rank 文件 | `<algo>_<case>_rank<RR><suffix>`，rank 补零到至少两位 | `symm_single-n16_ag_bf16_1024MiB_rank03.nccl.log` |
+| case | `<workload>-<size>MiB-<dtype>-<scenario>[-<part>]`，workload 写全称（`all_gather`、`reduce_scatter`、`all_reduce`、`all_gather+reduce_scatter`；cross 固定为 `all_gather_A+reduce_scatter_B`），part 为 `AB-concurrent`/`AB-cross` | `all_gather-1024MiB-bf16-single-n16`、`all_gather+reduce_scatter-256MiB-bf16-split-n16-contiguous-AB-concurrent`、`all_gather_A+reduce_scatter_B-1024MiB-bf16-split-n16-contiguous-AB-cross` |
+| case 目录 | `<algo>-<case>`（`case_dir_name`），算法打头，拷出 run 目录也能看出测的是什么 | `nvls-all_reduce-1024MiB-bf16-single-n16` |
+| 每 rank 文件 | `<algo>-<case>.rank_<RR><suffix>`，rank 补零到至少两位 | `nvls-all_reduce-1024MiB-bf16-single-n16.rank_01.nsys-rep` |
 
 `<size>` 是完整张量：AG 的接收（输出）总量、RS 的发送（输入）总量、AR 的原地归约总量；AG/RS 每卡 shard = `size / n`。
 
@@ -434,15 +449,16 @@ results/gb200/nvls-collective/gpu-num-<W>/<yyyymmdd-hhmmss>/
    rank 0 上打印，比如 split 的 B 组在全局 rank 8 上，也是靠这一步汇到 rank 0。
 3. rank 0 计算统计量，**追加**到 `<algo>/results.jsonl`；`metadata.json`、`nsys/index.tsv` 也只由
    rank 0 写。其他 rank 不写这些文件，所以不存在多节点并发写同一文件的问题。
-4. 每个进程只写自己名字的文件：`nccl-raw/nccl-<host>-<pid>.log`、`comm/` 与 `cases/<case>/` 下带
-   `_rank<RR>` 的日志、`nsys/rank<R>*.nsys-rep`（`R` 是 torchrun 设置的全局 `RANK`），以及每个节点的
+4. 每个进程只写自己名字的文件：`nccl-raw/nccl-<host>-<pid>.log`、`comm/` 与 `cases/<algo>-<case>/` 下带
+   `.rank_<RR>` 的日志、`nsys/rank<R>.<K>.nsys-rep`（`R` 是 torchrun 设置的全局 `RANK`），以及每个节点的
    `torchrun-node<k>.log`。`case.json` 只由 rank 0 写。
 5. 三个实现是三次独立的 torchrun，结果在 `ring/`、`nvls/`、`symm/` 三个 `results.jsonl` 里。
    node 0 的 torchrun 只有在 rank 0 退出后才返回，而 rank 0 退出前已经写完 `results.jsonl`，
    所以随后执行的 `collective_metrics.py` 读到的是完整数据，合并成一份 `compare.md`；合并时会
    检查每个文件里的 `algo` 与目录一致。
 6. `--nsys` 时，各节点的 nsys 报告可能比 node 0 晚落盘，`analyse_nsys.py` 会等到报告数达到
-   `world_size × case 数` 且文件大小不再变化（最多 300 秒）后，再逐份导出 SQLite 汇总。
+   `world_size × case 数` 且文件大小不再变化（最多 300 秒）后再归档；超时就先归档已有的，
+   之后再跑一次 `analyse_results.sh` 会把晚到的补上（按编号 K 归档，与先后顺序无关）。
 
 `results.jsonl` 每行一个 case：`scenario`、`phase`、`total_ranks`、`layout`、`group_index`、
 `workload`、`group_size`、`ranks`、`size_bytes`、`makespan_ms`、`ag_ms`/`rs_ms`/`ar_ms`、`host_bound`、
@@ -457,7 +473,7 @@ NVLink 拓扑的映射。已有输出目录会报 `FileExistsError`，重复实�
 接受结论前检查：
 
 1. `check_passed` 全为 true，且 metadata 里的 NCCL 版本、GPU 映射与计划一致。
-2. 实现由程序逐 launch 校验（见“实现校验”），跑完即保证；人工复核时看 `cases/<case>/` 里 comm rank 0
+2. 实现由程序逐 launch 校验（见“实现校验”），跑完即保证；人工复核时看 `cases/<algo>-<case>/` 里 comm rank 0
    的日志切片。只看 `NVLS supported` 或只看 window 注册成功都不能证明某个 collective 用了哪条实现。
 3. `split` 的 A、B 两组都和 `single-n<T/2>` 比 `T_concurrent / T_isolated`；两组没有共同 GPU
    仍可能共享交换机链路和控制器，减速本身不能定位到 SHARP ALU。

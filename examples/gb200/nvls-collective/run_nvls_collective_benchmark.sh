@@ -20,14 +20,17 @@ usage() {
 Benchmark torch all-gather / reduce-scatter / all-reduce with ring and NVLS on GB200.
 
 Run the same command on every node (DLC style). For each algorithm a fresh torchrun job
-is started, because NCCL_ALGO is fixed when a communicator is created. Node 0 merges the
-results into compare.md.
+is started, because NCCL_ALGO is fixed when a communicator is created. After the last pass
+node 0 runs analyse_results.sh (compare.md and, with --nsys, nsys_kernels.md); a failure there
+is only a warning, so a finished benchmark is never lost to its post-processing. Re-run it by
+hand with: bash examples/gb200/nvls-collective/analyse_results.sh --output-dir <run dir>
 
 Output: results/gb200/nvls-collective/gpu-num-<nnodes*gpus-per-node>/<yyyymmdd-hhmmss> in this
-repo, one <algo>/ per family. Each test gets <algo>/cases/<case>/ (e.g.
-symm/cases/single-n16_ag_bf16_1024MiB/) with every member rank's NCCL log of that test,
-case.json and, with --nsys, the per-rank reports <algo>_<case>_rank<RR>.nsys-rep. A test fails
-unless NCCL's TUNING log shows the expected implementation for every launch. Node 0 stamps the id and hands it to the other nodes through the run_timestamp_and_logs
+repo, one <algo>/ per family. Each test gets <algo>/cases/<algo>-<case>/ (e.g.
+nvls/cases/nvls-all_reduce-1024MiB-bf16-single-n16/) with every member rank's NCCL log
+<algo>-<case>.rank_<RR>.nccl.log, case.json and, with --nsys, the per-rank reports
+<algo>-<case>.rank_<RR>.nsys-rep. A test fails unless NCCL's TUNING log shows the expected
+implementation for every launch. Node 0 stamps the id and hands it to the other nodes through the run_timestamp_and_logs
 helper (TCPStore on MASTER_ADDR:<master-port - 1>), so the repo must be on storage every node
 can see. An exported RUN_TIME pins it, which is what a re-run of one comparison needs.
 
@@ -59,7 +62,8 @@ Options:
   --symm-kernel KERNEL    For the symm pass: default, ag, rs or ar (pins NCCL_SYM_KERNEL); needs
                           --workloads with that op only, because the pin masks the other op
   --nsys                  One Nsight Systems report per rank per case (capture range = timed trials);
-                          node 0 then exports them to SQLite and writes nsys_kernels.md
+                          node 0 files them under cases/ after each pass, then exports them to
+                          SQLite and writes nsys_kernels.md
   --dry-run               Print commands only
   -h, --help              Show this help
 
@@ -288,7 +292,7 @@ for index in "${!algo_list[@]}"; do
         # multicast (MC) symmetric kernels eligible; NCCL_WIN_ENABLE turns on window registration.
         symm) nccl_algo=""; nvls_enable=1; win_enable=1 ;;
     esac
-    # Whole-process NCCL logs; the benchmark copies each test's slice into <algo>/cases/<case>/.
+    # Whole-process NCCL logs; the benchmark copies each test's slice into <algo>/cases/<algo>-<case>/.
     nccl_raw_dir="${algo_dir}/nccl-raw"
     $DRY_RUN || mkdir -p "$nccl_raw_dir"
     algo_env=(
@@ -321,9 +325,9 @@ for index in "${!algo_list[@]}"; do
             die "${nsys_dir} already contains Nsight reports; ${output_dir} was not a fresh run directory"
         fi
         # Each worker gets its own nsys session. Only the timed trials of each case are captured
-        # (cudaProfilerStart/Stop in the benchmark); "repeat" writes one report per case. The case
-        # label is the outermost NVTX range in each report and nsys/index.tsv lists every case in
-        # capture order with its wall-clock window, so mapping never depends on nsys file naming.
+        # (cudaProfilerStart/Stop in the benchmark); "repeat" writes rank<R>.<K>.nsys-rep for the
+        # K-th case. nsys/index.tsv maps K to the case, and the case label is also the outermost
+        # NVTX range in each report, which the analysis checks against where the report was filed.
         torchrun_extra=(--no-python)
         worker=(
             nsys profile
@@ -357,18 +361,17 @@ for index in "${!algo_list[@]}"; do
         compgen -G "${nsys_dir}/rank*.nsys-rep" >/dev/null \
             || die "nsys wrote no report under ${nsys_dir}; inspect ${algo_dir}/torchrun-node${node_rank}.log"
     fi
+    if $nsys_enabled && (( node_rank == 0 )); then
+        # Rename this pass's reports into cases/<algo>-<case>/ now, so a later pass that fails
+        # leaves them labelled. Only renames (no export); waits for the other nodes' reports.
+        run uv run --no-sync python "${script_dir}/analyse_nsys.py" --output-dir "$output_dir" \
+            --algo "$algo" --file-only \
+            || warn "filing ${algo} nsys reports failed; analyse_results.sh retries it"
+    fi
 done
 
 if (( node_rank == 0 )); then
-    compare_args=()
-    for algo in "${algo_list[@]}"; do
-        compare_args+=(--input "${algo}=${output_dir}/${algo}/results.jsonl")
-    done
-    run uv run --no-sync python "${script_dir}/collective_metrics.py" "${compare_args[@]}" \
-        --output "${output_dir}/compare.md"
-    if $nsys_enabled; then
-        # nsys export --type sqlite on every rank's report, then nsys_collective_kernels.sql.
-        # Waits for the other nodes' reports to land on the shared output directory first.
-        run uv run --no-sync python "${script_dir}/analyse_nsys.py" --output-dir "$output_dir"
-    fi
+    run bash "${script_dir}/analyse_results.sh" --output-dir "$output_dir" \
+        || warn "post-processing failed; the measurements are in ${output_dir}. Retry with:" \
+            "bash ${script_dir}/analyse_results.sh --output-dir ${output_dir}"
 fi

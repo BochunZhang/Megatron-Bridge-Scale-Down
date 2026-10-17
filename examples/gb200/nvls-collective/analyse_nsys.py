@@ -12,21 +12,28 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Query all-gather / reduce-scatter / all-reduce kernel cost from the ``--nsys`` reports with SQL.
+"""File the ``--nsys`` reports under their cases, then query AG / RS / AR kernel cost with SQL.
 
-nsys writes one report per rank per case as ``<algo>/nsys/rank<R>*.nsys-rep``; its own suffix
-for repeated captures is version dependent. This script exports each report with
-``nsys export --type sqlite``, reads the case from the report's outer NVTX range and moves the
-report and its export to ``<algo>/cases/<case>/<algo>_<case>_rank<RR>.{nsys-rep,sqlite}``, next
-to that case's NCCL logs. It then runs the queries in ``nsys_collective_kernels.sql`` on every
-filed report and joins the result back to ``<algo>/results.jsonl`` through the case's NVTX label
-and the rank's group. Only the Python standard library is used::
+nsys writes one report per rank per case as ``<algo>/nsys/rank<R>.<K>.nsys-rep``, where ``K`` is
+the rank's ``K``-th ``cudaProfilerStart``/``Stop`` window. Every rank opens one window per case
+in the same order, and rank 0 lists them in ``<algo>/nsys/index.tsv`` (``capture_index`` -> NVTX
+label ``<algo>/<case>``), so report ``K`` of every rank is moved to
+``<algo>/cases/<algo>-<case>/<algo>-<case>.rank_<RR>.nsys-rep``, next to that case's NCCL logs,
+without exporting it. ``--file-only`` stops there; the launcher runs it on node 0 after each pass.
 
-    python analyse_nsys.py --output-dir <dir>
+The analysis exports every filed report with ``nsys export --type sqlite``, checks that its outer
+NVTX range is the case it was filed under, runs the queries in ``nsys_collective_kernels.sql`` and
+joins the result back to ``<algo>/results.jsonl`` through the case's NVTX label and the rank's
+group. A rank outside every group of a case launches no kernel inside its window, so its export
+has no kernel tables and contributes nothing. Only the Python standard library is used::
+
+    python analyse_nsys.py --output-dir <dir>                         # file what is left, analyse
+    python analyse_nsys.py --output-dir <dir> --algo ring --file-only
 
 Outputs ``<algo>/nsys/kernels.csv`` (one row per report, trial, op and kernel) and
 ``<output-dir>/nsys_kernels.md`` (per case and group: median over trials of the slowest rank).
-Running it again reuses the filed reports and their exports.
+Running it again reuses the filed reports and their exports. One pass that fails to analyse does
+not stop the others; the script exits non-zero after writing what it could.
 """
 
 from __future__ import annotations
@@ -51,7 +58,7 @@ HERE = Path(__file__).resolve().parent
 if str(HERE) not in sys.path:
     sys.path.insert(0, str(HERE))  # the sibling module, also when this file is loaded by path
 
-from collective_metrics import ALGORITHMS, rank_file, workload_ops  # noqa: E402
+from collective_metrics import ALGORITHMS, case_dir_name, rank_file, workload_ops  # noqa: E402
 
 
 LOGGER = logging.getLogger(__name__)
@@ -62,8 +69,11 @@ REQUIRED_COLUMNS = {
     "CUPTI_ACTIVITY_KIND_RUNTIME": {"start", "globalTid", "correlationId"},
     "CUPTI_ACTIVITY_KIND_KERNEL": {"start", "end", "deviceId", "streamId", "correlationId", "globalPid", "shortName"},
 }
-_RANK = re.compile(r"^rank(\d+)(?!\d)")
-_FILED_RANK = re.compile(r"_rank(\d+)$")
+# nsys only creates these when the window recorded CUDA activity. A rank outside every group of
+# a case waits in the Gloo barrier and synchronizes, so it can have neither.
+KERNEL_TABLES = {"CUPTI_ACTIVITY_KIND_RUNTIME", "CUPTI_ACTIVITY_KIND_KERNEL"}
+_RAW_REPORT = re.compile(r"^rank(\d+)\.(\d+)\.nsys-rep$")
+_FILED_RANK = re.compile(r"\.rank_(\d+)$")
 QUERY_NAMES = {"kernels", "overlap", "label"}
 NS_PER_MS = 1e6
 
@@ -100,20 +110,40 @@ def load_queries(path: Path = SQL_PATH) -> dict[str, str]:
     return queries
 
 
-def report_rank(path: Path) -> int:
-    """Rank encoded by the launcher's ``--output=.../rank%q{RANK}``; nsys appends its own suffix."""
-    match = _RANK.match(path.name)
+def raw_capture(path: Path) -> tuple[int, int]:
+    """(rank, capture index) of a report named by the launcher's ``--output=.../rank%q{RANK}``.
+
+    With ``--capture-range-end=repeat`` nsys appends ``.<K>`` for the ``K``-th capture, from 1.
+    """
+    match = _RAW_REPORT.match(path.name)
     if match is None:
-        raise ValueError(f"cannot read a rank from report name {path.name!r}")
-    return int(match.group(1))
+        raise ValueError(f"cannot read a rank and capture index from report name {path.name!r}")
+    return int(match.group(1)), int(match.group(2))
 
 
 def filed_rank(path: Path) -> int:
-    """Rank of a report already filed as ``<algo>_<case>_rank<RR>.nsys-rep``."""
+    """Rank of a report already filed as ``<algo>-<case>.rank_<RR>.nsys-rep``."""
     match = _FILED_RANK.search(path.stem)
     if match is None:
         raise ValueError(f"cannot read a rank from filed report {path.name!r}")
     return int(match.group(1))
+
+
+def filed_label(algo: str, report: Path) -> str:
+    """The NVTX label ``<algo>/<case>`` a report filed under ``cases/<algo>-<case>/`` must carry."""
+    prefix = f"{algo}-"
+    if not report.parent.name.startswith(prefix):
+        raise ValueError(f"{report}: case directory does not start with {prefix!r}")
+    return f"{algo}/{report.parent.name[len(prefix) :]}"
+
+
+def read_index(nsys_dir: Path) -> list[str]:
+    """Case labels in capture order: element ``K - 1`` is the label of capture ``K``."""
+    with (nsys_dir / "index.tsv").open(encoding="utf-8", newline="") as handle:
+        rows = sorted((int(row["capture_index"]), row["label"]) for row in csv.DictReader(handle, delimiter="\t"))
+    if [index for index, _ in rows] != list(range(1, len(rows) + 1)):
+        raise RuntimeError(f"{nsys_dir / 'index.tsv'}: capture indices are not 1..{len(rows)}")
+    return [label for _, label in rows]
 
 
 def wait_for_reports(nsys_dir: Path, *, expected: int, timeout_s: float, poll_s: float = 5.0) -> list[Path]:
@@ -131,7 +161,7 @@ def wait_for_reports(nsys_dir: Path, *, expected: int, timeout_s: float, poll_s:
             return reports
         if time.monotonic() > deadline:
             LOGGER.warning(
-                "%s: %d of %d reports after %.0fs; analysing what exists", nsys_dir, len(reports), expected, timeout_s
+                "%s: %d of %d reports after %.0fs; filing what exists", nsys_dir, len(reports), expected, timeout_s
             )
             return reports
         previous = sizes
@@ -150,68 +180,68 @@ def export_sqlite(report: Path, *, nsys_bin: str) -> Path:
     return target
 
 
-def check_schema(connection: sqlite3.Connection, path: Path) -> None:
-    """Fail with the missing table/column instead of an opaque SQL error."""
+def check_schema(connection: sqlite3.Connection, path: Path) -> set[str]:
+    """Fail with the missing table/column instead of an opaque SQL error; return the tables present."""
     tables = {row[0] for row in connection.execute("SELECT name FROM sqlite_master WHERE type='table'")}
     for table, columns in REQUIRED_COLUMNS.items():
         if table not in tables:
+            if table in KERNEL_TABLES:
+                continue
             raise RuntimeError(f"{path}: table {table} is missing; was the run profiled with --trace=cuda,nvtx?")
         present = {row[1] for row in connection.execute(f'PRAGMA table_info("{table}")')}
         if columns - present:
             raise RuntimeError(
                 f"{path}: {table} lacks columns {sorted(columns - present)} (nsys export schema changed)"
             )
+    return tables
 
 
-def report_label(sqlite_path: Path, queries: dict[str, str]) -> str:
-    """The ``<algo>/<case>`` NVTX label of one exported report."""
-    connection = sqlite3.connect(sqlite_path)
-    try:
-        check_schema(connection, sqlite_path)
-        labels = [row[0] for row in connection.execute(queries["label"])]
-    finally:
-        connection.close()
-    if len(labels) != 1:
-        raise RuntimeError(f"{sqlite_path}: expected one case label, found {labels}")
-    return labels[0]
-
-
-def file_reports(
-    algo_dir: Path, reports: Sequence[Path], queries: dict[str, str], *, nsys_bin: str, world_size: int
-) -> list[Path]:
-    """Move raw ``nsys/rank<R>*`` reports and their exports into their case directories."""
+def file_reports(algo_dir: Path, reports: Sequence[Path], labels: Sequence[str], *, world_size: int) -> list[Path]:
+    """Move raw ``nsys/rank<R>.<K>`` reports (and any export of them) into their case directories."""
     algo = algo_dir.name
     filed = []
     for report in reports:
-        rank = report_rank(report)
-        sqlite_path = export_sqlite(report, nsys_bin=nsys_bin)
-        label_algo, _, case = report_label(sqlite_path, queries).partition("/")
+        rank, capture = raw_capture(report)
+        if not 1 <= capture <= len(labels):
+            raise RuntimeError(f"{report}: capture {capture} is not in nsys/index.tsv ({len(labels)} captures)")
+        label_algo, _, case = labels[capture - 1].partition("/")
         if label_algo != algo or not case or "/" in case:
-            raise RuntimeError(f"{report}: NVTX label {label_algo}/{case} does not name a {algo} case")
+            raise RuntimeError(f"{report}: NVTX label {labels[capture - 1]} does not name a {algo} case")
+        name = case_dir_name(algo, case)
         target = (
-            algo_dir / "cases" / case / rank_file(algo, case, rank=rank, world_size=world_size, suffix=".nsys-rep")
+            algo_dir / "cases" / name / rank_file(algo, case, rank=rank, world_size=world_size, suffix=".nsys-rep")
         )
         if target.exists():
-            raise FileExistsError(f"{report} and {target} are both rank {rank} of {case}")
+            raise FileExistsError(f"{report} and {target} are both rank {rank} of {name}")
         target.parent.mkdir(parents=True, exist_ok=True)
-        # rename keeps mtimes, so export_sqlite still recognizes the moved export as current.
-        sqlite_path.rename(target.with_suffix(".sqlite"))
+        export = report.with_suffix(".sqlite")
+        if export.exists():
+            # rename keeps mtimes, so export_sqlite still recognizes the moved export as current.
+            export.rename(target.with_suffix(".sqlite"))
         report.rename(target)
         filed.append(target)
     return filed
 
 
 def query_report(
-    sqlite_path: Path, queries: dict[str, str], *, algo: str, rank: int
+    sqlite_path: Path, queries: dict[str, str], *, algo: str, rank: int, label: str
 ) -> tuple[list[KernelRow], dict[tuple[str, str], int]]:
-    """Run both queries on one exported report."""
+    """Check the report's case label, then run both queries on it.
+
+    A report without kernel tables (a rank that sat the case out) yields no rows.
+    """
     connection = sqlite3.connect(sqlite_path)
     try:
-        check_schema(connection, sqlite_path)
+        tables = check_schema(connection, sqlite_path)
+        labels = [row[0] for row in connection.execute(queries["label"])]
+        if labels != [label]:
+            raise RuntimeError(f"{sqlite_path}: filed as {label} but its case NVTX ranges are {labels}")
+        if not KERNEL_TABLES <= tables:
+            return [], {}
         kernels = [
             KernelRow(algo, rank, sqlite_path.stem, *row) for row in connection.execute(queries["kernels"]).fetchall()
         ]
-        overlap = {(label, trial): int(ns) for label, trial, ns in connection.execute(queries["overlap"])}
+        overlap = {(lbl, trial): int(ns) for lbl, trial, ns in connection.execute(queries["overlap"])}
     finally:
         connection.close()
     return kernels, overlap
@@ -360,27 +390,35 @@ def _load_results(path: Path) -> list[dict[str, object]]:
         return [json.loads(line) for line in handle if line.strip()]
 
 
+def file_algo(algo_dir: Path, *, timeout_s: float) -> list[Path]:
+    """File this pass's raw reports under ``cases/``; return every filed report of the pass."""
+    nsys_dir = algo_dir / "nsys"
+    labels = read_index(nsys_dir)
+    world_size = int(json.loads((algo_dir / "metadata.json").read_text(encoding="utf-8"))["world_size"])
+    filed = sorted(algo_dir.glob("cases/*/*.nsys-rep"))
+    raw = wait_for_reports(nsys_dir, expected=world_size * len(labels) - len(filed), timeout_s=timeout_s)
+    filed += file_reports(algo_dir, raw, labels, world_size=world_size)
+    LOGGER.info("%s: %d reports filed under %s", algo_dir.name, len(filed), algo_dir / "cases")
+    return sorted(filed)
+
+
 def analyse_algo(
     algo_dir: Path, queries: dict[str, str], *, nsys_bin: str, timeout_s: float
 ) -> tuple[list[KernelRow], list[dict[str, object]]]:
-    """Export and query every report of one algorithm pass."""
+    """File, export and query every report of one algorithm pass."""
     algo = algo_dir.name
-    nsys_dir = algo_dir / "nsys"
-    index_path = nsys_dir / "index.tsv"
     results = _load_results(algo_dir / "results.jsonl")
-    world_size = int(json.loads((algo_dir / "metadata.json").read_text(encoding="utf-8"))["world_size"])
-    captures = len(index_path.read_text(encoding="utf-8").splitlines()) - 1
-    filed = sorted(algo_dir.glob("cases/*/*.nsys-rep"))
-    raw = wait_for_reports(nsys_dir, expected=world_size * captures - len(filed), timeout_s=timeout_s)
-    filed += file_reports(algo_dir, raw, queries, nsys_bin=nsys_bin, world_size=world_size)
     kernels: list[KernelRow] = []
     overlap: dict[tuple[int, str, str], int] = {}
-    for report in sorted(filed):
+    filed = file_algo(algo_dir, timeout_s=timeout_s)
+    for report in filed:
         rank = filed_rank(report)
-        rows, report_overlap = query_report(export_sqlite(report, nsys_bin=nsys_bin), queries, algo=algo, rank=rank)
+        rows, report_overlap = query_report(
+            export_sqlite(report, nsys_bin=nsys_bin), queries, algo=algo, rank=rank, label=filed_label(algo, report)
+        )
         kernels += rows
         overlap.update({(rank, label, trial): ns for (label, trial), ns in report_overlap.items()})
-    with (nsys_dir / "kernels.csv").open("w", newline="", encoding="utf-8") as handle:
+    with (algo_dir / "nsys" / "kernels.csv").open("w", newline="", encoding="utf-8") as handle:
         writer = csv.writer(handle)
         writer.writerow(KernelRow.__dataclass_fields__)
         writer.writerows([getattr(row, name) for name in KernelRow.__dataclass_fields__] for row in kernels)
@@ -390,25 +428,43 @@ def analyse_algo(
 
 
 def main(argv: Sequence[str] | None = None) -> None:
-    """Analyse every algorithm / impl directory that was run with ``--nsys``."""
+    """File and analyse every algorithm / impl directory that was run with ``--nsys``."""
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--output-dir", type=Path, required=True, help="Launcher --output-dir")
+    parser.add_argument("--algo", help="Only this pass directory (default: every <algo>/nsys/index.tsv)")
+    parser.add_argument("--file-only", action="store_true", help="Move the reports into cases/, skip the SQL")
     parser.add_argument("--nsys-bin", default="nsys")
     parser.add_argument("--wait-seconds", type=float, default=300.0, help="Wait for other nodes' reports")
     args = parser.parse_args(argv)
 
-    queries = load_queries()
-    rows: list[dict[str, object]] = []
     # Every pass directory that was profiled; the C++ benchmark writes the same layout per impl.
     algos = sorted((p.parent.parent.name for p in args.output_dir.glob("*/nsys/index.tsv")), key=algo_order)
+    if args.algo is not None:
+        algos = [algo for algo in algos if algo == args.algo]
+    if not algos:
+        raise FileNotFoundError(f"no {args.algo or '<algo>'}/nsys/index.tsv under {args.output_dir}")
+    queries = load_queries()
+    rows: list[dict[str, object]] = []
+    failed = []
     for algo in algos:
         algo_dir = args.output_dir / algo
-        if (algo_dir / "nsys" / "index.tsv").exists():
-            rows += analyse_algo(algo_dir, queries, nsys_bin=args.nsys_bin, timeout_s=args.wait_seconds)[1]
-    if not rows:
-        raise FileNotFoundError(f"no <algo>/nsys/index.tsv with matching kernels under {args.output_dir}")
-    (args.output_dir / "nsys_kernels.md").write_text(render(rows), encoding="utf-8")
-    LOGGER.info("wrote %s (%d cases)", args.output_dir / "nsys_kernels.md", len(rows))
+        try:
+            if args.file_only:
+                file_algo(algo_dir, timeout_s=args.wait_seconds)
+            else:
+                rows += analyse_algo(algo_dir, queries, nsys_bin=args.nsys_bin, timeout_s=args.wait_seconds)[1]
+        except Exception:
+            LOGGER.exception("%s: nsys %s failed", algo, "filing" if args.file_only else "analysis")
+            failed.append(algo)
+    if not args.file_only and rows:
+        (args.output_dir / "nsys_kernels.md").write_text(render(rows), encoding="utf-8")
+        LOGGER.info("wrote %s (%d cases)", args.output_dir / "nsys_kernels.md", len(rows))
+    if failed:
+        raise RuntimeError(f"nsys {'filing' if args.file_only else 'analysis'} failed for {', '.join(failed)}")
+    if not args.file_only and not rows:
+        raise RuntimeError(
+            f"no AllGather/ReduceScatter/AllReduce kernels matched results.jsonl under {args.output_dir}"
+        )
 
 
 if __name__ == "__main__":

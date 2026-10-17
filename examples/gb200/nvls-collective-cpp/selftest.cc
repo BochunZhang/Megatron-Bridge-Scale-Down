@@ -151,11 +151,12 @@ static void testHelpers() {
   EXPECT(halves.first.size() == 8 && halves.first[1] == 2 && halves.second[0] == 1);
   halves = splitGroups(16, "contiguous");
   EXPECT(halves.first.back() == 7 && halves.second.front() == 8);
-  EXPECT(caseName("single-n4", "", "ag+rs", "bf16", 64) == "single-n4_ag+rs_bf16_64MiB");
+  EXPECT(caseName("single-n4", "", "ag+rs", "bf16", 64) == "all_gather+reduce_scatter-64MiB-bf16-single-n4");
+  EXPECT(caseName("single-n16", "", "ar", "bf16", 1024) == "all_reduce-1024MiB-bf16-single-n16");
   EXPECT(caseName(scenarioName("split", 16, "contiguous"), kCrossPart, kCrossWorkload, "bf16", 1024) ==
-         "split-n16-contiguous-AB-cross_agA-rsB_bf16_1024MiB");
+         "all_gather_A+reduce_scatter_B-1024MiB-bf16-split-n16-contiguous-AB-cross");
   EXPECT(caseName(scenarioName("split", 16, "contiguous"), "AB-concurrent", "ag", "bf16", 64) ==
-         "split-n16-contiguous-AB-concurrent_ag_bf16_64MiB");
+         "all_gather-64MiB-bf16-split-n16-contiguous-AB-concurrent");
   // A split half is measured only while both halves run; its reference is single-n<T/2>.
   EXPECT(splitParts() == std::vector<std::string>({"AB-concurrent", "AB-cross"}));
   bool threw = false;
@@ -172,9 +173,11 @@ static void testHelpers() {
     threw = true;
   }
   EXPECT(threw);
-  EXPECT(rankFile("symm", "single-n16_ag_bf16_1024MiB", 3, 16, ".nccl.log") ==
-         "symm_single-n16_ag_bf16_1024MiB_rank03.nccl.log");
-  EXPECT(rankFile("tma", "x", 7, 128, ".log") == "tma_x_rank007.log");
+  EXPECT(caseDirName("symmetric-tma", "all_gather-1024MiB-bf16-single-n16") ==
+         "symmetric-tma-all_gather-1024MiB-bf16-single-n16");
+  EXPECT(rankFile("nvls", "all_reduce-1024MiB-bf16-single-n16", 1, 16, ".nsys-rep") ==
+         "nvls-all_reduce-1024MiB-bf16-single-n16.rank_01.nsys-rep");
+  EXPECT(rankFile("tma", "x", 7, 128, ".log") == "tma-x.rank_007.log");
   EXPECT(ncclDebugPath("/r/nccl-%h-%p.log", "gb200-07.cluster", 42) == "/r/nccl-gb200-07-42.log");
   EXPECT(ncclDebugPath("a%%b%x", "h", 1) == "a%b%x");
   auto conc = trialConcurrency({{2.0, 4.0}, {1.0, 4.0}});

@@ -440,22 +440,34 @@ def test_case_names_carry_scenario_part_workload_dtype_and_size():
     split = metrics.scenario_name("split", total_ranks=16, layout="contiguous")
     assert (single, split) == ("single-n16", "split-n16-contiguous")
     assert metrics.case_name(single, part=None, workload="ag", dtype="bf16", size_mib=1024) == (
-        "single-n16_ag_bf16_1024MiB"
+        "all_gather-1024MiB-bf16-single-n16"
+    )
+    assert metrics.case_name(single, part=None, workload="ar", dtype="bf16", size_mib=1024) == (
+        "all_reduce-1024MiB-bf16-single-n16"
     )
     assert metrics.case_name(split, part="AB-concurrent", workload="ag+rs", dtype="fp32", size_mib=64) == (
-        "split-n16-contiguous-AB-concurrent_ag+rs_fp32_64MiB"
+        "all_gather+reduce_scatter-64MiB-fp32-split-n16-contiguous-AB-concurrent"
     )
-    assert metrics.rank_file("symm", "single-n16_ag_bf16_1024MiB", rank=3, world_size=16, suffix=".nccl.log") == (
-        "symm_single-n16_ag_bf16_1024MiB_rank03.nccl.log"
+
+
+@pytest.mark.unit
+def test_case_directories_and_rank_files_lead_with_the_algorithm():
+    case = "all_reduce-1024MiB-bf16-single-n16"
+    assert metrics.case_dir_name("nvls", case) == "nvls-all_reduce-1024MiB-bf16-single-n16"
+    assert metrics.rank_file("nvls", case, rank=1, world_size=16, suffix=".nsys-rep") == (
+        "nvls-all_reduce-1024MiB-bf16-single-n16.rank_01.nsys-rep"
     )
-    assert metrics.rank_file("ring", "x", rank=7, world_size=128, suffix=".nsys-rep") == "ring_x_rank007.nsys-rep"
+    assert metrics.rank_file("symm", case, rank=3, world_size=16, suffix=".nccl.log") == (
+        "symm-all_reduce-1024MiB-bf16-single-n16.rank_03.nccl.log"
+    )
+    assert metrics.rank_file("ring", "x", rank=7, world_size=128, suffix=".nsys-rep") == "ring-x.rank_007.nsys-rep"
 
 
 @pytest.mark.unit
 def test_cross_case_name_pairs_the_cross_part_with_its_workload():
     assert metrics.case_name(
         "split-n16-contiguous", part="AB-cross", workload="agA-rsB", dtype="bf16", size_mib=1024
-    ) == ("split-n16-contiguous-AB-cross_agA-rsB_bf16_1024MiB")
+    ) == ("all_gather_A+reduce_scatter_B-1024MiB-bf16-split-n16-contiguous-AB-cross")
     for part, workload in (("AB-cross", "ag"), ("AB-concurrent", "agA-rsB"), (None, "agA-rsB")):
         with pytest.raises(ValueError, match="belongs to part"):
             metrics.case_name("split-n16-contiguous", part=part, workload=workload, dtype="bf16", size_mib=16)
@@ -604,7 +616,7 @@ def _record(**overrides):
         "n_nodes": 1,
         "mnnvl": False,
         "profiled": False,
-        "case": "single-n8_ag_bf16_256MiB",
+        "case": "all_gather-256MiB-bf16-single-n8",
         "iters": 20,
         "trial_makespan_ms": [1.0],
         "concurrency": None,
@@ -843,7 +855,7 @@ def test_completion_rows_report_mean_median_and_mean_based_bandwidth():
         iters=20,
     )
     (row,) = metrics.completion_rows([record])
-    assert row[:8] == ["ring", "single-n8_ag_bf16_256MiB", "single8", "isolated", "8", "ag+rs", "1024", "3x20"]
+    assert row[:8] == ["ring", "all_gather-256MiB-bf16-single-n8", "single8", "isolated", "8", "ag+rs", "1024", "3x20"]
     assert row[8:12] == ["2.000", "2.500", "1.000", "3.000"]
     # Two ops of 1 GiB in 2 ms: algbw = 2 * 1.073741824 GB / 0.002 s, busbw = algbw * 7/8.
     assert row[12] == f"{2 * 1.073741824 / 0.002:.1f}"
@@ -990,7 +1002,7 @@ SYMM_AR = (
 def test_all_reduce_is_a_workload_of_its_own():
     assert metrics.workload_ops("ar") == ("ar",)
     assert metrics.case_name("single-n8", part=None, workload="ar", dtype="bf16", size_mib=64) == (
-        "single-n8_ar_bf16_64MiB"
+        "all_reduce-64MiB-bf16-single-n8"
     )
     args = benchmark.parse_args(["--algo", "nvls", "--output-dir", "/tmp/x", "--workloads", "ar"])
     assert args.workloads == ["ar"]
