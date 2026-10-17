@@ -325,3 +325,8 @@ def test_wait_gives_up_and_returns_what_exists(tmp_path):
 def test_main_refuses_a_directory_without_profiled_runs(tmp_path):
     with pytest.raises(FileNotFoundError, match="nsys/index.tsv"):
         analyse.main(["--output-dir", str(tmp_path), "--wait-seconds", "0"])
+
+
+def test_algo_order_puts_torch_families_first_then_cpp_impls_by_name():
+    names = ["tma", "symm", "ce", "ring", "stmc", "nvls"]
+    assert sorted(names, key=analyse.algo_order) == ["ring", "nvls", "symm", "ce", "stmc", "tma"]

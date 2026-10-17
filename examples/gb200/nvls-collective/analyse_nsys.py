@@ -268,9 +268,7 @@ def summarize(
         cases[(algo, label, group)].append(slowest)
 
     rows = []
-    for (algo, label, group), trials in sorted(
-        cases.items(), key=lambda item: (ALGORITHMS.index(item[0][0]), item[0][1:])
-    ):
+    for (algo, label, group), trials in sorted(cases.items(), key=lambda item: (algo_order(item[0][0]), item[0][1:])):
         record = next(r for (lbl, _), r in records.items() if lbl == label and r["group_name"] == group)
         stats = {key: median(trial[key] for trial in trials) for key in trials[0]}
         shorter = min(stats["ag_ms"], stats["rs_ms"])
@@ -292,6 +290,11 @@ def summarize(
             }
         )
     return rows
+
+
+def algo_order(algo: str) -> tuple[int, str]:
+    """Sort key: this directory's families first, then any other pass (e.g. ../nvls-collective-cpp's tma, ce)."""
+    return (ALGORITHMS.index(algo), "") if algo in ALGORITHMS else (len(ALGORITHMS), algo)
 
 
 def _fmt(value: object, digits: int = 3) -> str:
@@ -378,7 +381,7 @@ def analyse_algo(
 
 
 def main(argv: Sequence[str] | None = None) -> None:
-    """Analyse every algorithm directory that was run with ``--nsys``."""
+    """Analyse every algorithm / impl directory that was run with ``--nsys``."""
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--output-dir", type=Path, required=True, help="Launcher --output-dir")
     parser.add_argument("--nsys-bin", default="nsys")
@@ -387,7 +390,9 @@ def main(argv: Sequence[str] | None = None) -> None:
 
     queries = load_queries()
     rows: list[dict[str, object]] = []
-    for algo in ALGORITHMS:
+    # Every pass directory that was profiled; the C++ benchmark writes the same layout per impl.
+    algos = sorted((p.parent.parent.name for p in args.output_dir.glob("*/nsys/index.tsv")), key=algo_order)
+    for algo in algos:
         algo_dir = args.output_dir / algo
         if (algo_dir / "nsys" / "index.tsv").exists():
             rows += analyse_algo(algo_dir, queries, nsys_bin=args.nsys_bin, timeout_s=args.wait_seconds)[1]

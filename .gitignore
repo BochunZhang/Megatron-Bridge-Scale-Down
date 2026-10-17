@@ -193,3 +193,6 @@ slurm*.out
 .tmp/
 
 *.pickle
+
+# Local NCCL source trees (install/install-nccl-2.32.3.sh)
+/nccl/
