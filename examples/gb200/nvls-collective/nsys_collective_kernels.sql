@@ -15,7 +15,7 @@
 -- All-gather / reduce-scatter kernel cost from one `nsys export --type sqlite` report.
 --
 -- Every report written by `run_nvls_collective_benchmark.sh --nsys` holds one case of one rank:
--- an outer NVTX range named like "symm/single4/ag+rs/256MiB" around NVTX ranges "trial0".."trialN".
+-- an outer NVTX range named like "symm/single-n4_ag+rs_bf16_256MiB" around NVTX ranges "trial0".."trialN".
 -- Warmup, buffer allocation and window registration happen outside the capture window.
 --
 -- A kernel belongs to a trial when the CUDA runtime call that launched it (joined on
@@ -30,7 +30,8 @@
 -- The torch.cuda._sleep launch-delay kernel is not an NCCL kernel and is excluded.
 --
 -- Run: sqlite3 -header -csv report.sqlite < nsys_collective_kernels.sql
--- The first result set is per (trial, op, kernel); the second is per trial AG/RS overlap.
+-- The first result set is per (trial, op, kernel); the second is per trial AG/RS overlap; the third
+-- is the case label analyse_nsys.py uses to file the report under <algo>/cases/<case>/.
 
 -- name: kernels
 WITH
@@ -131,3 +132,11 @@ JOIN trial_kernels AS r ON r.label = a.label AND r.trial = a.trial AND r.op = 'r
 WHERE a.op = 'ag'
 GROUP BY a.label, a.trial
 ORDER BY a.label, a.trial;
+
+-- name: label
+-- The case of one report: the outer NVTX range "<algo>/<case>" that every rank opens around
+-- the timed trials, including ranks that sit the case out. Exactly one row is expected.
+SELECT DISTINCT COALESCE(n.text, s.value) AS label
+FROM NVTX_EVENTS AS n
+LEFT JOIN StringIds AS s ON s.id = n.textId
+WHERE n.end IS NOT NULL AND COALESCE(n.text, s.value) LIKE '%/%MiB';

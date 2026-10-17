@@ -37,6 +37,7 @@ sys.modules[_SPEC.name] = analyse
 _SPEC.loader.exec_module(analyse)
 
 AG = "ncclDevKernel_AllGather_RING_LL"
+CASE = "single-n2_ag+rs_bf16_64MiB"
 RS = "ncclDevKernel_ReduceScatter_Sum_bf16_RING_LL"
 SCHEMA = """
 CREATE TABLE StringIds(id INTEGER PRIMARY KEY, value TEXT);
@@ -95,7 +96,7 @@ def _make_report(path: Path, *, label: str, trials: list[list[tuple[str, int, in
 def _make_run(
     tmp_path: Path, *, per_rank_trials: dict[int, list[list[tuple[str, int, int, int]]]], iters: int
 ) -> Path:
-    label = "symm/single2/ag+rs/64MiB"
+    label = f"symm/{CASE}"
     algo_dir = tmp_path / "symm"
     nsys_dir = algo_dir / "nsys"
     nsys_dir.mkdir(parents=True)
@@ -109,6 +110,7 @@ def _make_run(
         "scenario": "single",
         "phase": "isolated",
         "group_name": "single2",
+        "case": CASE,
         "group_size": 2,
         "ranks": sorted(per_rank_trials),
         "workload": "ag+rs",
@@ -133,18 +135,36 @@ def _query(path: Path):
 
 
 @pytest.mark.unit
-def test_sql_file_defines_both_queries():
-    assert set(analyse.load_queries()) == {"kernels", "overlap"}
+def test_sql_file_defines_every_query():
+    assert set(analyse.load_queries()) == {"kernels", "overlap", "label"}
+
+
+@pytest.mark.unit
+def test_label_query_reads_the_case_range_and_ignores_trials(tmp_path):
+    path = tmp_path / "r.sqlite"
+    _make_report(path, label=f"ring/{CASE}", trials=[[(AG, 20, 30, 1030)], [(AG, 20, 30, 1030)]])
+    assert analyse.report_label(path, analyse.load_queries()) == f"ring/{CASE}"
+
+
+@pytest.mark.unit
+def test_label_query_refuses_a_report_without_a_case(tmp_path):
+    path = tmp_path / "r.sqlite"
+    db = sqlite3.connect(path)
+    db.executescript(SCHEMA)
+    db.close()
+    with pytest.raises(RuntimeError, match="expected one case label"):
+        analyse.report_label(path, analyse.load_queries())
 
 
 @pytest.mark.unit
 def test_kernels_query_keeps_only_collectives_launched_inside_trials(tmp_path):
     path = tmp_path / "r.sqlite"
-    _make_report(path, label="ring/single8/ag/16MiB", trials=[[(AG, 20, 30, 1030), (AG, 25, 1030, 2030)]])
+    label = "ring/single-n8_ag_bf16_16MiB"
+    _make_report(path, label=label, trials=[[(AG, 20, 30, 1030), (AG, 25, 1030, 2030)]])
     kernels, overlap = _query(path)
     assert len(kernels) == 1
     row = kernels[0]
-    assert (row.label, row.trial, row.op, row.kernel) == ("ring/single8/ag/16MiB", "trial0", "ag", AG)
+    assert (row.label, row.trial, row.op, row.kernel) == (label, "trial0", "ag", AG)
     assert (row.kernels, row.busy_ns, row.min_ns, row.max_ns, row.streams) == (2, 2000, 1000, 1000, 1)
     assert row.last_end_ns - row.first_start_ns == 2000
     assert overlap == {}  # no RS kernels, so the AG×RS join is empty
@@ -157,7 +177,8 @@ def test_overlap_query_measures_ag_rs_intersection(tmp_path):
         [(AG, 20, 100, 1100), (RS, 21, 600, 1600)],  # 500 ns overlap
         [(AG, 20, 100, 1100), (RS, 21, 1100, 2100)],  # back to back, no overlap
     ]
-    _make_report(path, label="nvls/single8/ag+rs/64MiB", trials=trials)
+    label = "nvls/single-n8_ag+rs_bf16_64MiB"
+    _make_report(path, label=label, trials=trials)
     kernels, overlap = _query(path)
     assert {(row.trial, row.op) for row in kernels} == {
         ("trial0", "ag"),
@@ -165,7 +186,7 @@ def test_overlap_query_measures_ag_rs_intersection(tmp_path):
         ("trial1", "ag"),
         ("trial1", "rs"),
     }
-    assert overlap == {("nvls/single8/ag+rs/64MiB", "trial0"): 500, ("nvls/single8/ag+rs/64MiB", "trial1"): 0}
+    assert overlap == {(label, "trial0"): 500, (label, "trial1"): 0}
 
 
 @pytest.mark.unit
@@ -208,6 +229,46 @@ def test_summary_takes_slowest_rank_then_median_over_trials(tmp_path):
     csv_lines = (run / "symm" / "nsys" / "kernels.csv").read_text(encoding="utf-8").splitlines()
     assert csv_lines[0].startswith("algo,rank,report,label,trial,op,kernel")
     assert len(csv_lines) == 1 + 2 * 3 * 2  # header + ranks × trials × ops
+    assert csv_lines[1].split(",")[2] == f"symm_{CASE}_rank00"
+
+
+@pytest.mark.unit
+def test_reports_are_filed_under_their_case_and_reused_on_a_second_run(tmp_path):
+    trial = [(AG, 20, 100, 1100), (RS, 21, 600, 1600)]
+    run = _make_run(tmp_path, per_rank_trials={0: [trial], 1: [trial]}, iters=1)
+    analyse.main(["--output-dir", str(run), "--wait-seconds", "0"])
+    case_dir = run / "symm" / "cases" / CASE
+    assert sorted(path.name for path in case_dir.iterdir()) == [
+        f"symm_{CASE}_rank00.nsys-rep",
+        f"symm_{CASE}_rank00.sqlite",
+        f"symm_{CASE}_rank01.nsys-rep",
+        f"symm_{CASE}_rank01.sqlite",
+    ]
+    assert not list((run / "symm" / "nsys").glob("rank*"))
+    first = (run / "nsys_kernels.md").read_text(encoding="utf-8")
+    # Nothing is left in nsys/, so the second run must work from the filed reports alone.
+    analyse.main(["--output-dir", str(run), "--wait-seconds", "0"])
+    assert (run / "nsys_kernels.md").read_text(encoding="utf-8") == first
+
+
+@pytest.mark.unit
+def test_filing_refuses_a_report_of_another_algorithm(tmp_path):
+    run = _make_run(tmp_path, per_rank_trials={0: [[(AG, 20, 100, 1100)]]}, iters=1)
+    nsys_dir = run / "symm" / "nsys"
+    report = nsys_dir / "rank0.1.nsys-rep"
+    report.with_suffix(".sqlite").unlink()
+    _make_report(report.with_suffix(".sqlite"), label=f"ring/{CASE}", trials=[[(AG, 20, 100, 1100)]])
+    stamp = report.stat().st_mtime + 20
+    os.utime(report.with_suffix(".sqlite"), (stamp, stamp))
+    with pytest.raises(RuntimeError, match="does not name a symm case"):
+        analyse.file_reports(run / "symm", [report], analyse.load_queries(), nsys_bin="nsys", world_size=1)
+
+
+@pytest.mark.unit
+def test_filed_rank_reads_the_padded_suffix():
+    assert analyse.filed_rank(Path(f"symm_{CASE}_rank07.nsys-rep")) == 7
+    with pytest.raises(ValueError, match="filed report"):
+        analyse.filed_rank(Path("rank0.1.nsys-rep"))
 
 
 @pytest.mark.unit

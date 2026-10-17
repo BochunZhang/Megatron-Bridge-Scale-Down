@@ -39,6 +39,12 @@ BYTES_PER_GB = 1_000_000_000
 ALGORITHMS = ("ring", "nvls", "symm")
 WORKLOADS = ("ag", "rs", "ag+rs")
 SPLIT_LAYOUTS = ("contiguous", "interleaved")
+# Split cases: each half-group alone, both half-groups running the same workload at the same
+# time, and "cross": group A all-gathers while group B reduce-scatters, at the same time.
+SPLIT_PARTS = ("A-isolated", "B-isolated", "AB-concurrent", "AB-cross")
+CROSS_PART = "AB-cross"
+CROSS_WORKLOAD = "agA-rsB"
+CROSS_GROUP_WORKLOADS = ("ag", "rs")  # per split group, A then B
 NCCL_ALGO_ENV = {"ring": "Ring", "nvls": "NVLS", "symm": None}
 
 
@@ -70,6 +76,39 @@ def split_groups(total_ranks: int, layout: str) -> tuple[list[int], list[int]]:
     raise ValueError(f"unknown split layout {layout!r}; expected one of {SPLIT_LAYOUTS}")
 
 
+def scenario_name(scenario: str, *, total_ranks: int, layout: str | None = None) -> str:
+    """Name one set of communicators: ``single-n8`` or ``split-n16-contiguous``."""
+    if scenario == "single" and layout is None:
+        return f"single-n{total_ranks}"
+    if scenario == "split" and layout in SPLIT_LAYOUTS:
+        return f"split-n{total_ranks}-{layout}"
+    raise ValueError(f"unknown scenario {scenario!r} with layout {layout!r}")
+
+
+def case_name(scenario: str, *, part: str | None, workload: str, dtype: str, size_mib: int) -> str:
+    """Name one test, e.g. ``split-n16-contiguous-AB-concurrent_ag+rs_bf16_1024MiB``.
+
+    The name is the case directory, the stem of every per-rank file in it, and (prefixed with
+    the algorithm) the outer NVTX range of the case's nsys report, so it must stay a single
+    path component. ``size_mib`` is the full tensor: AG output / RS input. The cross part takes
+    ``CROSS_WORKLOAD`` (``agA-rsB``), every other case one of ``WORKLOADS``.
+    """
+    if part is not None and part not in SPLIT_PARTS:
+        raise ValueError(f"unknown split part {part!r}; expected one of {SPLIT_PARTS}")
+    if (part == CROSS_PART) != (workload == CROSS_WORKLOAD):
+        raise ValueError(f"workload {CROSS_WORKLOAD!r} belongs to part {CROSS_PART!r} only, got {part!r}/{workload!r}")
+    if workload != CROSS_WORKLOAD:
+        workload_ops(workload)
+    prefix = scenario if part is None else f"{scenario}-{part}"
+    return f"{prefix}_{workload}_{dtype}_{size_mib}MiB"
+
+
+def rank_file(algo: str, name: str, *, rank: int, world_size: int, suffix: str) -> str:
+    """Per-rank file name ``<algo>_<name>_rank<RR><suffix>``, zero-padded so files sort by rank."""
+    width = max(2, len(str(world_size - 1)))
+    return f"{algo}_{name}_rank{rank:0{width}d}{suffix}"
+
+
 def alg_bandwidth_gb_s(*, total_bytes: int, seconds: float) -> float:
     """Full-tensor payload rate: AG output bytes or RS input bytes per second."""
     if seconds <= 0:
@@ -82,6 +121,18 @@ def bus_bandwidth_gb_s(*, total_bytes: int, group_size: int, seconds: float) -> 
     if group_size < 2:
         raise ValueError("group_size must be at least 2")
     return alg_bandwidth_gb_s(total_bytes=total_bytes, seconds=seconds) * (group_size - 1) / group_size
+
+
+def trial_concurrency(spans_by_group: Sequence[Sequence[float]]) -> list[float]:
+    """Per trial, ``min / max`` of the groups' times measured from the shared start gate.
+
+    ``spans_by_group[g][t]`` is group ``g``'s slowest-rank time in trial ``t``. Because every
+    group starts at the gate, the shorter group was running during exactly that share of the
+    longer group's time: 1 means both groups moved data for the whole trial.
+    """
+    if len(spans_by_group) < 2:
+        raise ValueError("concurrency needs at least two groups")
+    return [min(spans) / max(spans) for spans in zip(*spans_by_group, strict=True)]
 
 
 def overlap_metrics(*, ag_s: float, rs_s: float, both_s: float) -> dict[str, float]:
@@ -206,15 +257,17 @@ def kernel_rows(records: Sequence[dict[str, object]]) -> list[list[str]]:
     """Question 2, second half: which concrete kernel each family actually ran.
 
     The kernel name comes from NCCL's own log lines: ``Algo ... proto ...`` for the classic
-    collectives and ``[Symmetric]: ... -> Kernel ...`` for the window path. An empty cell means
-    the log line was not found, so the case must not be reported as that family.
+    collectives and ``[Symmetric]: ... -> Kernel ...`` for the window path. ``nccl_impl`` is
+    the value the benchmark checked against every launch of the case; older records only
+    carry the last line seen. An empty cell means the log line was not found, so the case
+    must not be reported as that family.
     """
     rows = []
     keys = {(str(r["algo"]), str(r["group_name"])) for r in records}
     for algo, group_name in sorted(keys, key=lambda k: (ALGORITHMS.index(k[0]), k[1])):
         mine = [r for r in records if r["algo"] == algo and r["group_name"] == group_name]
         evidence = {
-            str(r.get("nccl_kernel") or r.get("nccl_algo")) for r in mine if r.get("nccl_kernel") or r.get("nccl_algo")
+            str(found) for r in mine if (found := r.get("nccl_impl") or r.get("nccl_kernel") or r.get("nccl_algo"))
         }
         n_nodes = sorted({int(r["n_nodes"]) for r in mine if r.get("n_nodes") is not None})
         rows.append([algo, group_name, ",".join(map(str, n_nodes)) or "-", "; ".join(sorted(evidence)) or "-"])
@@ -224,7 +277,11 @@ def kernel_rows(records: Sequence[dict[str, object]]) -> list[list[str]]:
 def split_rows(records: Sequence[dict[str, object]]) -> list[list[str]]:
     """Question 3: each half-group alone versus both half-groups at the same time."""
     fields = ("algo", "total_ranks", "layout", "size_bytes", "workload", "group_index")
-    index = {_key(r, *fields, "phase"): r for r in records if r["scenario"] == "split"}
+    index = {
+        _key(r, *fields, "phase"): r
+        for r in records
+        if r["scenario"] == "split" and r["phase"] in ("isolated", "concurrent")
+    }
     rows = []
     for key in sorted(
         {k[:-1] for k in index},
@@ -249,18 +306,114 @@ def split_rows(records: Sequence[dict[str, object]]) -> list[list[str]]:
                 _fmt(iso_bw),
                 _fmt(conc_bw),
                 _fmt(slowdown, 3),
+                _fmt(concurrent and _optional_float(concurrent.get("concurrency")), 3),
+            ]
+        )
+    return rows
+
+
+def _optional_float(value: object) -> float | None:
+    return None if value is None else float(value)  # type: ignore[arg-type]
+
+
+def cross_rows(records: Sequence[dict[str, object]]) -> list[list[str]]:
+    """Question 4: group A all-gathers while group B reduce-scatters, each against itself alone.
+
+    The isolated references are the split cases where A ran ``ag`` alone and B ran ``rs`` alone;
+    ``slowdown = T_cross / T_isolated`` of the same group and op.
+    """
+    fields = ("algo", "total_ranks", "layout", "size_bytes", "phase", "group_index", "workload")
+    index = {_key(r, *fields): r for r in records if r["scenario"] == "split"}
+    shapes = {key[:4] for key in index if key[4] == "cross"}
+    rows = []
+    for shape in sorted(shapes, key=lambda k: (ALGORITHMS.index(str(k[0])), *k[1:])):
+        cells: list[str] = []
+        cross_bw = 0.0
+        for group_index, workload in enumerate(CROSS_GROUP_WORKLOADS):
+            cross = index.get((*shape, "cross", group_index, workload))
+            isolated = index.get((*shape, "isolated", group_index, workload))
+            slowdown = None
+            if cross and isolated:
+                slowdown = float(cross["makespan_ms"]) / float(isolated["makespan_ms"])
+            if cross:
+                cross_bw += float(cross["aggregate_busbw_gb_s"])
+            cells += [
+                _fmt(isolated and float(isolated["aggregate_busbw_gb_s"])),
+                _fmt(cross and float(cross["aggregate_busbw_gb_s"])),
+                _fmt(cross and float(cross["makespan_ms"]), 3),
+                _fmt(slowdown, 3),
+            ]
+        any_cross = index.get((*shape, "cross", 0, CROSS_GROUP_WORKLOADS[0])) or index.get(
+            (*shape, "cross", 1, CROSS_GROUP_WORKLOADS[1])
+        )
+        algo, total_ranks, layout, size_bytes = shape
+        rows.append(
+            [
+                str(algo),
+                str(total_ranks),
+                str(layout),
+                str(int(size_bytes) // BYTES_PER_MIB),
+                *cells,
+                _fmt(cross_bw),
+                _fmt(any_cross and _optional_float(any_cross.get("concurrency")), 3),
+            ]
+        )
+    return rows
+
+
+def completion_rows(records: Sequence[dict[str, object]]) -> list[list[str]]:
+    """Table 0: every test and group with its completion time per iteration over the trials.
+
+    ``mean`` is the arithmetic mean over trials of the slowest rank's per-iteration time; the
+    bandwidth columns in this table are computed from that mean, every op of the workload
+    contributing ``size`` (algbw) or ``size * (n-1)/n`` (busbw).
+    """
+    rows = []
+    ordered = sorted(
+        records,
+        key=lambda r: (ALGORITHMS.index(str(r["algo"])), str(r.get("case") or ""), str(r["group_name"])),
+    )
+    for r in ordered:
+        trials = [float(t) for t in r["trial_makespan_ms"]]  # type: ignore[union-attr]
+        mean_ms = float(r.get("mean_makespan_ms") or sum(trials) / len(trials))  # type: ignore[arg-type]
+        size_bytes, group_size = int(r["size_bytes"]), int(r["group_size"])  # type: ignore[arg-type]
+        n_ops = len(workload_ops(str(r["workload"])))
+        algbw = n_ops * alg_bandwidth_gb_s(total_bytes=size_bytes, seconds=mean_ms / 1e3)
+        rows.append(
+            [
+                str(r["algo"]),
+                str(r.get("case") or "-"),
+                str(r["group_name"]),
+                str(r.get("phase") or "-"),
+                str(group_size),
+                str(r["workload"]),
+                str(size_bytes // BYTES_PER_MIB),
+                f"{len(trials)}x{r['iters']}",
+                _fmt(mean_ms, 3),
+                _fmt(float(r["makespan_ms"]), 3),  # type: ignore[arg-type]
+                _fmt(min(trials), 3),
+                _fmt(max(trials), 3),
+                _fmt(algbw),
+                _fmt(algbw * (group_size - 1) / group_size),
+                _fmt(_optional_float(r.get("concurrency")), 3),
             ]
         )
     return rows
 
 
 def render_report(records: Sequence[dict[str, object]]) -> str:
-    """Render the three comparison tables as Markdown."""
+    """Render the comparison tables as Markdown."""
     profiled = sorted({str(r["algo"]) for r in records if r.get("profiled")})
     lines = [
         "# AG / RS: ring vs NVLS vs symmetric memory",
         "",
-        "busbw = size * (n-1)/n / t, decimal GB/s, median over trials; size is the full tensor.",
+        "计时：每个 trial 先过一次全 scenario 的 GPU 同步起点（1 元素 all-reduce），再背靠背发 iters 次；",
+        "t = (该 rank 所有 op 完成 − 起点) / iters，trial 内取组内最慢 rank。除表 0 外各表取 trials 的中位数。",
+        "",
+        "换算：size = 完整张量（AG 每卡接收总量 / RS 每卡输入总量），每卡 shard = size/n，十进制 GB/s：",
+        "algbw = size / t；busbw = size·(n−1)/n / t（nccl-tests 定义，= 每卡实际收/发字节数 / t）；",
+        "ag+rs 的 aggregate busbw = 两个 op 的 size·(n−1)/n 之和 / makespan；不同组的带宽不相加，需要时自己把各组行相加。",
+        "concurrency = min(T_A, T_B) / max(T_A, T_B)：两组从同一起点出发，1 表示两组全程同时在跑。",
         "",
     ]
     if profiled:
@@ -270,6 +423,34 @@ def render_report(records: Sequence[dict[str, object]]) -> str:
             "",
         ]
     lines += [
+        "## 0. 每个测试的完成时间",
+        "",
+        "mean/median/min/max：各 trial（每个 trial 取组内最慢 rank）的每次迭代完成时间，单位 ms；",
+        "本表的 algbw/busbw 用 mean 计算。",
+        "",
+    ]
+    lines += _table(
+        [
+            "algo",
+            "case",
+            "group",
+            "phase",
+            "ranks",
+            "workload",
+            "MiB",
+            "trials x iters",
+            "mean ms",
+            "median ms",
+            "min ms",
+            "max ms",
+            "algbw",
+            "busbw",
+            "concurrency",
+        ],
+        completion_rows(records),
+    )
+    lines += [
+        "",
         "## 1. AG、RS 单独与同时发起",
         "",
         "speedup = (T_AG + T_RS) / T_AG+RS；1 表示完全串行，overlap_fraction = 1 表示短的操作被完全隐藏。",
@@ -307,7 +488,8 @@ def render_report(records: Sequence[dict[str, object]]) -> str:
             "",
             "### 2b. 实际执行的内核（来自 NCCL TUNING 日志，非环境变量推断）",
             "",
-            "nNodes > 1 的 symm 行不是平铺对称内存结果：NCCL 2.28.9 对多节点 communicator 摘掉 LSA 内核。",
+            "每个 case 的每次 launch 都已核对：ring 只能是 Ring/*，nvls 只能是 NVLS/*，symm 只能是对称内核，"
+            "任何 CopyEngine 或回退到经典内核的 launch 都会让该 case 失败，不会出现在这里。",
             "",
         ]
         lines += _table(["algo", "group", "nNodes", "kernel evidence"], kernel_table)
@@ -319,8 +501,46 @@ def render_report(records: Sequence[dict[str, object]]) -> str:
         "",
     ]
     lines += _table(
-        ["algo", "total", "layout", "MiB", "workload", "group", "isolated busbw", "concurrent busbw", "slowdown"],
+        [
+            "algo",
+            "total",
+            "layout",
+            "MiB",
+            "workload",
+            "group",
+            "isolated busbw",
+            "concurrent busbw",
+            "slowdown",
+            "concurrency",
+        ],
         split_rows(records),
+    )
+    lines += [
+        "",
+        "## 4. 两组同时：A 组 all-gather，B 组 reduce-scatter",
+        "",
+        "isolated 是同一组单独跑同一个 op（split 的 A-isolated ag、B-isolated rs）；"
+        "slowdown = T_cross / T_isolated；A+B busbw 是两组 busbw 之和。",
+        "",
+    ]
+    lines += _table(
+        [
+            "algo",
+            "total",
+            "layout",
+            "MiB",
+            "A AG isolated busbw",
+            "A AG cross busbw",
+            "A AG cross ms",
+            "A slowdown",
+            "B RS isolated busbw",
+            "B RS cross busbw",
+            "B RS cross ms",
+            "B slowdown",
+            "A+B cross busbw",
+            "concurrency",
+        ],
+        cross_rows(records),
     )
     return "\n".join(lines) + "\n"
 

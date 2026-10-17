@@ -24,7 +24,10 @@ is started, because NCCL_ALGO is fixed when a communicator is created. Node 0 me
 results into compare.md.
 
 Output: results/gb200/nvls-collective/gpu-num-<nnodes*gpus-per-node>/<yymmdd-hhmmss> in this
-repo. Node 0 stamps the id and hands it to the other nodes through the run_timestamp_and_logs
+repo, one <algo>/ per family. Each test gets <algo>/cases/<case>/ (e.g.
+symm/cases/single-n16_ag_bf16_1024MiB/) with every member rank's NCCL log of that test,
+case.json and, with --nsys, the per-rank reports <algo>_<case>_rank<RR>.nsys-rep. A test fails
+unless NCCL's TUNING log shows the expected implementation for every launch. Node 0 stamps the id and hands it to the other nodes through the run_timestamp_and_logs
 helper (TCPStore on MASTER_ADDR:<master-port - 1>), so the repo must be on storage every node
 can see. An exported RUN_TIME pins it, which is what a re-run of one comparison needs.
 
@@ -44,13 +47,15 @@ Options:
   --group-sizes LIST      Single-group sizes (default: 4,8,16,32 capped at nnodes*gpus-per-node)
   --split-totals LIST     Ranks shared by two concurrent half-groups (default: 16 if available)
   --split-layouts LIST    contiguous,interleaved (default: contiguous)
-  --workloads LIST        ag,rs,ag+rs (default: all)
+  --workloads LIST        ag,rs,ag+rs (default: all); with both ag and rs, split scenarios also run
+                          the cross case (group A all-gathers while group B reduce-scatters)
   --sizes-mib LIST        Full tensor sizes in MiB (default: 16,64,256,1024)
   --dtype bf16|fp32       Payload dtype (default: bf16)
   --warmup N              Untimed iterations per case (default: 5)
   --iters N               Back-to-back iterations per trial (default: 20)
   --trials N              Timed trials, median reported (default: 5)
-  --symm-kernel KERNEL    For the symm pass: default, ag or rs (pins NCCL_SYM_KERNEL)
+  --symm-kernel KERNEL    For the symm pass: default, ag or rs (pins NCCL_SYM_KERNEL); needs
+                          --workloads with that op only, because the pin masks the other op
   --nsys                  One Nsight Systems report per rank per case (capture range = timed trials);
                           node 0 then exports them to SQLite and writes nsys_kernels.md
   --dry-run               Print commands only
@@ -158,6 +163,10 @@ case "$symm_kernel" in
     rs) symm_kernel_env="ReduceScatter_LDMC" ;;
     *) die "--symm-kernel accepts default, ag or rs; got $symm_kernel" ;;
 esac
+# Fail before the ring/nvls passes run: the benchmark rejects this in the symm pass anyway.
+if [[ "$symm_kernel" != default && "$workloads" != "$symm_kernel" ]]; then
+    die "--symm-kernel ${symm_kernel} masks the other op's symmetric kernels; pass --workloads ${symm_kernel}"
+fi
 if (( nnodes > 1 )) && [[ "$master_addr" == 127.0.0.1 ]]; then
     die "multi-node runs require --master-addr or MASTER_ADDR"
 fi
@@ -271,6 +280,9 @@ for index in "${!algo_list[@]}"; do
         # multicast (MC) symmetric kernels eligible; NCCL_WIN_ENABLE turns on window registration.
         symm) nccl_algo=""; nvls_enable=1; win_enable=1 ;;
     esac
+    # Whole-process NCCL logs; the benchmark copies each test's slice into <algo>/cases/<case>/.
+    nccl_raw_dir="${algo_dir}/nccl-raw"
+    $DRY_RUN || mkdir -p "$nccl_raw_dir"
     algo_env=(
         NCCL_ALGO="$nccl_algo"
         NCCL_NVLS_ENABLE="$nvls_enable"
@@ -279,11 +291,15 @@ for index in "${!algo_list[@]}"; do
         NCCL_LAUNCH_ORDER_IMPLICIT=1
         NCCL_DEBUG=INFO
         NCCL_DEBUG_SUBSYS="$debug_subsys"
-        NCCL_DEBUG_FILE="${algo_dir}/nccl-%h-%p.log"
+        NCCL_DEBUG_FILE="${nccl_raw_dir}/nccl-%h-%p.log"
         GLOO_SOCKET_IFNAME="$gloo_ifname"
         NCCL_SOCKET_IFNAME="$nccl_socket_ifname"
     )
     [[ -n "$win_enable" ]] && algo_env+=(NCCL_WIN_ENABLE="$win_enable")
+    # Without this, an AllGather whose per-rank count exceeds 8Mi elements runs on the copy
+    # engines (enqueue.cc, Blackwell + NVLink + registered window) and never reaches a
+    # symmetric kernel, whatever NCCL_SYM_KERNEL says. INT64_MAX disables that branch.
+    [[ -n "$win_enable" ]] && algo_env+=(NCCL_SYM_CE_THRESHOLD=9223372036854775807)
     [[ -n "$win_enable" && -n "$symm_kernel_env" ]] && algo_env+=(NCCL_SYM_KERNEL="$symm_kernel_env")
     # Cross-tray groups must use the NVLink fabric; forcing MNNVL makes a fallback to IB fail.
     (( nnodes > 1 )) && algo_env+=(NCCL_MNNVL_ENABLE=1)
