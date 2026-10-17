@@ -43,7 +43,9 @@ script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 repo_root="$(cd -- "${script_dir}/.." && pwd)"
 dest="${repo_root}/nccl/nccl-2.32.3"
 cuda_home="${CUDA_HOME:-/usr/local/cuda}"
-jobs="$(nproc 2>/dev/null || echo 16)"
+# GNU nproc returns OMP_NUM_THREADS when it is set, and training environments usually export
+# OMP_NUM_THREADS=1; drop it (and OMP_THREAD_LIMIT) so only the CPU affinity mask counts.
+jobs="$(env -u OMP_NUM_THREADS -u OMP_THREAD_LIMIT nproc 2>/dev/null || echo 16)"
 check_only=false
 
 die() {
