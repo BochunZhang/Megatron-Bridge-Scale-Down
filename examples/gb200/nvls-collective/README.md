@@ -92,7 +92,7 @@ NCCL 2.29.7 在挑对称内核**之前**就有一个分支（`src/enqueue.cc:296
 - 这个分支不看 `NCCL_SYM_KERNEL`，所以固定 `AllGather_STMC` 也拦不住。
 - ReduceScatter 没有 CE 实现（`ncclCeImplemented` 只有 AG/AlltoAll/Scatter/Gather）。
 
-默认 sizes 下若不处理，n=4/8 的 256、1024 MiB 和 n=16/32 的 1024 MiB AG 都会是 CE。launcher 给
+默认 sizes（16–2048 MiB）下若不处理，bf16 时 n=4 的 ≥128 MiB、n=8 的 ≥256 MiB、n=16 的 ≥512 MiB、n=32 的 ≥1024 MiB AG 都会是 CE。另外 2048 MiB 时 `nRanks × shard = 2 GiB`，NCCL 会去掉对称 LL 内核（LL 用 32 位计数，`sym_kernels.cc` 的 `nBusBytes >= 2<<30`），只剩 ST/STMC。launcher 给
 symm 设 `NCCL_SYM_CE_THRESHOLD=9223372036854775807`，程序也要求它不小于最大 payload 字节数，
 否则拒绝启动；万一仍出现 `AllGather [Copy Engine]` 行，实现校验会让该 case 失败。
 
@@ -155,7 +155,7 @@ DLC 会注入 `MASTER_ADDR` 和 `RANK`/`NODE_RANK`，所以不用再传 `--maste
 
 ```bash
 bash examples/gb200/nvls-collective/run_nvls_collective_benchmark.sh \
-  --algos ring,symm --group-sizes 4 --sizes-mib 16,64,256,1024
+  --algos ring,symm --group-sizes 4
 ```
 
 16 卡（4 节点 × 4 卡）时只看问题 3：
@@ -171,7 +171,7 @@ bash examples/gb200/nvls-collective/run_nvls_collective_benchmark.sh \
 
 ### 输出目录（不需要指定）
 
-固定为仓库内 `results/gb200/nvls-collective/gpu-num-<总卡数>/<yymmdd-hhmmss>`，时间戳由
+固定为仓库内 `results/gb200/nvls-collective/gpu-num-<总卡数>/<yyyymmdd-hhmmss>`，时间戳由
 [`scripts/scale-down/common/run_timestamp_and_logs.sh`](../../scripts/scale-down/common/run_timestamp_and_logs.sh)
 的 `resolve_run_time` 给出——**和 scale-down 实验脚本用的是同一个 run id**：
 
@@ -344,7 +344,7 @@ busbw = 357.9 × 7/8 = 313.2 GB/s。表 1–4 用 trial 中位数换算，表 0 
 ## 输出与验收
 
 ```text
-results/gb200/nvls-collective/gpu-num-<W>/<yymmdd-hhmmss>/
+results/gb200/nvls-collective/gpu-num-<W>/<yyyymmdd-hhmmss>/
   ring/
     results.jsonl  metadata.json               # 只由全局 rank 0 写
     torchrun-node<k>.log                       # 每个节点一份

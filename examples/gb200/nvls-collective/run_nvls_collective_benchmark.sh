@@ -23,7 +23,7 @@ Run the same command on every node (DLC style). For each algorithm a fresh torch
 is started, because NCCL_ALGO is fixed when a communicator is created. Node 0 merges the
 results into compare.md.
 
-Output: results/gb200/nvls-collective/gpu-num-<nnodes*gpus-per-node>/<yymmdd-hhmmss> in this
+Output: results/gb200/nvls-collective/gpu-num-<nnodes*gpus-per-node>/<yyyymmdd-hhmmss> in this
 repo, one <algo>/ per family. Each test gets <algo>/cases/<case>/ (e.g.
 symm/cases/single-n16_ag_bf16_1024MiB/) with every member rank's NCCL log of that test,
 case.json and, with --nsys, the per-rank reports <algo>_<case>_rank<RR>.nsys-rep. A test fails
@@ -49,7 +49,7 @@ Options:
   --split-layouts LIST    contiguous,interleaved (default: contiguous)
   --workloads LIST        ag,rs,ag+rs (default: all); with both ag and rs, split scenarios also run
                           the cross case (group A all-gathers while group B reduce-scatters)
-  --sizes-mib LIST        Full tensor sizes in MiB (default: 16,64,256,1024)
+  --sizes-mib LIST        Full tensor sizes in MiB (default: 16,32,64,128,256,512,1024,2048)
   --dtype bf16|fp32       Payload dtype (default: bf16)
   --warmup N              Untimed iterations per case (default: 5)
   --iters N               Back-to-back iterations per trial (default: 20)
@@ -101,7 +101,7 @@ group_sizes=""
 split_totals=""
 split_layouts="contiguous"
 workloads="ag,rs,ag+rs"
-sizes_mib="16,64,256,1024"
+sizes_mib="16,32,64,128,256,512,1024,2048"
 dtype="bf16"
 warmup="5"
 iters="20"
@@ -221,7 +221,7 @@ export NNODES="$nnodes"
 export NODE_RANK="$node_rank"
 export GLOO_SOCKET_IFNAME="$gloo_ifname"
 resolve_run_time "$DRY_RUN"
-# <yymmdd-hhmmss> keeps each job's directory unique without scanning the tree, so a re-run of
+# <yyyymmdd-hhmmss> keeps each job's directory unique without scanning the tree, so a re-run of
 # the same comparison gets a new one; export RUN_TIME to write into a specific id instead.
 output_dir="${results_root}/gpu-num-${world_size}/${RUN_TIME}"
 [[ -n "$RUN_TIME" ]] || die "could not resolve the run id"

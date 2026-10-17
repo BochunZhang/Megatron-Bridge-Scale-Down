@@ -239,7 +239,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Per-group workloads; split scenarios also run the AG-on-A / RS-on-B cross case when ag and rs are both listed",
     )
     parser.add_argument(
-        "--sizes-mib", type=_csv_ints, default=[16, 64, 256, 1024], help="Full tensor: AG output / RS input per rank"
+        "--sizes-mib",
+        type=_csv_ints,
+        default=[16, 32, 64, 128, 256, 512, 1024, 2048],
+        help="Full tensor: AG output / RS input per rank",
     )
     parser.add_argument("--dtype", choices=sorted(DTYPES), default="bf16")
     parser.add_argument("--warmup", type=int, default=5, help="Untimed iterations before every trial set")

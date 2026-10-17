@@ -130,7 +130,7 @@ def test_defaults_cover_the_requested_matrix():
     assert args.split_totals == [16]
     assert args.split_layouts == ["contiguous"]
     assert args.workloads == ["ag", "rs", "ag+rs"]
-    assert args.sizes_mib == [16, 64, 256, 1024]
+    assert args.sizes_mib == [16, 32, 64, 128, 256, 512, 1024, 2048]
     assert args.dtype == "bf16"
     assert args.symm_kernel == "default"
     assert args.nsys is False
