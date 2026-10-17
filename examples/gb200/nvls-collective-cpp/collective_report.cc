@@ -13,7 +13,7 @@
 // limitations under the License.
 
 // Merge the per-impl results.jsonl files of one run into compare.md (the tables of
-// ../nvls-collective/collective_metrics.py, plus 2a: TMA / CE AllGather against stmc).
+// ../nvls-collective/collective_metrics.py, plus 2a: TMA / CE AllGather against symmetric).
 //
 //   collective_report --input ring=<dir>/ring/results.jsonl --input tma=<dir>/tma/results.jsonl ... \
 //       --output <dir>/compare.md
@@ -102,8 +102,39 @@ std::vector<std::string> presentImpls(const std::vector<Row>& rows) {
 
 Opt aggregate(const Row* row) { return optNum(row, "aggregate_busbw_gb_s"); }
 
+std::map<std::string, std::string> kernelsOf(const Row* row) {
+  return row ? recordKernels(row->at("nccl_impl"), row->at("dtype")) : std::map<std::string, std::string>{};
+}
+
+std::string opLabel(const std::string& op) {
+  std::string label = op;
+  for (char& c : label) c = char(std::toupper((unsigned char)c));
+  return label;
+}
+
+// All kernels of a record: the single op's kernel, or "AG <k>; RS <k>" for the ag+rs pair.
+std::string kernelSummary(const Row& row) {
+  auto kernels = kernelsOf(&row);
+  if (kernels.empty()) return "-";
+  if (kernels.size() == 1) return kernels.begin()->second;
+  std::string out;
+  for (const std::string& op : {"ag", "rs", "ar"}) {
+    if (kernels.count(op)) out += (out.empty() ? "" : "; ") + opLabel(op) + " " + kernels.at(op);
+  }
+  return out;
+}
+
+// Kernel of op in its isolated case; the AG+RS pair is added only if it ran another one.
+std::string kernelCell(const std::string& op, const Row* isolated, const Row* pair = nullptr) {
+  auto alone = kernelsOf(isolated), together = kernelsOf(pair);
+  std::string a = alone.count(op) ? alone.at(op) : "", t = together.count(op) ? together.at(op) : "";
+  if (!t.empty() && t != a) return (a.empty() ? "-" : a) + "（pair：" + t + "）";
+  return a.empty() ? "-" : a;
+}
+
 // Table 0: every test and group with its completion time per iteration over the trials. The
-// bandwidth columns use the mean, every op of the workload contributing size (algbw).
+// bandwidth columns use the mean, every op of the workload contributing its own bus traffic:
+// size * (n-1)/n for AG and RS, twice that for AR.
 void completionTable(std::ostream& out, const std::vector<Row>& rows) {
   std::vector<const Row*> ordered;
   for (const Row& r : rows) ordered.push_back(&r);
@@ -117,18 +148,22 @@ void completionTable(std::ostream& out, const std::vector<Row>& rows) {
     double meanMs = optNum(r, "mean_makespan_ms").value_or(mean(trials));
     size_t bytes = std::stoull(r->at("size_bytes"));
     int n = std::stoi(r->at("group_size"));
-    double algbw = workloadOps(r->at("workload")).size() * algBandwidthGBs(double(bytes), meanMs / 1e3);
+    std::vector<std::string> ops = workloadOps(r->at("workload"));
+    double algbw = ops.size() * algBandwidthGBs(double(bytes), meanMs / 1e3);
+    double busbw = 0;
+    for (const std::string& op : ops) busbw += opBusBandwidthGBs(op, double(bytes), n, meanMs / 1e3);
     body.push_back({r->at("algo"), r->at("case"), r->at("group_name"), r->at("phase"), std::to_string(n),
                     r->at("workload"), std::to_string(bytes / kBytesPerMiB), std::to_string(trials.size()) + "x" + r->at("iters"),
                     fmt(meanMs, 3), fmt(num(*r, "makespan_ms"), 3), fmt(*std::min_element(trials.begin(), trials.end()), 3),
-                    fmt(*std::max_element(trials.begin(), trials.end()), 3), fmt(algbw, 1),
-                    fmt(algbw * (n - 1) / n, 1), cell(optNum(r, "concurrency"), 3)});
+                    fmt(*std::max_element(trials.begin(), trials.end()), 3), fmt(algbw, 1), fmt(busbw, 1),
+                    cell(optNum(r, "concurrency"), 3), kernelSummary(*r)});
   }
   table(out, {"algo", "case", "group", "phase", "ranks", "workload", "MiB", "trials x iters", "mean ms", "median ms",
-              "min ms", "max ms", "algbw", "busbw", "concurrency"},
+              "min ms", "max ms", "algbw", "busbw", "concurrency", "kernel"},
         body);
 }
 
+// Table 1: isolated AG / RS / AR versus AG and RS issued together on one group.
 void singleTable(std::ostream& out, const std::vector<Row>& rows) {
   auto index = singleIndex(rows);
   std::set<std::tuple<int, int, size_t>> keys;
@@ -142,6 +177,7 @@ void singleTable(std::ostream& out, const std::vector<Row>& rows) {
     size_t bytes = std::get<2>(k);
     const Row* ag = lookup(index, {impl, n, bytes, "ag"});
     const Row* rs = lookup(index, {impl, n, bytes, "rs"});
+    const Row* ar = lookup(index, {impl, n, bytes, "ar"});
     const Row* both = lookup(index, {impl, n, bytes, "ag+rs"});
     Opt speedup, overlap;
     if (ag && rs && both) {
@@ -150,11 +186,13 @@ void singleTable(std::ostream& out, const std::vector<Row>& rows) {
       overlap = (a + r - b) / std::min(a, r);
     }
     body.push_back({impl, std::to_string(n), std::to_string(bytes / kBytesPerMiB), cell(optNum(ag, "ag_busbw_gb_s")),
-                    cell(optNum(rs, "rs_busbw_gb_s")), cell(optNum(both, "ag_busbw_gb_s")),
-                    cell(optNum(both, "rs_busbw_gb_s")), cell(aggregate(both)), cell(speedup, 2), cell(overlap, 2)});
+                    cell(optNum(rs, "rs_busbw_gb_s")), cell(optNum(ar, "ar_busbw_gb_s")),
+                    cell(optNum(both, "ag_busbw_gb_s")), cell(optNum(both, "rs_busbw_gb_s")), cell(aggregate(both)),
+                    cell(speedup, 2), cell(overlap, 2), kernelCell("ag", ag, both), kernelCell("rs", rs, both),
+                    kernelCell("ar", ar)});
   }
-  table(out, {"algo", "ranks", "MiB", "AG busbw", "RS busbw", "AG in pair", "RS in pair", "pair aggregate", "speedup",
-              "overlap_fraction"},
+  table(out, {"algo", "ranks", "MiB", "AG busbw", "RS busbw", "AR busbw", "AG in pair", "RS in pair", "pair aggregate",
+              "speedup", "overlap_fraction", "AG kernel", "RS kernel", "AR kernel"},
         body);
 }
 
@@ -236,22 +274,27 @@ SplitShape splitShape(const Row& r) {
   return {implRank(r.at("algo")), std::stoi(r.at("total_ranks")), r.at("layout"), std::stoull(r.at("size_bytes"))};
 }
 
+// Table 3: both half-groups at the same time versus one group of the same size alone.
+// The isolated reference of either half of a T-rank split is the single group of T/2 ranks with
+// the same size and workload; slowdown = T_concurrent / T_single.
 void splitTable(std::ostream& out, const std::vector<Row>& rows) {
+  auto single = singleIndex(rows);
   using Key = std::tuple<SplitShape, int, int>;  // shape, workload, group_index
-  std::map<Key, std::map<std::string, const Row*>> index;
+  std::map<Key, const Row*> index;
   for (const Row& r : rows) {
-    if (r.at("scenario") != "split" || (r.at("phase") != "isolated" && r.at("phase") != "concurrent")) continue;
-    index[{splitShape(r), workloadRank(r.at("workload")), std::stoi(r.at("group_index"))}][r.at("phase")] = &r;
+    if (r.at("scenario") != "split" || r.at("phase") != "concurrent") continue;
+    index[{splitShape(r), workloadRank(r.at("workload")), std::stoi(r.at("group_index"))}] = &r;
   }
   std::vector<std::vector<std::string>> body;
   for (const auto& item : index) {
-    const Row* iso = item.second.count("isolated") ? item.second.at("isolated") : nullptr;
-    const Row* conc = item.second.count("concurrent") ? item.second.at("concurrent") : nullptr;
+    const SplitShape& s = std::get<0>(item.first);
+    const std::string& workload = workloads()[std::get<1>(item.first)];
+    const Row* conc = item.second;
+    const Row* iso = lookup(single, {implName(std::get<0>(s)), std::get<1>(s) / 2, std::get<3>(s), workload});
     Opt slowdown;
     if (iso && conc) slowdown = num(*conc, "makespan_ms") / num(*iso, "makespan_ms");
-    const SplitShape& s = std::get<0>(item.first);
     body.push_back({implName(std::get<0>(s)), std::to_string(std::get<1>(s)), std::get<2>(s),
-                    std::to_string(std::get<3>(s) / kBytesPerMiB), workloads()[std::get<1>(item.first)],
+                    std::to_string(std::get<3>(s) / kBytesPerMiB), workload,
                     std::string(1, "AB"[std::get<2>(item.first)]), cell(aggregate(iso)), cell(aggregate(conc)),
                     cell(slowdown, 3), cell(optNum(conc, "concurrency"), 3)});
   }
@@ -260,21 +303,18 @@ void splitTable(std::ostream& out, const std::vector<Row>& rows) {
         body);
 }
 
-// Table 4: group A all-gathers while group B reduce-scatters, each against the same group running
-// the same op alone (split A-isolated ag, B-isolated rs).
+// Table 4: group A all-gathers while group B reduce-scatters, each against a single group of
+// T/2 ranks running the same op alone (single-n<T/2> ag for A, rs for B).
 void crossTable(std::ostream& out, const std::vector<Row>& rows) {
-  using Key = std::tuple<SplitShape, std::string, int, std::string>;  // shape, phase, group_index, workload
+  auto single = singleIndex(rows);
+  using Key = std::tuple<SplitShape, int, std::string>;  // shape, group_index, workload
   std::map<Key, const Row*> index;
   std::set<SplitShape> crossShapes;
   for (const Row& r : rows) {
-    if (r.at("scenario") != "split") continue;
-    index[{splitShape(r), r.at("phase"), std::stoi(r.at("group_index")), r.at("workload")}] = &r;
-    if (r.at("phase") == "cross") crossShapes.insert(splitShape(r));
+    if (r.at("scenario") != "split" || r.at("phase") != "cross") continue;
+    index[{splitShape(r), std::stoi(r.at("group_index")), r.at("workload")}] = &r;
+    crossShapes.insert(splitShape(r));
   }
-  auto get = [&](const Key& k) -> const Row* {
-    auto it = index.find(k);
-    return it == index.end() ? nullptr : it->second;
-  };
   std::vector<std::vector<std::string>> body;
   for (const SplitShape& s : crossShapes) {
     std::vector<std::string> line = {implName(std::get<0>(s)), std::to_string(std::get<1>(s)), std::get<2>(s),
@@ -283,8 +323,9 @@ void crossTable(std::ostream& out, const std::vector<Row>& rows) {
     Opt concurrency;
     for (int g = 0; g < 2; g++) {
       const std::string& w = crossGroupWorkloads()[g];
-      const Row* cross = get({s, "cross", g, w});
-      const Row* iso = get({s, "isolated", g, w});
+      auto it = index.find({s, g, w});
+      const Row* cross = it == index.end() ? nullptr : it->second;
+      const Row* iso = lookup(single, {implName(std::get<0>(s)), std::get<1>(s) / 2, std::get<3>(s), w});
       Opt slowdown;
       if (cross && iso) slowdown = num(*cross, "makespan_ms") / num(*iso, "makespan_ms");
       if (cross) {
@@ -356,12 +397,13 @@ int main(int argc, char** argv) {
     if (r.at("profiled") == "true") profiled.insert(r.at("algo"));
   }
   std::ofstream out(output);
-  out << "# AG / RS on GB200 with NCCL 2.32.3: ring vs NVLS vs symmetric kernels (STMC / TMA / CE)\n\n"
+  out << "# AG / RS / AR on GB200 with NCCL 2.32.3: ring vs NVLS vs symmetric kernels (multimem / TMA / CE)\n\n"
       << "计时：每个 trial 先过一次全 scenario 的 GPU 同步起点（1 元素 all-reduce），再背靠背发 iters 次；\n"
       << "t = (该 rank 所有 op 完成 − 起点) / iters，trial 内取组内最慢 rank。除表 0 外各表取 trials 的中位数。\n\n"
-      << "换算：size = 完整张量（AG 每卡接收总量 / RS 每卡输入总量），每卡 shard = size/n，十进制 GB/s：\n"
-      << "algbw = size / t；busbw = size·(n−1)/n / t（nccl-tests 定义，= 每卡实际收/发字节数 / t）；\n"
-      << "ag+rs 的 aggregate busbw = 两个 op 的 size·(n−1)/n 之和 / makespan；不同组的带宽不相加，需要时自己把各组行相加。\n"
+      << "换算：size = 完整张量（AG 每卡接收总量 / RS 每卡输入总量 / AR 每卡归约总量），十进制 GB/s：\n"
+      << "AG、RS 每卡 shard = size/n，busbw = size·(n−1)/n / t（nccl-tests 定义，= 每卡实际收/发字节数 / t）；\n"
+      << "AR 没有分片，每卡归约整块 size，busbw = 2·size·(n−1)/n / t（收、发各算一次，nccl-tests 的 all-reduce 口径）；\n"
+      << "ag+rs 的 aggregate busbw = 两个 op 的 busbw 之和 / makespan；不同组的带宽不相加，需要时自己把各组行相加。\n"
       << "concurrency = min(T_A, T_B) / max(T_A, T_B)：两组从同一起点出发，1 表示两组全程同时在跑。\n\n";
   if (!profiled.empty()) {
     std::string list;
@@ -371,31 +413,44 @@ int main(int argc, char** argv) {
   }
   out << "## 0. 每个测试的完成时间\n\n"
       << "mean/median/min/max：各 trial（每个 trial 取组内最慢 rank）的每次迭代完成时间，单位 ms；\n"
-      << "本表的 algbw/busbw 用 mean 计算。\n\n";
+      << "本表的 algbw/busbw 用 mean 计算。\n\n"
+      << "kernel：该组 comm rank 0 的 NCCL TUNING 日志里，本 case 每一次 launch（含 warmup）记录的实现，\n"
+      << "换算成 NCCL 2.32.3 实际运行的函数名，不是由环境变量推断：\n"
+      << "对称路径是对称内核 `ncclSymkDevKernel_<Coll>_<algo>`（launch 的就是它）；ring/nvls 是经典路径真正执行的\n"
+      << "设备函数 `ncclDevFunc_<Coll>_<ALGO>_<PROTO>`——经典路径每个 collective 只 launch 一个特化 kernel\n"
+      << "（如 `ncclDevKernel_AllGather_RING_LL`，nsys 里看到的就是这个名字），再按 funcId 分发到该设备函数，\n"
+      << "所以 nvls 的 AG 在 nsys 里也叫 `*_RING_LL`。copy-engine 的 AllGather 是 cudaMemcpy，没有 kernel。\n"
+      << "一个 op 出现多种实现时用 `\\|` 全部列出；`-` 表示没有日志证据。\n\n";
   completionTable(out, rows);
-  out << "\n## 1. AG、RS 单独与同时发起\n\n"
-      << "speedup = (T_AG + T_RS) / T_AG+RS；1 表示完全串行，overlap_fraction = 1 表示短的操作被完全隐藏。\n\n";
+  out << "\n## 1. AG、RS、AR 单独与 AG+RS 同时发起\n\n"
+      << "speedup = (T_AG + T_RS) / T_AG+RS；1 表示完全串行，overlap_fraction = 1 表示短的操作被完全隐藏。\n"
+      << "AR busbw 已按 all-reduce 口径乘 2，可直接和 AG/RS 的 busbw 比。\n"
+      << "AG/RS/AR kernel：单独跑该 op 那个 case 的实际函数（来源同表 0）；AG+RS 同时发起时若换了实现，括号里注明。\n\n";
   singleTable(out, rows);
   out << "\n## 1b. 各实现的绝对吞吐（aggregate busbw）\n\n";
   bestTable(out, rows, present);
-  out << "\n## 2. 各实现相对 ring（aggregate busbw）\n\n";
+  out << "\n## 2. 各实现相对 ring（aggregate busbw）\n\n"
+      << "symmetric / symmetric-tma / copy-engine 是 window 注册的对称内存路径，与 ring/NVLS 走不同内核家族；"
+      << "它们的绝对列见 1b，上面的比值只是和 ring 放在同一口径下的对照。\n\n";
   std::vector<std::string> all;
   for (const Impl& impl : impls()) all.push_back(impl.name);
   ratioTable(out, rows, present, "ring", all);
-  out << "\n## 2a. TMA / CE AllGather 相对寄存器 multimem.st（stmc）\n\n"
-      << "四个实现的 ReduceScatter 都固定为 ReduceScatter_LDMC（multimem.ld_reduce），所以 rs 行应接近 1，"
-      << "ag 与 ag+rs 行的差异只来自 AllGather 的数据搬运方式：stmc = SM 寄存器 multimem.st，"
-      << "tma = TMA cp.async.bulk 写 multicast 地址，ce = copy engine 写 multicast 地址，ce-uc = copy engine 写 N-1 份 unicast。\n\n";
-  ratioTable(out, rows, present, "stmc", {"tma", "ce", "ce-uc"});
+  out << "\n## 2a. TMA / CE AllGather 相对寄存器 multimem.st（symmetric）\n\n"
+      << "三个对称实现的 ReduceScatter 都固定为 ReduceScatter_LDMC（multimem.ld_reduce），symmetric-tma 与 copy-engine "
+      << "只测 ag 和 ag+rs，差异只来自 AllGather 的数据搬运方式：symmetric = SM 寄存器 multimem.st，"
+      << "symmetric-tma = TMA cp.async.bulk 写 multicast 地址，copy-engine = copy engine 写 multicast 地址。\n\n";
+  ratioTable(out, rows, present, "symmetric", {"symmetric-tma", "copy-engine"});
   out << "\n### 2b. 实际执行的内核（来自 NCCL TUNING 日志，非环境变量推断）\n\n"
-      << "每个 case 的每次 launch 都已核对：每个实现只接受它固定的内核（tma 只能是 AllGather_TmaSTMC，"
-      << "ce 只能是带 NVLS 同步的 Copy Engine 等），不符合的 case 会让整次运行失败，不会出现在这里。\n\n";
+      << "每个 case 的每次 launch 都已核对：ring 只能是 Ring/*，nvls 只能是 NVLS/*，symmetric-tma 只能是 "
+      << "AllGather_TmaSTMC，copy-engine 只能是带 NVLS 同步的 Copy Engine 等（`bench_core.h` `impls()`），"
+      << "任何回退到其他实现的 launch 都会让该 case 失败，不会出现在这里。\n\n";
   kernelTable(out, rows);
-  out << "\n## 3. 两个半组同时运行同一负载\n\n"
-      << "slowdown = T_concurrent / T_isolated（同一组自身的 makespan），1 表示没有相互干扰。\n\n";
+  out << "\n## 3. 两个半组同时运行\n\n"
+      << "T 卡切成两个 T/2 组同时跑同一负载；isolated 取 single 里同样 T/2 卡、同大小、同负载的结果（rank 0..T/2-1）。\n"
+      << "slowdown = T_concurrent / T_isolated，1 表示没有相互干扰。\n\n";
   splitTable(out, rows);
   out << "\n## 4. 两组同时：A 组 all-gather，B 组 reduce-scatter\n\n"
-      << "isolated 是同一组单独跑同一个 op（split 的 A-isolated ag、B-isolated rs）；"
+      << "isolated 取 single 里 T/2 卡单独跑同一个 op（A 对 ag、B 对 rs）；"
       << "slowdown = T_cross / T_isolated；A+B busbw 是两组 busbw 之和。\n\n";
   crossTable(out, rows);
   std::printf("wrote %s (%zu records)\n", output.c_str(), rows.size());

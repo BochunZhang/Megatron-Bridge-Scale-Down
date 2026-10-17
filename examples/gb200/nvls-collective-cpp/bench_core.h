@@ -53,30 +53,46 @@ struct Impl {
   const char* agSelection;  // ncclCollConfig_t::algSelection for AllGather; nullptr = automatic
   bool agCopyEngine;        // AllGather sets CTAPolicy = NCCL_CTA_POLICY_ZERO (copy-engine path)
   const char* rsSelection;  // ncclCollConfig_t::algSelection for ReduceScatter
+  const char* arSelection;  // ncclCollConfig_t::algSelection for AllReduce; nullptr = automatic
   const char* agExpect;     // what every AllGather launch must report, see implementationMatches
   const char* rsExpect;
-  const char* ceMulticast;  // "mc" / "uc": required NCCL_CE_COLL_AG_MULTICAST_THRESHOLD, else nullptr
+  const char* arExpect;     // what every AllReduce launch must report, see implementationMatches
+  unsigned workloadMask;    // which workloads() entries this impl measures, see workloadMaskOf
 };
+
+// Bit i of the returned mask is set when workloads()[i] is in `names` (defined below).
+inline unsigned workloadMaskOf(const std::vector<std::string>& names);
 
 // algSelection tags match registry names by prefix (src/config/algorithm_registry.cc), so only
 // tags that are not a prefix of another name are used: "SYMK_STMC" never matches TmaSTMC, but
 // "SYMK_ST" would also match SYMK_STMC.
+//
+// The five implementations and what each one measures:
+//   ring            classic kernels on plain buffers; AG, RS, AG+RS, AR
+//   nvls            NVLS_SIMPLE on plain buffers; AG, RS, AG+RS, AR
+//   symmetric       register multimem: AllGather_STMC (multimem.st) and ReduceScatter_LDMC
+//                   (multimem.ld_reduce), plus AllReduce_RSxLDMC_AGxSTMC; all four workloads
+//   symmetric-tma   TMA AllGather (AllGather_TmaSTMC) with the same LDMC ReduceScatter, so only
+//                   AG and AG+RS are measured; RS and AR are covered by `symmetric`
+//   copy-engine     CE AllGather writing the multicast address with the same LDMC ReduceScatter,
+//                   so only AG and AG+RS are measured; RS and AR are covered by `symmetric`
 inline const std::vector<Impl>& impls() {
   static const std::vector<Impl> table = {
-    {"ring", false, false, "RING", false, "RING", "Ring/*", "Ring/*", nullptr},
-    {"nvls", false, false, "NVLS_SIMPLE", false, "NVLS_SIMPLE", "NVLS/*", "NVLS/*", nullptr},
-    // NCCL's own choice among the symmetric kernels; NCCL_SYM_CE_THRESHOLD keeps AG off the CE.
-    {"symm", true, false, nullptr, false, nullptr, "Symmetric/*", "Symmetric/*", nullptr},
+    {"ring", false, false, "RING", false, "RING", "RING", "Ring/*", "Ring/*", "Ring/*",
+     workloadMaskOf({"ag", "rs", "ag+rs", "ar"})},
+    {"nvls", false, false, "NVLS_SIMPLE", false, "NVLS_SIMPLE", "NVLS_SIMPLE", "NVLS/*", "NVLS/*", "NVLS/*",
+     workloadMaskOf({"ag", "rs", "ag+rs", "ar"})},
     // Register multimem.st AllGather and multimem.ld_reduce ReduceScatter: the non-TMA baseline.
-    {"stmc", true, true, "SYMK_STMC", false, "SYMK_LDMC", "Symmetric/AllGather_STMC",
-     "Symmetric/ReduceScatter_LDMC", nullptr},
+    // AllReduce_RSxLDMC_AGxSTMC is the AllReduce built from the same two primitives.
+    {"symmetric", true, true, "SYMK_STMC", false, "SYMK_LDMC", "SYMK_RSxLDMC_AGxSTMC",
+     "Symmetric/AllGather_STMC", "Symmetric/ReduceScatter_LDMC", "Symmetric/AllReduce_RSxLDMC_AGxSTMC",
+     workloadMaskOf({"ag", "rs", "ag+rs", "ar"})},
     // TMA AllGather: cp.async.bulk global->smem, then cp.async.bulk smem->multicast address.
-    {"tma", true, true, "SYMK_TmaSTMC", false, "SYMK_LDMC", "Symmetric/AllGather_TmaSTMC",
-     "Symmetric/ReduceScatter_LDMC", nullptr},
+    {"symmetric-tma", true, true, "SYMK_TmaSTMC", false, "SYMK_LDMC", nullptr, "Symmetric/AllGather_TmaSTMC",
+     "Symmetric/ReduceScatter_LDMC", nullptr, workloadMaskOf({"ag", "ag+rs"})},
     // Copy-engine AllGather writing the multicast address (one CE copy per rank), LDMC RS.
-    {"ce", true, true, nullptr, true, "SYMK_LDMC", "CopyEngine+NVLSSync", "Symmetric/ReduceScatter_LDMC", "mc"},
-    // Same, but the CE writes N-1 unicast copies into the peers' windows.
-    {"ce-uc", true, true, nullptr, true, "SYMK_LDMC", "CopyEngine+NVLSSync", "Symmetric/ReduceScatter_LDMC", "uc"},
+    {"copy-engine", true, true, nullptr, true, "SYMK_LDMC", nullptr, "CopyEngine+NVLSSync",
+     "Symmetric/ReduceScatter_LDMC", nullptr, workloadMaskOf({"ag", "ag+rs"})},
   };
   return table;
 }
@@ -131,7 +147,8 @@ inline std::vector<int> parsePositiveInts(const std::string& text) {
 // case_name, rank_file).
 
 inline const std::vector<std::string>& workloads() {
-  static const std::vector<std::string> list = {"ag", "rs", "ag+rs"};
+  // "ar" is always standalone: AllReduce is never mixed with AG or RS traffic.
+  static const std::vector<std::string> list = {"ag", "rs", "ag+rs", "ar"};
   return list;
 }
 
@@ -140,15 +157,35 @@ inline int workloadRank(const std::string& name) {
   return int(std::find(list.begin(), list.end(), name) - list.begin());
 }
 
+// Bit i of the returned mask is set when workloads()[i] is in `names`.
+inline unsigned workloadMaskOf(const std::vector<std::string>& names) {
+  unsigned mask = 0;
+  for (const std::string& name : names) {
+    if (workloadRank(name) == int(workloads().size())) throw std::invalid_argument("unknown workload '" + name + "'");
+    mask |= 1u << workloadRank(name);
+  }
+  return mask;
+}
+
+// The requested workloads this impl measures, in the requested order.
+inline std::vector<std::string> measuredWorkloads(const Impl& impl, const std::vector<std::string>& requested) {
+  std::vector<std::string> out;
+  for (const std::string& name : requested) {
+    if (impl.workloadMask & (1u << workloadRank(name))) out.push_back(name);
+  }
+  return out;
+}
+
 inline const std::vector<std::string>& splitLayouts() {
   static const std::vector<std::string> list = {"contiguous", "interleaved"};
   return list;
 }
 
-// Split cases: each half-group alone, both half-groups running the same workload at the same
-// time, and "cross": group A all-gathers while group B reduce-scatters, at the same time.
+// Split cases: both half-groups run the same workload at the same time, and "cross": group A
+// all-gathers while group B reduce-scatters, at the same time. Neither half runs alone: the
+// reference for a half-group of T/2 ranks is the single group of T/2 ranks (single-n<T/2>).
 inline const std::vector<std::string>& splitParts() {
-  static const std::vector<std::string> list = {"A-isolated", "B-isolated", "AB-concurrent", "AB-cross"};
+  static const std::vector<std::string> list = {"AB-concurrent", "AB-cross"};
   return list;
 }
 const std::string kCrossPart = "AB-cross";
@@ -160,11 +197,16 @@ inline const std::vector<std::string>& crossGroupWorkloads() {  // per split gro
 
 inline std::vector<std::string> workloadOps(const std::string& workload) {
   if (workload == "ag+rs") return {"ag", "rs"};
-  if (workload == "ag" || workload == "rs") return {workload};
+  if (workload == "ag" || workload == "rs" || workload == "ar") return {workload};
   throw std::invalid_argument("unknown workload '" + workload + "'");
 }
 
-inline std::string opFunc(const std::string& op) { return op == "ag" ? "AllGather" : "ReduceScatter"; }
+inline std::string opFunc(const std::string& op) {
+  if (op == "ag") return "AllGather";
+  if (op == "rs") return "ReduceScatter";
+  if (op == "ar") return "AllReduce";
+  throw std::invalid_argument("unknown op '" + op + "'");
+}
 
 // Two equal, disjoint halves of [0, total): first/second half or even/odd ranks.
 inline std::pair<std::vector<int>, std::vector<int>> splitGroups(int total, const std::string& layout) {
@@ -213,12 +255,21 @@ inline std::string rankFile(const std::string& impl, const std::string& name, in
   return impl + "_" + name + "_rank" + buf + suffix;
 }
 
-// Full-tensor payload rate: AG output bytes or RS input bytes per second.
+// Full-tensor payload rate: AG output bytes, RS input bytes or AR input bytes per second.
 inline double algBandwidthGBs(double totalBytes, double seconds) { return totalBytes / seconds / kBytesPerGB; }
 
 // nccl-tests bus bandwidth for AG/RS: total_bytes * (n - 1) / n / t.
 inline double busBandwidthGBs(double totalBytes, int groupSize, double seconds) {
   return algBandwidthGBs(totalBytes, seconds) * (groupSize - 1) / groupSize;
+}
+
+// Bus bandwidth of one op of a workload (collective_metrics.py: op_bus_bandwidth_gb_s). An
+// all-reduce of total_bytes per rank sends (n - 1) / n of them and receives the same amount back,
+// so it counts twice: the nccl-tests all-reduce factor 2 * (n - 1) / n.
+inline double opBusBandwidthGBs(const std::string& op, double totalBytes, int groupSize, double seconds) {
+  if (op != "ag" && op != "rs" && op != "ar") throw std::invalid_argument("unknown op '" + op + "'");
+  double bus = busBandwidthGBs(totalBytes, groupSize, seconds);
+  return op == "ar" ? 2 * bus : bus;
 }
 
 inline double median(std::vector<double> values) {
@@ -316,12 +367,16 @@ inline bool parseTuningLine(const std::string& line, TuningLaunch* out) {
 }
 
 // expect is '|'-separated alternatives; "Ring/*" matches the family before '/', a trailing '*'
-// is a prefix match, anything else must match exactly.
+// is a prefix match, anything else must match exactly.  Both the prefix and exact comparisons are
+// case-insensitive so the check works across NCCL releases: older releases log ncclAlgoStr()
+// ("Ring", "NVLS") while 2.29+ logs ncclAlgoToString() ("RING", "NVLS"); kernel names like
+// "Simple" vs "SIMPLE" vary similarly.
 inline bool implementationMatches(const std::string& expect, const std::string& impl) {
   for (const std::string& alt : splitString(expect, '|')) {
     if (!alt.empty() && alt.back() == '*') {
-      if (impl.compare(0, alt.size() - 1, alt, 0, alt.size() - 1) == 0) return true;
-    } else if (impl == alt) {
+      size_t len = alt.size() - 1;
+      if (impl.size() >= len && strncasecmp(impl.c_str(), alt.c_str(), len) == 0) return true;
+    } else if (strcasecmp(impl.c_str(), alt.c_str()) == 0) {
       return true;
     }
   }
@@ -351,8 +406,10 @@ inline void parseCommLine(const std::string& line, CommLogInfo* info) {
 // Check every collective launch comm rank 0 of one group logged during one case (warmup + timed
 // trials): each op must appear exactly `launches` times with `shardBytes` per rank on the
 // implementation the impl pins, and the start gate exactly `gateLaunches` times (only the gate's
-// comm rank 0 logs it). Other AllReduce sizes are the benchmark's world barrier and are ignored;
-// any other collective is an error. Returns the observed implementations per function.
+// comm rank 0 logs it). AllReduce with <= kWorldBarrierBytes (kGateBytes or world-barrier size) is
+// either the start gate or the world barrier and is never counted as payload.  Returns the
+// observed implementations per function.
+constexpr size_t kWorldBarrierBytes = kWorldBarrierCount * sizeof(int32_t);  // 8 Bytes
 inline std::string checkLaunches(const std::vector<std::string>& lines, const Impl& impl,
                                  const std::vector<std::string>& ops, size_t launches, size_t shardBytes,
                                  size_t gateLaunches, std::vector<std::string>* errors) {
@@ -361,12 +418,33 @@ inline std::string checkLaunches(const std::vector<std::string>& lines, const Im
   std::map<std::string, size_t> foreign;
   std::set<std::string> funcs;
   size_t gates = 0;
+  bool hasAr = std::find(ops.begin(), ops.end(), "ar") != ops.end();
   for (const std::string& op : ops) funcs.insert(opFunc(op));
   for (const std::string& line : lines) {
     TuningLaunch launch;
     if (!parseTuningLine(line, &launch)) continue;
     if (launch.func == "AllReduce") {
-      if (launch.bytes == kGateBytes) gates++;
+      if (launch.bytes == kGateBytes) {
+        // Start gate: 4-Byte fp32 all-reduce on the gate communicator.
+        gates++;
+        continue;
+      }
+      if (launch.bytes <= kWorldBarrierBytes && !hasAr) {
+        // World barrier (8-Byte int32*2): ignore it when AR is not the payload.
+        continue;
+      }
+      if (hasAr) {
+        // When AR is the payload, large AllReduces are the tested collective; small ones are
+        // the gate or world barrier and are handled above / fall through to foreign below.
+        if (launch.bytes <= kWorldBarrierBytes) {
+          continue;  // world barrier
+        }
+        seen[launch.func][launch.impl]++;
+        sizes[launch.func][launch.bytes]++;
+        continue;
+      }
+      // AR is not in ops but we saw a large AllReduce: foreign.
+      foreign[launch.func + "=" + launch.impl]++;
       continue;
     }
     if (!funcs.count(launch.func)) {
@@ -384,7 +462,10 @@ inline std::string checkLaunches(const std::vector<std::string>& lines, const Im
   std::string observed;
   for (const std::string& op : ops) {
     std::string func = opFunc(op);
-    std::string expect = op == "ag" ? impl.agExpect : impl.rsExpect;
+    std::string expect;
+    if (op == "ag") expect = impl.agExpect ? impl.agExpect : "";
+    else if (op == "rs") expect = impl.rsExpect ? impl.rsExpect : "";
+    else if (op == "ar") expect = impl.arExpect ? impl.arExpect : "";
     size_t total = 0;
     std::string wrong, names;
     for (const auto& item : seen[func]) {
@@ -407,6 +488,54 @@ inline std::string checkLaunches(const std::vector<std::string>& lines, const Im
     if (!names.empty()) observed += (observed.empty() ? "" : ";") + func + "=" + names;
   }
   return observed;
+}
+
+// The CUDA function that did the work for one implementation read from the TUNING log
+// (collective_metrics.py: kernel_name). Names follow NCCL 2.32.3's generators. The symmetric path
+// launches one kernel per variant, ncclSymkDevKernel_<Coll>_<algo>[_sum_<ty>]
+// (src/device/symmetric/generate.py), so the launched kernel names the variant. The classic path
+// launches one specialized kernel per collective (ncclDevKernel_<Coll>[_Sum_<ty>]_RING_LL) that
+// dispatches on its funcId to ncclDevFunc_<Coll>[_Sum_<ty>]_<ALGO>_<PROTO> (src/device/generate.py);
+// that device function is what ran, so it is the name reported here. The copy-engine path has no
+// kernel. dtype is the benchmark dtype, bf16 or fp32.
+inline std::string kernelName(const std::string& func, const std::string& implementation, const std::string& dtype) {
+  std::string ty = dtype == "fp32" ? "f32" : dtype;
+  bool reduces = func != "AllGather";
+  size_t slash = implementation.find('/');
+  std::string family = implementation.substr(0, slash);
+  std::string detail = slash == std::string::npos ? "" : implementation.substr(slash + 1);
+  if (family == "Symmetric") {
+    if (detail.rfind(func + "_", 0) == 0) detail = detail.substr(func.size() + 1);
+    return "ncclSymkDevKernel_" + func + "_" + detail + (reduces ? "_sum_" + ty : "");
+  }
+  if (family.rfind("CopyEngine", 0) == 0 || family == "HierarchicalCE") return family + "（cudaMemcpy，无 kernel）";
+  auto upper = [](std::string s) {
+    for (char& c : s) c = char(std::toupper((unsigned char)c));
+    return s;
+  };
+  return "ncclDevFunc_" + func + (reduces ? "_Sum_" + ty : "") + "_" + upper(family) + "_" + upper(detail);
+}
+
+// Map each op of a record to the kernel(s) its checked nccl_impl evidence names, e.g.
+// "AllGather=NVLS/SIMPLE;ReduceScatter=NVLS/SIMPLE" (collective_metrics.py: record_kernels).
+// Several implementations of one op ('|') are all listed; no evidence maps to nothing.
+inline std::map<std::string, std::string> recordKernels(const std::string& ncclImpl, const std::string& dtype) {
+  std::map<std::string, std::string> kernels;
+  for (const std::string& entry : splitString(ncclImpl, ';')) {
+    size_t eq = entry.find('=');
+    if (entry.empty() || eq == std::string::npos) continue;
+    std::string func = entry.substr(0, eq), op;
+    if (func == "AllGather") op = "ag";
+    else if (func == "ReduceScatter") op = "rs";
+    else if (func == "AllReduce") op = "ar";
+    else continue;
+    std::string names;
+    for (const std::string& impl : splitString(entry.substr(eq + 1), '|')) {
+      if (!impl.empty()) names += (names.empty() ? "" : " \\| ") + kernelName(func, impl, dtype);
+    }
+    kernels[op] = names;
+  }
+  return kernels;
 }
 
 ////////////////////////////////////////////////////////////////////////////////

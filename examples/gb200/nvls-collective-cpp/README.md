@@ -14,10 +14,10 @@
 
 | 问题 | 场景 | case 名 |
 | --- | --- | --- |
-| 分别发起 AG、RS，和同时发起 AG+RS 的吞吐 | 单组（同一批 rank）依次跑 AG、RS、AG+RS | `single` |
-| 各实现对比（ring / NVLS / 对称内核 / TMA / CE） | 同一矩阵每个 `--impl` 各跑一遍 | 每个实现一次启动 |
-| 16 卡下同时开启两个 8 group | 16 卡切成两个 8 rank 组，每组单独跑，再两组同时跑同一负载 | `split` |
-| 两个独立组同时：A 做 AG、B 做 RS | 同一 split，A 组 all-gather 的同时 B 组 reduce-scatter，各自对照单独跑 | `split` 的 `AB-cross` |
+| 分别发起 AG、RS、AR，和同时发起 AG+RS 的吞吐 | 单组（同一批 rank）依次跑 AG、RS、AR、AG+RS | `single` |
+| 各实现对比（ring / NVLS / symmetric / TMA / CE） | 同一矩阵每个 `--impl` 各跑一遍 | 每个实现一次启动 |
+| 16 卡下同时开启两个 8 group | 16 卡切成两个 8 rank 组，两组同时跑同一负载 | `split` 的 `AB-concurrent` |
+| 两个独立组同时：A 做 AG、B 做 RS | 同一 split，A 组 all-gather 的同时 B 组 reduce-scatter | `split` 的 `AB-cross` |
 
 `single` 的 `ag+rs` 用两个 communicator + 两条 CUDA stream 同时发射，与单独测的 AG、RS 直接比较：
 
@@ -33,21 +33,16 @@ overlap_fraction = (T_AG + T_RS - T_AG+RS) / min(T_AG, T_RS)   # 1 = 短的操�
 copy engine，`forceAlgSelection = 1`（默认）让不可用的选择直接报错，而不是悄悄回退。所以**不再需要**
 `NCCL_ALGO` / `NCCL_SYM_KERNEL` 这些进程级开关，launcher 反而会把它们 unset。
 
-| `--impl` | buffer | AllGather | ReduceScatter |
-| --- | --- | --- | --- |
-| `ring` | `cudaMalloc` | `algSelection=RING` | `RING` |
-| `nvls` | `cudaMalloc` | `NVLS_SIMPLE` | `NVLS_SIMPLE` |
-| `symm` | `ncclMemAlloc` + window | 不指定（NCCL 在对称内核里自选） | 不指定 |
-| `stmc` | 同上 | `SYMK_STMC`：寄存器 `multimem.st` | `SYMK_LDMC`：`multimem.ld_reduce` |
-| `tma` | 同上 | `SYMK_TmaSTMC`：TMA | `SYMK_LDMC` |
-| `ce` | 同上 | `CTAPolicy=ZERO`，CE 写 multicast 地址 | `SYMK_LDMC` |
-| `ce-uc` | 同上 | `CTAPolicy=ZERO`，CE 写 N−1 份 unicast | `SYMK_LDMC` |
+| `--impl` | buffer | AllGather | ReduceScatter | AllReduce | 测量哪些 workload |
+| --- | --- | --- | --- | --- | --- |
+| `ring` | `cudaMalloc` | `RING` | `RING` | `RING` | ag, rs, ag+rs, ar |
+| `nvls` | `cudaMalloc` | `NVLS_SIMPLE` | `NVLS_SIMPLE` | `NVLS_SIMPLE` | ag, rs, ag+rs, ar |
+| `symmetric` | `ncclMemAlloc` + window | `SYMK_STMC` (寄存器 `multimem.st`) | `SYMK_LDMC` (`multimem.ld_reduce`) | `SYMK_RSxLDMC_AGxSTMC` | ag, rs, ag+rs, ar |
+| `symmetric-tma` | 同上 | `SYMK_TmaSTMC` (TMA multicast) | `SYMK_LDMC` | — | ag, ag+rs |
+| `copy-engine` | 同上 | `CTAPolicy=ZERO` (CE 写 multicast) | `SYMK_LDMC` | — | ag, ag+rs |
 
-`algSelection` 的标签按前缀匹配（`src/config/algorithm_registry.cc`），所以用的都是不会成为别的名字前缀的
-标签：`SYMK_ST` 会同时命中 `SYMK_STMC`，因此不用。
-
-`stmc` / `tma` / `ce` / `ce-uc` 的 RS 完全相同，`compare.md` 2a 表把它们都和 `stmc` 比，差异只来自
-AllGather 怎么搬数据：
+`symmetric-tma` 和 `copy-engine` 只测 AllGather 和 AG+RS，因为它们的 ReduceScatter 跟 `symmetric` 完全一样
+（都是 `SYMK_LDMC`），单独测 RS 没有意义。AllReduce 同样在 `symmetric` 里已经覆盖。
 
 - **TmaSTMC**（`src/device/symmetric/primitives.cuh` `bcastMultimem<.., EnableTma=true>`）：每个 warp 的
   lane 0 先 `cp.async.bulk` 把输入块搬进 shared memory，再 `cp.async.bulk` 从 smem 写到 multicast 地址，
@@ -102,14 +97,14 @@ make -C examples/gb200/nvls-collective-cpp NCCL_HOME=nccl/nccl-2.32.3/build CUDA
 
 ## 运行
 
-单托盘 4 卡，先只看新增的两组：
+单托盘 4 卡，测 TMA 和 copy-engine：
 
 ```bash
 bash examples/gb200/nvls-collective-cpp/run_nvls_collective_benchmark.sh \
-  --impls stmc,tma,ce,ce-uc --sizes-mib 64,256,1024 --trials 3
+  --impls symmetric-tma,copy-engine --sizes-mib 64,256,1024 --trials 3
 ```
 
-全部实现；16 卡起默认带 8+8 split（含 cross）：
+全部实现；16 卡起默认带 split（16 卡上 8+8，32 卡上 16+16，含 cross）：
 
 ```bash
 bash examples/gb200/nvls-collective-cpp/run_nvls_collective_benchmark.sh             # 1 托盘
@@ -123,7 +118,9 @@ NCCL 自己通过 `NCCL_COMM_ID=<master-addr>:<master-port + i>` 建 bootstrap�
 
 `MASTER_ADDR`/`RANK` 注入、run id 握手、`eth0`/`bond1` 接口选择都和 `../nvls-collective` 相同；
 `--sizes-mib` 默认 16,32,64,128,256,512,1024,2048（完整张量，AG 输出 / RS 输入）；`--group-sizes` 默认取 4/8/16/32 中
-不超过总卡数的部分；`--split-totals` 默认在 ≥16 卡时取 16，布局默认只有 `contiguous`。
+不超过总卡数的部分；`--split-totals` 默认取 16/32 中放得下的最大值（16 卡 → 8+8，32 卡 → 16+16），布局默认
+只有 `contiguous`。split 的半组大小 `T/2` 必须在 `--group-sizes` 里（它提供 single 参照），默认值满足这个条件；
+自定义时程序会检查。
 
 ### nsys
 
@@ -146,8 +143,7 @@ CE AllGather 是 memcpy，不是 kernel，所以 `ce`/`ce-uc` 在 SQL 表里只�
 
 1. `spinKernel`（约 `--launch-delay-ms`，默认 5 ms），让后面所有 launch 在 GPU 开跑前都已入队；
 2. **同步起点（start gate）**：在覆盖整个 scenario 所有 rank 的独立 communicator 上做一次 1 个 fp32 元素的
-   all-reduce。没有共同 communicator 的 A、B 两组会在几微秒内同时离开它；split 的 isolated case 里闲着的
-   另一半组也要过这道门，保证门的成员在所有 case 里一致；
+   all-reduce。没有共同 communicator 的 A、B 两组会在几微秒内同时离开它；
 3. 记 start 事件，然后 `--iters` 次背靠背发射，结束事件记在各自 stream 上，主 stream 汇合后计时。
 
 world communicator 上的 barrier 只负责让各 rank 进入同一个 trial（8 字节 all-reduce，不计时），真正的起点
@@ -162,9 +158,9 @@ concurrency = min(T_A, T_B) / max(T_A, T_B)   # 每个 trial 一个值，报告�
 | 单 rank 每次迭代时间 | `t_rank = (该 rank 所有 op 的结束事件 − start) / iters`；`ag_ms`/`rs_ms` 是各 op 自己 stream 的结束事件 |
 | 每个 trial 的时间 `t` | 组内最慢 rank 的 `t_rank` |
 | 完成时间 | 表 0 给出各 trial `t` 的 mean / median / min / max（`mean_makespan_ms`、`makespan_ms`、`trial_makespan_ms`） |
-| `size` | 完整张量字节数：AG 每卡的接收（输出）总量，RS 每卡的发送（输入）总量；每卡 shard = `size/n` |
+| `size` | 完整张量字节数：AG 每卡的接收（输出）总量，RS 每卡的发送（输入）总量，AR 每卡原地归约的总量；AG/RS 每卡 shard = `size/n`，AR 不分片 |
 | algbw | `size / t`，十进制 GB/s |
-| busbw | `size × (n−1)/n / t`（nccl-tests 定义） |
+| busbw | AG/RS：`size × (n−1)/n / t`（nccl-tests 定义）；AR：`2 × size × (n−1)/n / t`（nccl-tests 的 all-reduce 定义），因此可以和 AG/RS 的 busbw 直接比 |
 | aggregate busbw | 单个组内所有 op 的 busbw 之和，用该组 makespan 算 |
 
 `enqueue_ms` 记录主机入队时间，超过 `--launch-delay-ms` 的 case 标 `[HOST-BOUND]`，不参与结论。
@@ -184,21 +180,28 @@ concurrency = min(T_A, T_B) / max(T_A, T_B)   # 每个 trial 一个值，报告�
 
 ## 对比表格（`compare.md`）
 
-`collective_report` 把每个实现的 `results.jsonl` 合并：
+`collective_report` 把每个实现的 `results.jsonl` 合并成以下几张表，格式与 `../nvls-collective/collective_metrics.py`
+相同（另加 2a），除表 0 外每格都是 trial 中位数：
 
-| 表 | 回答 | 关键列 |
-| --- | --- | --- |
-| 0 | 每个测试的完成时间 | mean / median / min / max ms、由 mean 算的 algbw / busbw、concurrency |
-| 1 | AG / RS / AG+RS | AG busbw、RS busbw、AG+RS 中各自 busbw、pair aggregate、speedup、overlap_fraction |
-| 1b | 各实现的绝对吞吐 | 每个实现的 aggregate busbw 与最高者 |
-| 2 | 相对 ring | 每个实现的 aggregate busbw 与 /ring |
-| 2a | **TMA / CE 相对 stmc** | tma、ce、ce-uc 的 aggregate busbw 与 /stmc |
-| 2b | 实际执行的内核 | 实测 nNodes、nLsaTeams、multimem、逐 launch 校验过的实现 |
-| 3 | 两个 8 组同跑同一负载 | isolated / concurrent busbw、slowdown、concurrency |
-| 4 | A 组 AG、B 组 RS 同时跑 | 各自 isolated / cross busbw、cross ms、slowdown、A+B cross busbw、concurrency |
+| 表 | 回答 | 每行 | 关键列 |
+| --- | --- | --- | --- |
+| 0 | 每个测试的完成时间 | 实现 × case × 组 | mean / median / min / max ms、由 mean 算的 algbw / busbw、concurrency、**kernel** |
+| 1 | AG / RS / AR / AG+RS | 实现 × 组大小 × 消息 | AG busbw、RS busbw、AR busbw、AG+RS 中各自 busbw、pair aggregate、`speedup`、`overlap_fraction`、**AG / RS / AR kernel** |
+| 1b | 各实现的绝对吞吐 | 组大小 × 消息 × 负载 | 每个实现的 aggregate busbw 与最高者 |
+| 2 | 相对 ring | 组大小 × 消息 × 负载 | 每个实现的 aggregate busbw 与 /ring |
+| 2a | **TMA / CE 相对 symmetric** | 组大小 × 消息 × 负载 | symmetric-tma、copy-engine 的 aggregate busbw 与 /symmetric |
+| 2b | 实际执行的内核 | 实现 × 组 | 实测 nNodes、nLsaTeams、multimem、逐 launch 校验过的实现 |
+| 3 | 两个 T/2 组同跑同一负载 | 实现 × 布局 × 消息 × 负载 × 组 | isolated busbw（取自 `single-n<T/2>`）、concurrent busbw、`slowdown = T_concurrent / T_isolated`、concurrency |
+| 4 | A 组 AG、B 组 RS 同时跑 | 实现 × 布局 × 消息 | A 的 AG 与 B 的 RS 各自的 isolated / cross busbw、cross ms、slowdown，`A+B cross busbw`、concurrency |
 
-表 4 的 isolated 参照是同一 split 里 A 组单独跑 `ag`、B 组单独跑 `rs` 的 case，所以 cross case 只在
-`--workloads` 同时包含 `ag` 和 `rs` 时运行（默认包含）。
+表 0、表 1 的 kernel 列来自 `nccl_impl`（benchmark 逐 launch 核对过的 TUNING 日志），按 NCCL 2.32.3 的代码生成器
+换算成实际运行的函数名（`bench_core.h` 的 `kernelName`）：对称路径是 `ncclSymkDevKernel_<Coll>_<algo>[_sum_<ty>]`，
+ring/nvls 是经典路径分发到的设备函数 `ncclDevFunc_<Coll>[_Sum_<ty>]_<ALGO>_<PROTO>`，copy-engine 的 AllGather
+是 cudaMemcpy，没有 kernel。表 1 里 AG+RS 同时发起时换了实现会在括号里注明 `pair：...`。
+
+表 3、表 4 的 isolated 参照都是 `single-n<T/2>` 里同大小、同负载的 case（表 4：A 对 `ag`、B 对 `rs`），
+所以 `T/2` 必须出现在 `--group-sizes` 中；split 场景本身只跑 AB-concurrent 和 AB-cross，不单独跑 A、B。
+表 4 的 cross case 只在 `--workloads` 同时包含 `ag` 和 `rs` 时运行（默认包含）。
 
 ## 输出
 
@@ -224,10 +227,10 @@ results/gb200/nvls-collective-cpp/gpu-num-<W>/<yyyymmdd-hhmmss>/
 | 项 | 格式 | 例子 |
 | --- | --- | --- |
 | scenario | `single-n<n>` / `split-n<T>-<layout>` | `single-n16`、`split-n16-contiguous` |
-| case | `<scenario>[-<part>]_<workload>_<dtype>_<size>MiB`，part 为 `A-isolated`/`B-isolated`/`AB-concurrent`/`AB-cross`；cross 的 workload 固定为 `agA-rsB` | `single-n4_ag_bf16_1024MiB`、`split-n16-contiguous-AB-cross_agA-rsB_bf16_1024MiB` |
+| case | `<scenario>[-<part>]_<workload>_<dtype>_<size>MiB`，part 为 `AB-concurrent`/`AB-cross`；cross 的 workload 固定为 `agA-rsB` | `single-n4_ag_bf16_1024MiB`、`split-n16-contiguous-AB-cross_agA-rsB_bf16_1024MiB` |
 | 每 rank 文件 | `<impl>_<case>_rank<RR><suffix>`，rank 补零到至少两位 | `tma_single-n4_ag_bf16_1024MiB_rank03.nccl.log` |
 
-`results.jsonl` 每行一个 (case, 组)：`algo`（= impl）、`scenario`、`phase`（isolated / concurrent / cross）、
+`results.jsonl` 每行一个 (case, 组)：`algo`（= impl）、`scenario`、`phase`（single 为 isolated，split 为 concurrent / cross）、
 `total_ranks`、`layout`、`group_index`、`case`/`case_dir`、`workload`、`group_size`、`ranks`、`size_bytes`、
 `makespan_ms`、`mean_makespan_ms`、`trial_makespan_ms`、`ag_ms`/`rs_ms`、各类带宽、`concurrency`、
 `host_bound`，以及实测证据 `nccl_impl`、`n_nodes`、`mnnvl`、`n_lsa_teams`、`multimem_support`。

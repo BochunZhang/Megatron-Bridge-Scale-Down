@@ -71,10 +71,18 @@ static void testMatches() {
   EXPECT(implementationMatches("Symmetric/AllGather_TmaSTMC", "Symmetric/AllGather_TmaSTMC"));
   EXPECT(!implementationMatches("Symmetric/AllGather_STMC", "Symmetric/AllGather_TmaSTMC"));
   EXPECT(!implementationMatches("CopyEngine+NVLSSync", "CopyEngine"));
+  // NCCL 2.29+ logs ncclAlgoToString() in upper-case ("RING", "NVLS") while older releases used
+  // mixed case ("Ring").  implementationMatches must accept both without caring about case.
+  EXPECT(implementationMatches("Ring/*", "RING/LL128"));
+  EXPECT(implementationMatches("Ring/*", "RING/SIMPLE"));
+  EXPECT(implementationMatches("NVLS/*", "NVLS/SIMPLE"));
+  EXPECT(!implementationMatches("Ring/*", "NVLS/SIMPLE"));
+  // Exact patterns are also case-insensitive.
+  EXPECT(implementationMatches("Symmetric/AllGather_TmaSTMC", "Symmetric/AllGather_TmaSTMC"));
 }
 
 static void testCheckLaunches() {
-  const Impl& tma = *findImpl("tma");
+  const Impl& tma = *findImpl("symmetric-tma");
   std::vector<std::string> lines;
   for (int i = 0; i < 3; i++) {
     lines.push_back(line("AllGather [Symmetric]: 1024 Bytes -> Kernel AllGather_TmaSTMC nchannels 2 nthreads 512 nWorks 1"));
@@ -97,7 +105,7 @@ static void testCheckLaunches() {
   checkLaunches(lines, tma, {"ag", "rs"}, 3, 1024, 3, &errors);
   EXPECT(errors.size() == 3);
 
-  const Impl& ce = *findImpl("ce");
+  const Impl& ce = *findImpl("copy-engine");
   errors.clear();
   checkLaunches({line("AllGather [Copy Engine]: 1024 Bytes -> cudaMemcpy")}, ce, {"ag"}, 1, 1024, 0, &errors);
   EXPECT(errors.size() == 1);  // CE without NVLS sync means the comm has no LSA multimem
@@ -105,7 +113,7 @@ static void testCheckLaunches() {
   checkLaunches({line("AllGather: 1024 Bytes -> Algo Ring proto Simple channel{Lo..Hi}={0..1} cgaClusterSize 1")}, ce,
                 {"rs"}, 0, 1024, 0, &errors);
   EXPECT(errors.size() == 1);  // foreign collective
-  const Impl& symm = *findImpl("symm");
+  const Impl& symm = *findImpl("symmetric");
   errors.clear();
   checkLaunches({line("AllGather [Copy Engine]: 1024 Bytes -> cudaMemcpy; CE synchronization with NVLS")}, symm, {"ag"},
                 1, 1024, 0, &errors);
@@ -146,9 +154,20 @@ static void testHelpers() {
   EXPECT(caseName("single-n4", "", "ag+rs", "bf16", 64) == "single-n4_ag+rs_bf16_64MiB");
   EXPECT(caseName(scenarioName("split", 16, "contiguous"), kCrossPart, kCrossWorkload, "bf16", 1024) ==
          "split-n16-contiguous-AB-cross_agA-rsB_bf16_1024MiB");
+  EXPECT(caseName(scenarioName("split", 16, "contiguous"), "AB-concurrent", "ag", "bf16", 64) ==
+         "split-n16-contiguous-AB-concurrent_ag_bf16_64MiB");
+  // A split half is measured only while both halves run; its reference is single-n<T/2>.
+  EXPECT(splitParts() == std::vector<std::string>({"AB-concurrent", "AB-cross"}));
   bool threw = false;
   try {
     caseName("split-n16-contiguous", "AB-concurrent", kCrossWorkload, "bf16", 64);
+  } catch (const std::invalid_argument&) {
+    threw = true;
+  }
+  EXPECT(threw);
+  threw = false;
+  try {
+    caseName("split-n16-contiguous", "A-isolated", "ag", "bf16", 64);
   } catch (const std::invalid_argument&) {
     threw = true;
   }
@@ -162,11 +181,15 @@ static void testHelpers() {
   EXPECT(conc.size() == 2 && conc[0] == 0.5 && conc[1] == 1.0);
   EXPECT(mean({1, 2, 3}) == 2);
   EXPECT(std::fabs(busBandwidthGBs(1e9, 4, 1.0) - 0.75) < 1e-12);
+  EXPECT(std::fabs(opBusBandwidthGBs("ag", 1e9, 4, 1.0) - 0.75) < 1e-12);
+  EXPECT(std::fabs(opBusBandwidthGBs("ar", 1e9, 4, 1.0) - 1.5) < 1e-12);
   EXPECT(median({3, 1, 2}) == 2 && median({4, 1, 2, 3}) == 2.5);
   EXPECT(parsePositiveInts("16,64,16") == std::vector<int>({16, 64}));
   EXPECT(workloadOps("ag+rs").size() == 2);
+  EXPECT(workloadOps("ar") == std::vector<std::string>({"ar"}));
+  EXPECT(opFunc("ar") == "AllReduce");
   for (const Impl& impl : impls()) {
-    EXPECT(impl.agCopyEngine == (impl.ceMulticast != nullptr));
+    EXPECT(!impl.agCopyEngine || impl.agSelection == nullptr);  // the CE path takes no algSelection
     EXPECT(!impl.needsMultimem || impl.windows);
   }
 }
@@ -179,6 +202,20 @@ static std::vector<std::string> tagMatches(const std::string& tag, const std::ve
     if (name.size() >= tag.size() && strncasecmp(name.c_str(), tag.c_str(), tag.size()) == 0) out.push_back(name);
   }
   return out;
+}
+
+static void testKernelNames() {
+  EXPECT(kernelName("AllGather", "NVLS/SIMPLE", "bf16") == "ncclDevFunc_AllGather_NVLS_SIMPLE");
+  EXPECT(kernelName("ReduceScatter", "Ring/Simple", "fp32") == "ncclDevFunc_ReduceScatter_Sum_f32_RING_SIMPLE");
+  EXPECT(kernelName("AllGather", "Symmetric/AllGather_TmaSTMC", "bf16") == "ncclSymkDevKernel_AllGather_TmaSTMC");
+  EXPECT(kernelName("AllReduce", "Symmetric/AllReduce_RSxLDMC_AGxSTMC", "bf16") ==
+         "ncclSymkDevKernel_AllReduce_RSxLDMC_AGxSTMC_sum_bf16");
+  EXPECT(kernelName("AllGather", "CopyEngine+NVLSSync", "bf16").rfind("CopyEngine+NVLSSync（", 0) == 0);
+  auto kernels = recordKernels("AllGather=RING/LL|RING/SIMPLE;ReduceScatter=Symmetric/ReduceScatter_LDMC", "bf16");
+  EXPECT(kernels.size() == 2);
+  EXPECT(kernels["ag"] == "ncclDevFunc_AllGather_RING_LL \\| ncclDevFunc_AllGather_RING_SIMPLE");
+  EXPECT(kernels["rs"] == "ncclSymkDevKernel_ReduceScatter_LDMC_sum_bf16");
+  EXPECT(recordKernels("", "bf16").empty());
 }
 
 static void testSelectionTags() {
@@ -215,6 +252,7 @@ int main() {
   testJson();
   testHelpers();
   testSelectionTags();
+  testKernelNames();
   if (failures) {
     std::fprintf(stderr, "%d check(s) failed\n", failures);
     return 1;

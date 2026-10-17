@@ -53,7 +53,8 @@ Options:
   --gpus-per-node N       GPUs per node (default: 4, one GB200 compute tray)
   --impls LIST            ring,nvls,symm,stmc,tma,ce,ce-uc (default: ring,nvls,symm,stmc,tma,ce)
   --group-sizes LIST      Single-group sizes (default: 4,8,16,32 capped at nnodes*gpus-per-node)
-  --split-totals LIST     Ranks shared by two concurrent half-groups (default: 16 if available)
+  --split-totals LIST     Ranks shared by two concurrent half-groups (default: 16 if available);
+                          T/2 must be in --group-sizes, which provides the single-group reference
   --split-layouts LIST    contiguous,interleaved (default: contiguous)
   --workloads LIST        ag,rs,ag+rs (default: all); with both ag and rs, split scenarios also run
                           the cross case (group A all-gathers while group B reduce-scatters)
@@ -104,7 +105,7 @@ node_rank="${NODE_RANK:-${RANK:-0}}"
 master_addr="${MASTER_ADDR:-${DLC_MASTER_ADDR:-127.0.0.1}}"
 master_port="29711"
 gpus_per_node="4"
-impls="ring,nvls,symm,stmc,tma,ce"
+impls="ring,nvls,symmetric,symmetric-tma,copy-engine"
 group_sizes=""
 split_totals=""
 split_layouts="contiguous"
@@ -154,20 +155,25 @@ done
 (( master_port > 1 )) || die "--master-port must be > 1 (master-port - 1 hosts the run-dir handshake)"
 world_size=$(( nnodes * gpus_per_node ))
 
+# Defaults follow the allocation: every 4/8/16/32 that fits, and one split of the largest of 16/32
+# that fits into two halves (8+8 on 16 GPUs, 16+16 on 32). Each half's single-group reference is
+# the single group of the same size, which the group-size default already includes.
 if [[ -z "$group_sizes" ]]; then
     for n in 4 8 16 32; do
         (( n <= world_size )) && group_sizes+="${group_sizes:+,}$n"
     done
     [[ -n "$group_sizes" ]] || group_sizes="$world_size"
 fi
-if [[ -z "$split_totals" ]] && (( world_size >= 16 )); then
-    split_totals="16"
+if [[ -z "$split_totals" ]]; then
+    for n in 16 32; do
+        (( n <= world_size )) && split_totals="$n"
+    done
 fi
 IFS=, read -r -a impl_list <<<"$impls"
 for impl in "${impl_list[@]}"; do
     case "$impl" in
-        ring|nvls|symm|stmc|tma|ce|ce-uc) ;;
-        *) die "--impls accepts ring,nvls,symm,stmc,tma,ce,ce-uc; got $impl" ;;
+        ring|nvls|symmetric|symmetric-tma|copy-engine) ;;
+        *) die "--impls accepts ring,nvls,symmetric,symmetric-tma,copy-engine; got $impl" ;;
     esac
 done
 if (( nnodes > 1 )) && [[ "$master_addr" == 127.0.0.1 ]]; then
@@ -295,14 +301,14 @@ for index in "${!impl_list[@]}"; do
     case "$impl" in
         ring) impl_env+=(NCCL_NVLS_ENABLE=0) ;;
         nvls) impl_env+=(NCCL_NVLS_ENABLE=1) ;;
-        # Without a selection, an AllGather whose per-rank count exceeds 8Mi elements runs on the
-        # copy engines (enqueue.cc, Blackwell + NVLink + registered window). INT64_MAX disables
-        # that branch, so symm measures the symmetric kernels like ../nvls-collective.
-        symm) impl_env+=(NCCL_NVLS_ENABLE=1 NCCL_WIN_ENABLE=1 NCCL_SYM_CE_THRESHOLD=9223372036854775807) ;;
-        stmc|tma) impl_env+=(NCCL_NVLS_ENABLE=1 NCCL_WIN_ENABLE=1) ;;
-        # threshold >= 0 bypasses the CE cost model (ce_coll.cc): MC iff shard <= threshold.
-        ce) impl_env+=(NCCL_NVLS_ENABLE=1 NCCL_WIN_ENABLE=1 NCCL_CE_COLL_AG_MULTICAST_THRESHOLD=4611686018427387904) ;;
-        ce-uc) impl_env+=(NCCL_NVLS_ENABLE=1 NCCL_WIN_ENABLE=1 NCCL_CE_COLL_AG_MULTICAST_THRESHOLD=0) ;;
+        # symmetric: register multimem (AllGather_STMC, ReduceScatter_LDMC, AllReduce_RSxLDMC_AGxSTMC);
+        # keep NCCL_SYM_CE_THRESHOLD high to prevent AG fallback to CE.
+        symmetric) impl_env+=(NCCL_NVLS_ENABLE=1 NCCL_WIN_ENABLE=1 NCCL_SYM_CE_THRESHOLD=9223372036854775807) ;;
+        # symmetric-tma: TMA AllGather (AllGather_TmaSTMC) with LDMC RS; measures only AG and AG+RS.
+        symmetric-tma) impl_env+=(NCCL_NVLS_ENABLE=1 NCCL_WIN_ENABLE=1 NCCL_SYM_CE_THRESHOLD=9223372036854775807) ;;
+        # copy-engine: CE AllGather writing multicast address with LDMC RS; measures only AG and AG+RS.
+        # threshold=INT64_MAX/2 forces multicast (> 1 GiB per rank).
+        copy-engine) impl_env+=(NCCL_NVLS_ENABLE=1 NCCL_WIN_ENABLE=1 NCCL_CE_COLL_AG_MULTICAST_THRESHOLD=4611686018427387904) ;;
     esac
     # Cross-tray groups must use the NVLink fabric; forcing MNNVL makes a fallback to IB fail.
     (( nnodes > 1 )) && impl_env+=(NCCL_MNNVL_ENABLE=1)

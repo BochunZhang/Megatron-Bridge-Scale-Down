@@ -29,9 +29,10 @@
 // Scenarios (same as ../nvls-collective; all inside one launch):
 //   single: ranks [0, n) for every n in --group-sizes run AG alone, RS alone and AG+RS at the
 //           same time on two streams and two communicators.
-//   split:  ranks [0, T) for every T in --split-totals are cut into two halves; each half runs
-//           alone, then both run the same workload at the same time, and (cross) group A
-//           all-gathers while group B reduce-scatters.
+//   split:  ranks [0, T) for every T in --split-totals are cut into two halves; both halves run
+//           the same workload at the same time, and (cross) group A all-gathers while group B
+//           reduce-scatters. Neither half runs alone: its reference is single-n<T/2>, so T/2
+//           must be one of --group-sizes.
 // Every timed trial opens with a start gate: a one-element all-reduce over all ranks of the
 // scenario on its own communicator, so every group's clock starts at the same moment, which
 // concurrency = min(T_A, T_B) / max(T_A, T_B) relies on.
@@ -208,7 +209,8 @@ static void usage() {
     "Usage: nvls_collective_bench --impl IMPL --output-dir DIR [options]\n"
     "  --impl ring|nvls|symm|stmc|tma|ce|ce-uc\n"
     "  --group-sizes LIST      single-group sizes (default 4,8,16,32)\n"
-    "  --split-totals LIST     ranks shared by two concurrent halves, or none (default 16)\n"
+    "  --split-totals LIST     ranks shared by two concurrent halves, or none (default 16);\n"
+    "                          half (T/2) must be in --group-sizes\n"
     "  --split-layouts LIST    contiguous,interleaved (default contiguous)\n"
     "  --workloads LIST        ag,rs,ag+rs (default all); with ag and rs, split also runs the cross case\n"
     "  --sizes-mib LIST        full tensor = AG output / RS input (default 16,32,64,128,256,512,1024,2048)\n"
@@ -315,10 +317,16 @@ static void checkEnvironment(const Options& o, int worldSize) {
   if (name == "symm") {
     // Without a selection, enqueue.cc sends an AllGather with count > NCCL_SYM_CE_THRESHOLD
     // (elements) to the copy engines; a byte bound at least as large as the biggest payload
-    // keeps every AllGather on the symmetric kernels.
+    // keeps every AllGather on the symmetric kernels.  Mirror run_nvls_collective_benchmark.sh:
+    // set INT64_MAX automatically so the caller never has to remember this variable.  An
+    // explicit value is kept if it is already large enough; a missing or insufficient one is
+    // replaced with a warning.
     std::string threshold = envOr("NCCL_SYM_CE_THRESHOLD");
     if (!digits(threshold) || std::stoull(threshold) < largest) {
-      die("--impl symm requires NCCL_SYM_CE_THRESHOLD >= " + std::to_string(largest) + ", got '" + threshold + "'");
+      std::fprintf(stderr, "[rank %d] WARNING: NCCL_SYM_CE_THRESHOLD='%s' is not >= %llu; setting it"
+                          " to INT64_MAX so every AllGather stays on the symmetric kernels\n",
+                   gRank, threshold.c_str(), (unsigned long long)largest);
+      setenv("NCCL_SYM_CE_THRESHOLD", "18446744073709551615", 1);
     }
   }
   if (impl.ceMulticast) {
@@ -351,6 +359,12 @@ static void checkEnvironment(const Options& o, int worldSize) {
   }
   for (int t : o.splitTotals) {
     if (t % 2 || t < 4) die("--split-totals must be even and >= 4");
+    // A split half is compared with the single group of the same size, so that size must be
+    // measured; this is the same rule as ../nvls-collective.
+    if (std::find(o.groupSizes.begin(), o.groupSizes.end(), t / 2) == o.groupSizes.end()) {
+      die("--split-totals " + std::to_string(t) + " needs its half (" + std::to_string(t / 2) +
+          ") in --group-sizes, which provides the single-group reference");
+    }
   }
 }
 
@@ -443,6 +457,7 @@ struct Group {
   int commRank = -1;
   ncclComm_t ag = nullptr;
   ncclComm_t rs = nullptr;
+  ncclComm_t ar = nullptr;  // AllReduce communicator; shared with ag/rs for classic impls
   CommLogInfo logInfo;
   int multimemSupport = -1;
   int nLsaTeams = -1;
@@ -495,7 +510,7 @@ static Scenario createScenario(World& world, const Options& o, NcclLog& log, cud
   bool inScenario = color != NCCL_SPLIT_NOCOLOR;
   ncclConfig_t config = NCCL_CONFIG_INITIALIZER;
   NCCL_CHECK(ncclCommSplit(world.comm, inScenario ? 0 : NCCL_SPLIT_NOCOLOR, world.rank, &s.gate, &config));
-  ncclComm_t comms[2];
+  ncclComm_t comms[3];
   for (ncclComm_t& comm : comms) {
     ncclConfig_t groupConfig = NCCL_CONFIG_INITIALIZER;
     NCCL_CHECK(ncclCommSplit(world.comm, color, world.rank, &comm, &groupConfig));
@@ -504,6 +519,7 @@ static Scenario createScenario(World& world, const Options& o, NcclLog& log, cud
     if (group.member) {
       group.ag = comms[0];
       group.rs = comms[1];
+      group.ar = comms[2];
     }
   }
 
@@ -521,15 +537,20 @@ static Scenario createScenario(World& world, const Options& o, NcclLog& log, cud
   for (Group& group : s.groups) {
     if (group.member) {
       size_t n = group.ranks.size(), count = 1024;
-      float *shard, *full;
+      float *shard, *full, *buf;
       CUDA_CHECK(cudaMalloc(&shard, count * sizeof(float)));
       CUDA_CHECK(cudaMalloc(&full, n * count * sizeof(float)));
+      CUDA_CHECK(cudaMalloc(&buf, count * sizeof(float)));
       NCCL_CHECK(ncclAllGather(shard, full, count, ncclFloat32, group.ag, stream));
       CUDA_CHECK(cudaStreamSynchronize(stream));
       NCCL_CHECK(ncclReduceScatter(full, shard, count, ncclFloat32, ncclSum, group.rs, stream));
       CUDA_CHECK(cudaStreamSynchronize(stream));
+      // Warm up the AR communicator with a small in-place all-reduce.
+      NCCL_CHECK(ncclAllReduce(buf, buf, count, ncclFloat32, ncclSum, group.ar, stream));
+      CUDA_CHECK(cudaStreamSynchronize(stream));
       CUDA_CHECK(cudaFree(shard));
       CUDA_CHECK(cudaFree(full));
+      CUDA_CHECK(cudaFree(buf));
       ncclCommProperties_t props = NCCL_COMM_PROPERTIES_INITIALIZER;
       NCCL_CHECK(ncclCommQueryProperties(group.ag, &props));
       group.multimemSupport = props.multimemSupport;
@@ -576,6 +597,7 @@ static void destroyScenario(World& world, Scenario& s, NcclLog& log) {
     if (group.member) {
       NCCL_CHECK(ncclCommDestroy(group.ag));
       NCCL_CHECK(ncclCommDestroy(group.rs));
+      NCCL_CHECK(ncclCommDestroy(group.ar));
     }
   }
   if (s.gate) {
@@ -595,14 +617,16 @@ struct Buffers {
   void* agOut = nullptr;
   void* rsIn = nullptr;
   void* rsOut = nullptr;
-  ncclWindow_t wins[4] = {};
+  void* arIn = nullptr;   // AllReduce in-place buffer (in == out for AR)
+  ncclWindow_t wins[5] = {};
 };
 
 struct Streams {
   cudaStream_t main = nullptr;
   cudaStream_t ag = nullptr;
   cudaStream_t rs = nullptr;
-  cudaEvent_t start = nullptr, end = nullptr, agEnd = nullptr, rsEnd = nullptr;
+  cudaStream_t ar = nullptr;
+  cudaEvent_t start = nullptr, end = nullptr, agEnd = nullptr, rsEnd = nullptr, arEnd = nullptr;
 };
 
 // Fixed-size record every rank contributes to the world gather after each case.
@@ -612,7 +636,7 @@ struct RankResult {
   int32_t passed;
   int32_t implChecked;  // 1 on comm rank 0 of the group, which owns the TUNING lines
   int32_t nNodes, mnnvl, symmetricMultimem, multimemSupport, nLsaTeams;
-  float makespan[kMaxTrials], agMs[kMaxTrials], rsMs[kMaxTrials], enqueueMs[kMaxTrials];
+  float makespan[kMaxTrials], agMs[kMaxTrials], rsMs[kMaxTrials], arMs[kMaxTrials], enqueueMs[kMaxTrials];
   char observed[256];
   char errors[1024];
 };
@@ -643,7 +667,8 @@ static bool hasOp(const std::vector<std::string>& ops, const char* op) {
 }
 
 // AG chunk k equals k + 1; RS input is 1 on even and 2 on odd group ranks, so every partial sum
-// is a small integer that bf16 holds exactly in any reduction order.
+// is a small integer that bf16 holds exactly in any reduction order.  AR is in-place: input is
+// commRank+1 on every element, so the sum is 1+2+...+n = n*(n+1)/2.
 static Buffers makeBuffers(const Impl& impl, const Group& group, const std::vector<std::string>& ops, size_t sizeBytes,
                            const Dtype& dt, cudaStream_t stream) {
   Buffers b;
@@ -660,6 +685,10 @@ static Buffers makeBuffers(const Impl& impl, const Group& group, const std::vect
     fill(dt, b.rsIn, numel, float(group.commRank % 2 + 1), stream);
     fill(dt, b.rsOut, shard, 0.f, stream);
   }
+  if (hasOp(ops, "ar")) {
+    b.arIn = allocPayload(impl, sizeBytes);
+    fill(dt, b.arIn, numel, float(group.commRank + 1), stream);
+  }
   CUDA_CHECK(cudaStreamSynchronize(stream));
   if (impl.windows) {
     // Registration is collective over the communicator (bootstrap barrier in dev_runtime.cc):
@@ -672,6 +701,9 @@ static Buffers makeBuffers(const Impl& impl, const Group& group, const std::vect
       NCCL_CHECK(ncclCommWindowRegister(group.rs, b.rsIn, sizeBytes, &b.wins[2], NCCL_WIN_COLL_SYMMETRIC));
       NCCL_CHECK(ncclCommWindowRegister(group.rs, b.rsOut, shard * dt.size, &b.wins[3], NCCL_WIN_COLL_SYMMETRIC));
     }
+    if (b.arIn) {
+      NCCL_CHECK(ncclCommWindowRegister(group.ar, b.arIn, sizeBytes, &b.wins[4], NCCL_WIN_COLL_SYMMETRIC));
+    }
   }
   return b;
 }
@@ -679,10 +711,13 @@ static Buffers makeBuffers(const Impl& impl, const Group& group, const std::vect
 // Release the window registration before the memory goes away.
 static void freeBuffers(const Impl& impl, const Group& group, Buffers& b) {
   CUDA_CHECK(cudaDeviceSynchronize());
-  for (int i = 0; i < 4; i++) {
-    if (b.wins[i]) NCCL_CHECK(ncclCommWindowDeregister(i < 2 ? group.ag : group.rs, b.wins[i]));
+  for (int i = 0; i < 5; i++) {
+    if (b.wins[i]) {
+      ncclComm_t comm = (i < 2) ? group.ag : (i < 4) ? group.rs : group.ar;
+      NCCL_CHECK(ncclCommWindowDeregister(comm, b.wins[i]));
+    }
   }
-  for (void* ptr : {b.agIn, b.agOut, b.rsIn, b.rsOut}) freePayload(impl, ptr);
+  for (void* ptr : {b.agIn, b.agOut, b.rsIn, b.rsOut, b.arIn}) freePayload(impl, ptr);
   b = Buffers();
 }
 
@@ -702,6 +737,7 @@ struct CaseContext {
   unsigned long long delayNs;
   ncclCollConfig_t agConfig;
   ncclCollConfig_t rsConfig;
+  ncclCollConfig_t arConfig;
   int captureIndex = 0;
 };
 
@@ -710,25 +746,29 @@ static void launchOps(const CaseContext& ctx, const Group& group, const Buffers&
   for (const std::string& op : ops) {
     if (op == "ag") {
       NCCL_CHECK(ncclAllGatherConfig(b.agIn, b.agOut, shardCount, ctx.dt.nccl, group.ag, ctx.streams.ag, &ctx.agConfig));
-    } else {
+    } else if (op == "rs") {
       NCCL_CHECK(ncclReduceScatterConfig(b.rsIn, b.rsOut, shardCount, ctx.dt.nccl, ncclSum, group.rs, ctx.streams.rs,
                                          &ctx.rsConfig));
+    } else {  // "ar": in-place all-reduce; shardCount here is the full element count per rank
+      NCCL_CHECK(ncclAllReduceConfig(b.arIn, b.arIn, shardCount, ctx.dt.nccl, ncclSum, group.ar, ctx.streams.ar,
+                                     &ctx.arConfig));
     }
   }
 }
 
 struct TrialTimes {
-  float makespan = 0, ag = 0, rs = 0, enqueue = 0;
+  float makespan = 0, ag = 0, rs = 0, ar = 0, enqueue = 0;
 };
 
 // Pass the start gate, run `iters` back-to-back launches; per-iteration ms. The spin kernel keeps
 // the gate and every launch queued before any of them runs, so host enqueue time is not measured.
-// Every rank of the scenario passes the gate, including the idle half of an isolated split case
-// (which returns false), so the gate has the same members in every case. The start event is
-// recorded after the gate: all groups' clocks start within a few microseconds of each other.
+// Every rank of the scenario passes the gate, including ranks outside it (which return false), so
+// the gate has the same members in every case. The start event is recorded after the gate: all
+// groups' clocks start within a few microseconds of each other.
 static bool timedTrial(const CaseContext& ctx, const Scenario& s, const Group* group, const Buffers& b,
                        const std::vector<std::string>& ops, size_t shardCount, TrialTimes* t) {
   const Streams& st = ctx.streams;
+  bool hasAg = hasOp(ops, "ag"), hasRs = hasOp(ops, "rs"), hasAr = hasOp(ops, "ar");
   if (ctx.delayNs) spinKernel<<<1, 1, 0, st.main>>>(ctx.delayNs);
   auto hostStart = std::chrono::steady_clock::now();
   NCCL_CHECK(ncclAllReduce(s.gateBuf, s.gateBuf, 1, ncclFloat32, ncclSum, s.gate, st.main));
@@ -739,21 +779,23 @@ static bool timedTrial(const CaseContext& ctx, const Scenario& s, const Group* g
   CUDA_CHECK(cudaEventRecord(st.start, st.main));
   CUDA_CHECK(cudaStreamWaitEvent(st.ag, st.start));
   CUDA_CHECK(cudaStreamWaitEvent(st.rs, st.start));
+  CUDA_CHECK(cudaStreamWaitEvent(st.ar, st.start));
   for (int i = 0; i < ctx.o.iters; i++) launchOps(ctx, *group, b, ops, shardCount);
   t->enqueue = std::chrono::duration<float, std::milli>(std::chrono::steady_clock::now() - hostStart).count();
-  CUDA_CHECK(cudaEventRecord(st.agEnd, st.ag));
-  CUDA_CHECK(cudaEventRecord(st.rsEnd, st.rs));
-  CUDA_CHECK(cudaStreamWaitEvent(st.main, st.agEnd));
-  CUDA_CHECK(cudaStreamWaitEvent(st.main, st.rsEnd));
+  if (hasAg) CUDA_CHECK(cudaEventRecord(st.agEnd, st.ag));
+  if (hasRs) CUDA_CHECK(cudaEventRecord(st.rsEnd, st.rs));
+  if (hasAr) CUDA_CHECK(cudaEventRecord(st.arEnd, st.ar));
+  if (hasAg) CUDA_CHECK(cudaStreamWaitEvent(st.main, st.agEnd));
+  if (hasRs) CUDA_CHECK(cudaStreamWaitEvent(st.main, st.rsEnd));
+  if (hasAr) CUDA_CHECK(cudaStreamWaitEvent(st.main, st.arEnd));
   CUDA_CHECK(cudaEventRecord(st.end, st.main));
   CUDA_CHECK(cudaEventSynchronize(st.end));
   float ms;
   CUDA_CHECK(cudaEventElapsedTime(&ms, st.start, st.end));
   t->makespan = ms / ctx.o.iters;
-  CUDA_CHECK(cudaEventElapsedTime(&ms, st.start, st.agEnd));
-  t->ag = ms / ctx.o.iters;
-  CUDA_CHECK(cudaEventElapsedTime(&ms, st.start, st.rsEnd));
-  t->rs = ms / ctx.o.iters;
+  if (hasAg) { CUDA_CHECK(cudaEventElapsedTime(&ms, st.start, st.agEnd)); t->ag = ms / ctx.o.iters; }
+  if (hasRs) { CUDA_CHECK(cudaEventElapsedTime(&ms, st.start, st.rsEnd)); t->rs = ms / ctx.o.iters; }
+  if (hasAr) { CUDA_CHECK(cudaEventElapsedTime(&ms, st.start, st.arEnd)); t->ar = ms / ctx.o.iters; }
   return true;
 }
 
@@ -761,7 +803,7 @@ static void copyString(char* dst, size_t cap, const std::string& src) { std::snp
 
 // What one case runs: group g of the scenario runs workloads[g] when active[g].
 struct CaseSpec {
-  std::string phase;         // isolated / concurrent / cross
+  std::string phase;         // single: isolated; split: concurrent / cross
   std::string part;          // "" for single, else one of splitParts()
   std::string caseWorkload;  // the workload in the case name (kCrossWorkload for cross)
   std::vector<bool> active;
@@ -791,7 +833,12 @@ static std::vector<JsonObject> runCase(CaseContext& ctx, const Scenario& s, cons
     }
   }
   std::vector<std::string> ops = mine ? workloadOps(spec.workloads[groupIndex]) : std::vector<std::string>{};
-  size_t shardCount = mine ? spec.sizeBytes / ctx.dt.size / mine->ranks.size() : 0;
+  // AllReduce is in-place: the shard is the whole buffer, so shardCount = numel, not numel/n.
+  size_t shardCount = 0;
+  if (mine) {
+    size_t numel = spec.sizeBytes / ctx.dt.size;
+    shardCount = hasOp(ops, "ar") ? numel : numel / mine->ranks.size();
+  }
   Buffers buffers;
   if (mine) buffers = makeBuffers(impl, *mine, ops, spec.sizeBytes, ctx.dt, ctx.streams.main);
   world.barrier();
@@ -851,10 +898,15 @@ static std::vector<JsonObject> runCase(CaseContext& ctx, const Scenario& s, cons
     if (hasOp(ops, "rs")) {
       local.passed &= countMismatches(ctx.dt, buffers.rsOut, shardCount, 0, float(n + n / 2), ctx.streams.main) == 0;
     }
+    if (hasOp(ops, "ar")) {
+      // AR is in-place: every element should equal 1+2+...+n = n*(n+1)/2.
+      local.passed &= countMismatches(ctx.dt, buffers.arIn, shardCount, 0, float(n * (n + 1) / 2), ctx.streams.main) == 0;
+    }
     for (int t = 0; t < o.trials; t++) {
       local.makespan[t] = trials[t].makespan;
       local.agMs[t] = trials[t].ag;
       local.rsMs[t] = trials[t].rs;
+      local.arMs[t] = trials[t].ar;
       local.enqueueMs[t] = trials[t].enqueue;
     }
     local.nNodes = mine->logInfo.nNodes;
@@ -916,24 +968,26 @@ static std::vector<JsonObject> runCase(CaseContext& ctx, const Scenario& s, cons
 
   // The slowest rank defines each trial of each group.
   struct GroupTrials {
-    std::vector<double> makespan, ag, rs, enqueue;
+    std::vector<double> makespan, ag, rs, ar, enqueue;
     const RankResult* owner = nullptr;
   };
   std::vector<GroupTrials> perGroup(s.groups.size());
   for (size_t g = 0; g < s.groups.size(); g++) {
     if (!spec.active[g]) continue;
     for (int t = 0; t < o.trials; t++) {
-      float m = 0, a = 0, r = 0, e = 0;
+      float m = 0, a = 0, r = 0, ar = 0, e = 0;
       for (const RankResult& item : all) {
         if (item.groupIndex != int(g)) continue;
         m = std::max(m, item.makespan[t]);
         a = std::max(a, item.agMs[t]);
         r = std::max(r, item.rsMs[t]);
+        ar = std::max(ar, item.arMs[t]);
         e = std::max(e, item.enqueueMs[t]);
       }
       perGroup[g].makespan.push_back(m);
       perGroup[g].ag.push_back(a);
       perGroup[g].rs.push_back(r);
+      perGroup[g].ar.push_back(ar);
       perGroup[g].enqueue.push_back(e);
     }
     for (const RankResult& item : all) {
@@ -997,13 +1051,14 @@ static std::vector<JsonObject> runCase(CaseContext& ctx, const Scenario& s, cons
     r.set("mean_enqueue_ms", jNum(mean(gt.enqueue)));
     double aggregate = 0;
     for (const std::string& op : groupOps) {
-      const std::vector<double>& times = op == "ag" ? gt.ag : gt.rs;
+      const std::vector<double>& times = op == "ag" ? gt.ag : op == "rs" ? gt.rs : gt.ar;
       double ms = median(times);
       r.set(op + "_ms", jNum(ms));
       r.set("mean_" + op + "_ms", jNum(mean(times)));
       r.set(op + "_algbw_gb_s", jNum(algBandwidthGBs(double(spec.sizeBytes), ms / 1e3)));
-      r.set(op + "_busbw_gb_s", jNum(busBandwidthGBs(double(spec.sizeBytes), n, ms / 1e3)));
-      aggregate += busBandwidthGBs(double(spec.sizeBytes), n, mk / 1e3);
+      // An all-reduce counts both directions, so its busbw already carries the factor 2.
+      r.set(op + "_busbw_gb_s", jNum(opBusBandwidthGBs(op, double(spec.sizeBytes), n, ms / 1e3)));
+      aggregate += opBusBandwidthGBs(op, double(spec.sizeBytes), n, mk / 1e3);
     }
     r.set("aggregate_busbw_gb_s", jNum(aggregate));
     records.push_back(r);
@@ -1150,7 +1205,8 @@ int main(int argc, char** argv) {
   CUDA_CHECK(cudaStreamCreateWithFlags(&streams.main, cudaStreamNonBlocking));
   CUDA_CHECK(cudaStreamCreateWithFlags(&streams.ag, cudaStreamNonBlocking));
   CUDA_CHECK(cudaStreamCreateWithFlags(&streams.rs, cudaStreamNonBlocking));
-  for (cudaEvent_t* e : {&streams.start, &streams.end, &streams.agEnd, &streams.rsEnd}) CUDA_CHECK(cudaEventCreate(e));
+  CUDA_CHECK(cudaStreamCreateWithFlags(&streams.ar, cudaStreamNonBlocking));
+  for (cudaEvent_t* e : {&streams.start, &streams.end, &streams.agEnd, &streams.rsEnd, &streams.arEnd}) CUDA_CHECK(cudaEventCreate(e));
 
   CaseContext ctx{o,
                   dt,
@@ -1159,7 +1215,8 @@ int main(int argc, char** argv) {
                   streams,
                   (unsigned long long)(o.launchDelayMs * 1e6),
                   collConfig(o.impl->agSelection, o.impl->agCopyEngine),
-                  collConfig(o.impl->rsSelection, false)};
+                  collConfig(o.impl->rsSelection, false),
+                  collConfig(o.impl->arSelection, false)};
   if (world.rank == 0 && o.nsys) {
     fs::create_directories(fs::path(o.outputDir) / "nsys");
     std::ofstream(fs::path(o.outputDir) / "nsys" / "index.tsv")
@@ -1186,7 +1243,7 @@ int main(int argc, char** argv) {
     for (int r = 0; r < n; r++) ranks[r] = r;
     Scenario s = createScenario(world, o, log, streams.main, "single", n, "", {{"single" + std::to_string(n), ranks}});
     for (int mib : o.sizesMiB) {
-      for (const std::string& workload : o.workloads) {
+      for (const std::string& workload : measuredWorkloads(impl, o.workloads)) {
         emit(runCase(ctx, s, {"isolated", "", workload, {true}, {workload}, size_t(mib) * kBytesPerMiB}));
       }
     }
@@ -1201,10 +1258,9 @@ int main(int argc, char** argv) {
                                   {{prefix + "-A", halves.first}, {prefix + "-B", halves.second}});
       for (int mib : o.sizesMiB) {
         size_t sizeBytes = size_t(mib) * kBytesPerMiB;
-        for (const std::string& workload : o.workloads) {
-          // The other half still passes the gate, so it stays idle, not absent.
-          emit(runCase(ctx, s, {"isolated", "A-isolated", workload, {true, false}, {workload, workload}, sizeBytes}));
-          emit(runCase(ctx, s, {"isolated", "B-isolated", workload, {false, true}, {workload, workload}, sizeBytes}));
+        for (const std::string& workload : measuredWorkloads(impl, o.workloads)) {
+          // Both halves run together; the reference of each half is single-n<T/2>, like
+          // ../nvls-collective. No half runs alone.
           emit(runCase(ctx, s, {"concurrent", "AB-concurrent", workload, {true, true}, {workload, workload}, sizeBytes}));
         }
         if (hasCross(o)) {
