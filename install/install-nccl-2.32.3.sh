@@ -176,7 +176,7 @@ check_switch NCCL_SYM_TMA_ENABLE 0 "removes AllGather_TmaSTMC / ReduceScatter_Tm
 check_switch NCCL_WIN_ENABLE 0 "no symmetric windows, so no symmetric kernels and no CE collectives"
 check_switch NCCL_CUMEM_ENABLE 0 "symmetricSupport requires cuMem (init.cc)"
 # NCCL_NVLS_ENABLE is runtime-only (default 2 = on when the GPU reports multicast support,
-# src/transport/nvls.cc). run_nvls_collective_cpp.sh exports it per pass (ring 0, all others 1),
+# src/transport/nvls.cc). run_nvls_collective_benchmark.sh exports it per pass (ring 0, all others 1),
 # and an exported value beats nccl.conf (setenv(..., 0) in src/os/linux.cc), so a 0 here only
 # matters for runs outside the launcher.
 for file in ENV "${conf_files[@]}"; do
@@ -190,7 +190,7 @@ for file in ENV "${conf_files[@]}"; do
     [[ "$value" == 0 ]] && note "NCCL_NVLS_ENABLE=0 in ${where}; the launcher overrides it, set NCCL_NVLS_ENABLE=1 for manual runs"
 done
 for name in NCCL_ALGO NCCL_SYM_KERNEL NCCL_CTA_POLICY; do
-    [[ -n "${!name:-}" ]] && note "${name}=${!name} is set here; run_nvls_collective_cpp.sh unsets it per pass"
+    [[ -n "${!name:-}" ]] && note "${name}=${!name} is set here; run_nvls_collective_benchmark.sh unsets it per pass"
 done
 
 if command -v nvidia-smi >/dev/null; then

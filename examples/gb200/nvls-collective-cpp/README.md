@@ -105,15 +105,15 @@ make -C examples/gb200/nvls-collective-cpp NCCL_HOME=nccl/nccl-2.32.3/build CUDA
 单托盘 4 卡，先只看新增的两组：
 
 ```bash
-bash examples/gb200/nvls-collective-cpp/run_nvls_collective_cpp.sh \
+bash examples/gb200/nvls-collective-cpp/run_nvls_collective_benchmark.sh \
   --impls stmc,tma,ce,ce-uc --sizes-mib 64,256,1024 --trials 3
 ```
 
 全部实现；16 卡起默认带 8+8 split（含 cross）：
 
 ```bash
-bash examples/gb200/nvls-collective-cpp/run_nvls_collective_cpp.sh             # 1 托盘
-bash examples/gb200/nvls-collective-cpp/run_nvls_collective_cpp.sh --nnodes 4  # 每个节点执行同一条
+bash examples/gb200/nvls-collective-cpp/run_nvls_collective_benchmark.sh             # 1 托盘
+bash examples/gb200/nvls-collective-cpp/run_nvls_collective_benchmark.sh --nnodes 4  # 每个节点执行同一条
 ```
 
 每个节点为每张 GPU 起一个 `nvls_collective_bench` 进程（`RANK = node_rank × gpus_per_node + local_rank`），
@@ -237,8 +237,8 @@ results/gb200/nvls-collective-cpp/gpu-num-<W>/<yyyymmdd-hhmmss>/
 
 ```bash
 make -C examples/gb200/nvls-collective-cpp selftest   # TUNING 日志解析、选择标签、命名、JSON、带宽
-bash -n examples/gb200/nvls-collective-cpp/run_nvls_collective_cpp.sh
-bash examples/gb200/nvls-collective-cpp/run_nvls_collective_cpp.sh --dry-run --nnodes 4 --master-addr 10.0.0.1
+bash -n examples/gb200/nvls-collective-cpp/run_nvls_collective_benchmark.sh
+bash examples/gb200/nvls-collective-cpp/run_nvls_collective_benchmark.sh --dry-run --nnodes 4 --master-addr 10.0.0.1
 ```
 
 selftest 用的是 2.32.3 源码里的日志格式串，验证的是解析逻辑，**不能**代替 GB200 上的真实运行。

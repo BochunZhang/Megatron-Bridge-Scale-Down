@@ -43,7 +43,7 @@ Node 0 builds the binaries first, then stamps the run id and hands it to the oth
 be on storage every node can see. An exported RUN_TIME pins the id.
 
 Usage:
-  run_nvls_collective_cpp.sh [options]
+  run_nvls_collective_benchmark.sh [options]
 
 Options:
   --nnodes N              Nodes in the job (default: NNODES or 1)
@@ -73,11 +73,11 @@ Options:
 
 Examples:
   # One tray (4 GPUs): smoke test of the TMA and CE AllGather against the register kernel.
-  bash examples/gb200/nvls-collective-cpp/run_nvls_collective_cpp.sh \
+  bash examples/gb200/nvls-collective-cpp/run_nvls_collective_benchmark.sh \
     --impls stmc,tma,ce --sizes-mib 64 --trials 2
 
   # Eight trays in one NVL72 domain (32 GPUs); run the same command on every node.
-  bash examples/gb200/nvls-collective-cpp/run_nvls_collective_cpp.sh --nnodes 8
+  bash examples/gb200/nvls-collective-cpp/run_nvls_collective_benchmark.sh --nnodes 8
 USAGE
 }
 

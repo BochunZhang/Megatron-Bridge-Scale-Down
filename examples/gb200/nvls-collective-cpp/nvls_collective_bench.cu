@@ -14,7 +14,7 @@
 
 // All-gather / reduce-scatter throughput on GB200 with NCCL 2.32.3, without torch or MPI.
 //
-// One process per GPU, started by run_nvls_collective_cpp.sh with RANK / WORLD_SIZE / LOCAL_RANK
+// One process per GPU, started by run_nvls_collective_benchmark.sh with RANK / WORLD_SIZE / LOCAL_RANK
 // and NCCL_COMM_ID=<master>:<port>: every rank calls ncclGetUniqueId (which returns the id built
 // from NCCL_COMM_ID) and world rank 0's ncclCommInitRank starts the bootstrap root there. All
 // scenario communicators are ncclCommSplit children of that world communicator; the world
@@ -215,7 +215,7 @@ static void usage() {
     "  --dtype bf16|fp32       (default bf16)\n"
     "  --warmup N --iters N --trials N --launch-delay-ms MS   (default 5 20 5 5)\n"
     "  --nsys                  one cudaProfilerStart/Stop window + NVTX range per case\n"
-    "Environment: RANK, WORLD_SIZE, LOCAL_RANK, NCCL_COMM_ID (set by run_nvls_collective_cpp.sh).\n");
+    "Environment: RANK, WORLD_SIZE, LOCAL_RANK, NCCL_COMM_ID (set by run_nvls_collective_benchmark.sh).\n");
 }
 
 static Options parseOptions(int argc, char** argv) {
@@ -1100,7 +1100,7 @@ int main(int argc, char** argv) {
   std::setvbuf(stdout, nullptr, _IOLBF, 0);
   Options o = parseOptions(argc, argv);
   if (envOr("RANK").empty() || envOr("WORLD_SIZE").empty() || envOr("LOCAL_RANK").empty()) {
-    die("RANK, WORLD_SIZE and LOCAL_RANK must be set (run_nvls_collective_cpp.sh does)");
+    die("RANK, WORLD_SIZE and LOCAL_RANK must be set (run_nvls_collective_benchmark.sh does)");
   }
   World world;
   world.rank = gRank = std::stoi(envOr("RANK"));
