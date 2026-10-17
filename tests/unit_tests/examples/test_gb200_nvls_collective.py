@@ -319,7 +319,7 @@ def test_environment_check_requires_the_nccl_log_the_check_reads(monkeypatch, na
 
 
 # The three TUNING launch lines as nccl-2.29.7 prints them (debug.cc prefix + call-site format).
-CLASSIC_AG = "h:1:2 [0] NCCL INFO AllGather: 16777216 Bytes -> Algo NVLS proto Simple channel{Lo..Hi}={0..15}"
+CLASSIC_AG = "h:1:2 [0] NCCL INFO AllGather: 16777216 Bytes -> Algo NVLS proto SIMPLE channel{Lo..Hi}={0..15}"
 SYMM_AG = "h:1:2 [0] NCCL INFO AllGather [Symmetric]: 16777216 Bytes -> Kernel AllGather_STMC nchannels 8 nthreads 512 nWorks 1"
 SYMM_RS = "h:1:2 [0] NCCL INFO ReduceScatter [Symmetric]: 16777216 Bytes -> Kernel ReduceScatter_LDMC nchannels 8 nthreads 512 nWorks 1"
 CE_AG = "h:1:2 [0] NCCL INFO AllGather [Copy Engine]: 16777216 Bytes -> cudaMemcpy; CE synchronization with NVLS"
@@ -327,7 +327,7 @@ CE_AG = "h:1:2 [0] NCCL INFO AllGather [Copy Engine]: 16777216 Bytes -> cudaMemc
 
 @pytest.mark.unit
 def test_parse_tuning_line_reads_every_launch_format():
-    assert benchmark.parse_tuning_line(CLASSIC_AG) == ("AllGather", "NVLS/Simple", 16777216)
+    assert benchmark.parse_tuning_line(CLASSIC_AG) == ("AllGather", "NVLS/SIMPLE", 16777216)
     assert benchmark.parse_tuning_line(SYMM_AG) == ("AllGather", "Symmetric/AllGather_STMC", 16777216)
     assert benchmark.parse_tuning_line(CE_AG) == ("AllGather", "CopyEngine", 16777216)
     assert benchmark.parse_tuning_line("h:1:2 [0] NCCL INFO Channel 00/32 : 0 1 2 3") is None
@@ -352,7 +352,7 @@ def _check(lines, *, algo="symm", ops=("ag",), launches=2, shard_bytes=16777216,
     )
 
 
-GATE = "h:1:2 [0] NCCL INFO AllReduce: 4 Bytes -> Algo Ring proto LL channel{Lo..Hi}={0..0}"
+GATE = "h:1:2 [0] NCCL INFO AllReduce: 4 Bytes -> Algo RING proto LL channel{Lo..Hi}={0..0}"
 
 
 @pytest.mark.unit
@@ -365,7 +365,7 @@ def test_check_implementation_counts_start_gates_only_where_they_are_logged():
     # Any other rank must not see gate lines, and a payload-sized all-reduce is never a gate.
     assert _check([GATE, SYMM_AG, SYMM_AG])[1] == ["start gate: 1 AllReduce launches in the NCCL log, expected 0"]
     big = GATE.replace(": 4 Bytes", ": 4096 Bytes")
-    assert _check([big, SYMM_AG, SYMM_AG])[1] == ["unexpected collective AllReduce=Ring/LL x1"]
+    assert _check([big, SYMM_AG, SYMM_AG])[1] == ["unexpected collective AllReduce=RING/LL x1"]
 
 
 @pytest.mark.unit
@@ -388,7 +388,7 @@ def test_check_implementation_rejects_a_single_copy_engine_launch():
 @pytest.mark.unit
 def test_check_implementation_rejects_a_classic_fallback_and_a_pin_mismatch():
     _, errors = _check([SYMM_AG, CLASSIC_AG], pinned_kernel="AllGather_ST")
-    assert errors == ["AllGather: expected Symmetric/AllGather_ST, got NVLS/Simple x1, Symmetric/AllGather_STMC x1"]
+    assert errors == ["AllGather: expected Symmetric/AllGather_ST, got NVLS/SIMPLE x1, Symmetric/AllGather_STMC x1"]
 
 
 @pytest.mark.unit
@@ -397,7 +397,7 @@ def test_check_implementation_holds_classic_passes_to_their_algorithm(algo, acce
     _, errors = _check([CLASSIC_AG, CLASSIC_AG], algo=algo)
     assert (errors == []) is accepted
     if not accepted:
-        assert errors == ["AllGather: expected Ring/*, got NVLS/Simple x2"]
+        assert errors == ["AllGather: expected Ring/*, got NVLS/SIMPLE x2"]
 
 
 @pytest.mark.unit
@@ -950,3 +950,11 @@ def test_timed_trial_passes_the_gate_before_its_clock_starts(monkeypatch, member
         # The idle half-group only passes the gate, so the gate always has every scenario rank.
         assert kinds[2:] == ["sync"]
         assert result is None
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("name", ["RING", "Ring"])  # 2.29 ncclAlgoToString / older ncclAlgoStr
+def test_check_implementation_accepts_the_algorithm_name_in_any_case(name):
+    # Reproduces the 32-GPU failure "AllGather: expected Ring/*, got RING/SIMPLE x105".
+    line = f"h:1:2 [0] NCCL INFO AllGather: 4194304 Bytes -> Algo {name} proto SIMPLE channel{{Lo..Hi}}={{0..7}}"
+    assert _check([line] * 105, algo="ring", launches=105, shard_bytes=4194304) == (f"AllGather={name}/SIMPLE", [])

@@ -425,8 +425,9 @@ def implementation_matches(algo: str, op: str, implementation: str, *, pinned_ke
     if algo == "symm":
         family, _, kernel = implementation.partition("/")
         return family == "Symmetric" and kernel in SYMM_KERNELS[op] and pinned_kernel in (None, kernel)
+    # 2.29 logs ncclAlgoToString() ("RING", "NVLS"); older releases used ncclAlgoStr ("Ring").
     expected = NCCL_ALGO_ENV[algo]
-    return implementation.split("/", 1)[0] == expected
+    return implementation.split("/", 1)[0].upper() == expected.upper()
 
 
 def check_implementation(
