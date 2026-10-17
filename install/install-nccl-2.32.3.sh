@@ -137,6 +137,11 @@ echo "=== Library: ${lib}"
 for symbol in ncclAllGatherConfig ncclReduceScatterConfig ncclCommWindowRegister ncclMemAlloc ncclCommQueryProperties; do
     nm -D --defined-only "$lib" 2>/dev/null | grep -qw "$symbol" && ok "exports ${symbol}" || bad "does not export ${symbol}"
 done
+# NVLS / multicast is compiled in only under CUDART_VERSION >= 12010 (src/transport/nvls.cc);
+# otherwise ncclNvlsInit is a stub and NCCL_NVLS_ENABLE=1 can never take effect. The INFO string
+# below exists only in the real branch, so finding it in the library proves NVLS was built.
+grep -aq "NVLS multicast support is" "$lib" && ok "NVLS / multicast transport compiled in (CUDART >= 12.1)" \
+    || bad "NVLS transport is the stub in ${lib}; rebuild with a CUDA >= 12.1 toolkit"
 cuobjdump="${cuda_home}/bin/cuobjdump"
 if [[ -x "$cuobjdump" ]]; then
     # The TMA/multimem kernel bodies are compiled under __CUDA_ARCH__ >= 900
@@ -170,7 +175,20 @@ check_switch() {
 check_switch NCCL_SYM_TMA_ENABLE 0 "removes AllGather_TmaSTMC / ReduceScatter_TmaLD"
 check_switch NCCL_WIN_ENABLE 0 "no symmetric windows, so no symmetric kernels and no CE collectives"
 check_switch NCCL_CUMEM_ENABLE 0 "symmetricSupport requires cuMem (init.cc)"
-check_switch NCCL_NVLS_ENABLE 0 "no multicast: STMC / TmaSTMC / LDMC and the CE multicast path are removed"
+# NCCL_NVLS_ENABLE is runtime-only (default 2 = on when the GPU reports multicast support,
+# src/transport/nvls.cc). run_nvls_collective_cpp.sh exports it per pass (ring 0, all others 1),
+# and an exported value beats nccl.conf (setenv(..., 0) in src/os/linux.cc), so a 0 here only
+# matters for runs outside the launcher.
+for file in ENV "${conf_files[@]}"; do
+    if [[ "$file" == ENV ]]; then
+        value="${NCCL_NVLS_ENABLE:-}" where="the environment"
+    else
+        [[ -n "$file" && -f "$file" ]] || continue
+        value="$(sed -n 's/^[[:space:]]*NCCL_NVLS_ENABLE[[:space:]]*=[[:space:]]*\([0-9]*\).*/\1/p' "$file" | tail -1)"
+        where="$file"
+    fi
+    [[ "$value" == 0 ]] && note "NCCL_NVLS_ENABLE=0 in ${where}; the launcher overrides it, set NCCL_NVLS_ENABLE=1 for manual runs"
+done
 for name in NCCL_ALGO NCCL_SYM_KERNEL NCCL_CTA_POLICY; do
     [[ -n "${!name:-}" ]] && note "${name}=${!name} is set here; run_nvls_collective_cpp.sh unsets it per pass"
 done
@@ -201,4 +219,5 @@ if (( failures )); then
     die "${failures} check(s) failed"
 fi
 echo "=== NCCL 2.32.3 ready: NCCL_HOME=${build_dir}"
+echo "  library: ${build_dir}/lib/libnccl.so (-> libnccl.so.2), headers: ${build_dir}/include"
 echo "  make -C examples/gb200/nvls-collective-cpp NCCL_HOME=${build_dir} CUDA_HOME=${cuda_home}"
