@@ -122,7 +122,8 @@ NCCL 自己通过 `NCCL_COMM_ID=<master-addr>:<master-port + i>` 建 bootstrap�
 只读一次。某个 rank 失败时 launcher 杀掉同轮其余 rank 并报错退出。
 
 `MASTER_ADDR`/`RANK` 注入、run id 握手、`eth0`/`bond1` 接口选择都和 `../nvls-collective` 相同；
-`--group-sizes` 默认取 4/8/16/32 中不超过总卡数的部分，`--split-totals` 默认在 ≥16 卡时取 16。
+`--sizes-mib` 默认 16,32,64,128,256,512,1024,2048（完整张量，AG 输出 / RS 输入）；`--group-sizes` 默认取 4/8/16/32 中
+不超过总卡数的部分；`--split-totals` 默认在 ≥16 卡时取 16，布局默认只有 `contiguous`。
 
 ### nsys
 
@@ -202,7 +203,7 @@ concurrency = min(T_A, T_B) / max(T_A, T_B)   # 每个 trial 一个值，报告�
 ## 输出
 
 ```text
-results/gb200/nvls-collective-cpp/gpu-num-<W>/<yymmdd-hhmmss>/
+results/gb200/nvls-collective-cpp/gpu-num-<W>/<yyyymmdd-hhmmss>/
   <impl>/                                      # ring nvls symm stmc tma ce ce-uc
     results.jsonl  metadata.json               # 只由全局 rank 0 写，schema 与 ../nvls-collective 相同
     bench-node<k>.log                          # 每个节点一份（该节点所有 rank 的 stdout/stderr）

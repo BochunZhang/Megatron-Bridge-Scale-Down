@@ -33,7 +33,7 @@ Implementations (the kernel is pinned per call with ncclCollConfig_t, forceAlgSe
   ce      AG = copy engine, one copy to the multicast address (CTAPolicy=ZERO), RS = ReduceScatter_LDMC
   ce-uc   AG = copy engine, N-1 unicast copies, RS = ReduceScatter_LDMC
 
-Output: results/gb200/nvls-collective-cpp/gpu-num-<nnodes*gpus-per-node>/<yymmdd-hhmmss>, one
+Output: results/gb200/nvls-collective-cpp/gpu-num-<nnodes*gpus-per-node>/<yyyymmdd-hhmmss>, one
 <impl>/ per pass, laid out like ../nvls-collective: results.jsonl, metadata.json, nccl-raw/,
 comm/ and per test <impl>/cases/<case>/ (e.g. tma/cases/single-n4_ag_bf16_1024MiB/) with every
 member rank's NCCL log of that test, case.json and, with --nsys, <impl>_<case>_rank<RR>.nsys-rep.
@@ -57,7 +57,7 @@ Options:
   --split-layouts LIST    contiguous,interleaved (default: contiguous)
   --workloads LIST        ag,rs,ag+rs (default: all); with both ag and rs, split scenarios also run
                           the cross case (group A all-gathers while group B reduce-scatters)
-  --sizes-mib LIST        Full tensor sizes in MiB (default: 16,64,256,1024)
+  --sizes-mib LIST        Full tensor sizes in MiB (default: 16,32,64,128,256,512,1024,2048)
   --dtype bf16|fp32       Payload dtype (default: bf16)
   --warmup N              Untimed iterations per case, >= 1 (default: 5)
   --iters N               Back-to-back iterations per trial (default: 20)
@@ -109,7 +109,7 @@ group_sizes=""
 split_totals=""
 split_layouts="contiguous"
 workloads="ag,rs,ag+rs"
-sizes_mib="16,64,256,1024"
+sizes_mib="16,32,64,128,256,512,1024,2048"
 dtype="bf16"
 warmup="5"
 iters="20"

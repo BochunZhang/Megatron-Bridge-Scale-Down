@@ -192,7 +192,7 @@ struct Options {
   std::vector<int> splitTotals = {16};
   std::vector<std::string> splitLayouts = {"contiguous"};
   std::vector<std::string> workloads = nvls_bench::workloads();
-  std::vector<int> sizesMiB = {16, 64, 256, 1024};
+  std::vector<int> sizesMiB = {16, 32, 64, 128, 256, 512, 1024, 2048};
   std::string dtype = "bf16";
   int warmup = 5;
   int iters = 20;
@@ -211,7 +211,7 @@ static void usage() {
     "  --split-totals LIST     ranks shared by two concurrent halves, or none (default 16)\n"
     "  --split-layouts LIST    contiguous,interleaved (default contiguous)\n"
     "  --workloads LIST        ag,rs,ag+rs (default all); with ag and rs, split also runs the cross case\n"
-    "  --sizes-mib LIST        full tensor = AG output / RS input (default 16,64,256,1024)\n"
+    "  --sizes-mib LIST        full tensor = AG output / RS input (default 16,32,64,128,256,512,1024,2048)\n"
     "  --dtype bf16|fp32       (default bf16)\n"
     "  --warmup N --iters N --trials N --launch-delay-ms MS   (default 5 20 5 5)\n"
     "  --nsys                  one cudaProfilerStart/Stop window + NVTX range per case\n"
