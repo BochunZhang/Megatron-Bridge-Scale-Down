@@ -12,7 +12,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Query all-gather / reduce-scatter kernel cost from the ``--nsys`` reports with SQL.
+"""Query all-gather / reduce-scatter / all-reduce kernel cost from the ``--nsys`` reports with SQL.
 
 nsys writes one report per rank per case as ``<algo>/nsys/rank<R>*.nsys-rep``; its own suffix
 for repeated captures is version dependent. This script exports each report with
@@ -51,7 +51,7 @@ HERE = Path(__file__).resolve().parent
 if str(HERE) not in sys.path:
     sys.path.insert(0, str(HERE))  # the sibling module, also when this file is loaded by path
 
-from collective_metrics import ALGORITHMS, rank_file  # noqa: E402
+from collective_metrics import ALGORITHMS, rank_file, workload_ops  # noqa: E402
 
 
 LOGGER = logging.getLogger(__name__)
@@ -233,7 +233,11 @@ def summarize(
     overlap: dict[tuple[int, str, str], int],
     results: Sequence[dict[str, object]],
 ) -> list[dict[str, object]]:
-    """Per case and group: median over trials of the slowest rank's per-iteration kernel times."""
+    """Per case and group: median over trials of the slowest rank's per-iteration kernel times.
+
+    Only the ops of the case's own workload are counted. That drops start-gate AllReduce kernels
+    from AG/RS cases of reports whose trial range still contains the gate (the C++ benchmark).
+    """
     records = _rank_records(results)
     per_trial: dict[tuple[str, str, str, str], dict[int, dict[str, float]]] = defaultdict(dict)
     names: dict[tuple[str, str, str], set[str]] = defaultdict(set)
@@ -241,9 +245,11 @@ def summarize(
         record = records.get((row.label, row.rank))
         if record is None:
             continue  # idle rank of a split case, or a label with no results row
+        if row.op not in workload_ops(str(record["workload"])):
+            continue  # e.g. the start gate's AllReduce inside an AG/RS trial
         group = str(record["group_name"])
         sample = per_trial[(row.algo, row.label, group, row.trial)].setdefault(
-            row.rank, {"ag": 0.0, "rs": 0.0, "first": float("inf"), "last": 0.0}
+            row.rank, {"ag": 0.0, "rs": 0.0, "ar": 0.0, "first": float("inf"), "last": 0.0}
         )
         sample[row.op] += row.busy_ns
         sample["first"] = min(sample["first"], row.first_start_ns)
@@ -260,6 +266,7 @@ def summarize(
             values = {
                 "ag_ms": sample["ag"] / iters / NS_PER_MS,
                 "rs_ms": sample["rs"] / iters / NS_PER_MS,
+                "ar_ms": sample["ar"] / iters / NS_PER_MS,
                 "overlap_ms": ov / iters / NS_PER_MS,
                 "span_ms": (sample["last"] - sample["first"]) / iters / NS_PER_MS,
             }
@@ -310,6 +317,7 @@ def render(rows: Sequence[dict[str, object]]) -> str:
         "phase",
         "AG kernel ms/iter",
         "RS kernel ms/iter",
+        "AR kernel ms/iter",
         "AG∩RS ms/iter",
         "overlap_fraction",
         "kernel span ms/iter",
@@ -318,7 +326,7 @@ def render(rows: Sequence[dict[str, object]]) -> str:
         "kernels",
     ]
     lines = [
-        "# AG / RS kernel cost from nsys (SQL)",
+        "# AG / RS / AR kernel cost from nsys (SQL)",
         "",
         "每格：trial 中位数，trial 内取组内最慢 rank；ms/iter = 该 trial 内 kernel 时长之和 / iters。",
         "kernel 时长含等待对端的时间。经典 NCCL kernel 名不反映算法（NVLS 也显示 *_RING_LL），算法看 compare.md 2b。",
@@ -335,6 +343,7 @@ def render(rows: Sequence[dict[str, object]]) -> str:
             row["phase"],
             _fmt(row["ag_ms"]),
             _fmt(row["rs_ms"]),
+            _fmt(row["ar_ms"]),
             _fmt(row["overlap_ms"]),
             _fmt(row["overlap_fraction"], 2),
             _fmt(row["span_ms"]),
@@ -376,7 +385,7 @@ def analyse_algo(
         writer.writerow(KernelRow.__dataclass_fields__)
         writer.writerows([getattr(row, name) for name in KernelRow.__dataclass_fields__] for row in kernels)
     if not kernels:
-        LOGGER.warning("%s: no AllGather/ReduceScatter kernels found in %d reports", algo, len(filed))
+        LOGGER.warning("%s: no AllGather/ReduceScatter/AllReduce kernels found in %d reports", algo, len(filed))
     return kernels, summarize(kernels, overlap, results)
 
 

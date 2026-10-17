@@ -37,6 +37,7 @@ sys.modules[_SPEC.name] = analyse
 _SPEC.loader.exec_module(analyse)
 
 AG = "ncclDevKernel_AllGather_RING_LL"
+AR = "ncclDevKernel_AllReduce_Sum_bf16_RING_LL"
 CASE = "single-n2_ag+rs_bf16_64MiB"
 RS = "ncclDevKernel_ReduceScatter_Sum_bf16_RING_LL"
 SCHEMA = """
@@ -57,7 +58,7 @@ def _make_report(path: Path, *, label: str, trials: list[list[tuple[str, int, in
     trial are added so the tests also prove they are excluded.
     """
     tid, gpid = (pid << 24) | 7, pid << 24
-    strings = {AG: 1, RS: 2, "sleep_kernel": 3, label: 4}
+    strings = {AG: 1, RS: 2, "sleep_kernel": 3, label: 4, AR: 5}
     db = sqlite3.connect(path)
     db.executescript(SCHEMA)
     db.executemany("INSERT INTO StringIds VALUES (?, ?)", [(i, s) for s, i in strings.items()])
@@ -88,7 +89,7 @@ def _make_report(path: Path, *, label: str, trials: list[list[tuple[str, int, in
         )
         launch("sleep_kernel", start + 2, start + 3, start + 10, 9)
         for name, at, k_start, k_end in kernels:
-            launch(name, start + at, start + k_start, start + k_end, 1 if name == AG else 2)
+            launch(name, start + at, start + k_start, start + k_end, {AG: 1, RS: 2, AR: 3}[name])
     db.commit()
     db.close()
 
@@ -330,3 +331,51 @@ def test_main_refuses_a_directory_without_profiled_runs(tmp_path):
 def test_algo_order_puts_torch_families_first_then_cpp_impls_by_name():
     names = ["tma", "symm", "ce", "ring", "stmc", "nvls"]
     assert sorted(names, key=analyse.algo_order) == ["ring", "nvls", "symm", "ce", "stmc", "tma"]
+
+
+@pytest.mark.unit
+def test_kernels_query_classifies_all_reduce_and_the_gate_stays_outside_trials(tmp_path):
+    path = tmp_path / "r.sqlite"
+    label = "nvls/single-n8_ar_bf16_64MiB"
+    _make_report(path, label=label, trials=[[(AR, 20, 100, 1100), (AR, 25, 1100, 2100)]])
+    # The torch benchmark launches its start gate (an AllReduce) before the trial range opens.
+    db = sqlite3.connect(path)
+    db.execute("INSERT INTO CUPTI_ACTIVITY_KIND_RUNTIME VALUES (10000, 10005, ?, 999, 0)", ((4242 << 24) | 7,))
+    db.execute("INSERT INTO CUPTI_ACTIVITY_KIND_KERNEL VALUES (10006, 10010, 0, 3, 999, ?, 5, 0)", (4242 << 24,))
+    db.commit()
+    db.close()
+    kernels, overlap = _query(path)
+    assert [(row.trial, row.op, row.kernel, row.kernels, row.busy_ns) for row in kernels] == [
+        ("trial0", "ar", AR, 2, 2000)
+    ]
+    assert overlap == {}
+
+
+@pytest.mark.unit
+def test_summary_counts_only_the_ops_of_the_case_workload():
+    # A trial range that still contains the gate (C++ benchmark) shows an AllReduce in an AG case.
+    kernels = [
+        analyse.KernelRow("ce", 0, "r", "L", "trial0", "ag", AG, 0, 2, 2_000_000, 1, 1, 0, 2_000_000, 1),
+        analyse.KernelRow("ce", 0, "r", "L", "trial0", "ar", AR, 0, 1, 5_000, 5_000, 5_000, 0, 5_000, 1),
+    ]
+    results = [
+        {
+            "nsys_label": "L",
+            "ranks": [0],
+            "group_name": "g",
+            "group_size": 4,
+            "workload": "ag",
+            "phase": "isolated",
+            "iters": 2,
+            "makespan_ms": 1.0,
+        }
+    ]
+    (row,) = analyse.summarize(kernels, {}, results)
+    assert row["ag_ms"] == pytest.approx(1.0)
+    assert row["ar_ms"] == 0.0
+    assert row["kernels"] == AG
+    # In an "ar" case the all-reduce kernels are the measurement.
+    results[0]["workload"] = "ar"
+    (row,) = analyse.summarize(kernels, {}, results)
+    assert row["ar_ms"] == pytest.approx(0.0025)
+    assert row["ag_ms"] == 0.0

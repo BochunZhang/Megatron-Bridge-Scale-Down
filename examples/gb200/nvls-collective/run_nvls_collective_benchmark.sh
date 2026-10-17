@@ -17,7 +17,7 @@ set -euo pipefail
 
 usage() {
     cat <<'USAGE'
-Benchmark torch all-gather / reduce-scatter with ring and NVLS on GB200.
+Benchmark torch all-gather / reduce-scatter / all-reduce with ring and NVLS on GB200.
 
 Run the same command on every node (DLC style). For each algorithm a fresh torchrun job
 is started, because NCCL_ALGO is fixed when a communicator is created. Node 0 merges the
@@ -45,16 +45,18 @@ Options:
   --gpus-per-node N       GPUs per node (default: 4, one GB200 compute tray)
   --algos LIST            ring,nvls,symm (default: ring,nvls,symm)
   --group-sizes LIST      Single-group sizes (default: 4,8,16,32 capped at nnodes*gpus-per-node)
-  --split-totals LIST     Ranks shared by two concurrent half-groups (default: 16 if available)
+  --split-totals LIST     Ranks cut into two concurrent half-groups; T/2 must be in --group-sizes
+                          (default: the largest of 16,32 that fits: 8+8 on 16 GPUs, 16+16 on 32)
   --split-layouts LIST    contiguous,interleaved (default: contiguous)
-  --workloads LIST        ag,rs,ag+rs (default: all); with both ag and rs, split scenarios also run
-                          the cross case (group A all-gathers while group B reduce-scatters)
+  --workloads LIST        ag,rs,ar,ag+rs (default: all); ar is an in-place all-reduce of the whole
+                          tensor; with both ag and rs, split scenarios also run the cross case
+                          (group A all-gathers while group B reduce-scatters)
   --sizes-mib LIST        Full tensor sizes in MiB (default: 16,32,64,128,256,512,1024,2048)
   --dtype bf16|fp32       Payload dtype (default: bf16)
   --warmup N              Untimed iterations per case (default: 5)
   --iters N               Back-to-back iterations per trial (default: 20)
   --trials N              Timed trials, median reported (default: 5)
-  --symm-kernel KERNEL    For the symm pass: default, ag or rs (pins NCCL_SYM_KERNEL); needs
+  --symm-kernel KERNEL    For the symm pass: default, ag, rs or ar (pins NCCL_SYM_KERNEL); needs
                           --workloads with that op only, because the pin masks the other op
   --nsys                  One Nsight Systems report per rank per case (capture range = timed trials);
                           node 0 then exports them to SQLite and writes nsys_kernels.md
@@ -100,7 +102,7 @@ algos="ring,nvls,symm"
 group_sizes=""
 split_totals=""
 split_layouts="contiguous"
-workloads="ag,rs,ag+rs"
+workloads="ag,rs,ar,ag+rs"
 sizes_mib="16,32,64,128,256,512,1024,2048"
 dtype="bf16"
 warmup="5"
@@ -141,15 +143,19 @@ done
 [[ "$node_rank" =~ ^[0-9]+$ ]] && (( node_rank < nnodes )) || die "--node-rank must be in [0, nnodes)"
 world_size=$(( nnodes * gpus_per_node ))
 
-# Defaults follow the allocation: every 4/8/16/32 that fits, and the 8+8 split when 16 GPUs exist.
+# Defaults follow the allocation: every 4/8/16/32 that fits, and one split of the largest of 16/32
+# that fits into two halves (8+8 on 16 GPUs, 16+16 on 32). Each half's isolated reference is the
+# single group of the same size, which the group-size default already includes.
 if [[ -z "$group_sizes" ]]; then
     for n in 4 8 16 32; do
         (( n <= world_size )) && group_sizes+="${group_sizes:+,}$n"
     done
     [[ -n "$group_sizes" ]] || group_sizes="$world_size"
 fi
-if [[ -z "$split_totals" ]] && (( world_size >= 16 )); then
-    split_totals="16"
+if [[ -z "$split_totals" ]]; then
+    for n in 16 32; do
+        (( n <= world_size )) && split_totals="$n"
+    done
 fi
 IFS=, read -r -a algo_list <<<"$algos"
 for algo in "${algo_list[@]}"; do
@@ -161,7 +167,9 @@ case "$symm_kernel" in
     # answer "does the multicast symmetric kernel help" are the *MC ones.
     ag) symm_kernel_env="AllGather_STMC" ;;
     rs) symm_kernel_env="ReduceScatter_LDMC" ;;
-    *) die "--symm-kernel accepts default, ag or rs; got $symm_kernel" ;;
+    # Reduce-scatter + all-gather through multicast: the only symmetric AR the benchmark accepts.
+    ar) symm_kernel_env="AllReduce_RSxLDMC_AGxSTMC" ;;
+    *) die "--symm-kernel accepts default, ag, rs or ar; got $symm_kernel" ;;
 esac
 # Fail before the ring/nvls passes run: the benchmark rejects this in the symm pass anyway.
 if [[ "$symm_kernel" != default && "$workloads" != "$symm_kernel" ]]; then

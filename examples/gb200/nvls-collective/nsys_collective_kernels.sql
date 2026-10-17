@@ -12,7 +12,7 @@
 -- See the License for the specific language governing permissions and
 -- limitations under the License.
 --
--- All-gather / reduce-scatter kernel cost from one `nsys export --type sqlite` report.
+-- All-gather / reduce-scatter / all-reduce kernel cost from one `nsys export --type sqlite` report.
 --
 -- Every report written by `run_nvls_collective_benchmark.sh --nsys` holds one case of one rank:
 -- an outer NVTX range named like "symm/single-n4_ag+rs_bf16_256MiB" around NVTX ranges "trial0".."trialN".
@@ -22,6 +22,11 @@
 -- correlationId, in the same process) started inside that trial's NVTX range. This is the
 -- launch-time attribution used by examples/gb200/benchmark/mbench/build_csv.py; it does not
 -- depend on when the GPU actually ran the kernel.
+--
+-- The start gate is a one-element AllReduce. The torch benchmark opens each trial range only after
+-- it, so in an "ar" case every AllReduce kernel inside a trial is the payload all-reduce. The C++
+-- benchmark (../nvls-collective-cpp) still opens the range before its gate, so analyse_nsys.py keeps
+-- only the ops of each case's own workload; a C++ "ar" case counts one extra tiny gate kernel.
 --
 -- Kernels are classified by collective only. NCCL 2.28.9 specializes one classic kernel per
 -- collective (best_kernel() in src/device/generate.py), so an NVLS all-gather still appears as
@@ -59,13 +64,18 @@ collective_kernels AS (
         r.start AS launch_start,
         (r.globalTid >> 24) & 16777215 AS pid,
         s.value AS kernel,
-        CASE WHEN s.value LIKE '%AllGather%' THEN 'ag' ELSE 'rs' END AS op
+        CASE
+            WHEN s.value LIKE '%AllGather%' THEN 'ag'
+            WHEN s.value LIKE '%ReduceScatter%' THEN 'rs'
+            ELSE 'ar'
+        END AS op
     FROM CUPTI_ACTIVITY_KIND_KERNEL AS k
     JOIN CUPTI_ACTIVITY_KIND_RUNTIME AS r
         ON r.correlationId = k.correlationId
         AND ((r.globalTid >> 24) & 16777215) = ((k.globalPid >> 24) & 16777215)
     JOIN StringIds AS s ON s.id = k.shortName
-    WHERE s.value LIKE 'nccl%' AND (s.value LIKE '%AllGather%' OR s.value LIKE '%ReduceScatter%')
+    WHERE s.value LIKE 'nccl%'
+        AND (s.value LIKE '%AllGather%' OR s.value LIKE '%ReduceScatter%' OR s.value LIKE '%AllReduce%')
 )
 SELECT
     t.label,

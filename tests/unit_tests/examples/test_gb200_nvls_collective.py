@@ -21,8 +21,11 @@ requirement that both entry points stay importable with the standard library alo
 
 import argparse
 import ast
+import contextlib
 import importlib.util
 import json
+import os
+import re
 import sys
 import types
 from pathlib import Path
@@ -129,7 +132,7 @@ def test_defaults_cover_the_requested_matrix():
     assert args.group_sizes == [4, 8, 16, 32]
     assert args.split_totals == [16]
     assert args.split_layouts == ["contiguous"]
-    assert args.workloads == ["ag", "rs", "ag+rs"]
+    assert args.workloads == ["ag", "rs", "ar", "ag+rs"]
     assert args.sizes_mib == [16, 32, 64, 128, 256, 512, 1024, 2048]
     assert args.dtype == "bf16"
     assert args.symm_kernel == "default"
@@ -270,20 +273,27 @@ def test_parse_nccl_lines_returns_none_without_evidence():
 
 
 @pytest.mark.unit
-def test_symm_pass_requires_a_ce_threshold_above_every_payload(monkeypatch):
+def test_symm_pass_auto_sets_ce_threshold_above_every_payload(monkeypatch, caplog):
     args = benchmark.parse_args(["--algo", "symm", "--output-dir", "/tmp/x", "--sizes-mib", "16,1024"])
     monkeypatch.delenv("NCCL_ALGO", raising=False)
     monkeypatch.setenv("NCCL_WIN_ENABLE", "1")
     _debug_env(monkeypatch)
+    # A missing or insufficient NCCL_SYM_CE_THRESHOLD is replaced with INT64_MAX so the caller
+    # never has to set it by hand; the benchmark warns and keeps every AllGather on the symmetric
+    # kernels instead of falling back to the copy-engine path.
     monkeypatch.delenv("NCCL_SYM_CE_THRESHOLD", raising=False)
-    with pytest.raises(RuntimeError, match="NCCL_SYM_CE_THRESHOLD >= 1073741824"):
+    with caplog.at_level("WARNING"):
         benchmark._check_environment("symm", 32, args)
+    assert os.environ["NCCL_SYM_CE_THRESHOLD"] == "9223372036854775807"
     # NCCL's default (8Mi elements) sends 1 GiB bf16 all-gathers on <= 64 ranks to the copy engines.
     monkeypatch.setenv("NCCL_SYM_CE_THRESHOLD", str(8 * 1024 * 1024))
-    with pytest.raises(RuntimeError, match="copy-engine"):
+    with caplog.at_level("WARNING"):
         benchmark._check_environment("symm", 32, args)
+    assert os.environ["NCCL_SYM_CE_THRESHOLD"] == "9223372036854775807"
+    # An explicit value already large enough is kept as-is.
     monkeypatch.setenv("NCCL_SYM_CE_THRESHOLD", str(1024 * 1024 * 1024))
     benchmark._check_environment("symm", 32, args)
+    assert os.environ["NCCL_SYM_CE_THRESHOLD"] == str(1024 * 1024 * 1024)
 
 
 @pytest.mark.unit
@@ -340,13 +350,25 @@ def test_parse_nccl_lines_reports_the_copy_engine_path():
     )
 
 
-def _check(lines, *, algo="symm", ops=("ag",), launches=2, shard_bytes=16777216, pinned_kernel=None, gate_launches=0):
+def _check(
+    lines,
+    *,
+    algo="symm",
+    ops=("ag",),
+    launches=2,
+    size_bytes=2 * 16777216,
+    group_size=2,
+    pinned_kernel=None,
+    gate_launches=0,
+):
+    # Defaults: a 32 MiB tensor on 2 ranks, so AG/RS lines carry a 16 MiB shard.
     return benchmark.check_implementation(
         lines,
         algo=algo,
         ops=ops,
         launches=launches,
-        shard_bytes=shard_bytes,
+        size_bytes=size_bytes,
+        group_size=group_size,
         pinned_kernel=pinned_kernel,
         gate_launches=gate_launches,
     )
@@ -402,7 +424,7 @@ def test_check_implementation_holds_classic_passes_to_their_algorithm(algo, acce
 
 @pytest.mark.unit
 def test_check_implementation_counts_launches_sizes_and_foreign_collectives():
-    _, errors = _check([SYMM_AG, SYMM_RS], launches=3, shard_bytes=4096)
+    _, errors = _check([SYMM_AG, SYMM_RS], launches=3, size_bytes=8192)
     assert errors == [
         "unexpected collective ReduceScatter=Symmetric/ReduceScatter_LDMC x1",
         "AllGather: 1 launches in the NCCL log, expected 3",
@@ -600,9 +622,9 @@ def test_single_rows_report_ag_rs_and_the_concurrent_pair_separately():
     ]
     rows = metrics.single_rows(records)
     assert len(rows) == 1
-    algo, ranks, mib, ag, rs, ag_pair, rs_pair, aggregate, speedup, overlap = rows[0]
+    algo, ranks, mib, ag, rs, ar, ag_pair, rs_pair, aggregate, speedup, overlap, *_kernels = rows[0]
     assert (algo, ranks, mib) == ("ring", "8", "256")
-    assert (ag, rs) == ("100.0", "50.0")
+    assert (ag, rs, ar) == ("100.0", "50.0", "-")
     assert (ag_pair, rs_pair, aggregate) == ("100.0", "100.0", "66.6")
     assert speedup == "1.00"
     assert overlap == "0.00"
@@ -611,7 +633,7 @@ def test_single_rows_report_ag_rs_and_the_concurrent_pair_separately():
 @pytest.mark.unit
 def test_single_rows_leave_overlap_columns_empty_without_the_pair():
     rows = metrics.single_rows([_record()])
-    assert rows[0][-2:] == ["-", "-"]
+    assert rows[0][9:11] == ["-", "-"]
 
 
 @pytest.mark.unit
@@ -669,58 +691,30 @@ def test_report_flags_profiled_runs():
 
 
 @pytest.mark.unit
-def test_split_rows_compare_each_group_against_itself():
-    common = {"scenario": "split", "total_ranks": 16, "layout": "contiguous", "size_mib": 256}
+def test_split_rows_compare_each_half_with_the_single_group_of_its_size():
+    split = {"scenario": "split", "total_ranks": 16, "layout": "contiguous", "phase": "concurrent", "group_size": 8}
     records = [
-        _record(
-            **common,
-            workload="ag",
-            phase="isolated",
-            group_index=0,
-            group_size=8,
-            makespan_ms=1.0,
-            aggregate_busbw_gb_s=100.0,
-        ),
-        _record(
-            **common,
-            workload="ag",
-            phase="isolated",
-            group_index=1,
-            group_size=8,
-            makespan_ms=1.2,
-            aggregate_busbw_gb_s=90.0,
-        ),
-        _record(
-            **common,
-            workload="ag",
-            phase="concurrent",
-            group_index=0,
-            group_size=8,
-            makespan_ms=1.1,
-            aggregate_busbw_gb_s=95.0,
-        ),
-        _record(
-            **common,
-            workload="ag",
-            phase="concurrent",
-            group_index=1,
-            group_size=8,
-            makespan_ms=1.36,
-            aggregate_busbw_gb_s=80.0,
-        ),
+        # single-n8 is the isolated reference of both halves of the 16-rank split.
+        _record(workload="ag", makespan_ms=1.0, aggregate_busbw_gb_s=100.0),
+        _record(**split, workload="ag", group_index=0, makespan_ms=1.1, aggregate_busbw_gb_s=95.0),
+        _record(**split, workload="ag", group_index=1, makespan_ms=1.36, aggregate_busbw_gb_s=80.0),
+        # A single group of another size is not a reference.
+        _record(workload="ag", group_size=16, group_name="single16", makespan_ms=9.0),
     ]
     rows = metrics.split_rows(records)
-    assert len(rows) == 2
-    assert rows[0][:6] == ["ring", "16", "contiguous", "256", "ag", "A"]
-    assert rows[0][-2] == "1.100"
-    assert rows[1][-2] == "1.133"
-    assert all(row[5] in {"A", "B"} for row in rows)
+    assert [row[:6] for row in rows] == [
+        ["ring", "16", "contiguous", "256", "ag", "A"],
+        ["ring", "16", "contiguous", "256", "ag", "B"],
+    ]
+    assert [row[6:9] for row in rows] == [["100.0", "95.0", "1.100"], ["100.0", "80.0", "1.360"]]
+    # Without the single-n8 record the reference cells stay empty instead of being guessed.
+    assert metrics.split_rows(records[1:3])[0][6:9] == ["-", "95.0", "-"]
 
 
 @pytest.mark.unit
 def test_render_report_contains_every_question_and_survives_empty_input():
     report = metrics.render_report([_record(), _record(algo="nvls", aggregate_busbw_gb_s=200.0)])
-    assert "1. AG、RS 单独与同时发起" in report
+    assert "1. AG、RS、AR 单独与 AG+RS 同时发起" in report
     assert "1b. 各实现的绝对吞吐" in report
     assert "2. 各实现相对 ring" in report
     assert "3. 两个半组同时运行" in report
@@ -815,9 +809,13 @@ def test_pool_registration_goes_through_the_nccl_backend(monkeypatch):
     monkeypatch.setattr(benchmark.torch, "device", lambda kind: kind, raising=False)
     monkeypatch.setattr(benchmark.torch.cuda, "synchronize", lambda: None, raising=False)
     calls = []
-    ag, rs = _FakeNcclBackend(calls), _FakeNcclBackend(calls)
+    ag, rs, ar = _FakeNcclBackend(calls), _FakeNcclBackend(calls), _FakeNcclBackend(calls)
     group = benchmark.CollectiveGroup(
-        name="single4", ranks=[0, 1, 2, 3], ag_pg=_FakeProcessGroup(ag), rs_pg=_FakeProcessGroup(rs)
+        name="single4",
+        ranks=[0, 1, 2, 3],
+        ag_pg=_FakeProcessGroup(ag),
+        rs_pg=_FakeProcessGroup(rs),
+        ar_pg=_FakeProcessGroup(ar),
     )
     pool = object()
     benchmark._register_pool(group, pool)
@@ -825,8 +823,10 @@ def test_pool_registration_goes_through_the_nccl_backend(monkeypatch):
     assert calls == [
         ("register", ag, pool, True),
         ("register", rs, pool, True),
+        ("register", ar, pool, True),
         ("deregister", ag, pool),
         ("deregister", rs, pool),
+        ("deregister", ar, pool),
     ]
 
 
@@ -849,34 +849,20 @@ def test_completion_rows_report_mean_median_and_mean_based_bandwidth():
     assert row[12] == f"{2 * 1.073741824 / 0.002:.1f}"
     assert row[13] == f"{2 * 1.073741824 / 0.002 * 7 / 8:.1f}"
     assert row[14] == "-"
+    assert row[15] == "-"  # no nccl_impl evidence, so no kernel is claimed
 
 
 @pytest.mark.unit
-def test_cross_rows_compare_each_group_with_the_same_op_alone():
-    common = {"scenario": "split", "total_ranks": 16, "layout": "contiguous", "group_size": 8}
+def test_cross_rows_compare_each_group_with_the_same_op_on_the_single_group():
+    cross = {"scenario": "split", "total_ranks": 16, "layout": "contiguous", "phase": "cross", "group_size": 8}
     records = [
-        _record(**common, phase="isolated", group_index=0, workload="ag", makespan_ms=1.0, aggregate_busbw_gb_s=400.0),
-        _record(**common, phase="isolated", group_index=1, workload="rs", makespan_ms=2.0, aggregate_busbw_gb_s=200.0),
-        _record(
-            **common,
-            phase="cross",
-            group_index=0,
-            workload="ag",
-            makespan_ms=1.2,
-            aggregate_busbw_gb_s=333.3,
-            concurrency=0.5,
-        ),
-        _record(
-            **common,
-            phase="cross",
-            group_index=1,
-            workload="rs",
-            makespan_ms=2.4,
-            aggregate_busbw_gb_s=166.7,
-            concurrency=0.5,
-        ),
-        # Same-workload isolated runs of the other group are not the cross references.
-        _record(**common, phase="isolated", group_index=0, workload="rs", makespan_ms=9.0, aggregate_busbw_gb_s=1.0),
+        # single-n8 ag and rs are the references of A's all-gather and B's reduce-scatter.
+        _record(workload="ag", makespan_ms=1.0, aggregate_busbw_gb_s=400.0),
+        _record(workload="rs", makespan_ms=2.0, aggregate_busbw_gb_s=200.0),
+        _record(**cross, group_index=0, workload="ag", makespan_ms=1.2, aggregate_busbw_gb_s=333.3, concurrency=0.5),
+        _record(**cross, group_index=1, workload="rs", makespan_ms=2.4, aggregate_busbw_gb_s=166.7, concurrency=0.5),
+        # Another group size is not a reference.
+        _record(workload="rs", group_size=16, group_name="single16", makespan_ms=9.0, aggregate_busbw_gb_s=1.0),
     ]
     assert metrics.cross_rows(records) == [
         [
@@ -897,7 +883,28 @@ def test_cross_rows_compare_each_group_with_the_same_op_alone():
         ]
     ]
     # Cross records never leak into the same-workload split table.
-    assert all(row[-1] == "-" for row in metrics.split_rows(records))
+    assert metrics.split_rows(records) == []
+
+
+@pytest.mark.unit
+def test_split_parts_are_only_the_concurrent_and_cross_cases():
+    assert metrics.SPLIT_PARTS == ("AB-concurrent", "AB-cross")
+    with pytest.raises(ValueError, match="unknown split part"):
+        metrics.case_name("split-n32-contiguous", part="A-isolated", workload="ag", dtype="bf16", size_mib=16)
+
+
+@pytest.mark.unit
+def test_split_needs_its_half_as_a_single_group(monkeypatch):
+    monkeypatch.setenv("NCCL_ALGO", "NVLS")
+    monkeypatch.setenv("NCCL_NVLS_ENABLE", "1")
+    _debug_env(monkeypatch)
+    ok = benchmark.parse_args(["--algo", "nvls", "--output-dir", "/tmp/x", "--split-totals", "32"])
+    benchmark._check_environment("nvls", 32, ok)  # 16+16, and 16 is a default group size
+    missing = benchmark.parse_args(
+        ["--algo", "nvls", "--output-dir", "/tmp/x", "--group-sizes", "4,8", "--split-totals", "32"]
+    )
+    with pytest.raises(ValueError, match=re.escape("--split-totals [32] need their half ([16]) in --group-sizes")):
+        benchmark._check_environment("nvls", 32, missing)
 
 
 class _FakeEvent:
@@ -935,20 +942,31 @@ def test_timed_trial_passes_the_gate_before_its_clock_starts(monkeypatch, member
         benchmark.dist, "all_reduce", lambda tensor, group: calls.append(("gate", group)), raising=False
     )
     monkeypatch.setattr(benchmark, "_launch", lambda *args: calls.append(("launch",)))
+
+    @contextlib.contextmanager
+    def nvtx_range(name):
+        calls.append(("push", name))
+        yield
+        calls.append(("pop",))
+
+    monkeypatch.setattr(benchmark.nvtx, "range", nvtx_range, raising=False)
     gate = benchmark.StartGate(ranks=[0, 1], pg="gate-pg", tensor="t")
-    group = benchmark.CollectiveGroup(name="g", ranks=[0, 1], ag_pg=None, rs_pg=None) if member else None
+    group = benchmark.CollectiveGroup(name="g", ranks=[0, 1], ag_pg=None, rs_pg=None, ar_pg=None) if member else None
     result = benchmark._timed_trial(
-        group, None, ("ag",) if member else (), {"ag": _FakeStream()}, iters=2, delay_cycles=7, gate=gate
+        group, None, ("ag",) if member else (), {"ag": _FakeStream()}, iters=2, delay_cycles=7, gate=gate, trial=3
     )
     kinds = [call[0] for call in calls]
-    assert kinds[:2] == ["sleep", "gate"]
+    # The gate is an AllReduce: it must sit outside the trial range, or nsys would count it as "ar".
+    assert kinds[:3] == ["sleep", "gate", "push"]
+    assert calls[2] == ("push", "trial3")
+    assert kinds[-1] == "pop"
     if member:
         # start is recorded right after the gate, then the launches, then the op/end events.
-        assert kinds[2:] == ["record", "launch", "launch", "record", "record"]
+        assert kinds[3:-1] == ["record", "launch", "launch", "record", "record"]
         assert set(result) == {"makespan_ms", "enqueue_ms", "ag_ms"}
     else:
         # The idle half-group only passes the gate, so the gate always has every scenario rank.
-        assert kinds[2:] == ["sync"]
+        assert kinds[3:-1] == ["sync"]
         assert result is None
 
 
@@ -957,4 +975,224 @@ def test_timed_trial_passes_the_gate_before_its_clock_starts(monkeypatch, member
 def test_check_implementation_accepts_the_algorithm_name_in_any_case(name):
     # Reproduces the 32-GPU failure "AllGather: expected Ring/*, got RING/SIMPLE x105".
     line = f"h:1:2 [0] NCCL INFO AllGather: 4194304 Bytes -> Algo {name} proto SIMPLE channel{{Lo..Hi}}={{0..7}}"
-    assert _check([line] * 105, algo="ring", launches=105, shard_bytes=4194304) == (f"AllGather={name}/SIMPLE", [])
+    assert _check([line] * 105, algo="ring", launches=105, size_bytes=2 * 4194304) == (f"AllGather={name}/SIMPLE", [])
+
+
+# All-reduce: workload, payload size, bus bandwidth, kernel names and the implementation check.
+CLASSIC_AR = "h:1:2 [0] NCCL INFO AllReduce: 33554432 Bytes -> Algo NVLS proto SIMPLE channel{Lo..Hi}={0..15}"
+SYMM_AR = (
+    "h:1:2 [0] NCCL INFO AllReduce [Symmetric]: 33554432 Bytes -> Kernel AllReduce_RSxLDMC_AGxSTMC"
+    " nchannels 8 nthreads 512 nWorks 1"
+)
+
+
+@pytest.mark.unit
+def test_all_reduce_is_a_workload_of_its_own():
+    assert metrics.workload_ops("ar") == ("ar",)
+    assert metrics.case_name("single-n8", part=None, workload="ar", dtype="bf16", size_mib=64) == (
+        "single-n8_ar_bf16_64MiB"
+    )
+    args = benchmark.parse_args(["--algo", "nvls", "--output-dir", "/tmp/x", "--workloads", "ar"])
+    assert args.workloads == ["ar"]
+
+
+@pytest.mark.unit
+def test_all_reduce_moves_the_whole_tensor_per_rank():
+    # AG sendcount and RS recvcount are a shard; an all-reduce has no sharding.
+    assert metrics.per_rank_bytes("ag", 1024, 8) == 128
+    assert metrics.per_rank_bytes("rs", 1024, 8) == 128
+    assert metrics.per_rank_bytes("ar", 1024, 8) == 1024
+    with pytest.raises(ValueError, match="unknown op"):
+        metrics.per_rank_bytes("ag+rs", 1024, 8)
+
+
+@pytest.mark.unit
+def test_all_reduce_bus_bandwidth_uses_the_nccl_tests_factor_two():
+    # 1 GiB in 10 ms over 8 ranks: AG/RS busbw = algbw * 7/8, AR busbw = algbw * 2 * 7/8.
+    one_way = 107.3741824 * 7 / 8
+    kwargs = {"total_bytes": 1024**3, "group_size": 8, "seconds": 0.01}
+    assert metrics.op_bus_bandwidth_gb_s(op="ag", **kwargs) == pytest.approx(one_way)
+    assert metrics.op_bus_bandwidth_gb_s(op="rs", **kwargs) == pytest.approx(one_way)
+    assert metrics.op_bus_bandwidth_gb_s(op="ar", **kwargs) == pytest.approx(2 * one_way)
+
+
+@pytest.mark.unit
+def test_symm_all_reduce_accepts_only_the_multicast_rs_ag_kernel():
+    # Name as defined in NCCL 2.29.7 src/sym_kernels.cc kernelName[].
+    assert benchmark.SYMM_KERNELS["ar"] == ["AllReduce_RSxLDMC_AGxSTMC"]
+    assert benchmark.OP_FUNCS["ar"] == "AllReduce"
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("kernel", ["AllReduce_AGxLL_R", "AllReduce_AGxLLMC_R", "AllReduce_RSxLD_AGxST"])
+def test_symm_all_reduce_fails_on_any_other_symmetric_kernel(kernel):
+    # Any of these means NCCL lost the multicast kernel from its mask; the case must not pass.
+    line = SYMM_AR.replace("AllReduce_RSxLDMC_AGxSTMC", kernel)
+    assert _check([SYMM_AR, line], ops=("ar",))[1] == [
+        f"AllReduce: expected Symmetric/AllReduce_RSxLDMC_AGxSTMC, got Symmetric/{kernel} x1"
+    ]
+
+
+@pytest.mark.unit
+def test_symm_all_reduce_fails_on_a_classic_fallback():
+    assert _check([SYMM_AR, CLASSIC_AR], ops=("ar",))[1] == [
+        "AllReduce: expected Symmetric/AllReduce_RSxLDMC_AGxSTMC, got NVLS/SIMPLE x1"
+    ]
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    ("extra", "small"),
+    [
+        (["--group-sizes", "2,4", "--split-totals", "none"], "[2]"),
+        # A 4-rank split has 2-rank halves; its reference group of 2 must be listed too.
+        (["--group-sizes", "2,4", "--split-totals", "4"], "[2]"),
+    ],
+)
+def test_symm_all_reduce_rejects_groups_without_multicast(monkeypatch, extra, small):
+    # hasLsaMultimem needs an LSA team of more than 2 ranks, else RSxLDMC_AGxSTMC is masked out.
+    _debug_env(monkeypatch, ce_threshold="9223372036854775807")
+    monkeypatch.delenv("NCCL_ALGO", raising=False)
+    monkeypatch.setenv("NCCL_WIN_ENABLE", "1")
+    args = benchmark.parse_args(["--algo", "symm", "--output-dir", "/tmp/x", "--workloads", "ar", *extra])
+    with pytest.raises(ValueError, match=re.escape(f"groups of {small}")):
+        benchmark._check_environment("symm", 16, args)
+    # Without the all-reduce workload the same groups are fine.
+    args = benchmark.parse_args(["--algo", "symm", "--output-dir", "/tmp/x", "--workloads", "ag", *extra])
+    benchmark._check_environment("symm", 16, args)
+
+
+@pytest.mark.unit
+def test_symm_kernel_pin_accepts_the_all_reduce_kernel(monkeypatch):
+    args = benchmark.parse_args(
+        ["--algo", "symm", "--output-dir", "/tmp/x", "--symm-kernel", "ar", "--workloads", "ar"]
+    )
+    _debug_env(monkeypatch, ce_threshold="9223372036854775807")
+    monkeypatch.delenv("NCCL_ALGO", raising=False)
+    monkeypatch.setenv("NCCL_WIN_ENABLE", "1")
+    monkeypatch.setenv("NCCL_SYM_KERNEL", "AllReduce_RSxLDMC_AGxSTMC")
+    benchmark._check_environment("symm", 32, args)
+    monkeypatch.setenv("NCCL_SYM_KERNEL", "AllGather_STMC")
+    with pytest.raises(RuntimeError, match="requires NCCL_SYM_KERNEL in"):
+        benchmark._check_environment("symm", 32, args)
+
+
+@pytest.mark.unit
+def test_check_implementation_accepts_full_tensor_all_reduce_lines():
+    # 32 MiB tensor on 2 ranks: the AllReduce line carries all 32 MiB, not a 16 MiB shard.
+    assert _check([CLASSIC_AR, CLASSIC_AR], algo="nvls", ops=("ar",)) == ("AllReduce=NVLS/SIMPLE", [])
+    assert _check([SYMM_AR, SYMM_AR], ops=("ar",)) == ("AllReduce=Symmetric/AllReduce_RSxLDMC_AGxSTMC", [])
+    shard = CLASSIC_AR.replace("33554432 Bytes", "16777216 Bytes")
+    assert _check([CLASSIC_AR, shard], algo="nvls", ops=("ar",))[1] == [
+        "AllReduce: expected 33554432 B per rank, got 16777216 B x1"
+    ]
+
+
+@pytest.mark.unit
+def test_check_implementation_keeps_the_gate_apart_from_a_measured_all_reduce():
+    # Same function name; the 4-byte gate is counted as a gate, payload all-reduces as the op.
+    assert _check([GATE, CLASSIC_AR, GATE, CLASSIC_AR], algo="ring", ops=("ar",), gate_launches=2)[1] == [
+        "AllReduce: expected Ring/*, got NVLS/SIMPLE x2"
+    ]
+    assert _check([GATE, CLASSIC_AR, CLASSIC_AR], algo="nvls", ops=("ar",), gate_launches=1) == (
+        "AllReduce=NVLS/SIMPLE",
+        [],
+    )
+    # A symmetric all-reduce must not satisfy an AG/RS kernel family, nor the other way round.
+    assert not benchmark.implementation_matches(
+        "symm", "ag", "Symmetric/AllReduce_RSxLDMC_AGxSTMC", pinned_kernel=None
+    )
+    assert benchmark.implementation_matches("symm", "ar", "Symmetric/AllReduce_RSxLDMC_AGxSTMC", pinned_kernel=None)
+    assert not benchmark.implementation_matches("symm", "ar", "Symmetric/AllReduce_AGxLL_R", pinned_kernel=None)
+
+
+@pytest.mark.unit
+def test_all_reduce_records_report_doubled_bus_bandwidth():
+    ar = _record(
+        workload="ar",
+        size_bytes=1024**3,
+        size_mib=1024,
+        makespan_ms=2.0,
+        trial_makespan_ms=[2.0],
+        mean_makespan_ms=2.0,
+        ar_busbw_gb_s=123.4,
+        aggregate_busbw_gb_s=123.4,
+    )
+    single = metrics.single_rows([ar])
+    assert single[0][5] == "123.4"  # AR busbw column
+    (row,) = metrics.completion_rows([ar])
+    algbw = 1.073741824 / 0.002
+    assert row[12] == f"{algbw:.1f}"
+    assert row[13] == f"{algbw * 2 * 7 / 8:.1f}"
+
+
+@pytest.mark.unit
+def test_report_names_all_reduce():
+    report = metrics.render_report([_record(workload="ar", ar_busbw_gb_s=1.0)])
+    assert "AG / RS / AR" in report
+    assert "AR busbw" in report
+
+
+# Kernel columns: names derived from the checked NCCL TUNING evidence, per NCCL 2.29.7 generators.
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    ("func", "implementation", "dtype", "expected"),
+    [
+        ("AllGather", "Symmetric/AllGather_STMC", "bf16", "ncclSymkDevKernel_AllGather_STMC"),
+        ("ReduceScatter", "Symmetric/ReduceScatter_LDMC", "bf16", "ncclSymkDevKernel_ReduceScatter_LDMC_sum_bf16"),
+        (
+            "AllReduce",
+            "Symmetric/AllReduce_RSxLDMC_AGxSTMC",
+            "fp32",
+            "ncclSymkDevKernel_AllReduce_RSxLDMC_AGxSTMC_sum_f32",
+        ),
+        ("AllGather", "NVLS/SIMPLE", "bf16", "ncclDevFunc_AllGather_NVLS_SIMPLE"),
+        ("ReduceScatter", "RING/LL128", "bf16", "ncclDevFunc_ReduceScatter_Sum_bf16_RING_LL128"),
+        ("AllReduce", "Ring/Simple", "fp32", "ncclDevFunc_AllReduce_Sum_f32_RING_SIMPLE"),
+        ("AllGather", "CopyEngine", "bf16", "CopyEngine（cudaMemcpy，无 kernel）"),
+    ],
+)
+def test_kernel_name_follows_the_nccl_generators(func, implementation, dtype, expected):
+    assert metrics.kernel_name(func, implementation, dtype) == expected
+
+
+@pytest.mark.unit
+def test_record_kernels_reads_every_op_and_every_implementation():
+    record = _record(
+        dtype="bf16",
+        nccl_impl="AllGather=Symmetric/AllGather_ST|Symmetric/AllGather_STMC;ReduceScatter=Symmetric/ReduceScatter_LDMC",
+    )
+    assert metrics.record_kernels(record) == {
+        "ag": "ncclSymkDevKernel_AllGather_ST \\| ncclSymkDevKernel_AllGather_STMC",
+        "rs": "ncclSymkDevKernel_ReduceScatter_LDMC_sum_bf16",
+    }
+    assert metrics.record_kernels(_record()) == {}
+
+
+@pytest.mark.unit
+def test_completion_rows_name_the_kernel_of_each_case():
+    pair = _record(workload="ag+rs", nccl_impl="AllGather=NVLS/SIMPLE;ReduceScatter=NVLS/SIMPLE")
+    (row,) = metrics.completion_rows([pair])
+    assert row[-1] == "AG ncclDevFunc_AllGather_NVLS_SIMPLE; RS ncclDevFunc_ReduceScatter_Sum_bf16_NVLS_SIMPLE"
+
+
+@pytest.mark.unit
+def test_single_rows_show_isolated_kernels_and_flag_a_different_one_in_the_pair():
+    records = [
+        _record(algo="symm", workload="ag", nccl_impl="AllGather=Symmetric/AllGather_STMC"),
+        _record(algo="symm", workload="rs", nccl_impl="ReduceScatter=Symmetric/ReduceScatter_LDMC"),
+        _record(
+            algo="symm", workload="ar", ar_busbw_gb_s=1.0, nccl_impl="AllReduce=Symmetric/AllReduce_RSxLDMC_AGxSTMC"
+        ),
+        _record(
+            algo="symm",
+            workload="ag+rs",
+            nccl_impl="AllGather=Symmetric/AllGather_ST;ReduceScatter=Symmetric/ReduceScatter_LDMC",
+        ),
+    ]
+    (row,) = metrics.single_rows(records)
+    assert row[-3:] == [
+        "ncclSymkDevKernel_AllGather_STMC（pair：ncclSymkDevKernel_AllGather_ST）",
+        "ncclSymkDevKernel_ReduceScatter_LDMC_sum_bf16",
+        "ncclSymkDevKernel_AllReduce_RSxLDMC_AGxSTMC_sum_bf16",
+    ]

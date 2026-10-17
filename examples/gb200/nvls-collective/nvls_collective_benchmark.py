@@ -12,7 +12,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Measure torch all-gather / reduce-scatter throughput with ring or NVLS on GB200.
+"""Measure torch all-gather / reduce-scatter / all-reduce throughput with ring or NVLS on GB200.
 
 One launch measures one algorithm family, because ``NCCL_ALGO`` is fixed when a
 communicator is created and the symmetric-memory path needs its own buffer registration:
@@ -21,7 +21,7 @@ communicator is created and the symmetric-memory path needs its own buffer regis
 * ``symm``: ``NCCL_WIN_ENABLE`` / ``NCCL_SYM_KERNEL`` are forced, ``NCCL_ALGO`` is left
   unset, and every buffer is allocated inside a ``torch.cuda.MemPool`` backed by
   ``ncclMemAlloc`` and registered as a ``NCCL_WIN_COLL_SYMMETRIC`` window. NCCL then dispatches to its symmetric kernels
-  (``AllGather_STMC`` / ``ReduceScatter_LDMC`` on a NVLink domain), which are unrelated to
+  (``AllGather_STMC`` / ``ReduceScatter_LDMC`` / ``AllReduce_RSxLDMC_AGxSTMC`` on a NVLink domain), which are unrelated to
   the classic ring and NVLS collectives. ``NCCL_SYM_CE_THRESHOLD`` must exceed every payload,
   otherwise large AllGathers go to the copy engines instead.
 
@@ -36,16 +36,18 @@ log, ``case.json`` and, after ``analyse_nsys.py``, the case's nsys reports.
 
 Scenarios (all inside one torchrun job; ranks outside a group wait at a Gloo barrier):
 
-* ``single``: ranks ``[0, n)`` for every ``n`` in ``--group-sizes`` run AG alone, RS alone,
+* ``single``: ranks ``[0, n)`` for every ``n`` in ``--group-sizes`` run AG, RS and AR alone,
   and AG + RS at the same time on two streams and two communicators.
 * ``split``: ranks ``[0, T)`` for every ``T`` in ``--split-totals`` are cut into two groups of
-  ``T/2``; each group runs alone, then both run the same workload at the same time, then
-  (``cross``) group A all-gathers while group B reduce-scatters.
+  ``T/2``; both run the same workload at the same time, then (``cross``) group A all-gathers
+  while group B reduce-scatters. The isolated reference of each half is ``single`` with
+  ``n = T/2``, so ``T/2`` must be one of ``--group-sizes``.
 
 Every timed trial opens with a start gate: a one-element all-reduce over all ranks of the
 scenario, after which each rank records its start event. Groups that share no communicator
 therefore start their traffic together, and their times share one origin, which is what
-``concurrency = min(T_A, T_B) / max(T_A, T_B)`` relies on.
+``concurrency = min(T_A, T_B) / max(T_A, T_B)`` relies on. The gate is itself an all-reduce,
+so the NVTX trial range (and therefore the nsys kernel attribution) opens only after it.
 """
 
 from __future__ import annotations
@@ -69,16 +71,18 @@ import torch.cuda.profiler
 import torch.distributed as dist
 from collective_metrics import (
     BYTES_PER_MIB,
+    CONCURRENT_PART,
     CROSS_GROUP_WORKLOADS,
     CROSS_PART,
     CROSS_WORKLOAD,
     NCCL_ALGO_ENV,
+    OPS,
     SPLIT_LAYOUTS,
-    SPLIT_PARTS,
     WORKLOADS,
     alg_bandwidth_gb_s,
-    bus_bandwidth_gb_s,
     case_name,
+    op_bus_bandwidth_gb_s,
+    per_rank_bytes,
     rank_file,
     scenario_name,
     split_groups,
@@ -92,17 +96,30 @@ LOGGER = logging.getLogger(__name__)
 DTYPES = {"bf16": torch.bfloat16, "fp32": torch.float32}
 # Which symmetric kernels are eligible per collective; None leaves NCCL_SYM_KERNEL unset
 # so the user/default kernel mask applies.
+#
+# The all-reduce is measured on the multicast reduce-scatter + all-gather kernel only. NCCL 2.29.7
+# has three other symmetric all-reduce kernels (AllReduce_AGxLL_R, AllReduce_AGxLLMC_R,
+# AllReduce_RSxLD_AGxST), but its cost model (queryModel_lsa in sym_kernels.cc) picks
+# RSxLDMC_AGxSTMC for every n in 4..32 and every size in 16 MiB..2 GiB whenever that kernel is in
+# the mask. Seeing any other kernel therefore means the mask lost it -- no multicast
+# (hasLsaMultimem: NVLS off or an LSA team of <= 2 ranks), or a buffer outside a registered window
+# (ncclSymkPickKernel keeps only LL kernels) -- and the case must fail rather than be reported.
 SYMM_KERNELS = {
     "ag": ["AllGather_ST", "AllGather_LL", "AllGather_STMC", "AllGather_LLMC"],
     "rs": ["ReduceScatter_LD", "ReduceScatter_LL", "ReduceScatter_LDMC"],
+    "ar": ["AllReduce_RSxLDMC_AGxSTMC"],
 }
-OP_FUNCS = {"ag": "AllGather", "rs": "ReduceScatter"}
+# ncclSymkInitOnce sets hasLsaMultimem only for an LSA team of more than two ranks; without it the
+# RSxLDMC_AGxSTMC kernel is masked out (sym_kernels.cc ncclSymkMask).
+SYMM_AR_MIN_RANKS = 3
+OP_FUNCS = {"ag": "AllGather", "rs": "ReduceScatter", "ar": "AllReduce"}
 PROBE_FIELDS = ("nccl_algo", "nccl_kernel", "n_nodes", "mnnvl")
 # The three INFO(NCCL_TUNING, ...) lines NCCL 2.29 prints on comm rank 0 for every launch:
 #   "<Func>: <n> Bytes -> Algo <algo> proto <proto> ..."      enqueue.cc, classic kernels
 #   "<Func> [Symmetric]: <n> Bytes -> Kernel <name> ..."      scheduler/symmetric_sched.cc
 #   "<Func> [Copy Engine]: <n> Bytes -> cudaMemcpy..."        enqueue.cc, CE collectives
-# <n> is the per-rank count times the element size, i.e. the shard: AG sendcount, RS recvcount.
+# <n> is the per-rank count times the element size, i.e. the shard for AG (sendcount) and RS
+# (recvcount); an AllReduce has no sharding, so there <n> is the whole per-rank tensor.
 _TUNING_LINE = re.compile(
     r"NCCL INFO (\w+)(?: \[(Symmetric|Copy Engine)\])?: (\d+) Bytes -> "
     r"(?:Algo (\S+) proto (\S+)|Kernel (\S+)|cudaMemcpy)"
@@ -122,27 +139,37 @@ SLEEP_CALIBRATION_CYCLES = 10_000_000
 
 @dataclasses.dataclass
 class CollectiveGroup:
-    """One rank set with a dedicated communicator per collective so AG and RS can overlap."""
+    """One rank set with a dedicated communicator per collective so AG, RS and AR can overlap."""
 
     name: str
     ranks: list[int]
     ag_pg: dist.ProcessGroup | None
     rs_pg: dist.ProcessGroup | None
+    ar_pg: dist.ProcessGroup | None
 
     @property
     def size(self) -> int:
         """Number of ranks in the group."""
         return len(self.ranks)
 
+    def communicators(self) -> tuple[dist.ProcessGroup | None, ...]:
+        """Every communicator of the group, in a fixed order."""
+        return (self.ag_pg, self.rs_pg, self.ar_pg)
+
 
 @dataclasses.dataclass
 class Buffers:
-    """Pre-filled inputs and outputs for one group/size; inputs are never overwritten."""
+    """Pre-filled inputs and outputs for one group/size; inputs are never overwritten.
+
+    An all-reduce is in-place, so it gets its own buffer holding the small-integer input that
+    the reduction overwrites; ``rs_out`` cannot be reused because its contents are verified.
+    """
 
     ag_in: torch.Tensor
     ag_out: torch.Tensor
     rs_in: torch.Tensor
     rs_out: torch.Tensor
+    ar_buf: torch.Tensor
     pool: torch.cuda.MemPool | None = None
 
 
@@ -219,7 +246,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument(
         "--symm-kernel",
-        choices=["default", "ag", "rs"],
+        choices=["default", *SYMM_KERNELS],
         default="default",
         help="For --algo symm: assert the pinned NCCL_SYM_KERNEL matches SYMM_KERNELS[...]",
     )
@@ -229,7 +256,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--split-totals",
         type=_csv_ints_or_none,
         default=[16],
-        help="Ranks shared by two concurrent half-groups; 'none' skips the split scenario",
+        help="Ranks shared by two concurrent half-groups (T/2 must be in --group-sizes); 'none' skips the split scenario",
     )
     parser.add_argument("--split-layouts", type=_csv_choices(SPLIT_LAYOUTS), default=["contiguous"])
     parser.add_argument(
@@ -242,7 +269,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--sizes-mib",
         type=_csv_ints,
         default=[16, 32, 64, 128, 256, 512, 1024, 2048],
-        help="Full tensor: AG output / RS input per rank",
+        help="Full tensor: AG output / RS input / AR input per rank",
     )
     parser.add_argument("--dtype", choices=sorted(DTYPES), default="bf16")
     parser.add_argument("--warmup", type=int, default=5, help="Untimed iterations before every trial set")
@@ -291,15 +318,31 @@ def _check_environment(algo: str, world_size: int, args: argparse.Namespace) -> 
                 f"--symm-kernel {args.symm_kernel} masks every other symmetric kernel;"
                 f" run it with --workloads {args.symm_kernel}, got {args.workloads}"
             )
-        # The CE branch compares the element count with the threshold; a byte bound at least
-        # as large as the biggest payload keeps every AllGather on the symmetric kernels.
+        # The CE branch compares the element count with the threshold; a byte bound at least as
+        # large as the biggest payload keeps every AllGather on the symmetric kernels.  Mirror
+        # what run_nvls_collective_benchmark.sh does: set INT64_MAX automatically so the caller
+        # never has to remember this variable.  An explicit value is kept if it is already large
+        # enough; a missing or insufficient one is replaced with a warning.
         largest = max(args.sizes_mib) * BYTES_PER_MIB
+        _INT64_MAX = 9223372036854775807
         ce_threshold = os.environ.get(SYM_CE_THRESHOLD_ENV, "")
         if not ce_threshold.isdigit() or int(ce_threshold) < largest:
-            raise RuntimeError(
-                f"--algo symm requires {SYM_CE_THRESHOLD_ENV} >= {largest} so no AllGather takes the"
-                f" copy-engine path, got {ce_threshold!r}"
+            LOGGER.warning(
+                "%s=%r is not >= %d; setting it to INT64_MAX so every AllGather stays on the"
+                " symmetric kernels instead of falling back to the copy-engine path",
+                SYM_CE_THRESHOLD_ENV,
+                ce_threshold or "(unset)",
+                largest,
             )
+            os.environ[SYM_CE_THRESHOLD_ENV] = str(_INT64_MAX)
+        if "ar" in args.workloads:
+            halves = [n // 2 for n in args.split_totals]
+            small = sorted({n for n in args.group_sizes + halves if n < SYMM_AR_MIN_RANKS})
+            if small:
+                raise ValueError(
+                    f"--algo symm measures AllReduce_RSxLDMC_AGxSTMC, which NCCL only offers to groups of"
+                    f" >= {SYMM_AR_MIN_RANKS} ranks (multicast needs an LSA team of more than 2); got groups of {small}"
+                )
     else:
         assert expected is not None
         if actual.lower() != expected.lower():
@@ -322,6 +365,14 @@ def _check_environment(algo: str, world_size: int, args: argparse.Namespace) -> 
     bad_split = [n for n in args.split_totals if n % 2 or n < 4]
     if bad_split:
         raise ValueError(f"--split-totals must be even and >= 4, got {bad_split}")
+    # A split's half-groups are compared with the single group of the same size, so that size must
+    # be measured in the same pass.
+    unreferenced = [n for n in args.split_totals if n // 2 not in args.group_sizes]
+    if unreferenced:
+        raise ValueError(
+            f"--split-totals {unreferenced} need their half ({[n // 2 for n in unreferenced]}) in --group-sizes,"
+            f" which provides the isolated reference; got --group-sizes {args.group_sizes}"
+        )
     if any(n < 2 for n in args.group_sizes):
         raise ValueError("--group-sizes entries must be >= 2")
 
@@ -330,8 +381,15 @@ def _new_group(name: str, ranks: list[int]) -> CollectiveGroup:
     # new_group is collective over the default (Gloo) group: every rank calls it in the same order.
     ag_pg = dist.new_group(ranks=ranks, backend="nccl")
     rs_pg = dist.new_group(ranks=ranks, backend="nccl")
+    ar_pg = dist.new_group(ranks=ranks, backend="nccl")
     member = dist.get_rank() in ranks
-    return CollectiveGroup(name=name, ranks=ranks, ag_pg=ag_pg if member else None, rs_pg=rs_pg if member else None)
+    return CollectiveGroup(
+        name=name,
+        ranks=ranks,
+        ag_pg=ag_pg if member else None,
+        rs_pg=rs_pg if member else None,
+        ar_pg=ar_pg if member else None,
+    )
 
 
 def _new_gate(ranks: list[int]) -> StartGate:
@@ -436,7 +494,8 @@ def check_implementation(
     algo: str,
     ops: tuple[str, ...],
     launches: int,
-    shard_bytes: int,
+    size_bytes: int,
+    group_size: int,
     pinned_kernel: str | None,
     gate_launches: int = 0,
 ) -> tuple[str | None, list[str]]:
@@ -444,11 +503,16 @@ def check_implementation(
 
     ``lines`` are the NCCL log lines comm rank 0 of the group wrote during the case (warmup
     and timed trials). Each op must appear exactly ``launches`` times, every launch must move
-    ``shard_bytes`` per rank and use the expected implementation, and no other collective may
+    its own per-rank payload (:func:`collective_metrics.per_rank_bytes`: a shard for AG and RS,
+    the whole tensor for AR) and use the expected implementation, and no other collective may
     run except the start gate: exactly ``gate_launches`` AllReduce lines, which only the gate's
     comm rank 0 logs. Returns the observed implementations
     (``AllGather=Symmetric/AllGather_STMC;...``) and the list of violations; an empty list means
     the case measured what its name says.
+
+    An all-reduce's TUNING line carries the whole per-rank tensor, not a shard, and it uses the
+    same function name as the start gate. The gate is recognized by its 4-byte size first, so an
+    ``ar`` case only accepts all-reduce lines of its own payload size.
     """
     expected_funcs = {OP_FUNCS[op]: op for op in ops}
     seen: dict[str, Counter[str]] = {func: Counter() for func in expected_funcs}
@@ -488,10 +552,11 @@ def check_implementation(
                 want = f"{NCCL_ALGO_ENV[algo]}/*"
             got = ", ".join(f"{impl} x{n}" for impl, n in sorted(wrong.items()))
             errors.append(f"{func}: expected {want}, got {got}")
-        bad_sizes = {size: n for size, n in sizes[func].items() if size != shard_bytes}
+        want_bytes = per_rank_bytes(op=op, size_bytes=size_bytes, group_size=group_size)
+        bad_sizes = {size: n for size, n in sizes[func].items() if size != want_bytes}
         if bad_sizes:
             got = ", ".join(f"{size} B x{n}" for size, n in sorted(bad_sizes.items()))
-            errors.append(f"{func}: expected {shard_bytes} B per rank, got {got}")
+            errors.append(f"{func}: expected {want_bytes} B per rank, got {got}")
     observed = ";".join(f"{func}={'|'.join(sorted(seen[func]))}" for func in sorted(seen) if seen[func])
     return observed or None, errors
 
@@ -543,6 +608,9 @@ def _connect(groups: list[CollectiveGroup], gate: StartGate, rank: int) -> None:
             reduced = torch.empty(1024, device="cuda")
             dist.reduce_scatter_tensor(reduced, gathered, group=group.rs_pg)
             torch.cuda.synchronize()
+            reduced_inplace = torch.ones(1024, device="cuda")
+            dist.all_reduce(reduced_inplace, group=group.ar_pg)
+            torch.cuda.synchronize()
         torch.distributed.barrier()
 
 
@@ -556,7 +624,7 @@ def _nccl_backend(pg: dist.ProcessGroup) -> dist.ProcessGroupNCCL:
 
 
 def _register_pool(group: CollectiveGroup, pool: torch.cuda.MemPool | None) -> None:
-    """Register every segment of ``pool`` on both communicators as a symmetric window.
+    """Register every segment of ``pool`` on every communicator as a symmetric window.
 
     torch walks the allocator's snapshot for that pool and calls ``ncclCommWindowRegister``
     with ``NCCL_WIN_COLL_SYMMETRIC``; NCCL ends that call with a ``bootstrapBarrier``
@@ -566,7 +634,7 @@ def _register_pool(group: CollectiveGroup, pool: torch.cuda.MemPool | None) -> N
     if pool is None:
         return
     torch.cuda.synchronize()
-    for pg in (group.ag_pg, group.rs_pg):
+    for pg in group.communicators():
         _nccl_backend(pg).register_mem_pool(pool, symm=True)
     torch.cuda.synchronize()
 
@@ -597,17 +665,41 @@ def _make_buffers(group: CollectiveGroup, rank: int, size_bytes: int, dtype: tor
         pool = torch.cuda.MemPool(_nccl_backend(group.ag_pg).mem_allocator)
     with torch.cuda.use_mem_pool(pool) if pool else contextlib.nullcontext():
         return Buffers(
-            # AG chunk k must equal k + 1; RS input is 1 on even and 2 on odd group ranks so every
-            # partial sum stays a small integer that is exact in bf16 for any reduction order.
+            # AG chunk k must equal k + 1; RS and AR inputs are 1 on even and 2 on odd group ranks
+            # so every partial sum stays a small integer that is exact in bf16 for any reduction
+            # order. An all-reduce overwrites its input, hence a buffer of its own.
             ag_in=torch.full((shard,), float(index + 1), dtype=dtype, device="cuda"),
             ag_out=torch.empty(numel, dtype=dtype, device="cuda"),
             rs_in=torch.full((numel,), float(index % 2 + 1), dtype=dtype, device="cuda"),
             rs_out=torch.empty(shard, dtype=dtype, device="cuda"),
+            ar_buf=torch.full((numel,), float(index % 2 + 1), dtype=dtype, device="cuda"),
             pool=pool,
         )
 
 
+def _first_all_reduce_ok(group: CollectiveGroup, buffers: Buffers, stream: torch.cuda.Stream) -> bool:
+    """Launch one all-reduce on the pre-filled ``ar_buf``, check it, then zero the buffer.
+
+    An all-reduce is in-place, so every later launch sums the previous result again: after k
+    launches each element is ``(n + n/2) * n**(k-1)``, which overflows bf16 within a few dozen
+    launches. Only the first launch has a checkable result. The warmup and timed launches then
+    reduce zeros, which stay zero and cost NCCL exactly as much as any other payload.
+    """
+    with torch.cuda.stream(stream):
+        dist.all_reduce(buffers.ar_buf, group=group.ar_pg)
+    stream.synchronize()
+    ok = bool(torch.all(buffers.ar_buf.float() == group.size + group.size // 2).item())
+    buffers.ar_buf.zero_()
+    torch.cuda.synchronize()
+    return ok
+
+
 def _verify(group: CollectiveGroup, buffers: Buffers, ops: tuple[str, ...]) -> bool:
+    """Check the outputs after the last timed launch.
+
+    The all-reduce result was already checked by ``_first_all_reduce_ok``; afterwards it only
+    reduces zeros, so anything but zeros here means a launch read or wrote the wrong memory.
+    """
     ok = True
     if "ag" in ops:
         expected = torch.arange(1, group.size + 1, device="cuda", dtype=torch.float32)
@@ -615,6 +707,8 @@ def _verify(group: CollectiveGroup, buffers: Buffers, ops: tuple[str, ...]) -> b
     if "rs" in ops:
         expected_sum = group.size + group.size // 2
         ok &= bool(torch.all(buffers.rs_out.float() == expected_sum).item())
+    if "ar" in ops:
+        ok &= bool(torch.all(buffers.ar_buf == 0).item())
     return ok
 
 
@@ -626,8 +720,10 @@ def _launch(
             # async_op=False runs NCCL on the current stream and does not block the host.
             if op == "ag":
                 dist.all_gather_into_tensor(buffers.ag_out, buffers.ag_in, group=group.ag_pg)
-            else:
+            elif op == "rs":
                 dist.reduce_scatter_tensor(buffers.rs_out, buffers.rs_in, group=group.rs_pg)
+            else:
+                dist.all_reduce(buffers.ar_buf, group=group.ar_pg)
 
 
 def _calibrate_sleep_cycles_per_ms() -> float:
@@ -649,6 +745,7 @@ def _timed_trial(
     iters: int,
     delay_cycles: int,
     gate: StartGate,
+    trial: int,
 ) -> dict[str, float] | None:
     """Pass the start gate, run ``iters`` back-to-back launches and return per-iteration times in ms.
 
@@ -657,6 +754,10 @@ def _timed_trial(
     half of an isolated split case (which then returns ``None``), so the gate has the same
     members in every case. ``start`` is recorded after the gate: all groups' clocks start
     within a few microseconds of each other, and their end times can be compared directly.
+
+    The ``trialN`` NVTX range opens after the gate as well. The gate is an AllReduce, and an
+    ``ar`` case launches the same function, so a range that contained the gate would make the
+    nsys query attribute the gate's kernel to the all-reduce being measured.
     """
     main = torch.cuda.current_stream()
     if delay_cycles:
@@ -664,6 +765,21 @@ def _timed_trial(
     # Everything enqueued after the sleep must be queued before the sleep ends.
     host_start = time.perf_counter()
     dist.all_reduce(gate.tensor, group=gate.pg)
+    with nvtx.range(f"trial{trial}"):
+        return _run_timed(group, buffers, ops, streams, main=main, iters=iters, host_start=host_start)
+
+
+def _run_timed(
+    group: CollectiveGroup | None,
+    buffers: Buffers | None,
+    ops: tuple[str, ...],
+    streams: dict[str, torch.cuda.Stream],
+    *,
+    main: torch.cuda.Stream,
+    iters: int,
+    host_start: float,
+) -> dict[str, float] | None:
+    """Time ``iters`` back-to-back launches from the stream state left by the start gate."""
     if group is None:
         main.synchronize()
         return None
@@ -731,7 +847,7 @@ def _deregister_pool(group: CollectiveGroup, pool: torch.cuda.MemPool | None) ->
     if pool is None:
         return
     torch.cuda.synchronize()
-    for pg in (group.ag_pg, group.rs_pg):
+    for pg in group.communicators():
         _nccl_backend(pg).deregister_mem_pool(pool)
     torch.cuda.synchronize()
 
@@ -783,6 +899,8 @@ def run_case(
     # Window registration and anything since the previous case belong to this case's log.
     case_lines = nccl_log.consume()
 
+    # The only all-reduce launch with a checkable result; it counts as one extra launch below.
+    first_ar_ok = _first_all_reduce_ok(group, buffers, streams["ar"]) if group and "ar" in ops else True
     if group:
         for _ in range(args.warmup):
             _launch(group, buffers, ops, streams)
@@ -793,27 +911,35 @@ def run_case(
         for trial in range(args.trials):
             torch.distributed.barrier()
             if gate.pg is not None:
-                with nvtx.range(f"trial{trial}"):
-                    result = _timed_trial(
-                        group, buffers, ops, streams, iters=args.iters, delay_cycles=delay_cycles, gate=gate
-                    )
+                result = _timed_trial(
+                    group,
+                    buffers,
+                    ops,
+                    streams,
+                    iters=args.iters,
+                    delay_cycles=delay_cycles,
+                    gate=gate,
+                    trial=trial,
+                )
                 if result is not None:
                     trials.append(result)
     case_lines += nccl_log.consume()
-    passed = _verify(group, buffers, ops) if group else True
+    passed = first_ar_ok and (_verify(group, buffers, ops) if group else True)
     implementation, impl_errors = None, []
     if group:
         tuned = parse_nccl_lines(case_lines)
         probe.update({key: tuned[key] for key in ("nccl_algo", "nccl_kernel")})
     if group and rank == group.ranks[0]:
-        # dist.new_group keeps the rank order, so the group's first rank is comm rank 0 of both
-        # communicators, the only rank NCCL writes TUNING lines on.
+        # dist.new_group keeps the rank order, so the group's first rank is comm rank 0 of every
+        # communicator, the only rank NCCL writes TUNING lines on.
         implementation, impl_errors = check_implementation(
             case_lines,
             algo=args.algo,
             ops=ops,
-            launches=args.warmup + args.trials * args.iters,
-            shard_bytes=size_bytes // group.size,
+            # "ar" is a workload of its own, so its extra checked launch never skews another op.
+            launches=args.warmup + args.trials * args.iters + int("ar" in ops),
+            size_bytes=size_bytes,
+            group_size=group.size,
             pinned_kernel=(os.environ.get("NCCL_SYM_KERNEL") or None) if args.algo == "symm" else None,
             # Gate comm rank 0 is the scenario's first rank; it logs one AllReduce per trial.
             gate_launches=args.trials if rank == gate.ranks[0] else 0,
@@ -910,9 +1036,12 @@ def run_case(
         for op in group_ops[g.name]:
             seconds = stats[f"{op}_ms"] / 1e3
             record[f"{op}_algbw_gb_s"] = alg_bandwidth_gb_s(total_bytes=size_bytes, seconds=seconds)
-            record[f"{op}_busbw_gb_s"] = bus_bandwidth_gb_s(total_bytes=size_bytes, group_size=g.size, seconds=seconds)
-            aggregate_bus += bus_bandwidth_gb_s(
-                total_bytes=size_bytes, group_size=g.size, seconds=stats["makespan_ms"] / 1e3
+            record[f"{op}_busbw_gb_s"] = op_bus_bandwidth_gb_s(
+                op=op, total_bytes=size_bytes, group_size=g.size, seconds=seconds
+            )
+            # An all-reduce counts both directions, so its busbw already carries the factor 2.
+            aggregate_bus += op_bus_bandwidth_gb_s(
+                op=op, total_bytes=size_bytes, group_size=g.size, seconds=stats["makespan_ms"] / 1e3
             )
         record["aggregate_busbw_gb_s"] = aggregate_bus
         records.append(record)
@@ -966,7 +1095,7 @@ def main(argv: list[str] | None = None) -> None:
 
     cycles_per_ms = _calibrate_sleep_cycles_per_ms()
     delay_cycles = int(cycles_per_ms * args.launch_delay_ms)
-    streams = {"ag": torch.cuda.Stream(), "rs": torch.cuda.Stream()}
+    streams = {op: torch.cuda.Stream() for op in OPS}
     captures = CaptureWindows(args.nsys)
     nccl_log = NcclLog()
     nccl_log.consume()  # skip lines from the Gloo/default-group setup
@@ -1067,28 +1196,17 @@ def main(argv: list[str] | None = None) -> None:
             groups = [_new_group(f"{layout}{total}-A", ranks_a), _new_group(f"{layout}{total}-B", ranks_b)]
             topology, comm_log = connect(scenario, groups)
             common = {"scenario": "split", "total_ranks": total, "layout": layout}
-            isolated_parts, concurrent_part = SPLIT_PARTS[:2], SPLIT_PARTS[2]
+            # Neither half runs alone here: its isolated reference is single-n<total/2>, which
+            # runs the same rank count (ranks 0..total/2-1) on the same sizes and workloads.
             for size_bytes in sizes:
                 for workload in args.workloads:
-                    for index, group in enumerate(groups):
-                        # The other half-group still passes the gate, so it stays idle, not absent.
-                        isolated = Topology([group], rank, topology.comm_info, topology.gate)
-                        emit(
-                            run_case(
-                                isolated,
-                                **case_kwargs(scenario, isolated_parts[index], size_bytes, workload, [workload]),
-                            ),
-                            phase="isolated",
-                            group_index=index,
-                            **common,
-                        )
                     concurrent = run_case(
-                        topology, **case_kwargs(scenario, concurrent_part, size_bytes, workload, [workload] * 2)
+                        topology, **case_kwargs(scenario, CONCURRENT_PART, size_bytes, workload, [workload] * 2)
                     )
                     for index, record in enumerate(concurrent):
                         emit([record], phase="concurrent", group_index=index, **common)
-                # A all-gathers while B reduce-scatters; its references are A-isolated ag and
-                # B-isolated rs above, so it runs only when both of those were measured.
+                # A all-gathers while B reduce-scatters; its references are single-n<total/2> ag
+                # and rs, so it runs only when both of those are measured.
                 if set(CROSS_GROUP_WORKLOADS) <= set(args.workloads):
                     cross = run_case(
                         topology,
@@ -1106,7 +1224,7 @@ def _destroy(groups: list[CollectiveGroup], gate: StartGate) -> None:
     """Release communicators (and NVLS multicast memory) before the next group size."""
     torch.cuda.synchronize()
     torch.distributed.barrier()
-    for pg in [pg for group in groups for pg in (group.ag_pg, group.rs_pg)] + [gate.pg]:
+    for pg in [pg for group in groups for pg in group.communicators()] + [gate.pg]:
         if pg is not None:
             dist.destroy_process_group(pg)
     torch.distributed.barrier()
