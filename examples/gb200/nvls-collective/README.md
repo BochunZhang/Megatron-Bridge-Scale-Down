@@ -275,20 +275,30 @@ Slurm 分配内也能用，`--master-addr` 取第一个节点。
 
 ### 用 SQL 查 AG / RS / AR 的 kernel 开销
 
-所有 pass 跑完后，node 0 执行 [`analyse_results.sh`](analyse_results.sh)：先用 `collective_metrics.py`
-写 `compare.md`，再（仅 `--nsys`）执行 [`analyse_nsys.py`](analyse_nsys.py)：归档剩下的报告，对每份
+所有 pass 跑完后，node 0 只执行 [`analyse_results.sh`](analyse_results.sh)：用 `collective_metrics.py`
+写 `compare.md`，几秒就结束。nsys 的分析**不在作业里做**，作业结束后单独执行
+[`analyse_nsys.sh`](analyse_nsys.sh)（它调用 [`analyse_nsys.py`](analyse_nsys.py)）：归档剩下的报告，对每份
 报告跑 `nsys export --type sqlite`，再执行 [`nsys_collective_kernels.sql`](nsys_collective_kernels.sql)
 里的查询（`label` 用来核对归档，`kernels`、`overlap` 用来统计）。
 
+为什么拆开：32 卡、默认参数下每个 pass 有 5376 份报告，node 0 串行导出三个 pass 要两个多小时。
+如果放在 launcher 里，其他节点早就退出、进入作业里的下一条命令，在 `MASTER_ADDR:<master-port - 1>`
+的 RUN_TIME 握手上等 node 0，最终 `could not agree on RUN_TIME` 超时失败。`analyse_nsys.sh` 只用 CPU
+和 `nsys`，在任何能访问结果目录的机器上都能跑；Python 版和 C++ 版的结果目录都支持，可以一次传多个
+`--output-dir`。
+
 后处理和测量是分开的：`analyse_results.sh` 失败时 launcher 只打印 warning 和重跑命令，退出码仍由
-benchmark 本身决定，已经跑完的测量不会因为后处理出错而作废。任何一步失败，后面的步骤照样执行；
-`analyse_nsys.py` 里某个 pass 出错也不影响其他 pass 写进 `nsys_kernels.md`，最后以非零退出码报告。
-手动重跑（已归档的报告和 SQLite 导出会复用）：
+benchmark 本身决定，已经跑完的测量不会因为后处理出错而作废。`analyse_nsys.py` 里某个 pass 出错也
+不影响其他 pass 写进 `nsys_kernels.md`，最后以非零退出码报告。已归档的报告和比报告新的 SQLite 导出
+会复用，所以中断后重跑会接着做：
 
 ```bash
 bash examples/gb200/nvls-collective/analyse_results.sh \
   --output-dir results/gb200/nvls-collective/gpu-num-4/run-01
-# 只做 nsys 这一步，或者只归档某个 pass：
+# 作业结束后分析 nsys 报告（可重复 --output-dir，C++ 版的结果目录也可以）：
+bash examples/gb200/nvls-collective/analyse_nsys.sh \
+  --output-dir results/gb200/nvls-collective/gpu-num-4/run-01
+# 只归档某个 pass，或者只分析某个 pass：
 uv run --no-sync python examples/gb200/nvls-collective/analyse_nsys.py \
   --output-dir results/gb200/nvls-collective/gpu-num-4/run-01 [--algo nvls --file-only]
 # 或者对单份报告直接用 sqlite3：
@@ -417,12 +427,12 @@ results/gb200/nvls-collective/gpu-num-<W>/<yyyymmdd-hhmmss>/
     cases/ring-<case>/                         # 每个测试一个目录，如 ring-all_reduce-1024MiB-bf16-single-n16/
       case.json                                # rank 0：该 case 的结果记录，或实现校验失败的原因
       ring-<case>.rank_<RR>.nccl.log           # 每个参与 rank：本 case 期间的 NCCL 日志切片
-      ring-<case>.rank_<RR>.nsys-rep / .sqlite # 仅 --nsys，每个 pass 后归档 / 分析时导出
+      ring-<case>.rank_<RR>.nsys-rep / .sqlite # 仅 --nsys，每个 pass 后归档 / analyse_nsys.sh 导出
     nsys/{index.tsv, kernels.csv}              # 仅 --nsys；归档前的 rank<R>.<K>.nsys-rep 也在这里
   nvls/ ...
   symm/ ...                                    # window 注册的对称内存路径
   compare.md                                   # node 0 合并三个 results.jsonl
-  nsys_kernels.md                              # 仅 --nsys，node 0 用 SQL 汇总
+  nsys_kernels.md                              # 仅 --nsys，作业结束后 analyse_nsys.sh 用 SQL 汇总
 ```
 
 命名规则（`collective_metrics.py` 的 `scenario_name` / `case_name` / `rank_file`）：
@@ -458,7 +468,7 @@ results/gb200/nvls-collective/gpu-num-<W>/<yyyymmdd-hhmmss>/
    检查每个文件里的 `algo` 与目录一致。
 6. `--nsys` 时，各节点的 nsys 报告可能比 node 0 晚落盘，`analyse_nsys.py` 会等到报告数达到
    `world_size × case 数` 且文件大小不再变化（最多 300 秒）后再归档；超时就先归档已有的，
-   之后再跑一次 `analyse_results.sh` 会把晚到的补上（按编号 K 归档，与先后顺序无关）。
+   之后的 `analyse_nsys.sh` 会把晚到的补上（按编号 K 归档，与先后顺序无关）。
 
 `results.jsonl` 每行一个 case：`scenario`、`phase`、`total_ranks`、`layout`、`group_index`、
 `workload`、`group_size`、`ranks`、`size_bytes`、`makespan_ms`、`ag_ms`/`rs_ms`/`ar_ms`、`host_bound`、

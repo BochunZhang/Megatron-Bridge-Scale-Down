@@ -21,9 +21,12 @@ Benchmark torch all-gather / reduce-scatter / all-reduce with ring and NVLS on G
 
 Run the same command on every node (DLC style). For each algorithm a fresh torchrun job
 is started, because NCCL_ALGO is fixed when a communicator is created. After the last pass
-node 0 runs analyse_results.sh (compare.md and, with --nsys, nsys_kernels.md); a failure there
-is only a warning, so a finished benchmark is never lost to its post-processing. Re-run it by
-hand with: bash examples/gb200/nvls-collective/analyse_results.sh --output-dir <run dir>
+node 0 runs analyse_results.sh (compare.md, seconds); a failure there is only a warning, so a
+finished benchmark is never lost to its post-processing. Re-run it by hand with:
+  bash examples/gb200/nvls-collective/analyse_results.sh --output-dir <run dir>
+The --nsys reports are not analysed here: exporting them takes node 0 hours, long enough for the
+other nodes to time out in whatever the job runs next. Analyse them after the job with:
+  bash examples/gb200/nvls-collective/analyse_nsys.sh --output-dir <run dir>
 
 Output: results/gb200/nvls-collective/gpu-num-<nnodes*gpus-per-node>/<yyyymmdd-hhmmss> in this
 repo, one <algo>/ per family. Each test gets <algo>/cases/<algo>-<case>/ (e.g.
@@ -62,8 +65,8 @@ Options:
   --symm-kernel KERNEL    For the symm pass: default, ag, rs or ar (pins NCCL_SYM_KERNEL); needs
                           --workloads with that op only, because the pin masks the other op
   --nsys                  One Nsight Systems report per rank per case (capture range = timed trials);
-                          node 0 files them under cases/ after each pass, then exports them to
-                          SQLite and writes nsys_kernels.md
+                          node 0 files them under cases/ after each pass (renames only);
+                          nsys_kernels.md comes from analyse_nsys.sh after the job
   --dry-run               Print commands only
   -h, --help              Show this help
 
@@ -366,7 +369,7 @@ for index in "${!algo_list[@]}"; do
         # leaves them labelled. Only renames (no export); waits for the other nodes' reports.
         run uv run --no-sync python "${script_dir}/analyse_nsys.py" --output-dir "$output_dir" \
             --algo "$algo" --file-only \
-            || warn "filing ${algo} nsys reports failed; analyse_results.sh retries it"
+            || warn "filing ${algo} nsys reports failed; analyse_nsys.sh retries it"
     fi
 done
 
@@ -374,4 +377,8 @@ if (( node_rank == 0 )); then
     run bash "${script_dir}/analyse_results.sh" --output-dir "$output_dir" \
         || warn "post-processing failed; the measurements are in ${output_dir}. Retry with:" \
             "bash ${script_dir}/analyse_results.sh --output-dir ${output_dir}"
+    if $nsys_enabled; then
+        log "nsys reports are filed, not analysed; after the job run:" \
+            "bash ${script_dir}/analyse_nsys.sh --output-dir ${output_dir}"
+    fi
 fi

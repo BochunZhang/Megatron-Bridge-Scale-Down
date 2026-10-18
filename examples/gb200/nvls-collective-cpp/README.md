@@ -130,11 +130,14 @@ NCCL 自己通过 `NCCL_COMM_ID=<master-addr>:<master-port + i>` 建 bootstrap�
 `<impl>/nsys/index.tsv`。每个 pass 跑完，node 0 执行
 [`../nvls-collective/analyse_nsys.py`](../nvls-collective/analyse_nsys.py) `--algo <impl> --file-only`
 （只用 Python 标准库，与测量无关），按 `index.tsv` 把 `rank<R>.<K>.nsys-rep` 改名挪到
-`<impl>/cases/<impl>-<case>/<impl>-<case>.rank_<RR>.nsys-rep`。所有 pass 跑完后 node 0 执行
-[`analyse_results.sh`](analyse_results.sh)：`build/collective_report` 写 `compare.md`，再导出 SQLite、核对每份
-报告的 NVTX 标签、跑 [`nsys_collective_kernels.sql`](../nvls-collective/nsys_collective_kernels.sql) 写
-`nsys_kernels.md`。后处理失败只打印 warning 和重跑命令，不影响 benchmark 的退出码；手动重跑：
+`<impl>/cases/<impl>-<case>/<impl>-<case>.rank_<RR>.nsys-rep`。所有 pass 跑完后 node 0 只执行
+[`analyse_results.sh`](analyse_results.sh)：`build/collective_report` 写 `compare.md`，几秒结束。后处理失败只打印
+warning 和重跑命令，不影响 benchmark 的退出码；手动重跑：
 `bash examples/gb200/nvls-collective-cpp/analyse_results.sh --output-dir <run dir>`。
+导出 SQLite、核对每份报告的 NVTX 标签、跑 [`nsys_collective_kernels.sql`](../nvls-collective/nsys_collective_kernels.sql)
+写 `nsys_kernels.md` 这一步**不在作业里做**（32 卡时 node 0 要导出几个小时，其他节点会在作业的下一条命令里
+等握手超时），作业结束后单独执行：
+`bash examples/gb200/nvls-collective/analyse_nsys.sh --output-dir <run dir>`（只需 CPU 和 `nsys`，已导出的会复用）。
 CE AllGather 是 memcpy，不是 kernel，所以 `ce`/`ce-uc` 在 SQL 表里只有 RS 的 kernel 时间。
 `--nsys` 的数字带 `profiled=true`，只用来看 trace，结论表用不带 `--nsys` 的那次。
 
@@ -222,7 +225,7 @@ results/gb200/nvls-collective-cpp/gpu-num-<W>/<yyyymmdd-hhmmss>/
       <impl>-<case>.rank_<RR>.nsys-rep / .sqlite  # 仅 --nsys，每个 pass 后归档 / 分析时导出
     nsys/{index.tsv, kernels.csv}              # 仅 --nsys
   compare.md                                   # node 0 合并所有 results.jsonl
-  nsys_kernels.md                              # 仅 --nsys
+  nsys_kernels.md                              # 仅 --nsys，作业结束后 analyse_nsys.sh 生成
 ```
 
 命名与 `../nvls-collective/collective_metrics.py` 相同（`bench_core.h` 的 `scenarioName` / `caseName` /

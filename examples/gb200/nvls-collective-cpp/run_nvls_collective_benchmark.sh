@@ -22,10 +22,13 @@ Benchmark NCCL 2.32.3 all-gather / reduce-scatter on GB200 with a C++ program (n
 Run the same command on every node (DLC style). Each node starts one nvls_collective_bench
 process per GPU; NCCL bootstraps through NCCL_COMM_ID=<master-addr>:<port>. One pass per
 implementation, because NCCL reads NCCL_NVLS_ENABLE and the CE multicast threshold once per
-process. After the last pass node 0 runs analyse_results.sh (compare.md and, with --nsys,
-nsys_kernels.md); a failure there is only a warning, so a finished benchmark is never lost to its
-post-processing. Re-run it by hand with:
+process. After the last pass node 0 runs analyse_results.sh (compare.md, seconds); a failure
+there is only a warning, so a finished benchmark is never lost to its post-processing. Re-run it
+by hand with:
   bash examples/gb200/nvls-collective-cpp/analyse_results.sh --output-dir <run dir>
+The --nsys reports are not analysed here: exporting them takes node 0 hours, long enough for the
+other nodes to time out in whatever the job runs next. Analyse them after the job with:
+  bash examples/gb200/nvls-collective/analyse_nsys.sh --output-dir <run dir>
 
 Implementations (the kernel is pinned per call with ncclCollConfig_t, forceAlgSelection=1):
   ring    AG / RS algSelection=RING, plain cudaMalloc buffers
@@ -72,8 +75,8 @@ Options:
   --cuda-home DIR         CUDA toolkit (default: CUDA_HOME or /usr/local/cuda)
   --no-build              Use the existing build/ binaries
   --nsys                  One Nsight Systems report per rank per case (capture range = timed trials);
-                          node 0 files them under cases/ after each pass, then writes
-                          nsys_kernels.md (../nvls-collective/analyse_nsys.py, stdlib only)
+                          node 0 files them under cases/ after each pass (renames only);
+                          nsys_kernels.md comes from ../nvls-collective/analyse_nsys.sh after the job
   --dry-run               Print commands only
   -h, --help              Show this help
 
@@ -373,7 +376,7 @@ for index in "${!impl_list[@]}"; do
         # leaves them labelled. Only renames (no export); waits for the other nodes' reports.
         run uv run --no-sync python "${script_dir}/../nvls-collective/analyse_nsys.py" --output-dir "$output_dir" \
             --algo "$impl" --file-only \
-            || warn "filing ${impl} nsys reports failed; analyse_results.sh retries it"
+            || warn "filing ${impl} nsys reports failed; analyse_nsys.sh retries it"
     fi
 done
 
@@ -381,4 +384,8 @@ if (( node_rank == 0 )); then
     run bash "${script_dir}/analyse_results.sh" --output-dir "$output_dir" --report-bin "$report" \
         || warn "post-processing failed; the measurements are in ${output_dir}. Retry with:" \
             "bash ${script_dir}/analyse_results.sh --output-dir ${output_dir}"
+    if $nsys_enabled; then
+        log "nsys reports are filed, not analysed; after the job run:" \
+            "bash ${script_dir}/../nvls-collective/analyse_nsys.sh --output-dir ${output_dir}"
+    fi
 fi
