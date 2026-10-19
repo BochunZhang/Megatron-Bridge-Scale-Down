@@ -309,10 +309,12 @@ bash examples/gb200/nvls-collective/run_nvls_collective_benchmark.sh \
   --group-sizes 4 --sizes-mib 64,256 --trials 3 --nsys
 ```
 
-`--nsys` 用 `torchrun --no-python` 给**每个 worker** 套一个 `nsys profile`：
+`--nsys` 用 `torchrun --no-python` 给**每个 worker** 套一个 `nsys profile`（经
+[`nsys_worker.sh`](nsys_worker.sh) 补上本 rank 的 GPU id，见下文“NVLink / DRAM 吞吐曲线”）：
 
 ```text
-nsys profile --trace=cuda,nvtx --sample=none --cpuctxsw=none \
+nsys profile --gpu-metrics-devices=<本 rank 的 GPU> \
+  --trace=cuda,nvtx --sample=none --cpuctxsw=none --gpu-metrics-frequency=50000 \
   --capture-range=cudaProfilerApi --capture-range-end=repeat \
   --output=<algo>/nsys/rank%q{RANK} python nvls_collective_benchmark.py ...
 ```
@@ -346,7 +348,8 @@ Slurm 分配内也能用，`--master-addr` 取第一个节点。
 写 `compare.md`，几秒就结束。nsys 的分析**不在作业里做**，作业结束后单独执行
 [`analyse_nsys.sh`](analyse_nsys.sh)（它调用 [`analyse_nsys.py`](analyse_nsys.py)）：归档剩下的报告，对每份
 报告跑 `nsys export --type sqlite`，再执行 [`nsys_collective_kernels.sql`](nsys_collective_kernels.sql)
-里的查询（`label` 用来核对归档，`kernels`、`overlap` 用来统计）。
+里的查询（`label` 用来核对归档，`kernels`、`overlap` 用来统计，`gpu_metrics` 统计 NVLink / DRAM 吞吐，
+见下文）。
 
 为什么拆开：32 卡、默认参数下每个 pass 有 5376 份报告，node 0 串行导出三个 pass 要两个多小时。
 如果放在 launcher 里，其他节点早就退出、进入作业里的下一条命令，在 `MASTER_ADDR:<master-port - 1>`
@@ -396,6 +399,110 @@ trial 取中位数。
   分发到 NVLS/Ring。所以 nvls 运行里看到 `*_RING_LL` 是正常的，算法以 `compare.md` 2b 的 TUNING 日志为准。
   对称内存 kernel 的名字（`ncclSymkDevKernel_AllGather_STMC` 等）则直接带变体。
 - kernel 时长包含等待对端到达的时间，不是纯传输时间；数据来自 profile 运行，只和同一次的 CUDA-event 对照。
+
+### NVLink / DRAM 吞吐曲线（nsys GPU metrics）
+
+`--nsys` 同时打开 nsys 的 GPU Metrics 采样：硬件计数器按固定频率采样，单 pass、不串行化 kernel、
+不重放，所以 AG/RS 并发、两组同时跑这些场景也能看。打开报告后，时间线上每张 GPU 下面多出
+`NVLink bytes received / transmitted`、`DRAM Read / Write Bandwidth`、`SMs Active` 等行，和
+`ncclSymkDevKernel_*` 对齐显示。
+
+| 选项 | 默认 | 说明 |
+| --- | --- | --- |
+| `--nsys-gpu-metrics-frequency HZ` | 50000 | 10..200000；50 kHz 即每 20 µs 一个点。频率太高时 nsys 报告的 Diagnostics 页会出现 “Buffer overflow”，要调低 |
+| `--nsys-gpu-metrics-set SET` | 不传，由 nsys 选第一个支持该 GPU 的 metric set | 可选值和 GPU 编号在运行目录的 `nsys-gpu-metrics.node<N>.txt` 里（launcher 跑 `--gpu-metrics-devices=help` 和 `--gpu-metrics-set=help` 存下的）。默认 set 没有 NVLink 行时，`analyse_nsys.py` 会打 warning，换一个含 NVLink 的 set |
+
+实现要点：
+
+- **每个 rank 只采自己那张卡。** GPU metrics 按设备采样，一张卡只能有一个 nsys 会话在采，
+  同一节点 4 个 worker 都用 `all` 会冲突。GPU id 要等 torchrun 设好 `LOCAL_RANK` 之后才知道，所以
+  worker 是 [`nsys_worker.sh`](nsys_worker.sh)：它执行
+  `nsys profile --gpu-metrics-devices=<GPU> <launcher 给的 nsys 选项> python ...`，`<GPU>` 是
+  `LOCAL_RANK`（设了数字型 `CUDA_VISIBLE_DEVICES` 时取其中第 `LOCAL_RANK` 项）。
+- nsys 的 GPU 编号和 `nvidia-smi` 一样按 PCI bus 排序；launcher 在 `--nsys` 时设
+  `CUDA_DEVICE_ORDER=PCI_BUS_ID`，让 CUDA 的 `cuda:LOCAL_RANK` 用同一个顺序。核对方法：
+  `metadata.json` 里每个 rank 的 `pci_bus_id` 应和 `nsys-gpu-metrics.node<N>.txt` 里同编号 GPU 的 PCI 地址一致。
+- **权限和冲突**：GPU Metrics 需要 root 或 `NVreg_RestrictProfilingToAdminUsers=0`；和 DCGM 的 profiling
+  模块（如 dcgm-exporter 的 `DCGM_FI_PROF_*`）、ncu 抢同一组计数器，节点上跑着 DCGM profiling 时先
+  `dcgmi profile --pause`，跑完再 `--resume`。
+
+**读数的含义**（nsys User Guide 的 GPU Metrics → Available metrics 一节）：
+
+- `NVLink bytes received / transmitted` = `nvlrx__bytes` / `nvltx__bytes` 占峰值的百分比，**含协议开销**，是本卡
+  **18 条链路的合计**，nsys 看不到单条链路（单条链路用下面的 `--ncu` 看 `Nvlink_Tables`）。GB200 每方向
+  峰值约 900 GB/s，所以 GB/s ≈ % × 9。
+- `DRAM Read / Write Bandwidth` = HBM 接口在读 / 写的周期占比。
+- 两者都是**整卡**计数器，包含别的 GPU 经 NVSwitch 读写本卡 HBM 的流量：multicast 下 `ld_reduce`
+  的归约读、对端 `multimem.st` 扇出的写，都会记在被访问的那张卡上。
+- 取值是 0..100 的整数采样。
+
+`analyse_nsys.sh` 对有 GPU metrics 的报告多跑一条 `gpu_metrics` 查询：每个 trial 的 GPU 窗口取该 rank
+本 trial **第一个集合通信 kernel 开始到最后一个结束**（`iters` 次背靠背迭代，含其间的空隙），对窗口内
+每个 metric 的采样求平均和最大值。输出：
+
+- `<algo>/nsys/gpu_metrics.csv`：每份报告 × trial × metric 一行（set 里的所有 metric）。
+- `nsys_gpu_metrics.md`：只列名字含 NVLink / DRAM / C2C 的 metric；每个 case、组、metric 给出组内各
+  rank 的平均 / 最小 / 最大、窗口内单个采样的峰值，再对 trial 取中位数。rank 最小和最大差得多，说明
+  组内某张卡的链路或 HBM 明显比其他卡忙。`min samples` 太少（< 5）时只看量级。
+
+旧的 `--nsys` 运行（本选项加入前）没有 GPU metric 表，分析照常、不出 `nsys_gpu_metrics.md`。
+
+### 用 Nsight Compute 看 kernel 细节（--ncu）
+
+```bash
+bash examples/gb200/nvls-collective/run_nvls_collective_benchmark.sh \
+  --algos symm --workloads ag --sizes-mib 1024 --iters 2 --trials 1 --ncu
+```
+
+`--ncu` 给每个 worker 套一个 `ncu`（和 `--nsys` 互斥：两者用同一组计数器），每个 rank 写一份
+`<algo>/ncu/rank<R>.ncu-rep`，用 `ncu-ui` 打开。
+
+**profile 哪些 kernel。** 只 profile 每个 case **trial0** 里的 NCCL 集合通信 kernel：
+
+| 选项 | 作用 |
+| --- | --- |
+| `--profile-from-start=off` | 只在 benchmark 每个 case 的 `cudaProfilerStart/Stop` 窗口内（和 `--nsys` 是同一套窗口），warmup 不在内 |
+| `--nvtx --nvtx-include=trial0/` | 只要 trial0 这个 push/pop range 内的 kernel；start gate 在 range 打开前发射，被排除 |
+| `--kernel-name=regex:^nccl(Symk)?DevKernel_(AllGather\|ReduceScatter\|AllReduce)` | 排除 `_sleep` 延迟 kernel |
+
+每个 kernel 的 NVTX 上下文里能看到 case 标签 `<algo>/<case>`。每个被 profile 的 kernel 每个计数器 pass
+都要重放一次，一个 case 的 trial0 有 `iters × op 数` 个 kernel，所以**用 `--iters 1~2 --trials 1` 并限制
+`--sizes-mib`**。
+
+**为什么要 lockstep。** symmetric kernel 在 LSA barrier（`multimem.red`）上等所有对端，单个 rank 自己重放
+会卡死。所以用 `--communicator=tcp`（server 在 `--master-addr`，端口 `--ncu-port + algo 序号`，默认从
+49217 起）加 `--lockstep-kernel-launch`，所有 rank 同步发射、同步重放同一个 kernel。lockstep 要等所有
+ncu 实例，因此 `--ncu` 只允许**一个包含全部 rank 的组**：
+
+- `--group-sizes` 必须等于总卡数（不传时自动设成总卡数）。
+- 不跑 split，否则闲置的那半边永远不发 kernel，lockstep 会一直等。
+
+**失真控制。** `--clock-control=none`、`--cache-control=none`：ncu 默认锁 base 频率、每个 pass 前刷 L2，
+这里都关掉，让 kernel 在和计时运行相同的频率和缓存状态下跑。即使这样，ncu 仍然会串行化所有 kernel
+（AG+RS 的重叠在 ncu 下不存在），kernel 时长也包含等待最慢 rank 的时间。时间和带宽以不带 profiler 的
+运行和 nsys 为准，ncu 只用来看 kernel 内部。
+
+**默认 section**（`--ncu-sections` 可改，逗号分隔）：
+
+| section | 看什么 |
+| --- | --- |
+| `SpeedOfLight` | 计算 / 显存吞吐占峰值 |
+| `MemoryWorkloadAnalysis*` | 显存图：HBM、L2、peer（经 NVLink 访问对端）的字节数 |
+| `Nvlink` / `Nvlink_Tables` / `Nvlink_Topology` | NVLink 收发总量，以及**每条链路**的收发量和对端；用来看 18 条链路是否均匀 |
+| `C2CLink` | Grace ↔ Blackwell C2C 链路 |
+| `LaunchStats` / `Occupancy` / `SchedulerStats` / `WarpStateStats` | CTA 数、占用率、warp 停顿原因 |
+| `SourceCounters` | 按 SASS 指令的执行次数和停顿采样：`multimem.ld_reduce` 的延迟体现在**使用其结果**的那条指令的 `long_scoreboard` 上；`multimem.st` 体现为 `lg_throttle`、fence 上的 `membar` 和退出时的 `drain` |
+| `PmSampling` | kernel 运行期间的指标时间线（多 pass 拼出来） |
+
+命令行查看：
+
+```bash
+ncu --import <algo>/ncu/rank0.ncu-rep --page details --section Nvlink_Tables
+ncu --import <algo>/ncu/rank0.ncu-rep --page raw --csv | grep -i -E 'nvlrx__bytes|nvltx__bytes|dram__bytes'
+```
+
+各节以 `ncu --list-sections` 为准，GB200 上可用的 NVLink 指标用
+`ncu --query-metrics | grep -i -E "nvl|ctc"` 确认。
 
 ## 计时与正确性
 
@@ -497,12 +604,16 @@ results/gb200/nvls-collective/gpu-num-<W>/<yyyymmdd-hhmmss>/
       ring-<case>.rank_<RR>.nccl.log           # 每个参与 rank：本 case 期间的 NCCL 日志切片
       ring-<case>.rank_<RR>.nsys-rep / .sqlite # 仅 --nsys，每个 pass 后归档 / analyse_nsys.sh 导出
     nsys/{index.tsv, kernels.csv}              # 仅 --nsys；归档前的 rank<R>.<K>.nsys-rep 也在这里
+    nsys/gpu_metrics.csv                       # 仅 --nsys：每份报告 × trial × GPU metric 的窗口均值
+    ncu/rank<R>.ncu-rep                        # 仅 --ncu：每个 rank 一份，trial0 的集合通信 kernel
   nvls/ ...
   symm/ ...                                    # window 注册的对称内存路径
   symm-tma/ ...                                # AllGather_TmaSTMC + ReduceScatter_LDMC
   copy-engine/ ...                             # CE multicast AllGather + ReduceScatter_LDMC
   compare.md                                   # node 0 合并各 pass 的 results.jsonl
   nsys_kernels.md                              # 仅 --nsys，作业结束后 analyse_nsys.sh 用 SQL 汇总
+  nsys_gpu_metrics.md                          # 仅 --nsys：NVLink / DRAM / C2C 吞吐，同上
+  nsys-gpu-metrics.node<N>.txt                 # 仅 --nsys：nsys 的 GPU 编号和可选 metric set
 ```
 
 命名规则（`collective_metrics.py` 的 `scenario_name` / `case_name` / `rank_file`）：
@@ -575,7 +686,7 @@ uv run --no-sync ruff check examples/gb200/nvls-collective
 单测覆盖算法族/布局/负载的解析与默认值、五套环境约束（含 symm 必须不设
 `NCCL_ALGO`、必须开 `NCCL_WIN_ENABLE`、`NCCL_SYM_KERNEL` 必须与内核名一致；symm-tma/copy-engine 的
 `NCCL_SYM_KERNEL`、CE 阈值和 multicast 阈值）、tma/ce 逐 launch 的实现校验、NCCL 日志探针
-（algo/kernel/nNodes/MNNVL）、两个半组划分、带宽与重叠公式、报告四张表以及两个入口只用
-标准库可导入（torch 除外）。
+（algo/kernel/nNodes/MNNVL）、两个半组划分、带宽与重叠公式、报告四张表、nsys GPU metric 查询与汇总、
+launcher `--nsys` / `--ncu` 的 dry-run 命令行和选项校验，以及两个入口只用标准库可导入（torch 除外）。
 它们不需要 GPU、NCCL 或 NVLink，也**不能**验证 CUDA/NCCL 真实行为、带宽或 NVLS 资源。
 本目录的程序必须在上面说的 GB200 环境里编译/运行才能真正出数。

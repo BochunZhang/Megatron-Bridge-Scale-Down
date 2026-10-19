@@ -21,7 +21,9 @@ Analyse the --nsys reports of finished run_nvls_collective_benchmark.sh runs, of
 
 Works on run directories of both launchers (nvls-collective and nvls-collective-cpp): files any
 report still under <algo>/nsys/, exports every report to SQLite, runs nsys_collective_kernels.sql
-and writes <algo>/nsys/kernels.csv and <run dir>/nsys_kernels.md (analyse_nsys.py).
+and writes <algo>/nsys/kernels.csv and <run dir>/nsys_kernels.md (analyse_nsys.py); reports
+with GPU metrics also give <algo>/nsys/gpu_metrics.csv and <run dir>/nsys_gpu_metrics.md (NVLink,
+DRAM and C2C throughput over each trial's collective kernels).
 
 The launchers do not run this step: exporting every report of a 32-GPU run takes hours on node 0,
 and the other nodes would sit in the next job's rendezvous until it timed out. Run it after the

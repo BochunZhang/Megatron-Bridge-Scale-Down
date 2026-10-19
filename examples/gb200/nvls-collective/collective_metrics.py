@@ -602,7 +602,8 @@ def render_report(records: Sequence[dict[str, object]]) -> str:
     ]
     if profiled:
         lines += [
-            f"> 注意：{', '.join(profiled)} 是 `--nsys` 采集下的结果，含 Nsight 开销，只用于看 trace，"
+            f"> 注意：{', '.join(profiled)} 是 `--nsys` / `--ncu` 采集下的结果，含 Nsight 开销"
+            "（ncu 还会串行化并重放 trial0 的 kernel），只用于看 trace / kernel 细节，"
             "不要和非 profile 的数字放进同一张结论表。",
             "",
         ]

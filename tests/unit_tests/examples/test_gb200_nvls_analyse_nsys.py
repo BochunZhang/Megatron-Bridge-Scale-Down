@@ -109,6 +109,34 @@ def _make_idle_report(path: Path, *, label: str) -> None:
     db.close()
 
 
+NVL_RX = "NVLink bytes received [Throughput %]"
+NVL_TX = "NVLink bytes transmitted [Throughput %]"
+SM_ACTIVE = "SMs Active [Throughput %]"
+
+
+def _add_gpu_metrics(path: Path, samples: list[tuple[int, str, int]]) -> None:
+    """Add nsys GPU metric tables with (timestamp_ns, metric, value) samples to an export.
+
+    Every metric is listed twice in TARGET_INFO_GPU_METRICS (two GPU types), as nsys does for a
+    report that saw more than one GPU; the query must not double-count it.
+    """
+    names = {name: index for index, name in enumerate(sorted({metric for _, metric, _ in samples}))}
+    db = sqlite3.connect(path)
+    db.executescript(
+        "CREATE TABLE GPU_METRICS(timestamp INT, typeId INT, metricId INT, value INT);"
+        "CREATE TABLE TARGET_INFO_GPU_METRICS(typeId INT, sourceId INT, typeName TEXT, metricId INT, metricName TEXT);"
+    )
+    db.executemany(
+        "INSERT INTO TARGET_INFO_GPU_METRICS VALUES (?, 0, 'gpu', ?, ?)",
+        [(type_id, index, name) for name, index in names.items() for type_id in (1, 2)],
+    )
+    db.executemany(
+        "INSERT INTO GPU_METRICS VALUES (?, 1, ?, ?)", [(ts, names[metric], value) for ts, metric, value in samples]
+    )
+    db.commit()
+    db.close()
+
+
 def _write_index(nsys_dir: Path, labels: list[str]) -> None:
     rows = "".join(f"{i}\t{label}\tsingle\tisolated\t0\t1\n" for i, label in enumerate(labels, start=1))
     (nsys_dir / "index.tsv").write_text(
@@ -162,7 +190,7 @@ def _query(path: Path, label: str):
 
 @pytest.mark.unit
 def test_sql_file_defines_every_query():
-    assert set(analyse.load_queries()) == {"kernels", "overlap", "label"}
+    assert set(analyse.load_queries()) == {"kernels", "overlap", "label", "gpu_metrics"}
 
 
 @pytest.mark.unit
@@ -499,3 +527,92 @@ def test_summary_counts_only_the_ops_of_the_case_workload():
     (row,) = analyse.summarize(kernels, {}, results)
     assert row["ar_ms"] == pytest.approx(0.0025)
     assert row["ag_ms"] == 0.0
+
+
+@pytest.mark.unit
+def test_gpu_metrics_query_averages_samples_inside_each_trials_kernel_window(tmp_path):
+    path = tmp_path / "r.sqlite"
+    label = "symm/all_gather-1024MiB-bf16-single-n4"
+    # Trial windows on the GPU: trial0 = [10_100, 12_100], trial1 = [110_100, 110_600].
+    _make_report(path, label=label, trials=[[(AG, 20, 100, 1100), (AG, 25, 1100, 2100)], [(AG, 20, 100, 600)]])
+    _add_gpu_metrics(
+        path,
+        [
+            (10_050, NVL_TX, 99),  # before the first kernel (start gate, sleep): excluded
+            (10_500, NVL_TX, 40),
+            (11_500, NVL_TX, 60),
+            (11_500, NVL_RX, 90),
+            (12_200, NVL_TX, 99),  # after the last kernel: excluded
+            (110_300, NVL_TX, 10),
+        ],
+    )
+    rows = analyse.query_gpu_metrics(path, analyse.load_queries(), algo="symm", rank=3)
+    got = {(row.trial, row.metric): (row.samples, row.mean, row.peak, row.window_ns) for row in rows}
+    assert got == {
+        ("trial0", NVL_RX): (1, 90.0, 90, 2000),
+        ("trial0", NVL_TX): (2, 50.0, 60, 2000),
+        ("trial1", NVL_TX): (1, 10.0, 10, 500),
+    }
+    assert {(row.algo, row.rank, row.label) for row in rows} == {("symm", 3, label)}
+
+
+@pytest.mark.unit
+def test_gpu_metrics_query_is_empty_for_reports_without_metrics_or_kernels(tmp_path):
+    path = tmp_path / "r.sqlite"
+    _make_report(path, label=f"symm/{CASE}", trials=[[(AG, 20, 30, 1030)]])
+    assert analyse.query_gpu_metrics(path, analyse.load_queries(), algo="symm", rank=0) == []
+    idle = tmp_path / "idle.sqlite"
+    _make_idle_report(idle, label=f"symm/{IDLE_CASE}")
+    _add_gpu_metrics(idle, [(15, NVL_TX, 1)])
+    assert analyse.query_gpu_metrics(idle, analyse.load_queries(), algo="symm", rank=0) == []
+
+
+def _metric(rank: int, trial: str, metric: str, value: float, *, samples: int = 10, label: str = "L"):
+    return analyse.MetricRow("symm", rank, "r", label, trial, metric, samples, value, value + 5, 2_000_000)
+
+
+@pytest.mark.unit
+def test_metric_summary_keeps_the_rank_spread_and_takes_the_median_over_trials():
+    results = [
+        {"nsys_label": "L", "ranks": [0, 1], "group_name": "g", "workload": "ag", "phase": "isolated"},
+    ]
+    metrics = [
+        _metric(0, "trial0", NVL_TX, 40.0),
+        _metric(1, "trial0", NVL_TX, 60.0, samples=3),
+        _metric(0, "trial1", NVL_TX, 20.0),
+        _metric(1, "trial1", NVL_TX, 20.0),
+        _metric(0, "trial2", NVL_TX, 30.0),
+        _metric(1, "trial2", NVL_TX, 50.0),
+        _metric(0, "trial0", SM_ACTIVE, 80.0),  # not an NVLink / DRAM / C2C metric
+        _metric(7, "trial0", NVL_TX, 99.0),  # a rank outside every group
+    ]
+    (row,) = analyse.summarize_metrics(metrics, results)
+    assert (row["metric"], row["trials"], row["ranks"], row["min_samples"]) == (NVL_TX, 3, 2, 3)
+    assert row["mean"] == pytest.approx(40.0)  # trial means 50, 20, 40
+    assert row["rank_min"] == pytest.approx(30.0)  # 40, 20, 30
+    assert row["rank_max"] == pytest.approx(50.0)  # 60, 20, 50
+    assert row["peak"] == pytest.approx(55.0)  # 65, 25, 55
+    assert row["window_ms"] == pytest.approx(2.0)
+
+
+@pytest.mark.unit
+def test_main_writes_the_gpu_metric_report_only_for_runs_with_metrics(tmp_path):
+    trial = [(AG, 20, 100, 1100), (RS, 21, 600, 1600)]
+    run = _make_run(tmp_path, per_rank_trials={0: [trial], 1: [trial]}, iters=1)
+    analyse.main(["--output-dir", str(run), "--wait-seconds", "0"])
+    assert not (run / "nsys_gpu_metrics.md").exists()
+    assert not (run / "symm" / "nsys" / "gpu_metrics.csv").exists()
+
+    for rank, value in ((0, 30), (1, 50)):
+        export = run / "symm" / "cases" / f"symm-{CASE}" / f"symm-{CASE}.rank_{rank:02d}.sqlite"
+        _add_gpu_metrics(export, [(10_500, NVL_RX, value), (10_600, SM_ACTIVE, 90)])
+        _stamp_export(export.with_suffix(".nsys-rep"))
+    analyse.main(["--output-dir", str(run), "--wait-seconds", "0"])
+    report = (run / "nsys_gpu_metrics.md").read_text(encoding="utf-8")
+    rows = [line for line in report.splitlines() if line.startswith("| symm")]
+    assert len(rows) == 1  # SMs Active is in the CSV but not in the report
+    cells = [cell.strip() for cell in rows[0].strip("|").split("|")]
+    assert cells[4:8] == [NVL_RX, "40.0", "30.0", "50.0"]
+    csv_lines = (run / "symm" / "nsys" / "gpu_metrics.csv").read_text(encoding="utf-8").splitlines()
+    assert csv_lines[0] == "algo,rank,report,label,trial,metric,samples,mean,peak,window_ns"
+    assert len(csv_lines) == 1 + 2 * 2  # header + ranks × metrics

@@ -319,9 +319,16 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         action="store_true",
         help="Wrap every timed case in an NVTX range and a cudaProfilerStart/Stop capture window",
     )
+    parser.add_argument(
+        "--ncu",
+        action="store_true",
+        help="Open the same capture windows for ncu --profile-from-start off (no nsys/index.tsv)",
+    )
     args = parser.parse_args(argv)
     if min(args.warmup + 1, args.iters, args.trials) < 1:
         parser.error("--warmup must be >= 0, --iters and --trials must be >= 1")
+    if args.nsys and args.ncu:
+        parser.error("--nsys and --ncu are exclusive")
     if args.launch_delay_ms < 0:
         parser.error("--launch-delay-ms must be >= 0")
     return args
@@ -1130,8 +1137,9 @@ def run_case(
             "host_bound": max(trial["enqueue_ms"] for trial in per_trial) > delay_ms,
             "check_passed": True,
             # Profiled numbers include Nsight overhead; the report keeps them apart from timing runs.
-            "profiled": args.nsys,
-            "nsys_capture_index": capture_index,
+            "profiled": args.nsys or args.ncu,
+            "profiler": "nsys" if args.nsys else "ncu" if args.ncu else None,
+            "nsys_capture_index": capture_index if args.nsys else None,
             "nsys_label": label if args.nsys else None,
             "nsys_window_unix": list(captures.window_unix) if args.nsys and captures.window_unix else None,
             "trial_concurrency": concurrency,
@@ -1204,7 +1212,9 @@ def main(argv: list[str] | None = None) -> None:
     cycles_per_ms = _calibrate_sleep_cycles_per_ms()
     delay_cycles = int(cycles_per_ms * args.launch_delay_ms)
     streams = {op: torch.cuda.Stream() for op in OPS}
-    captures = CaptureWindows(args.nsys)
+    # ncu (--profile-from-start off) profiles only inside these windows too; the case NVTX range
+    # then names the case of every kernel in its report.
+    captures = CaptureWindows(args.nsys or args.ncu)
     nccl_log = NcclLog()
     nccl_log.consume()  # skip lines from the Gloo/default-group setup
     sizes = [mib * BYTES_PER_MIB for mib in args.sizes_mib]

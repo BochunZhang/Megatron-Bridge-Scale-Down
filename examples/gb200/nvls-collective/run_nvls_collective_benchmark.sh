@@ -74,9 +74,23 @@ Options:
   --trials N              Timed trials, median reported (default: 5)
   --symm-kernel KERNEL    For the symm pass only: default, ag, rs or ar (pins NCCL_SYM_KERNEL); needs
                           --workloads with that op only, because the pin masks the other op
-  --nsys                  One Nsight Systems report per rank per case (capture range = timed trials);
+  --nsys                  One Nsight Systems report per rank per case (capture range = timed trials),
+                          with GPU metrics (NVLink RX/TX, DRAM, ...) sampled on the rank's own GPU;
                           node 0 files them under cases/ after each pass (renames only);
-                          nsys_kernels.md comes from analyse_nsys.sh after the job
+                          nsys_kernels.md and nsys_gpu_metrics.md come from analyse_nsys.sh after the job
+  --nsys-gpu-metrics-set SET
+                          nsys GPU metric set alias (default: nsys picks the first set for the GPU);
+                          the choices are saved to nsys-gpu-metrics.node<N>.txt in the run directory
+  --nsys-gpu-metrics-frequency HZ
+                          GPU metric sampling rate, 10..200000 (default: 50000, one sample per 20 us)
+  --ncu                   One Nsight Compute report per rank (<algo>/ncu/rank<R>.ncu-rep): every
+                          NCCL collective kernel of trial0 of every case, all ranks in lockstep;
+                          needs one group of every rank (--group-sizes = all GPUs, no split);
+                          exclusive with --nsys
+  --ncu-sections LIST     Comma-separated ncu section identifiers (default: SpeedOfLight, memory
+                          workload, NVLink + tables + topology, C2CLink, launch/occupancy/scheduler,
+                          WarpStateStats, SourceCounters, PmSampling)
+  --ncu-port PORT         First ncu lockstep communicator port; algorithm i uses PORT+i (default: 49217)
   --dry-run               Print commands only
   -h, --help              Show this help
 
@@ -90,6 +104,15 @@ Examples:
 
   # Eight trays in one NVL72 domain (32 GPUs); run the same command on every node.
   bash examples/gb200/nvls-collective/run_nvls_collective_benchmark.sh --nnodes 8
+
+  # One tray: nsys trace plus NVLink / DRAM throughput curves of the symmetric kernels.
+  bash examples/gb200/nvls-collective/run_nvls_collective_benchmark.sh \
+    --algos symm --sizes-mib 256,1024 --trials 3 --nsys
+
+  # One tray: Nsight Compute details of the symmetric AG kernel (keep the case count small:
+  # every profiled kernel is replayed once per counter pass).
+  bash examples/gb200/nvls-collective/run_nvls_collective_benchmark.sh \
+    --algos symm --workloads ag --sizes-mib 1024 --iters 2 --trials 1 --ncu
 USAGE
 }
 
@@ -131,6 +154,17 @@ iters="20"
 trials="5"
 symm_kernel="default"
 nsys_enabled=false
+nsys_gpu_metrics_set=""
+nsys_gpu_metrics_frequency="50000"
+ncu_enabled=false
+# Kernel-level detail for the symmetric kernels: throughput and memory-chart (HBM, L2, peer) of
+# the kernel, NVLink totals and per-link tables, the Grace C2C link, where warps stall (per SASS
+# instruction in SourceCounters, e.g. multimem.ld_reduce / multimem.st), and PM sampling for the
+# behavior over the kernel's runtime.
+ncu_sections="SpeedOfLight,MemoryWorkloadAnalysis,MemoryWorkloadAnalysis_Chart,MemoryWorkloadAnalysis_Tables"
+ncu_sections+=",Nvlink,Nvlink_Tables,Nvlink_Topology,C2CLink,LaunchStats,Occupancy,SchedulerStats"
+ncu_sections+=",WarpStateStats,SourceCounters,PmSampling"
+ncu_port="49217"
 DRY_RUN=false
 
 while [[ $# -gt 0 ]]; do
@@ -152,17 +186,42 @@ while [[ $# -gt 0 ]]; do
         --trials) need_value "$@"; trials="$2"; shift 2 ;;
         --symm-kernel) need_value "$@"; symm_kernel="$2"; shift 2 ;;
         --nsys) nsys_enabled=true; shift ;;
+        --nsys-gpu-metrics-set) need_value "$@"; nsys_gpu_metrics_set="$2"; shift 2 ;;
+        --nsys-gpu-metrics-frequency) need_value "$@"; nsys_gpu_metrics_frequency="$2"; shift 2 ;;
+        --ncu) ncu_enabled=true; shift ;;
+        --ncu-sections) need_value "$@"; ncu_sections="$2"; shift 2 ;;
+        --ncu-port) need_value "$@"; ncu_port="$2"; shift 2 ;;
         --dry-run) DRY_RUN=true; shift ;;
         -h|--help) usage; exit 0 ;;
         *) die "unknown option: $1 (see --help)" ;;
     esac
 done
 
-for name in nnodes gpus_per_node master_port; do
+for name in nnodes gpus_per_node master_port nsys_gpu_metrics_frequency ncu_port; do
     [[ "${!name}" =~ ^[1-9][0-9]*$ ]] || die "--${name//_/-} must be a positive integer"
 done
 [[ "$node_rank" =~ ^[0-9]+$ ]] && (( node_rank < nnodes )) || die "--node-rank must be in [0, nnodes)"
 world_size=$(( nnodes * gpus_per_node ))
+(( nsys_gpu_metrics_frequency >= 10 && nsys_gpu_metrics_frequency <= 200000 )) \
+    || die "--nsys-gpu-metrics-frequency must be in [10, 200000] Hz"
+# Both profilers own the GPU performance counters; nsys GPU metrics cannot run under ncu.
+if $nsys_enabled && $ncu_enabled; then
+    die "--nsys and --ncu are exclusive: both need the GPU performance counters"
+fi
+[[ -n "$ncu_sections" ]] || die "--ncu-sections must not be empty"
+
+if $ncu_enabled; then
+    # ncu replays every profiled kernel once per counter pass, in lockstep across all ranks
+    # (--lockstep-kernel-launch). Lockstep waits for every ncu instance, so a case in which some
+    # rank launches no collective (a smaller group, or the idle half of a split) would hang.
+    # Only one group of every rank is allowed.
+    [[ -z "$group_sizes" || "$group_sizes" == "$world_size" ]] \
+        || die "--ncu profiles all ranks in lockstep; --group-sizes must be ${world_size} (all GPUs)"
+    [[ -z "$split_totals" || "$split_totals" == none ]] \
+        || die "--ncu profiles all ranks in lockstep; split scenarios leave ranks idle, drop --split-totals"
+    group_sizes="$world_size"
+    split_totals="none"
+fi
 
 # Defaults follow the allocation: every 4/8/16/32 that fits, and one split of the largest of 16/32
 # that fits into two halves (8+8 on 16 GPUs, 16+16 on 32). Each half's isolated reference is the
@@ -285,6 +344,14 @@ if $nsys_enabled; then
         nsys --version >&2
     fi
 fi
+if $ncu_enabled; then
+    # Same per-case capture windows and case NVTX ranges as --nsys; ncu profiles inside them only.
+    bench_args+=(--ncu)
+    if ! $DRY_RUN; then
+        command -v ncu >/dev/null || die "ncu is required when --ncu is enabled"
+        ncu --version >&2
+    fi
+fi
 
 run() {
     if $DRY_RUN; then
@@ -298,6 +365,14 @@ run() {
 echo "world_size=${world_size} nnodes=${nnodes} node_rank=${node_rank} group_sizes=${group_sizes}" \
     "split_totals=${split_totals:-none} ifname=${gloo_ifname} output_dir=${output_dir}" >&2
 $DRY_RUN || mkdir -p "$output_dir"
+if $nsys_enabled && ! $DRY_RUN; then
+    # Which GPU ids nsys samples (to check against the ranks' pci_bus_id in metadata.json) and which
+    # metric sets this GPU offers. Informational only: a failure here never stops the benchmark.
+    {
+        nsys profile --gpu-metrics-devices=help 2>&1
+        nsys profile --gpu-metrics-devices=all --gpu-metrics-set=help 2>&1
+    } >"${output_dir}/nsys-gpu-metrics.node${node_rank}.txt" || true
+fi
 
 # NCCL_SYM_CE_THRESHOLD is an element count; INT64_MAX keeps every AllGather off the copy engines.
 int64_max=9223372036854775807
@@ -372,12 +447,19 @@ for index in "${!algo_list[@]}"; do
         # (cudaProfilerStart/Stop in the benchmark); "repeat" writes rank<R>.<K>.nsys-rep for the
         # K-th case. nsys/index.tsv maps K to the case, and the case label is also the outermost
         # NVTX range in each report, which the analysis checks against where the report was filed.
+        # nsys_worker.sh adds --gpu-metrics-devices=<this rank's GPU>: GPU metrics (NVLink RX/TX,
+        # DRAM, ...) are sampled per GPU, and only one session may sample a GPU, so every worker
+        # samples its own. The id is only known once torchrun has set LOCAL_RANK.
         torchrun_extra=(--no-python)
         worker=(
-            nsys profile
+            bash "${script_dir}/nsys_worker.sh"
             --trace=cuda,nvtx
             --sample=none
             --cpuctxsw=none
+            --gpu-metrics-frequency="$nsys_gpu_metrics_frequency"
+        )
+        [[ -n "$nsys_gpu_metrics_set" ]] && worker+=(--gpu-metrics-set="$nsys_gpu_metrics_set")
+        worker+=(
             --capture-range=cudaProfilerApi
             --capture-range-end=repeat
             --force-overwrite=false
@@ -385,7 +467,47 @@ for index in "${!algo_list[@]}"; do
             python "${script_dir}/nvls_collective_benchmark.py"
         )
         algo_env+=(NSYS_TMPDIR="${NSYS_TMPDIR:-${nsys_dir}/.tmp}")
+        # nsys numbers GPUs like nvidia-smi (PCI bus order); make CUDA's LOCAL_RANK index agree.
+        algo_env+=(CUDA_DEVICE_ORDER=PCI_BUS_ID)
         $DRY_RUN || mkdir -p "${NSYS_TMPDIR:-${nsys_dir}/.tmp}"
+    fi
+    if $ncu_enabled; then
+        ncu_dir="${algo_dir}/ncu"
+        $DRY_RUN || mkdir -p "$ncu_dir"
+        if ! $DRY_RUN && compgen -G "${ncu_dir}/*.ncu-rep" >/dev/null; then
+            die "${ncu_dir} already contains Nsight Compute reports; ${output_dir} was not a fresh run directory"
+        fi
+        # One ncu instance per worker, joined through a TCP communicator on node 0, launching and
+        # replaying every profiled kernel in lockstep: a symmetric kernel waits on its peers in an
+        # LSA barrier, so a rank replaying alone would hang. Profiled: NCCL collective kernels in
+        # the trial0 NVTX range of each case (the start gate runs before that range opens, warmup
+        # outside the capture window). Clocks and caches are left alone so the kernel runs as in
+        # the timed passes: ncu would otherwise lock base clocks and flush L2 before every pass.
+        IFS=, read -r -a ncu_section_list <<<"$ncu_sections"
+        torchrun_extra=(--no-python)
+        worker=(
+            ncu
+            --communicator=tcp
+            --communicator-tcp-hostname="$master_addr"
+            --communicator-tcp-port="$(( ncu_port + index ))"
+            --communicator-tcp-num-peers="$world_size"
+            --lockstep-kernel-launch
+            --lockstep-nvtx-include="trial0/"
+            --profile-from-start=off
+            --nvtx
+            --nvtx-include="trial0/"
+            --kernel-name="regex:^nccl(Symk)?DevKernel_(AllGather|ReduceScatter|AllReduce)"
+            --replay-mode=kernel
+            --clock-control=none
+            --cache-control=none
+        )
+        for section in "${ncu_section_list[@]}"; do
+            worker+=(--section="$section")
+        done
+        worker+=(
+            --output="${ncu_dir}/rank%q{RANK}"
+            python "${script_dir}/nvls_collective_benchmark.py"
+        )
     fi
 
     echo "=== algo=${algo} (${algo_env[*]})" >&2
@@ -405,6 +527,11 @@ for index in "${!algo_list[@]}"; do
         compgen -G "${nsys_dir}/rank*.nsys-rep" >/dev/null \
             || die "nsys wrote no report under ${nsys_dir}; inspect ${algo_dir}/torchrun-node${node_rank}.log"
     fi
+    if $ncu_enabled && ! $DRY_RUN; then
+        # Copy-engine AllGather is a memcpy, so an "ag"-only copy-engine pass has nothing to profile.
+        compgen -G "${ncu_dir}/rank*.ncu-rep" >/dev/null \
+            || warn "ncu wrote no report under ${ncu_dir}; inspect ${algo_dir}/torchrun-node${node_rank}.log"
+    fi
     if $nsys_enabled && (( node_rank == 0 )); then
         # Rename this pass's reports into cases/<algo>-<case>/ now, so a later pass that fails
         # leaves them labelled. Only renames (no export); waits for the other nodes' reports.
@@ -421,5 +548,9 @@ if (( node_rank == 0 )); then
     if $nsys_enabled; then
         log "nsys reports are filed, not analysed; after the job run:" \
             "bash ${script_dir}/analyse_nsys.sh --output-dir ${output_dir}"
+    fi
+    if $ncu_enabled; then
+        log "ncu reports: ${output_dir}/<algo>/ncu/rank<R>.ncu-rep; open them in ncu-ui, or e.g." \
+            "ncu --import <report> --page details --section Nvlink_Tables"
     fi
 fi

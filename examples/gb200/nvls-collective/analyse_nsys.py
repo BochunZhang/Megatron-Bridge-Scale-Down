@@ -32,6 +32,10 @@ has no kernel tables and contributes nothing. Only the Python standard library i
 
 Outputs ``<algo>/nsys/kernels.csv`` (one row per report, trial, op and kernel) and
 ``<output-dir>/nsys_kernels.md`` (per case and group: median over trials of the slowest rank).
+Reports recorded with GPU metrics (``--gpu-metrics-devices``, which the launcher's ``--nsys`` turns
+on) also give ``<algo>/nsys/gpu_metrics.csv`` (one row per report, trial and metric: the metric's
+mean over the trial's collective kernels) and ``<output-dir>/nsys_gpu_metrics.md`` (NVLink, DRAM
+and C2C metrics per case and group: mean / min / max over the group's ranks, median over trials).
 Running it again reuses the filed reports and their exports. One pass that fails to analyse does
 not stop the others; the script exits non-zero after writing what it could.
 """
@@ -51,7 +55,7 @@ from collections import defaultdict
 from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from statistics import median
+from statistics import mean, median
 
 
 HERE = Path(__file__).resolve().parent
@@ -68,13 +72,20 @@ REQUIRED_COLUMNS = {
     "NVTX_EVENTS": {"start", "end", "text", "textId", "globalTid"},
     "CUPTI_ACTIVITY_KIND_RUNTIME": {"start", "globalTid", "correlationId"},
     "CUPTI_ACTIVITY_KIND_KERNEL": {"start", "end", "deviceId", "streamId", "correlationId", "globalPid", "shortName"},
+    "GPU_METRICS": {"timestamp", "metricId", "value"},
+    "TARGET_INFO_GPU_METRICS": {"metricId", "metricName"},
 }
 # nsys only creates these when the window recorded CUDA activity. A rank outside every group of
 # a case waits in the Gloo barrier and synchronizes, so it can have neither.
 KERNEL_TABLES = {"CUPTI_ACTIVITY_KIND_RUNTIME", "CUPTI_ACTIVITY_KIND_KERNEL"}
+# Only in reports recorded with --gpu-metrics-devices (not in runs from before the launcher set it).
+GPU_METRIC_TABLES = {"GPU_METRICS", "TARGET_INFO_GPU_METRICS"}
+# GPU metrics reported in nsys_gpu_metrics.md (gpu_metrics.csv keeps every metric of the set):
+# "NVLink bytes received/transmitted", "DRAM Read/Write Bandwidth", C2C link throughput.
+REPORTED_METRICS = re.compile(r"nvl|dram|c2c", re.IGNORECASE)
 _RAW_REPORT = re.compile(r"^rank(\d+)\.(\d+)\.nsys-rep$")
 _FILED_RANK = re.compile(r"\.rank_(\d+)$")
-QUERY_NAMES = {"kernels", "overlap", "label"}
+QUERY_NAMES = {"kernels", "overlap", "label", "gpu_metrics"}
 NS_PER_MS = 1e6
 
 
@@ -97,6 +108,22 @@ class KernelRow:
     first_start_ns: int
     last_end_ns: int
     streams: int
+
+
+@dataclass(frozen=True)
+class MetricRow:
+    """One GPU metric averaged over one trial's collective kernels, from one rank's report."""
+
+    algo: str
+    rank: int
+    report: str
+    label: str
+    trial: str
+    metric: str
+    samples: int
+    mean: float
+    peak: float
+    window_ns: int
 
 
 def load_queries(path: Path = SQL_PATH) -> dict[str, str]:
@@ -185,7 +212,7 @@ def check_schema(connection: sqlite3.Connection, path: Path) -> set[str]:
     tables = {row[0] for row in connection.execute("SELECT name FROM sqlite_master WHERE type='table'")}
     for table, columns in REQUIRED_COLUMNS.items():
         if table not in tables:
-            if table in KERNEL_TABLES:
+            if table in KERNEL_TABLES | GPU_METRIC_TABLES:
                 continue
             raise RuntimeError(f"{path}: table {table} is missing; was the run profiled with --trace=cuda,nvtx?")
         present = {row[1] for row in connection.execute(f'PRAGMA table_info("{table}")')}
@@ -245,6 +272,18 @@ def query_report(
     finally:
         connection.close()
     return kernels, overlap
+
+
+def query_gpu_metrics(sqlite_path: Path, queries: dict[str, str], *, algo: str, rank: int) -> list[MetricRow]:
+    """Per-trial GPU metric means of one report; empty without kernels or without GPU metrics."""
+    connection = sqlite3.connect(sqlite_path)
+    try:
+        tables = check_schema(connection, sqlite_path)
+        if not (KERNEL_TABLES | GPU_METRIC_TABLES) <= tables:
+            return []
+        return [MetricRow(algo, rank, sqlite_path.stem, *row) for row in connection.execute(queries["gpu_metrics"])]
+    finally:
+        connection.close()
 
 
 def _rank_records(results: Sequence[dict[str, object]]) -> dict[tuple[str, int], dict[str, object]]:
@@ -329,6 +368,49 @@ def summarize(
     return rows
 
 
+def summarize_metrics(metrics: Sequence[MetricRow], results: Sequence[dict[str, object]]) -> list[dict[str, object]]:
+    """Per case, group and reported metric: mean / min / max over the group's ranks, median over trials.
+
+    Unlike kernel time, a throughput has no "slowest rank": how far the ranks of one group drift
+    apart (one GPU's links or HBM busier than the others') is itself the finding, so it is kept
+    as min and max.
+    """
+    records = _rank_records(results)
+    per_trial: dict[tuple[str, str, str, str], dict[str, list[MetricRow]]] = defaultdict(lambda: defaultdict(list))
+    for row in metrics:
+        record = records.get((row.label, row.rank))
+        if record is None or not REPORTED_METRICS.search(row.metric):
+            continue  # idle rank of a split case, a label with no results row, or another metric
+        per_trial[(row.algo, row.label, str(record["group_name"]), row.metric)][row.trial].append(row)
+
+    rows = []
+    for (algo, label, group, metric), trials in sorted(
+        per_trial.items(), key=lambda item: (algo_order(item[0][0]), item[0][1:])
+    ):
+        record = next(r for (lbl, _), r in records.items() if lbl == label and r["group_name"] == group)
+        # One list per trial, holding that trial's row of every rank of the group.
+        by_trial = list(trials.values())
+        rows.append(
+            {
+                "algo": algo,
+                "label": label,
+                "group": group,
+                "workload": record["workload"],
+                "phase": record.get("phase"),
+                "metric": metric,
+                "trials": len(by_trial),
+                "ranks": max(len(ranks) for ranks in by_trial),
+                "mean": median(mean(r.mean for r in ranks) for ranks in by_trial),
+                "rank_min": median(min(r.mean for r in ranks) for ranks in by_trial),
+                "rank_max": median(max(r.mean for r in ranks) for ranks in by_trial),
+                "peak": median(max(r.peak for r in ranks) for ranks in by_trial),
+                "min_samples": min(r.samples for ranks in by_trial for r in ranks),
+                "window_ms": median(max(r.window_ns for r in ranks) for ranks in by_trial) / NS_PER_MS,
+            }
+        )
+    return rows
+
+
 def algo_order(algo: str) -> tuple[int, str]:
     """Sort key: this directory's families first, then any other pass (e.g. ../nvls-collective-cpp's tma, ce)."""
     return (ALGORITHMS.index(algo), "") if algo in ALGORITHMS else (len(ALGORITHMS), algo)
@@ -385,6 +467,53 @@ def render(rows: Sequence[dict[str, object]]) -> str:
     return "\n".join(lines) + "\n"
 
 
+def render_metrics(rows: Sequence[dict[str, object]]) -> str:
+    """Markdown table of the per-case GPU metric summary."""
+    header = [
+        "algo",
+        "case",
+        "group",
+        "phase",
+        "metric",
+        "mean %",
+        "rank min %",
+        "rank max %",
+        "peak sample %",
+        "min samples",
+        "window ms",
+    ]
+    lines = [
+        "# NVLink / DRAM / C2C throughput from nsys GPU metrics (SQL)",
+        "",
+        "每格：nsys GPU Metrics 采样值（占峰值的百分比，整数采样）在每个 trial 的 GPU 窗口内取平均，",
+        "窗口 = 该 rank 本 trial 第一个集合通信 kernel 开始到最后一个结束（含 iters 次背靠背迭代）。",
+        "mean / rank min / rank max：组内各 rank 的平均、最小、最大；peak sample：窗口内单个采样的最大值；",
+        "再对 trial 取中位数。min samples：所有 trial、所有 rank 中窗口内最少的采样数，太少（< 5）时只看量级。",
+        "NVLink bytes received / transmitted 是本卡**所有 NVLink 链路合计**（含协议开销），不能区分单条链路；",
+        "GB200 每方向峰值约 900 GB/s（18 × 50 GB/s），GB/s ≈ % × 9。DRAM 是 HBM 接口忙碌周期占比。",
+        "以下数字来自 --nsys 采集，含 Nsight 开销。",
+        "",
+        "| " + " | ".join(header) + " |",
+        "|" + "---|" * len(header),
+    ]
+    for row in rows:
+        cells = [
+            row["algo"],
+            row["label"],
+            row["group"],
+            row["phase"],
+            row["metric"],
+            _fmt(row["mean"], 1),
+            _fmt(row["rank_min"], 1),
+            _fmt(row["rank_max"], 1),
+            _fmt(row["peak"], 1),
+            row["min_samples"],
+            _fmt(row["window_ms"]),
+        ]
+        lines.append("| " + " | ".join(str(cell) for cell in cells) + " |")
+    return "\n".join(lines) + "\n"
+
+
 def _load_results(path: Path) -> list[dict[str, object]]:
     with path.open(encoding="utf-8") as handle:
         return [json.loads(line) for line in handle if line.strip()]
@@ -402,29 +531,49 @@ def file_algo(algo_dir: Path, *, timeout_s: float) -> list[Path]:
     return sorted(filed)
 
 
+def _write_csv(path: Path, row_type: type, rows: Sequence[object]) -> None:
+    with path.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.writer(handle)
+        writer.writerow(row_type.__dataclass_fields__)
+        writer.writerows([getattr(row, name) for name in row_type.__dataclass_fields__] for row in rows)
+
+
 def analyse_algo(
     algo_dir: Path, queries: dict[str, str], *, nsys_bin: str, timeout_s: float
-) -> tuple[list[KernelRow], list[dict[str, object]]]:
-    """File, export and query every report of one algorithm pass."""
+) -> tuple[list[KernelRow], list[dict[str, object]], list[dict[str, object]]]:
+    """File, export and query every report of one algorithm pass.
+
+    Returns the kernel rows, the per-case kernel summary and the per-case GPU metric summary.
+    """
     algo = algo_dir.name
     results = _load_results(algo_dir / "results.jsonl")
     kernels: list[KernelRow] = []
+    metrics: list[MetricRow] = []
     overlap: dict[tuple[int, str, str], int] = {}
     filed = file_algo(algo_dir, timeout_s=timeout_s)
     for report in filed:
         rank = filed_rank(report)
+        sqlite_path = export_sqlite(report, nsys_bin=nsys_bin)
         rows, report_overlap = query_report(
-            export_sqlite(report, nsys_bin=nsys_bin), queries, algo=algo, rank=rank, label=filed_label(algo, report)
+            sqlite_path, queries, algo=algo, rank=rank, label=filed_label(algo, report)
         )
         kernels += rows
         overlap.update({(rank, label, trial): ns for (label, trial), ns in report_overlap.items()})
-    with (algo_dir / "nsys" / "kernels.csv").open("w", newline="", encoding="utf-8") as handle:
-        writer = csv.writer(handle)
-        writer.writerow(KernelRow.__dataclass_fields__)
-        writer.writerows([getattr(row, name) for name in KernelRow.__dataclass_fields__] for row in kernels)
+        metrics += query_gpu_metrics(sqlite_path, queries, algo=algo, rank=rank)
+    _write_csv(algo_dir / "nsys" / "kernels.csv", KernelRow, kernels)
     if not kernels:
         LOGGER.warning("%s: no AllGather/ReduceScatter/AllReduce kernels found in %d reports", algo, len(filed))
-    return kernels, summarize(kernels, overlap, results)
+    if metrics:
+        _write_csv(algo_dir / "nsys" / "gpu_metrics.csv", MetricRow, metrics)
+        if not any(REPORTED_METRICS.search(row.metric) for row in metrics):
+            LOGGER.warning(
+                "%s: the GPU metric set has no NVLink/DRAM/C2C metric (%s); pick another with --nsys-gpu-metrics-set",
+                algo,
+                ", ".join(sorted({row.metric for row in metrics})),
+            )
+    elif kernels:
+        LOGGER.info("%s: no GPU metric samples in the reports (recorded without --gpu-metrics-devices)", algo)
+    return kernels, summarize(kernels, overlap, results), summarize_metrics(metrics, results)
 
 
 def main(argv: Sequence[str] | None = None) -> None:
@@ -445,6 +594,7 @@ def main(argv: Sequence[str] | None = None) -> None:
         raise FileNotFoundError(f"no {args.algo or '<algo>'}/nsys/index.tsv under {args.output_dir}")
     queries = load_queries()
     rows: list[dict[str, object]] = []
+    metric_rows: list[dict[str, object]] = []
     failed = []
     for algo in algos:
         algo_dir = args.output_dir / algo
@@ -452,13 +602,20 @@ def main(argv: Sequence[str] | None = None) -> None:
             if args.file_only:
                 file_algo(algo_dir, timeout_s=args.wait_seconds)
             else:
-                rows += analyse_algo(algo_dir, queries, nsys_bin=args.nsys_bin, timeout_s=args.wait_seconds)[1]
+                _, case_rows, case_metric_rows = analyse_algo(
+                    algo_dir, queries, nsys_bin=args.nsys_bin, timeout_s=args.wait_seconds
+                )
+                rows += case_rows
+                metric_rows += case_metric_rows
         except Exception:
             LOGGER.exception("%s: nsys %s failed", algo, "filing" if args.file_only else "analysis")
             failed.append(algo)
     if not args.file_only and rows:
         (args.output_dir / "nsys_kernels.md").write_text(render(rows), encoding="utf-8")
         LOGGER.info("wrote %s (%d cases)", args.output_dir / "nsys_kernels.md", len(rows))
+    if not args.file_only and metric_rows:
+        (args.output_dir / "nsys_gpu_metrics.md").write_text(render_metrics(metric_rows), encoding="utf-8")
+        LOGGER.info("wrote %s (%d rows)", args.output_dir / "nsys_gpu_metrics.md", len(metric_rows))
     if failed:
         raise RuntimeError(f"nsys {'filing' if args.file_only else 'analysis'} failed for {', '.join(failed)}")
     if not args.file_only and not rows:

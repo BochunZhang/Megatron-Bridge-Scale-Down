@@ -36,7 +36,8 @@
 --
 -- Run: sqlite3 -header -csv report.sqlite < nsys_collective_kernels.sql
 -- The first result set is per (trial, op, kernel); the second is per trial AG/RS overlap; the third
--- is the case label analyse_nsys.py checks against the <algo>/cases/<algo>-<case>/ the report was filed in.
+-- is the case label analyse_nsys.py checks against the <algo>/cases/<algo>-<case>/ the report was filed in;
+-- the fourth is per (trial, GPU metric) and needs a report recorded with --gpu-metrics-devices.
 
 -- name: kernels
 WITH
@@ -150,3 +151,59 @@ SELECT DISTINCT COALESCE(n.text, s.value) AS label
 FROM NVTX_EVENTS AS n
 LEFT JOIN StringIds AS s ON s.id = n.textId
 WHERE n.end IS NOT NULL AND COALESCE(n.text, s.value) LIKE '%/%MiB-%';
+
+-- name: gpu_metrics
+-- GPU metric samples (nsys --gpu-metrics-devices: NVLink RX/TX, DRAM read/write, ... as integer
+-- percent of peak) averaged over each trial's GPU window: first start to last end of the
+-- collective kernels launched in the trial. Each report samples only its rank's own GPU, and
+-- GPU_METRICS shares the kernels' timebase. The window covers every collective kernel of the
+-- trial; in a C++ report it therefore also starts at the start gate's tiny AllReduce.
+WITH
+ranges AS (
+    SELECT n.start, n.end, (n.globalTid >> 24) & 16777215 AS pid, COALESCE(n.text, s.value) AS name
+    FROM NVTX_EVENTS AS n
+    LEFT JOIN StringIds AS s ON s.id = n.textId
+    WHERE n.end IS NOT NULL
+),
+cases AS (
+    SELECT start, end, pid, name AS label FROM ranges WHERE name LIKE '%/%MiB-%'
+),
+trials AS (
+    SELECT c.label, t.name AS trial, t.start, t.end, t.pid
+    FROM ranges AS t
+    JOIN cases AS c ON c.pid = t.pid AND t.start >= c.start AND t.end <= c.end
+    WHERE t.name LIKE 'trial%'
+),
+collective_kernels AS (
+    SELECT k.start, k.end, r.start AS launch_start, (r.globalTid >> 24) & 16777215 AS pid
+    FROM CUPTI_ACTIVITY_KIND_KERNEL AS k
+    JOIN CUPTI_ACTIVITY_KIND_RUNTIME AS r
+        ON r.correlationId = k.correlationId
+        AND ((r.globalTid >> 24) & 16777215) = ((k.globalPid >> 24) & 16777215)
+    JOIN StringIds AS s ON s.id = k.shortName
+    WHERE s.value LIKE 'nccl%'
+        AND (s.value LIKE '%AllGather%' OR s.value LIKE '%ReduceScatter%' OR s.value LIKE '%AllReduce%')
+),
+windows AS (
+    SELECT t.label, t.trial, MIN(ck.start) AS start, MAX(ck.end) AS end
+    FROM trials AS t
+    JOIN collective_kernels AS ck ON ck.pid = t.pid AND ck.launch_start BETWEEN t.start AND t.end
+    GROUP BY t.label, t.trial
+),
+-- TARGET_INFO_GPU_METRICS can list a metric once per sampled GPU.
+metric_names AS (
+    SELECT DISTINCT metricId, metricName FROM TARGET_INFO_GPU_METRICS
+)
+SELECT
+    w.label,
+    w.trial,
+    m.metricName AS metric,
+    COUNT(*) AS samples,
+    AVG(g.value) AS mean,
+    MAX(g.value) AS peak,
+    w.end - w.start AS window_ns
+FROM windows AS w
+JOIN GPU_METRICS AS g ON g.timestamp BETWEEN w.start AND w.end
+JOIN metric_names AS m ON m.metricId = g.metricId
+GROUP BY w.label, w.trial, m.metricName
+ORDER BY w.label, w.trial, m.metricName;

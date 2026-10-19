@@ -26,6 +26,8 @@ import importlib.util
 import json
 import os
 import re
+import shutil
+import subprocess
 import sys
 import types
 from pathlib import Path
@@ -35,6 +37,7 @@ import pytest
 
 BENCHMARK_DIR = Path(__file__).resolve().parents[3] / "examples" / "gb200" / "nvls-collective"
 BENCHMARK_PATH = BENCHMARK_DIR / "nvls_collective_benchmark.py"
+LAUNCHER_PATH = BENCHMARK_DIR / "run_nvls_collective_benchmark.sh"
 METRICS_PATH = BENCHMARK_DIR / "collective_metrics.py"
 STDLIB_ONLY_IMPORTS = {
     "__future__",
@@ -137,6 +140,91 @@ def test_defaults_cover_the_requested_matrix():
     assert args.dtype == "bf16"
     assert args.symm_kernel == "default"
     assert args.nsys is False
+    assert args.ncu is False
+
+
+@pytest.mark.unit
+def test_nsys_and_ncu_are_exclusive():
+    base = ["--algo", "symm", "--output-dir", "/tmp/never-used"]
+    assert benchmark.parse_args([*base, "--ncu"]).ncu is True
+    with pytest.raises(SystemExit):
+        benchmark.parse_args([*base, "--nsys", "--ncu"])
+
+
+def _launcher_dry_run(*options: str) -> subprocess.CompletedProcess:
+    env = {**os.environ, "GLOO_SOCKET_IFNAME": "lo", "RUN_TIME": "dry-run-test"}
+    for name in ("NNODES", "NODE_RANK", "RANK", "MASTER_ADDR", "DLC_MASTER_ADDR", "NCCL_ALGO", "NCCL_NVLS_ENABLE"):
+        env.pop(name, None)
+    return subprocess.run(
+        ["bash", str(LAUNCHER_PATH), "--dry-run", "--algos", "symm", "--workloads", "ag", *options],
+        capture_output=True,
+        text=True,
+        env=env,
+        check=False,
+    )
+
+
+def _worker_command(stdout: str) -> list[str]:
+    (line,) = [line for line in stdout.splitlines() if "torch.distributed.run" in line]
+    words = line.replace("\\", "").split()
+    return words[words.index("--no-python") + 1 : words.index("--algo")]
+
+
+@pytest.mark.unit
+@pytest.mark.skipif(shutil.which("bash") is None, reason="needs bash")
+def test_launcher_nsys_samples_gpu_metrics_on_each_workers_own_gpu():
+    result = _launcher_dry_run("--nsys", "--nsys-gpu-metrics-set", "gb10x", "--nsys-gpu-metrics-frequency", "20000")
+    assert result.returncode == 0, result.stderr
+    worker = _worker_command(result.stdout)
+    # nsys_worker.sh resolves --gpu-metrics-devices from LOCAL_RANK, so one session per GPU.
+    assert worker[:2] == ["bash", str(BENCHMARK_DIR / "nsys_worker.sh")]
+    assert "--gpu-metrics-frequency=20000" in worker
+    assert "--gpu-metrics-set=gb10x" in worker
+    assert "--capture-range=cudaProfilerApi" in worker
+    assert "CUDA_DEVICE_ORDER=PCI_BUS_ID" in result.stdout
+    assert " --nsys " in result.stdout
+
+
+@pytest.mark.unit
+@pytest.mark.skipif(shutil.which("bash") is None, reason="needs bash")
+def test_launcher_ncu_profiles_trial0_of_one_full_group_in_lockstep():
+    result = _launcher_dry_run("--ncu", "--ncu-sections", "SpeedOfLight,Nvlink_Tables", "--ncu-port", "50000")
+    assert result.returncode == 0, result.stderr
+    worker = _worker_command(result.stdout)
+    assert worker[0] == "ncu"
+    for option in (
+        "--communicator=tcp",
+        "--communicator-tcp-num-peers=4",
+        "--communicator-tcp-port=50000",
+        "--lockstep-kernel-launch",
+        "--profile-from-start=off",
+        "--nvtx-include=trial0/",
+        "--clock-control=none",
+        "--cache-control=none",
+        "--section=SpeedOfLight",
+        "--section=Nvlink_Tables",
+    ):
+        assert option in worker
+    # Every rank is in the one group, so lockstep never waits on an idle rank.
+    assert "--group-sizes 4 " in result.stdout and "--split-totals none" in result.stdout
+    assert " --ncu " in result.stdout
+
+
+@pytest.mark.unit
+@pytest.mark.skipif(shutil.which("bash") is None, reason="needs bash")
+@pytest.mark.parametrize(
+    ("options", "message"),
+    [
+        (("--nsys", "--ncu"), "exclusive"),
+        (("--ncu", "--group-sizes", "2"), "--group-sizes must be 4"),
+        (("--ncu", "--split-totals", "4"), "split scenarios leave ranks idle"),
+        (("--nsys", "--nsys-gpu-metrics-frequency", "300000"), r"\[10, 200000\]"),
+    ],
+)
+def test_launcher_rejects_profiler_options_it_cannot_honor(options, message):
+    result = _launcher_dry_run(*options)
+    assert result.returncode != 0
+    assert re.search(message, result.stderr)
 
 
 @pytest.mark.unit
