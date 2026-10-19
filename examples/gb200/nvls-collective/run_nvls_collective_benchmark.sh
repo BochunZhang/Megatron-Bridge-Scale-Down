@@ -19,6 +19,16 @@ usage() {
     cat <<'USAGE'
 Benchmark torch all-gather / reduce-scatter / all-reduce with ring and NVLS on GB200.
 
+Five passes (families), each its own torchrun job:
+  ring            NCCL_ALGO=Ring on plain buffers; ag, rs, ar, ag+rs
+  nvls            NCCL_ALGO=NVLS on plain buffers; ag, rs, ar, ag+rs
+  symm            symmetric kernels on registered windows; ag, rs, ar, ag+rs
+  symm-tma   AG = AllGather_TmaSTMC (TMA -> multicast), RS = ReduceScatter_LDMC; ag, ag+rs
+  copy-engine     AG = copy engine writing the multicast address, RS = ReduceScatter_LDMC; ag, ag+rs
+symm-tma and copy-engine skip rs and ar: NCCL has no TMA multicast or CE reduce-scatter, so
+their RS is symm's ReduceScatter_LDMC. Both still run every single and split scenario (the split
+cross case too: group A all-gathers with the pass's AG while group B runs ReduceScatter_LDMC).
+
 Run the same command on every node (DLC style). For each algorithm a fresh torchrun job
 is started, because NCCL_ALGO is fixed when a communicator is created. After the last pass
 node 0 runs analyse_results.sh (compare.md, seconds); a failure there is only a warning, so a
@@ -49,7 +59,7 @@ Options:
   --master-addr ADDR      Rendezvous host (default: MASTER_ADDR, DLC_MASTER_ADDR or 127.0.0.1)
   --master-port PORT      First rendezvous port; algorithm i uses PORT+i (default: 29611)
   --gpus-per-node N       GPUs per node (default: 4, one GB200 compute tray)
-  --algos LIST            ring,nvls,symm (default: ring,nvls,symm)
+  --algos LIST            ring,nvls,symm,symm-tma,copy-engine (default: all five)
   --group-sizes LIST      Single-group sizes (default: 4,8,16,32 capped at nnodes*gpus-per-node)
   --split-totals LIST     Ranks cut into two concurrent half-groups; T/2 must be in --group-sizes
                           (default: the largest of 16,32 that fits: 8+8 on 16 GPUs, 16+16 on 32)
@@ -62,7 +72,7 @@ Options:
   --warmup N              Untimed iterations per case (default: 5)
   --iters N               Back-to-back iterations per trial (default: 20)
   --trials N              Timed trials, median reported (default: 5)
-  --symm-kernel KERNEL    For the symm pass: default, ag, rs or ar (pins NCCL_SYM_KERNEL); needs
+  --symm-kernel KERNEL    For the symm pass only: default, ag, rs or ar (pins NCCL_SYM_KERNEL); needs
                           --workloads with that op only, because the pin masks the other op
   --nsys                  One Nsight Systems report per rank per case (capture range = timed trials);
                           node 0 files them under cases/ after each pass (renames only);
@@ -73,6 +83,10 @@ Options:
 Examples:
   # One tray (4 GPUs): smoke test.
   bash examples/gb200/nvls-collective/run_nvls_collective_benchmark.sh --sizes-mib 64 --trials 2
+
+  # One tray: only the TMA and copy-engine AllGather passes (plus symm as their reference).
+  bash examples/gb200/nvls-collective/run_nvls_collective_benchmark.sh \
+    --algos symm,symm-tma,copy-engine --sizes-mib 64,256,1024 --trials 3
 
   # Eight trays in one NVL72 domain (32 GPUs); run the same command on every node.
   bash examples/gb200/nvls-collective/run_nvls_collective_benchmark.sh --nnodes 8
@@ -105,7 +119,7 @@ node_rank="${NODE_RANK:-${RANK:-0}}"
 master_addr="${MASTER_ADDR:-${DLC_MASTER_ADDR:-127.0.0.1}}"
 master_port="29611"
 gpus_per_node="4"
-algos="ring,nvls,symm"
+algos="ring,nvls,symm,symm-tma,copy-engine"
 group_sizes=""
 split_totals=""
 split_layouts="contiguous"
@@ -166,7 +180,10 @@ if [[ -z "$split_totals" ]]; then
 fi
 IFS=, read -r -a algo_list <<<"$algos"
 for algo in "${algo_list[@]}"; do
-    [[ "$algo" == ring || "$algo" == nvls || "$algo" == symm ]] || die "--algos accepts ring,nvls,symm; got $algo"
+    case "$algo" in
+        ring|nvls|symm|symm-tma|copy-engine) ;;
+        *) die "--algos accepts ring,nvls,symm,symm-tma,copy-engine; got $algo" ;;
+    esac
 done
 case "$symm_kernel" in
     default) symm_kernel_env="" ;;
@@ -257,7 +274,6 @@ else
     # Fewer than 16 GPUs: no default split; only single-group cases run.
     bench_args+=(--split-totals none)
 fi
-bench_args+=(--symm-kernel "$symm_kernel")
 
 # TUNING carries the per-collective "Algo ... proto ..." and "[Symmetric] ... Kernel ..." lines
 # that the benchmark parses as evidence of the executed kernel; INIT carries nNodes/MNNVL.
@@ -283,17 +299,44 @@ echo "world_size=${world_size} nnodes=${nnodes} node_rank=${node_rank} group_siz
     "split_totals=${split_totals:-none} ifname=${gloo_ifname} output_dir=${output_dir}" >&2
 $DRY_RUN || mkdir -p "$output_dir"
 
+# NCCL_SYM_CE_THRESHOLD is an element count; INT64_MAX keeps every AllGather off the copy engines.
+int64_max=9223372036854775807
 for index in "${!algo_list[@]}"; do
     algo="${algo_list[$index]}"
     algo_dir="${output_dir}/${algo}"
     $DRY_RUN || mkdir -p "$algo_dir"
+    sym_ce_threshold=""
+    sym_kernel=""
+    ce_multicast_threshold=""
+    algo_args=()
     case "$algo" in
         nvls) nccl_algo="NVLS"; nvls_enable=1; win_enable="" ;;
         ring) nccl_algo="Ring"; nvls_enable=0; win_enable="" ;;
         # The symmetric path is chosen by window registration, not by NCCL_ALGO. An empty
         # NCCL_ALGO means "unset" to both NCCL and the benchmark. NVLS_ENABLE=1 keeps the
         # multicast (MC) symmetric kernels eligible; NCCL_WIN_ENABLE turns on window registration.
-        symm) nccl_algo=""; nvls_enable=1; win_enable=1 ;;
+        # Without the CE threshold, an AllGather whose per-rank count exceeds 8Mi elements runs on
+        # the copy engines (enqueue.cc, Blackwell + NVLink + registered window) and never reaches a
+        # symmetric kernel, whatever NCCL_SYM_KERNEL says.
+        symm)
+            nccl_algo=""; nvls_enable=1; win_enable=1; sym_ce_threshold="$int64_max"
+            sym_kernel="$symm_kernel_env"
+            algo_args=(--symm-kernel "$symm_kernel")
+            ;;
+        # Same windows; NCCL 2.32 takes "<func>:<kernel>;..." in NCCL_SYM_KERNEL, so AG and RS are
+        # pinned separately and AllReduce (the start gate) is left alone.
+        symm-tma)
+            nccl_algo=""; nvls_enable=1; win_enable=1; sym_ce_threshold="$int64_max"
+            sym_kernel="allgather:AllGather_TmaSTMC;reducescatter:ReduceScatter_LDMC"
+            ;;
+        # Threshold 0 sends every AllGather to the copy engines; a multicast threshold above every
+        # shard (2^62 bytes, ce_coll.cc ncclCeAllGatherUseMulticast) makes it one CE copy to the
+        # multicast address instead of N-1 unicast copies. Only the RS needs a kernel pin.
+        copy-engine)
+            nccl_algo=""; nvls_enable=1; win_enable=1; sym_ce_threshold=0
+            ce_multicast_threshold=4611686018427387904
+            sym_kernel="reducescatter:ReduceScatter_LDMC"
+            ;;
     esac
     # Whole-process NCCL logs; the benchmark copies each test's slice into <algo>/cases/<algo>-<case>/.
     nccl_raw_dir="${algo_dir}/nccl-raw"
@@ -311,11 +354,9 @@ for index in "${!algo_list[@]}"; do
         NCCL_SOCKET_IFNAME="$nccl_socket_ifname"
     )
     [[ -n "$win_enable" ]] && algo_env+=(NCCL_WIN_ENABLE="$win_enable")
-    # Without this, an AllGather whose per-rank count exceeds 8Mi elements runs on the copy
-    # engines (enqueue.cc, Blackwell + NVLink + registered window) and never reaches a
-    # symmetric kernel, whatever NCCL_SYM_KERNEL says. INT64_MAX disables that branch.
-    [[ -n "$win_enable" ]] && algo_env+=(NCCL_SYM_CE_THRESHOLD=9223372036854775807)
-    [[ -n "$win_enable" && -n "$symm_kernel_env" ]] && algo_env+=(NCCL_SYM_KERNEL="$symm_kernel_env")
+    [[ -n "$sym_ce_threshold" ]] && algo_env+=(NCCL_SYM_CE_THRESHOLD="$sym_ce_threshold")
+    [[ -n "$sym_kernel" ]] && algo_env+=(NCCL_SYM_KERNEL="$sym_kernel")
+    [[ -n "$ce_multicast_threshold" ]] && algo_env+=(NCCL_CE_COLL_AG_MULTICAST_THRESHOLD="$ce_multicast_threshold")
     # Cross-tray groups must use the NVLink fabric; forcing MNNVL makes a fallback to IB fail.
     (( nnodes > 1 )) && algo_env+=(NCCL_MNNVL_ENABLE=1)
 
@@ -357,7 +398,7 @@ for index in "${!algo_list[@]}"; do
         --master_port="$(( master_port + index ))" \
         ${torchrun_extra[@]+"${torchrun_extra[@]}"} \
         "${worker[@]}" \
-        --algo "$algo" --output-dir "$algo_dir" "${bench_args[@]}" \
+        --algo "$algo" --output-dir "$algo_dir" "${bench_args[@]}" ${algo_args[@]+"${algo_args[@]}"} \
         2>&1 | { $DRY_RUN && cat || tee "${algo_dir}/torchrun-node${node_rank}.log"; }
 
     if $nsys_enabled && ! $DRY_RUN; then

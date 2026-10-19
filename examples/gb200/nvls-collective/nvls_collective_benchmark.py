@@ -24,13 +24,20 @@ communicator is created and the symmetric-memory path needs its own buffer regis
   (``AllGather_STMC`` / ``ReduceScatter_LDMC`` / ``AllReduce_RSxLDMC_AGxSTMC`` on a NVLink domain), which are unrelated to
   the classic ring and NVLS collectives. ``NCCL_SYM_CE_THRESHOLD`` must exceed every payload,
   otherwise large AllGathers go to the copy engines instead.
+* ``symm-tma`` / ``copy-engine``: the same windows, measuring only AG and AG+RS. The
+  AllGather is the TMA multicast symmetric kernel ``AllGather_TmaSTMC``, or a copy-engine
+  ``cudaMemcpy`` to the multicast address (``NCCL_SYM_CE_THRESHOLD=0`` sends every AllGather to
+  the CE, ``NCCL_CE_COLL_AG_MULTICAST_THRESHOLD`` above every shard makes it multicast). NCCL
+  has neither a TMA multicast nor a CE reduce-scatter, so the RS of both is the multicast
+  symmetric kernel ``ReduceScatter_LDMC``. ``NCCL_SYM_KERNEL`` pins both kernels (NCCL 2.32).
 
 ``run_nvls_collective_benchmark.sh`` launches one pass per family and merges them with
 ``collective_metrics.py``.
 
 Every launch is checked against NCCL's own TUNING log on comm rank 0: a case fails unless
 each op ran exactly warmup + trials * iters times, with the expected shard size, on the
-family's implementation (``Ring/*``, ``NVLS/*`` or a symmetric kernel; never ``CopyEngine``).
+family's implementation (``Ring/*``, ``NVLS/*``, a symmetric kernel or, for symm-tma and
+copy-engine, exactly the pinned one; ``CopyEngine`` only in copy-engine).
 Each case gets ``<output-dir>/cases/<algo>-<case>/`` (e.g. ``cases/nvls-all_reduce-1024MiB-bf16-single-n16/``)
 holding every member rank's slice of its NCCL log, ``case.json`` and, once filed by
 ``analyse_nsys.py``, the case's nsys reports ``<algo>-<case>.rank_<RR>.nsys-rep``.
@@ -83,6 +90,7 @@ from collective_metrics import (
     alg_bandwidth_gb_s,
     case_dir_name,
     case_name,
+    measured_workloads,
     op_bus_bandwidth_gb_s,
     per_rank_bytes,
     rank_file,
@@ -127,10 +135,33 @@ _TUNING_LINE = re.compile(
     r"(?:Algo (\S+) proto (\S+)|Kernel (\S+)|cudaMemcpy)"
 )
 COPY_ENGINE = "CopyEngine"
+# ce_coll.cc appends "; CE synchronization with NVLS" when the communicator has LSA multimem
+# (symkState.hasLsaMultimem), the precondition of the multicast CE AllGather.
+COPY_ENGINE_NVLS_SYNC = "CopyEngine+NVLSSync"
 # enqueue.cc sends an AllGather with sendcount > NCCL_SYM_CE_THRESHOLD (elements, default 8Mi)
 # on a window-registered Blackwell NVLink communicator to the copy engines, before any
 # symmetric kernel is considered and regardless of NCCL_SYM_KERNEL.
 SYM_CE_THRESHOLD_ENV = "NCCL_SYM_CE_THRESHOLD"
+# ncclCeAllGatherUseMulticast (ce_coll.cc): with LSA multimem, a value >= 0 bypasses the cost
+# model and a shard of at most this many bytes is written once to the multicast address
+# instead of N-1 unicast copies. The TUNING line does not say which one ran, so the
+# copy-engine pass requires a value above every payload.
+CE_AG_MULTICAST_THRESHOLD_ENV = "NCCL_CE_COLL_AG_MULTICAST_THRESHOLD"
+# symm-tma and copy-engine accept exactly one implementation per op. NCCL 2.32 parses
+# NCCL_SYM_KERNEL like NCCL_ALGO ("<func>:<kernel>;...", parseList in tuning/cost_model.cc):
+# a listed function may only use the listed kernel -- every classic algorithm included -- and
+# AllReduce, the start gate, keeps its default choice. copy-engine leaves AllGather unpinned:
+# NCCL_SYM_CE_THRESHOLD=0 sends it to the copy engines before any kernel is picked.
+PINNED_SYM_KERNEL = {
+    "symm-tma": "allgather:AllGather_TmaSTMC;reducescatter:ReduceScatter_LDMC",
+    "copy-engine": "reducescatter:ReduceScatter_LDMC",
+}
+PINNED_IMPLEMENTATIONS = {
+    "symm-tma": {"ag": "Symmetric/AllGather_TmaSTMC", "rs": "Symmetric/ReduceScatter_LDMC"},
+    "copy-engine": {"ag": COPY_ENGINE_NVLS_SYNC, "rs": "Symmetric/ReduceScatter_LDMC"},
+}
+# Families whose payload buffers live in a registered NCCL_WIN_COLL_SYMMETRIC window.
+WINDOW_ALGOS = ("symm", *PINNED_IMPLEMENTATIONS)
 
 # The start gate: a one-element fp32 all-reduce; its TUNING line is "AllReduce: 4 Bytes -> ...".
 GATE_FUNC = "AllReduce"
@@ -345,6 +376,8 @@ def _check_environment(algo: str, world_size: int, args: argparse.Namespace) -> 
                     f"--algo symm measures AllReduce_RSxLDMC_AGxSTMC, which NCCL only offers to groups of"
                     f" >= {SYMM_AR_MIN_RANKS} ranks (multicast needs an LSA team of more than 2); got groups of {small}"
                 )
+    elif algo in PINNED_IMPLEMENTATIONS:
+        _check_pinned_environment(algo, args)
     else:
         assert expected is not None
         if actual.lower() != expected.lower():
@@ -379,11 +412,54 @@ def _check_environment(algo: str, world_size: int, args: argparse.Namespace) -> 
         raise ValueError("--group-sizes entries must be >= 2")
 
 
-def _new_group(name: str, ranks: list[int]) -> CollectiveGroup:
+def _check_pinned_environment(algo: str, args: argparse.Namespace) -> None:
+    """Check the environment that makes symm-tma / copy-engine run exactly their implementation.
+
+    Unlike symm, nothing here is fixed up silently: each variable decides which AllGather runs,
+    so a wrong value would measure a different implementation under this family's name.
+    """
+    if os.environ.get("NCCL_ALGO", "").strip():
+        raise RuntimeError(f"--algo {algo} requires NCCL_ALGO to be unset")
+    if os.environ.get("NCCL_WIN_ENABLE") != "1" or os.environ.get("NCCL_NVLS_ENABLE") != "1":
+        raise RuntimeError(f"--algo {algo} requires NCCL_WIN_ENABLE=1 and NCCL_NVLS_ENABLE=1 (windows + multicast)")
+    if args.symm_kernel != "default":
+        raise ValueError(f"--symm-kernel applies to --algo symm only; --algo {algo} pins its own kernels")
+    pinned = os.environ.get("NCCL_SYM_KERNEL")
+    if pinned != PINNED_SYM_KERNEL[algo]:
+        raise RuntimeError(f"--algo {algo} requires NCCL_SYM_KERNEL={PINNED_SYM_KERNEL[algo]!r}, got {pinned!r}")
+    largest = max(args.sizes_mib) * BYTES_PER_MIB
+    ce_threshold = os.environ.get(SYM_CE_THRESHOLD_ENV, "")
+    if algo == "symm-tma" and (not ce_threshold.isdigit() or int(ce_threshold) < largest):
+        raise RuntimeError(
+            f"--algo symm-tma requires {SYM_CE_THRESHOLD_ENV} >= {largest}, got {ce_threshold!r}; otherwise"
+            " large AllGathers go to the copy engines"
+        )
+    if algo == "copy-engine":
+        if ce_threshold != "0":
+            raise RuntimeError(f"--algo copy-engine requires {SYM_CE_THRESHOLD_ENV}=0, got {ce_threshold!r}")
+        multicast = os.environ.get(CE_AG_MULTICAST_THRESHOLD_ENV, "")
+        if not multicast.isdigit() or int(multicast) < largest:
+            raise RuntimeError(
+                f"--algo copy-engine requires {CE_AG_MULTICAST_THRESHOLD_ENV} >= {largest} so every shard is written"
+                f" to the multicast address, got {multicast!r}"
+            )
+    if not measured_workloads(algo, args.workloads):
+        raise ValueError(f"--algo {algo} measures only ag and ag+rs; got --workloads {args.workloads}")
+    # TmaSTMC, LDMC and the multicast CE all need LSA multimem, which ncclSymkInitOnce grants only
+    # to an LSA team of more than two ranks.
+    small = sorted({n for n in args.group_sizes + [n // 2 for n in args.split_totals] if n < SYMM_AR_MIN_RANKS})
+    if small:
+        raise ValueError(f"--algo {algo} needs multicast, i.e. groups of >= {SYMM_AR_MIN_RANKS} ranks; got {small}")
+
+
+def _new_group(name: str, ranks: list[int], *, eager: bool = False) -> CollectiveGroup:
     # new_group is collective over the default (Gloo) group: every rank calls it in the same order.
-    ag_pg = dist.new_group(ranks=ranks, backend="nccl")
-    rs_pg = dist.new_group(ranks=ranks, backend="nccl")
-    ar_pg = dist.new_group(ranks=ranks, backend="nccl")
+    # With a device_id torch creates the members' NCCL communicator right away instead of at the
+    # first collective, so a window can be registered before any collective runs.
+    device_id = torch.device("cuda", torch.cuda.current_device()) if eager else None
+    ag_pg = dist.new_group(ranks=ranks, backend="nccl", device_id=device_id)
+    rs_pg = dist.new_group(ranks=ranks, backend="nccl", device_id=device_id)
+    ar_pg = dist.new_group(ranks=ranks, backend="nccl", device_id=device_id)
     member = dist.get_rank() in ranks
     return CollectiveGroup(
         name=name,
@@ -430,7 +506,8 @@ def parse_tuning_line(line: str) -> tuple[str, str, int] | None:
     """Return ``(func, implementation, shard_bytes)`` for one NCCL TUNING launch line.
 
     The implementation is ``<Algo>/<Proto>`` for classic kernels (``NVLS/Simple``),
-    ``Symmetric/<kernel>`` for the window path and ``CopyEngine`` for CE collectives.
+    ``Symmetric/<kernel>`` for the window path and ``CopyEngine`` for CE collectives, or
+    ``CopyEngine+NVLSSync`` when the CE line says its synchronization went through NVLS.
     """
     match = _TUNING_LINE.search(line)
     if match is None:
@@ -439,7 +516,8 @@ def parse_tuning_line(line: str) -> tuple[str, str, int] | None:
     if path == "Symmetric":
         implementation = f"Symmetric/{kernel}"
     elif path == "Copy Engine":
-        implementation = COPY_ENGINE
+        nvls_sync = "CE synchronization with NVLS" in line[match.end() :]
+        implementation = COPY_ENGINE_NVLS_SYNC if nvls_sync else COPY_ENGINE
     else:
         implementation = f"{algo}/{proto}"
     return func, implementation, int(nbytes)
@@ -463,8 +541,8 @@ def parse_nccl_lines(lines: list[str]) -> dict[str, object]:
         launch = parse_tuning_line(line)
         if launch is not None:
             func, implementation, _ = launch
-            if implementation == COPY_ENGINE:
-                kernels[func] = COPY_ENGINE
+            if implementation.startswith(COPY_ENGINE):
+                kernels[func] = implementation
             elif implementation.startswith("Symmetric/"):
                 kernels[func] = implementation.split("/", 1)[1]
             else:
@@ -485,6 +563,8 @@ def implementation_matches(algo: str, op: str, implementation: str, *, pinned_ke
     if algo == "symm":
         family, _, kernel = implementation.partition("/")
         return family == "Symmetric" and kernel in SYMM_KERNELS[op] and pinned_kernel in (None, kernel)
+    if algo in PINNED_IMPLEMENTATIONS:
+        return implementation == PINNED_IMPLEMENTATIONS[algo].get(op)
     # 2.29 logs ncclAlgoToString() ("RING", "NVLS"); older releases used ncclAlgoStr ("Ring").
     expected = NCCL_ALGO_ENV[algo]
     return implementation.split("/", 1)[0].upper() == expected.upper()
@@ -550,6 +630,8 @@ def check_implementation(
         if wrong:
             if algo == "symm":
                 want = f"Symmetric/{pinned_kernel or '|'.join(SYMM_KERNELS[op])}"
+            elif algo in PINNED_IMPLEMENTATIONS:
+                want = PINNED_IMPLEMENTATIONS[algo].get(op, "nothing")
             else:
                 want = f"{NCCL_ALGO_ENV[algo]}/*"
             got = ", ".join(f"{impl} x{n}" for impl, n in sorted(wrong.items()))
@@ -589,12 +671,15 @@ class NcclLog:
         return data[:cut].decode("utf-8", errors="replace").splitlines()
 
 
-def _connect(groups: list[CollectiveGroup], gate: StartGate, rank: int) -> None:
+def _connect(groups: list[CollectiveGroup], gate: StartGate, rank: int, *, windows: bool = False) -> None:
     """Create and connect every communicator serially before any concurrent launch.
 
     NCCL connects ring/NVLS channels on the first collective of each algorithm. Doing that
     while another communicator's kernel waits for peers can deadlock, so it happens here,
     one communicator at a time, with a device sync in between. The start gate goes first.
+
+    With ``windows`` (symm-tma, copy-engine) the AG and RS run on a registered window
+    instead (:func:`_connect_windows`); the groups must have been created with ``eager=True``.
     """
     if gate.pg is not None:
         dist.all_reduce(gate.tensor, group=gate.pg)
@@ -602,18 +687,38 @@ def _connect(groups: list[CollectiveGroup], gate: StartGate, rank: int) -> None:
     torch.distributed.barrier()
     for group in groups:
         if rank in group.ranks:
-            index = group.ranks.index(rank)
-            shard = torch.full((1024,), float(index), device="cuda")
-            gathered = torch.empty(1024 * group.size, device="cuda")
-            dist.all_gather_into_tensor(gathered, shard, group=group.ag_pg)
-            torch.cuda.synchronize()
-            reduced = torch.empty(1024, device="cuda")
-            dist.reduce_scatter_tensor(reduced, gathered, group=group.rs_pg)
-            torch.cuda.synchronize()
+            if windows:
+                _connect_windows(group, rank)
+            else:
+                index = group.ranks.index(rank)
+                shard = torch.full((1024,), float(index), device="cuda")
+                gathered = torch.empty(1024 * group.size, device="cuda")
+                dist.all_gather_into_tensor(gathered, shard, group=group.ag_pg)
+                torch.cuda.synchronize()
+                reduced = torch.empty(1024, device="cuda")
+                dist.reduce_scatter_tensor(reduced, gathered, group=group.rs_pg)
+                torch.cuda.synchronize()
             reduced_inplace = torch.ones(1024, device="cuda")
             dist.all_reduce(reduced_inplace, group=group.ar_pg)
             torch.cuda.synchronize()
         torch.distributed.barrier()
+
+
+def _connect_windows(group: CollectiveGroup, rank: int) -> None:
+    """Run the first AG and RS of a pinned family on a 4 KiB-per-rank registered window.
+
+    NCCL_SYM_KERNEL leaves a pinned function no classic algorithm, and the multicast kernels
+    only become eligible once the first symmetric window is registered (``ncclSymkInitOnce``
+    sets ``hasLsaMultimem``). An AG or RS on plain memory would therefore find no implementation
+    and fail; on a window it runs exactly the pinned one, like every case afterwards.
+    """
+    buffers = _make_buffers(group, rank, group.size * 1024 * 4, torch.float32, symm=True)
+    _register_pool(group, buffers.pool)
+    dist.all_gather_into_tensor(buffers.ag_out, buffers.ag_in, group=group.ag_pg)
+    torch.cuda.synchronize()
+    dist.reduce_scatter_tensor(buffers.rs_out, buffers.rs_in, group=group.rs_pg)
+    torch.cuda.synchronize()
+    _deregister_pool(group, buffers.pool)
 
 
 def _nccl_backend(pg: dist.ProcessGroup) -> dist.ProcessGroupNCCL:
@@ -893,7 +998,8 @@ def run_case(
     case_dir = args.output_dir / "cases" / case_dir_name(args.algo, case)
     label = f"{args.algo}/{case}"
     probe: dict[str, object] = dict(topology.comm_info)
-    buffers = _make_buffers(group, rank, size_bytes, DTYPES[args.dtype], symm=args.algo == "symm") if group else None
+    windows = args.algo in WINDOW_ALGOS
+    buffers = _make_buffers(group, rank, size_bytes, DTYPES[args.dtype], symm=windows) if group else None
     if group:
         _register_pool(group, buffers.pool)
     torch.cuda.synchronize()
@@ -1102,6 +1208,10 @@ def main(argv: list[str] | None = None) -> None:
     nccl_log = NcclLog()
     nccl_log.consume()  # skip lines from the Gloo/default-group setup
     sizes = [mib * BYTES_PER_MIB for mib in args.sizes_mib]
+    # symm-tma / copy-engine measure only ag and ag+rs; the cross case below still runs when
+    # ag and rs are both requested, because group B's RS is their pinned ReduceScatter_LDMC.
+    workloads = measured_workloads(args.algo, args.workloads)
+    pinned = args.algo in PINNED_IMPLEMENTATIONS
 
     nsys_index = args.output_dir / "nsys" / "index.tsv"
     indexed_captures: set[int] = set()
@@ -1163,7 +1273,7 @@ def main(argv: list[str] | None = None) -> None:
     def connect(scenario: str, groups: list[CollectiveGroup]) -> tuple[Topology, Path | None]:
         """Create the scenario's communicators and start gate; keep their init lines in ``comm/``."""
         gate = _new_gate(sorted(member for group in groups for member in group.ranks))
-        _connect(groups, gate, rank)
+        _connect(groups, gate, rank, windows=pinned)
         lines = nccl_log.consume()
         # The connect collectives' TUNING lines are tiny warm-up sizes; keep only the comm init.
         comm_info = {k: v for k, v in parse_nccl_lines(lines).items() if k in ("n_nodes", "mnnvl")}
@@ -1183,10 +1293,10 @@ def main(argv: list[str] | None = None) -> None:
 
     for n in args.group_sizes:
         scenario = scenario_name("single", total_ranks=n)
-        group = _new_group(f"single{n}", list(range(n)))
+        group = _new_group(f"single{n}", list(range(n)), eager=pinned)
         topology, comm_log = connect(scenario, [group])
         for size_bytes in sizes:
-            for workload in args.workloads:
+            for workload in workloads:
                 records = run_case(topology, **case_kwargs(scenario, None, size_bytes, workload, [workload]))
                 emit(records, scenario="single", phase="isolated", total_ranks=n, layout=None, group_index=0)
         destroy(topology, comm_log)
@@ -1195,20 +1305,24 @@ def main(argv: list[str] | None = None) -> None:
         for layout in args.split_layouts:
             scenario = scenario_name("split", total_ranks=total, layout=layout)
             ranks_a, ranks_b = split_groups(total, layout)
-            groups = [_new_group(f"{layout}{total}-A", ranks_a), _new_group(f"{layout}{total}-B", ranks_b)]
+            groups = [
+                _new_group(f"{layout}{total}-A", ranks_a, eager=pinned),
+                _new_group(f"{layout}{total}-B", ranks_b, eager=pinned),
+            ]
             topology, comm_log = connect(scenario, groups)
             common = {"scenario": "split", "total_ranks": total, "layout": layout}
             # Neither half runs alone here: its isolated reference is single-n<total/2>, which
             # runs the same rank count (ranks 0..total/2-1) on the same sizes and workloads.
             for size_bytes in sizes:
-                for workload in args.workloads:
+                for workload in workloads:
                     concurrent = run_case(
                         topology, **case_kwargs(scenario, CONCURRENT_PART, size_bytes, workload, [workload] * 2)
                     )
                     for index, record in enumerate(concurrent):
                         emit([record], phase="concurrent", group_index=index, **common)
                 # A all-gathers while B reduce-scatters; its references are single-n<total/2> ag
-                # and rs, so it runs only when both of those are measured.
+                # and rs, so it runs only when both of those are requested (symm-tma and
+                # copy-engine still run it, without measuring the rs reference themselves).
                 if set(CROSS_GROUP_WORKLOADS) <= set(args.workloads):
                     cross = run_case(
                         topology,

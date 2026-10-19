@@ -140,10 +140,11 @@ def test_defaults_cover_the_requested_matrix():
 
 
 @pytest.mark.unit
-def test_algo_choice_is_the_three_algorithm_families():
-    assert sorted(metrics.ALGORITHMS) == ["nvls", "ring", "symm"]
-    assert metrics.ALGORITHMS == ("ring", "nvls", "symm")
-    assert metrics.NCCL_ALGO_ENV["symm"] is None  # the window path does not set NCCL_ALGO
+def test_algo_choice_is_the_five_algorithm_families():
+    assert metrics.ALGORITHMS == ("ring", "nvls", "symm", "symm-tma", "copy-engine")
+    assert set(metrics.NCCL_ALGO_ENV) == set(metrics.ALGORITHMS)
+    for family in ("symm", "symm-tma", "copy-engine"):
+        assert metrics.NCCL_ALGO_ENV[family] is None  # the window paths do not set NCCL_ALGO
     for family in metrics.ALGORITHMS:
         benchmark.parse_args(["--algo", family, "--output-dir", "/tmp/never-used"])
     with pytest.raises(SystemExit):
@@ -339,14 +340,16 @@ CE_AG = "h:1:2 [0] NCCL INFO AllGather [Copy Engine]: 16777216 Bytes -> cudaMemc
 def test_parse_tuning_line_reads_every_launch_format():
     assert benchmark.parse_tuning_line(CLASSIC_AG) == ("AllGather", "NVLS/SIMPLE", 16777216)
     assert benchmark.parse_tuning_line(SYMM_AG) == ("AllGather", "Symmetric/AllGather_STMC", 16777216)
-    assert benchmark.parse_tuning_line(CE_AG) == ("AllGather", "CopyEngine", 16777216)
+    assert benchmark.parse_tuning_line(CE_AG) == ("AllGather", "CopyEngine+NVLSSync", 16777216)
+    unicast_sync = CE_AG.removesuffix("; CE synchronization with NVLS")
+    assert benchmark.parse_tuning_line(unicast_sync) == ("AllGather", "CopyEngine", 16777216)
     assert benchmark.parse_tuning_line("h:1:2 [0] NCCL INFO Channel 00/32 : 0 1 2 3") is None
 
 
 @pytest.mark.unit
 def test_parse_nccl_lines_reports_the_copy_engine_path():
     assert benchmark.parse_nccl_lines([CE_AG, SYMM_RS])["nccl_kernel"] == (
-        "AllGather=CopyEngine;ReduceScatter=ReduceScatter_LDMC"
+        "AllGather=CopyEngine+NVLSSync;ReduceScatter=ReduceScatter_LDMC"
     )
 
 
@@ -401,9 +404,10 @@ def test_check_implementation_accepts_symmetric_kernels_on_every_launch():
 @pytest.mark.unit
 def test_check_implementation_rejects_a_single_copy_engine_launch():
     observed, errors = _check([SYMM_AG, CE_AG])
-    assert observed == "AllGather=CopyEngine|Symmetric/AllGather_STMC"
+    assert observed == "AllGather=CopyEngine+NVLSSync|Symmetric/AllGather_STMC"
     assert errors == [
-        "AllGather: expected Symmetric/AllGather_ST|AllGather_LL|AllGather_STMC|AllGather_LLMC, got CopyEngine x1"
+        "AllGather: expected Symmetric/AllGather_ST|AllGather_LL|AllGather_STMC|AllGather_LLMC,"
+        " got CopyEngine+NVLSSync x1"
     ]
 
 
@@ -657,8 +661,8 @@ def test_algo_rows_pair_ring_and_nvls_on_the_same_workload():
     ]
     rows = metrics.algo_rows(records)
     assert len(rows) == 2
-    # columns: ranks, MiB, workload, ring, nvls, nvls/ring, symm, symm/ring
-    assert rows[0] == ["8", "256", "ag", "100.0", "250.0", "2.50", "-", "-"]
+    # columns: ranks, MiB, workload, ring, then <family>, <family>/ring for every other family
+    assert rows[0] == ["8", "256", "ag", "100.0", "250.0", "2.50", "-", "-", "-", "-", "-", "-"]
     assert rows[1][-1] == "-"  # no ring record at this size/workload
 
 
@@ -670,7 +674,7 @@ def test_best_of_ranks_every_family_and_names_the_winner():
         _record(algo="symm", aggregate_busbw_gb_s=310.0),
     ]
     rows = metrics._best_of(records)
-    assert rows[0] == ["8", "256", "ag", "100.0", "250.0", "310.0", "symm"]
+    assert rows[0] == ["8", "256", "ag", "100.0", "250.0", "310.0", "-", "-", "symm"]
 
 
 @pytest.mark.unit
@@ -1162,6 +1166,8 @@ def test_report_names_all_reduce():
         ("ReduceScatter", "RING/LL128", "bf16", "ncclDevFunc_ReduceScatter_Sum_bf16_RING_LL128"),
         ("AllReduce", "Ring/Simple", "fp32", "ncclDevFunc_AllReduce_Sum_f32_RING_SIMPLE"),
         ("AllGather", "CopyEngine", "bf16", "CopyEngine（cudaMemcpy，无 kernel）"),
+        ("AllGather", "CopyEngine+NVLSSync", "bf16", "CopyEngine+NVLSSync（cudaMemcpy，无 kernel）"),
+        ("AllGather", "Symmetric/AllGather_TmaSTMC", "bf16", "ncclSymkDevKernel_AllGather_TmaSTMC"),
     ],
 )
 def test_kernel_name_follows_the_nccl_generators(func, implementation, dtype, expected):
@@ -1208,3 +1214,137 @@ def test_single_rows_show_isolated_kernels_and_flag_a_different_one_in_the_pair(
         "ncclSymkDevKernel_ReduceScatter_LDMC_sum_bf16",
         "ncclSymkDevKernel_AllReduce_RSxLDMC_AGxSTMC_sum_bf16",
     ]
+
+
+# symm-tma and copy-engine: a TMA multicast or copy-engine multicast AllGather, paired with
+# the multicast symmetric ReduceScatter_LDMC; they measure only ag and ag+rs.
+TMA_AG = SYMM_AG.replace("Kernel AllGather_STMC", "Kernel AllGather_TmaSTMC")
+PINNED_ENV = {
+    "symm-tma": {
+        "NCCL_SYM_KERNEL": "allgather:AllGather_TmaSTMC;reducescatter:ReduceScatter_LDMC",
+        "NCCL_SYM_CE_THRESHOLD": "9223372036854775807",
+    },
+    "copy-engine": {
+        "NCCL_SYM_KERNEL": "reducescatter:ReduceScatter_LDMC",
+        "NCCL_SYM_CE_THRESHOLD": "0",
+        "NCCL_CE_COLL_AG_MULTICAST_THRESHOLD": "4611686018427387904",
+    },
+}
+
+
+def _pinned_env(monkeypatch, algo):
+    """The environment run_nvls_collective_benchmark.sh sets for a symm-tma / copy-engine pass."""
+    _debug_env(monkeypatch)
+    monkeypatch.delenv("NCCL_ALGO", raising=False)
+    monkeypatch.setenv("NCCL_WIN_ENABLE", "1")
+    monkeypatch.setenv("NCCL_NVLS_ENABLE", "1")
+    for name, value in PINNED_ENV[algo].items():
+        monkeypatch.setenv(name, value)
+
+
+@pytest.mark.unit
+def test_pinned_families_measure_only_ag_and_the_pair():
+    requested = ["ag", "rs", "ar", "ag+rs"]
+    assert metrics.measured_workloads("symm", requested) == requested
+    assert metrics.measured_workloads("symm-tma", requested) == ["ag", "ag+rs"]
+    assert metrics.measured_workloads("copy-engine", ["ag+rs", "rs", "ag"]) == ["ag+rs", "ag"]
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("algo", ["symm-tma", "copy-engine"])
+def test_pinned_environment_accepts_what_the_launcher_sets(monkeypatch, algo):
+    _pinned_env(monkeypatch, algo)
+    benchmark._check_environment(algo, 32, benchmark.parse_args(["--algo", algo, "--output-dir", "/tmp/x"]))
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    ("algo", "name", "value", "message"),
+    [
+        ("symm-tma", "NCCL_SYM_KERNEL", "AllGather_TmaSTMC", "requires NCCL_SYM_KERNEL="),
+        ("symm-tma", "NCCL_SYM_CE_THRESHOLD", "8388608", "large AllGathers go to the copy engines"),
+        ("symm-tma", "NCCL_ALGO", "NVLS", "requires NCCL_ALGO to be unset"),
+        ("symm-tma", "NCCL_NVLS_ENABLE", "0", "NCCL_NVLS_ENABLE=1"),
+        ("copy-engine", "NCCL_SYM_CE_THRESHOLD", "9223372036854775807", "NCCL_SYM_CE_THRESHOLD=0"),
+        # A shard above the multicast threshold would silently take the N-1 unicast copies.
+        ("copy-engine", "NCCL_CE_COLL_AG_MULTICAST_THRESHOLD", "1048576", "multicast address"),
+        ("copy-engine", "NCCL_SYM_KERNEL", "", "requires NCCL_SYM_KERNEL="),
+    ],
+)
+def test_pinned_environment_rejects_anything_that_changes_the_implementation(monkeypatch, algo, name, value, message):
+    _pinned_env(monkeypatch, algo)
+    monkeypatch.setenv(name, value)
+    with pytest.raises(RuntimeError, match=re.escape(message)):
+        benchmark._check_environment(algo, 32, benchmark.parse_args(["--algo", algo, "--output-dir", "/tmp/x"]))
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    ("extra", "message"),
+    [
+        (["--workloads", "rs,ar"], "measures only ag and ag+rs"),
+        (["--group-sizes", "2,4", "--split-totals", "none"], "groups of >= 3 ranks; got [2]"),
+        (["--workloads", "ag", "--symm-kernel", "ag"], "--symm-kernel applies to --algo symm only"),
+    ],
+)
+def test_pinned_environment_rejects_workloads_and_groups_it_cannot_measure(monkeypatch, extra, message):
+    _pinned_env(monkeypatch, "copy-engine")
+    args = benchmark.parse_args(["--algo", "copy-engine", "--output-dir", "/tmp/x", *extra])
+    with pytest.raises(ValueError, match=re.escape(message)):
+        benchmark._check_environment("copy-engine", 32, args)
+
+
+@pytest.mark.unit
+def test_check_implementation_holds_symmetric_tma_to_tma_ag_and_ldmc_rs():
+    assert _check([TMA_AG, SYMM_RS, TMA_AG, SYMM_RS], algo="symm-tma", ops=("ag", "rs")) == (
+        "AllGather=Symmetric/AllGather_TmaSTMC;ReduceScatter=Symmetric/ReduceScatter_LDMC",
+        [],
+    )
+    rs_ld = SYMM_RS.replace("ReduceScatter_LDMC", "ReduceScatter_LD")
+    _, errors = _check([TMA_AG, SYMM_AG, rs_ld, SYMM_RS], algo="symm-tma", ops=("ag", "rs"))
+    assert errors == [
+        "AllGather: expected Symmetric/AllGather_TmaSTMC, got Symmetric/AllGather_STMC x1",
+        "ReduceScatter: expected Symmetric/ReduceScatter_LDMC, got Symmetric/ReduceScatter_LD x1",
+    ]
+
+
+@pytest.mark.unit
+def test_check_implementation_holds_copy_engine_to_the_multicast_synchronized_ce():
+    assert _check([CE_AG, CE_AG], algo="copy-engine") == ("AllGather=CopyEngine+NVLSSync", [])
+    # Without "CE synchronization with NVLS" the communicator had no multimem, so no multicast copy.
+    unicast_sync = CE_AG.removesuffix("; CE synchronization with NVLS")
+    _, errors = _check([CE_AG, unicast_sync, SYMM_AG], algo="copy-engine", launches=3)
+    assert errors == ["AllGather: expected CopyEngine+NVLSSync, got CopyEngine x1, Symmetric/AllGather_STMC x1"]
+
+
+@pytest.mark.unit
+def test_symm_variant_rows_compare_tma_and_copy_engine_with_symm():
+    records = [
+        _record(algo="symm", aggregate_busbw_gb_s=200.0),
+        _record(algo="symm-tma", aggregate_busbw_gb_s=300.0),
+        _record(algo="copy-engine", aggregate_busbw_gb_s=100.0),
+        # symm-only shapes (rs) are not part of this table.
+        _record(algo="symm", workload="rs"),
+    ]
+    assert metrics.symm_variant_rows(records) == [["8", "256", "ag", "200.0", "300.0", "1.50", "100.0", "0.50"]]
+    report = metrics.render_report(records)
+    assert "### 2a." in report
+    assert "| ranks | MiB | workload | symm | symm-tma | symm-tma/symm | copy-engine | copy-engine/symm |" in report
+
+
+@pytest.mark.unit
+def test_connect_runs_pinned_families_on_windows(monkeypatch):
+    calls = []
+    monkeypatch.setattr(benchmark.torch.cuda, "synchronize", lambda: None, raising=False)
+    monkeypatch.setattr(benchmark.torch, "ones", lambda *a, **k: "ones", raising=False)
+    monkeypatch.setattr(benchmark.dist, "barrier", lambda: None, raising=False)
+    monkeypatch.setattr(benchmark.dist, "all_reduce", lambda t, group: calls.append(("ar", group)), raising=False)
+    monkeypatch.setattr(benchmark, "_connect_windows", lambda group, rank: calls.append(("windows", group.name)))
+    gate = benchmark.StartGate(ranks=[0, 1], pg=None, tensor=None)
+    groups = [
+        benchmark.CollectiveGroup(name="A", ranks=[0], ag_pg="ag", rs_pg="rs", ar_pg="ar-A"),
+        benchmark.CollectiveGroup(name="B", ranks=[1], ag_pg="ag", rs_pg="rs", ar_pg="ar-B"),
+    ]
+    benchmark._connect(groups, gate, 0, windows=True)
+    # Only this rank's group connects, AG/RS on a registered window and the AR as before.
+    assert calls == [("windows", "A"), ("ar", "ar-A")]

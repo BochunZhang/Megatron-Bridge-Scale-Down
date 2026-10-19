@@ -36,11 +36,23 @@ BYTES_PER_MIB = 1024 * 1024
 BYTES_PER_GB = 1_000_000_000
 # Algorithm families. "symm" is the window-registered symmetric-memory path; its report rows
 # sit alongside ring and nvls because it answers the same questions with a third implementation.
-ALGORITHMS = ("ring", "nvls", "symm")
+# "symm-tma" (AllGather_TmaSTMC) and "copy-engine" (CE AllGather to the multicast address)
+# are two more AllGather implementations on the same windows; both pair them with the multicast
+# ReduceScatter_LDMC, because NCCL has neither a TMA multicast nor a CE reduce-scatter.
+ALGORITHMS = ("ring", "nvls", "symm", "symm-tma", "copy-engine")
 # Collectives, in launch order of the ag+rs pair. "ar" is an all-reduce of the whole per-rank
 # tensor, so it moves twice the payload of one AG or RS shard exchange (see bus_bandwidth_gb_s).
 OPS = ("ag", "rs", "ar")
 WORKLOADS = ("ag", "rs", "ar", "ag+rs")
+# Workloads each family measures. symm-tma and copy-engine only differ from symm in the
+# AllGather: their RS alone would be symm's ReduceScatter_LDMC again, and they have no all-reduce.
+ALGO_WORKLOADS = {
+    "ring": WORKLOADS,
+    "nvls": WORKLOADS,
+    "symm": WORKLOADS,
+    "symm-tma": ("ag", "ag+rs"),
+    "copy-engine": ("ag", "ag+rs"),
+}
 SPLIT_LAYOUTS = ("contiguous", "interleaved")
 # Split cases: both half-groups running the same workload at the same time, and "cross": group A
 # all-gathers while group B reduce-scatters, at the same time. Neither half runs alone: the
@@ -50,7 +62,7 @@ CROSS_PART = "AB-cross"
 SPLIT_PARTS = (CONCURRENT_PART, CROSS_PART)
 CROSS_WORKLOAD = "agA-rsB"
 CROSS_GROUP_WORKLOADS = ("ag", "rs")  # per split group, A then B
-NCCL_ALGO_ENV = {"ring": "Ring", "nvls": "NVLS", "symm": None}
+NCCL_ALGO_ENV = {"ring": "Ring", "nvls": "NVLS", "symm": None, "symm-tma": None, "copy-engine": None}
 # Spelled-out workloads for case directory and report names.
 WORKLOAD_NAMES = {
     "ag": "all_gather",
@@ -66,6 +78,11 @@ def workload_ops(workload: str) -> tuple[str, ...]:
     if workload not in WORKLOADS:
         raise ValueError(f"unknown workload {workload!r}; expected one of {WORKLOADS}")
     return ("ag", "rs") if workload == "ag+rs" else (workload,)
+
+
+def measured_workloads(algo: str, requested: Sequence[str]) -> list[str]:
+    """The requested workloads that ``algo`` measures (``ALGO_WORKLOADS``), in the requested order."""
+    return [workload for workload in requested if workload in ALGO_WORKLOADS[algo]]
 
 
 def split_groups(total_ranks: int, layout: str) -> tuple[list[int], list[int]]:
@@ -214,7 +231,8 @@ def kernel_name(func: str, implementation: str, dtype: str) -> str:
 
     Args:
         func: NCCL function name as logged, e.g. ``AllGather``.
-        implementation: ``<ALGO>/<PROTO>``, ``Symmetric/<kernel>`` or ``CopyEngine``.
+        implementation: ``<ALGO>/<PROTO>``, ``Symmetric/<kernel>``, ``CopyEngine`` or
+            ``CopyEngine+NVLSSync`` (CE whose ready/complete flags go through multicast).
         dtype: Benchmark dtype, ``bf16`` or ``fp32``.
     """
     ty = NCCL_KERNEL_TYPES.get(dtype, dtype)
@@ -223,8 +241,8 @@ def kernel_name(func: str, implementation: str, dtype: str) -> str:
     if family == "Symmetric":
         algo = detail.removeprefix(f"{func}_")
         return f"ncclSymkDevKernel_{func}_{algo}" + (f"_sum_{ty}" if reduces else "")
-    if family == "CopyEngine":
-        return "CopyEngine（cudaMemcpy，无 kernel）"
+    if family.startswith("CopyEngine"):
+        return f"{family}（cudaMemcpy，无 kernel）"
     return f"ncclDevFunc_{func}" + (f"_Sum_{ty}" if reduces else "") + f"_{family.upper()}_{detail.upper()}"
 
 
@@ -367,6 +385,31 @@ def algo_rows(records: Sequence[dict[str, object]]) -> list[list[str]]:
             other_bw = record and float(record["aggregate_busbw_gb_s"])
             cells += [_fmt(other_bw), _fmt(other_bw / ring_bw if ring_bw and other_bw else None, 2)]
         rows.append([str(group_size), str(int(size_bytes) // BYTES_PER_MIB), str(workload), _fmt(ring_bw), *cells])
+    return rows
+
+
+# The families that replace symm's AllGather; table 2a compares them with symm.
+SYMM_VARIANTS = ("symm-tma", "copy-engine")
+
+
+def symm_variant_rows(records: Sequence[dict[str, object]]) -> list[list[str]]:
+    """TMA and copy-engine AllGather against symm's, as aggregate bus bandwidth, per shape.
+
+    All three share the windows and, in ag+rs, the multicast ReduceScatter_LDMC, so the ratio
+    isolates the AllGather implementation. Only shapes one of the variants measured appear.
+    """
+    index = _single_index(records)
+    shapes = {k[1:] for k in index if k[0] in SYMM_VARIANTS}
+    rows = []
+    for group_size, size_bytes, workload in sorted(shapes, key=lambda k: (k[0], k[1], WORKLOADS.index(str(k[2])))):
+        symm = index.get(("symm", group_size, size_bytes, workload))
+        symm_bw = symm and float(symm["aggregate_busbw_gb_s"])
+        cells: list[str] = []
+        for algo in SYMM_VARIANTS:
+            record = index.get((algo, group_size, size_bytes, workload))
+            bw = record and float(record["aggregate_busbw_gb_s"])
+            cells += [_fmt(bw), _fmt(bw / symm_bw if symm_bw and bw else None, 2)]
+        rows.append([str(group_size), str(int(size_bytes) // BYTES_PER_MIB), str(workload), _fmt(symm_bw), *cells])
     return rows
 
 
@@ -545,7 +588,7 @@ def render_report(records: Sequence[dict[str, object]]) -> str:
     """Render the comparison tables as Markdown."""
     profiled = sorted({str(r["algo"]) for r in records if r.get("profiled")})
     lines = [
-        "# AG / RS / AR: ring vs NVLS vs symmetric memory",
+        "# AG / RS / AR: ring vs NVLS vs symmetric memory (register / TMA / copy engine)",
         "",
         "计时：每个 trial 先过一次全 scenario 的 GPU 同步起点（1 元素 all-reduce），再背靠背发 iters 次；",
         "t = (该 rank 所有 op 完成 − 起点) / iters，trial 内取组内最慢 rank。除表 0 外各表取 trials 的中位数。",
@@ -574,7 +617,8 @@ def render_report(records: Sequence[dict[str, object]]) -> str:
         "symm 是对称内核 `ncclSymkDevKernel_<Coll>_<algo>`（launch 的就是它）；ring/nvls 是经典路径真正执行的",
         "设备函数 `ncclDevFunc_<Coll>_<ALGO>_<PROTO>`——经典路径每个 collective 只 launch 一个特化 kernel",
         "（如 `ncclDevKernel_AllGather_RING_LL`，nsys 里看到的就是这个名字），再按 funcId 分发到该设备函数，",
-        "所以 nvls 的 AG 在 nsys 里也叫 `*_RING_LL`。一个 op 出现多种实现时用 `\\|` 全部列出；`-` 表示没有日志证据。",
+        "所以 nvls 的 AG 在 nsys 里也叫 `*_RING_LL`。copy-engine 的 AG 是 cudaMemcpy，没有 kernel。",
+        "一个 op 出现多种实现时用 `\\|` 全部列出；`-` 表示没有日志证据。",
         "",
     ]
     lines += _table(
@@ -605,6 +649,8 @@ def render_report(records: Sequence[dict[str, object]]) -> str:
         "speedup = (T_AG + T_RS) / T_AG+RS；1 表示完全串行，overlap_fraction = 1 表示短的操作被完全隐藏。",
         "AR busbw 已按 all-reduce 口径乘 2，可直接和 AG/RS 的 busbw 比。",
         "AG/RS/AR kernel：单独跑该 op 那个 case 的实际函数（来源同表 0）；AG+RS 同时发起时若换了实现，括号里注明。",
+        "symm-tma、copy-engine 只测 ag 和 ag+rs，所以 RS/AR 列和 speedup、overlap_fraction 为 `-`；"
+        "pair 里的 RS 是 `ReduceScatter_LDMC`（见 RS kernel 列的 pair 注明）。",
         "",
     ]
     lines += _table(
@@ -636,15 +682,35 @@ def render_report(records: Sequence[dict[str, object]]) -> str:
         "上面的比值只是和 ring 放在同一口径下的对照。",
         "",
     ]
-    lines += _table(["ranks", "MiB", "workload", "ring", "nvls", "nvls/ring", "symm", "symm/ring"], algo_rows(records))
+    others = [algo for algo in ALGORITHMS if algo != "ring"]
+    lines += _table(
+        ["ranks", "MiB", "workload", "ring", *(col for algo in others for col in (algo, f"{algo}/ring"))],
+        algo_rows(records),
+    )
+    variant_table = symm_variant_rows(records)
+    if variant_table:
+        lines += [
+            "",
+            "### 2a. TMA / copy engine 的 AllGather 相对 symm（aggregate busbw）",
+            "",
+            "三者都在同一种 window 上跑，ag+rs 里的 RS 也都是 `ReduceScatter_LDMC`，比值只反映 AllGather 实现："
+            "symm 是寄存器 `multimem.st` 的对称内核，symm-tma 是 `AllGather_TmaSTMC`，"
+            "copy-engine 是 CE 写 multicast 地址。",
+            "",
+        ]
+        lines += _table(
+            ["ranks", "MiB", "workload", "symm", *(col for algo in SYMM_VARIANTS for col in (algo, f"{algo}/symm"))],
+            variant_table,
+        )
     kernel_table = kernel_rows(records)
     if kernel_table:
         lines += [
             "",
             "### 2b. 实际执行的内核（来自 NCCL TUNING 日志，非环境变量推断）",
             "",
-            "每个 case 的每次 launch 都已核对：ring 只能是 Ring/*，nvls 只能是 NVLS/*，symm 只能是对称内核，"
-            "任何 CopyEngine 或回退到经典内核的 launch 都会让该 case 失败，不会出现在这里。",
+            "每个 case 的每次 launch 都已核对：ring 只能是 Ring/*，nvls 只能是 NVLS/*，symm 只能是对称内核；"
+            "symm-tma 的 AG 只能是 `AllGather_TmaSTMC`，copy-engine 的 AG 只能是带 NVLS 同步的 CopyEngine，"
+            "二者的 RS 只能是 `ReduceScatter_LDMC`。不符合的 launch 会让该 case 失败，不会出现在这里。",
             "",
         ]
         lines += _table(["algo", "group", "nNodes", "kernel evidence"], kernel_table)
@@ -677,6 +743,8 @@ def render_report(records: Sequence[dict[str, object]]) -> str:
         "",
         "isolated 取 single 里 T/2 卡单独跑同一个 op（A 对 ag、B 对 rs）；"
         "slowdown = T_cross / T_isolated；A+B busbw 是两组 busbw 之和。",
+        "symm-tma、copy-engine 不单独测 rs，B 的 isolated 为 `-`；B 跑的是 `ReduceScatter_LDMC`，"
+        "表 1 里 RS kernel 同为它的 symm 行可作参照。",
         "",
     ]
     lines += _table(
