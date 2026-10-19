@@ -47,10 +47,16 @@
 #   --cuda-home DIR  CUDA 13.0 or 13.2 toolkit (default: CUDA_HOME or /usr/local/cuda)
 #   --work-dir DIR   Sources, build venv, NVPL / ACL and wheels (default: <megatron-bridge>/.tmp)
 #   --jobs N         MAX_JOBS (default: the official min(nproc - 2, 12))
+#   --skip-torch-build  Reuse the torch wheel already in the wheel dir; rebuild only torchvision
 #   --no-install     Stop after building the wheels
 #   --check-only     Skip clone, build and install; only run the checks against --python
 
 set -euo pipefail
+
+# uv pip reads [tool.uv] from the pyproject.toml in the working directory, and megatron-bridge's
+# override-dependencies turn torch / torchvision into "sys_platform == 'never'": every install of
+# those wheels would silently resolve to nothing.
+export UV_NO_CONFIG=1
 
 TORCH_TAG="v2.13.0"
 VISION_TAG="v0.28.0"
@@ -70,6 +76,7 @@ work="${repo_root}/.tmp"
 jobs=""
 install=true
 check_only=false
+skip_torch_build=false
 
 die() {
     echo "ERROR: $*" >&2
@@ -83,9 +90,10 @@ while [[ $# -gt 0 ]]; do
         --cuda-home) cuda_home="$2"; shift 2 ;;
         --work-dir) work="$2"; shift 2 ;;
         --jobs) jobs="$2"; shift 2 ;;
+        --skip-torch-build) skip_torch_build=true; shift ;;
         --no-install) install=false; shift ;;
         --check-only) check_only=true; shift ;;
-        -h|--help) sed -n '16,51p' "$0"; exit 0 ;;
+        -h|--help) sed -n '16,52p' "$0"; exit 0 ;;
         *) die "unknown argument: $1" ;;
     esac
 done
@@ -294,9 +302,16 @@ PY
     # 5. torch wheel (build_wheel.py), then repair_wheel.py with our NCCL in the RPATH
 
     raw_dir="${work}/wheels/raw-torch-${TORCH_TAG#v}"
+    mkdir -p "$wheel_dir"
+    rm -f "${wheel_dir}"/torchvision-*.whl
+    if $skip_torch_build; then
+        torch_whl="$(ls "${wheel_dir}"/torch-*.whl 2>/dev/null)" \
+            || die "--skip-torch-build: no torch wheel in ${wheel_dir}; drop the flag to build it"
+        echo "=== --skip-torch-build: reusing ${torch_whl}"
+    else
     rm -rf "$raw_dir"
-    mkdir -p "$raw_dir" "$wheel_dir"
-    rm -f "${wheel_dir}"/torch-*.whl "${wheel_dir}"/torchvision-*.whl
+    mkdir -p "$raw_dir"
+    rm -f "${wheel_dir}"/torch-*.whl
     echo "=== Building torch ${torch_version} (log: ${work}/torch-build.log)"
     (
         clean_build_env
@@ -375,12 +390,15 @@ for wheel in wheels:
 print(f"RPATH: {rpaths}:$ORIGIN")
 PY
     torch_whl="$(ls "${wheel_dir}"/torch-*.whl)"
+    fi
 
     ############################################################################
     # 6. torchvision wheel against that torch
 
     echo "=== Building torchvision ${VISION_TAG#v} (log: ${work}/torchvision-build.log)"
     uv pip install --python "$bpy" --reinstall --no-deps "$torch_whl"
+    "$bpy" -c 'import torch; print(f"build venv torch {torch.__version__}")' \
+        || die "torch is not importable in ${build_venv} after installing ${torch_whl}"
     uv pip install --python "$bpy" setuptools==72.1.0 pyyaml future ninja  # packaging/pre_build_script.sh
     for header in png.h jpeglib.h webp/decode.h; do
         [[ -f "/usr/include/${header}" || -f "/usr/local/include/${header}" ]] \

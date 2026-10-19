@@ -55,6 +55,7 @@ bash install/install-torch-2.13.0-nccl-2.32.3.sh 2>&1 | tee .tmp/install-torch-n
 | `--nccl-home DIR` | NCCL 2.32.3 的 build 目录，默认 `nccl/nccl-2.32.3/build` |
 | `--cuda-home DIR` | CUDA toolkit，默认 `CUDA_HOME` 或 `/usr/local/cuda` |
 | `--jobs N` | 编译并发数 `MAX_JOBS`，默认按官方取 `min(nproc - 2, 12)` |
+| `--skip-torch-build` | 复用 wheel 目录里已编好的 torch wheel，只重编 torchvision |
 | `--no-install` | 只编 wheel，不安装 |
 | `--check-only` | 不编译不安装，只对 `--python` 跑检查 |
 
@@ -80,12 +81,16 @@ wheel 编好后，其他 venv 不需要重新编译：
 ```bash
 python3.12 -m venv .venv/another-env && source .venv/another-env/bin/activate
 W=.tmp/wheels/torch-2.13.0-nccl-2.32.3
-uv pip install $W/torch-2.13.0+cu130-*.whl $W/torchvision-0.28.0+cu130-*.whl
+# UV_NO_CONFIG=1 必须加：见下面“注意事项”第一条
+UV_NO_CONFIG=1 uv pip install $W/torch-2.13.0+cu130-*.whl $W/torchvision-0.28.0+cu130-*.whl
 bash install/install-torch-2.13.0-nccl-2.32.3.sh --check-only
 ```
 
 ## 注意事项
 
+- **在仓库目录下手动 `uv pip install` 这两个 wheel 时，要加 `UV_NO_CONFIG=1`。** `uv pip` 会读取当前目录
+  `pyproject.toml` 的 `[tool.uv]`，而 megatron-bridge 的 `override-dependencies` 把 torch / torchvision 改写成了
+  `sys_platform == 'never'`，uv 会直接丢掉这两个要求，只输出 `Resolved in ...ms`，不报错也不安装。脚本内部已经设置了这个变量。
 - **不要删除或移动 `nccl/nccl-2.32.3/build`。** 它的绝对路径写在 `libtorch_cuda.so` 的 RPATH 里。换位置需要重新运行脚本。
 - **版本号和官方 wheel 相同（`2.13.0+cu130`）。** `uv pip install --reinstall torch`、`--upgrade` 或 `uv sync`
   都可能把它换回 PyPI 上的官方版本，而且从版本号上看不出区别。做完这类操作后，要用 `--check-only` 确认 NCCL 仍是 2.32.3。
