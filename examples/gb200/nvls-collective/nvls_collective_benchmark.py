@@ -409,12 +409,6 @@ def _check_environment(algo: str, world_size: int, args: argparse.Namespace) -> 
         raise ValueError(f"--split-totals must be even and >= 4, got {bad_split}")
     # A split's half-groups are compared with the single group of the same size, so that size must
     # be measured in the same pass.
-    unreferenced = [n for n in args.split_totals if n // 2 not in args.group_sizes]
-    if unreferenced:
-        raise ValueError(
-            f"--split-totals {unreferenced} need their half ({[n // 2 for n in unreferenced]}) in --group-sizes,"
-            f" which provides the isolated reference; got --group-sizes {args.group_sizes}"
-        )
     if any(n < 2 for n in args.group_sizes):
         raise ValueError("--group-sizes entries must be >= 2")
 
