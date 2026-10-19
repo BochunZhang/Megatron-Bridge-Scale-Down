@@ -14,7 +14,8 @@
 - CUDA toolkit 13.0 或 13.2，路径用 `CUDA_HOME` 或 `--cuda-home` 指定，默认 `/usr/local/cuda`。官方用的是
   13.0.2 / 13.2.1，小版本不同时脚本会警告。
 - `git`、`uv`、`wget`、C/C++ 编译器（官方用 gcc 13，版本不同时脚本会警告）、能访问 GitHub 和 PyPI。
-- 推荐安装 `libpng-dev libjpeg-turbo8-dev libwebp-dev`。缺少时 torchvision 会编成不带对应编解码的版本，脚本会警告。
+- 推荐先装好 PNG / JPEG / WebP 的开发包，见下面的 [PNG / JPEG / WebP](#png--jpeg--webp)。缺少时 torchvision 会编成
+  不带对应编解码的版本，脚本会警告。
 - 磁盘：torch 源码（含子模块）、build 目录、NVPL / ACL 都放在 `.tmp/` 下，需要几十 GB。
 
 NVPL 和 ACL 是 torch 在 aarch64 上的 BLAS / oneDNN 依赖。`/usr/local/lib`、`/acl` 下没有时，脚本会用官方的
@@ -32,9 +33,17 @@ bash install/install-nccl-2.32.3.sh
 python3.12 -m venv .venv/python3.12-torch2.13-nccl2.32.3
 source .venv/python3.12-torch2.13-nccl2.32.3/bin/activate
 
-# 3. 编 torch + torchvision，装进当前 venv，然后跑检查
+# 3. 编 torch，装进当前 venv；再用当前 venv 编 torchvision 并安装；最后跑检查
 bash install/install-torch-2.13.0-nccl-2.32.3.sh 2>&1 | tee .tmp/install-torch-nccl-2.32.3.log
 ```
+
+第 3 步里两个包用的 Python 环境不同：
+
+- **torch** 在 `.tmp/torch-2.13.0-build-py3.12` 这个构建 venv 里编。官方的 torch 构建依赖（`requirements-build.txt`、
+  固定的 numpy 等）只装在这里，不会改动你的 venv。
+- **torchvision** 用**当前激活的 venv**（`--python`）编：脚本先把刚编好的 torch 装进这个 venv，再用这个 venv 里的
+  Python、setuptools 和 torch 执行 `python -m build --no-isolation`，编完再装回这个 venv。脚本只会补装缺少的
+  `build` / `wheel` / `packaging` / `ninja` / `pyyaml`；venv 里没有 setuptools 时装 `setuptools<80`，已有的版本都不改。
 
 第 3 步的输出：
 
@@ -42,7 +51,7 @@ bash install/install-torch-2.13.0-nccl-2.32.3.sh 2>&1 | tee .tmp/install-torch-n
 | --- | --- |
 | torch / torchvision wheel | `.tmp/wheels/torch-2.13.0-nccl-2.32.3/torch-2.13.0+cu130-cp312-cp312-linux_aarch64.whl`、`torchvision-0.28.0+cu130-...whl` |
 | 编译日志 | `.tmp/torch-build.log`、`.tmp/torchvision-build.log` |
-| 编译用 venv（官方的编译依赖，不污染目标 venv） | `.tmp/torch-2.13.0-build-py3.12` |
+| torch 的编译用 venv（官方的编译依赖，不污染目标 venv） | `.tmp/torch-2.13.0-build-py3.12` |
 | 官方编译环境 / 运行时依赖 | `.tmp/torch-2.13.0-build.env`、`.tmp/torch-2.13.0-runtime-requirements.txt` |
 
 成功时最后一行是 `=== torch 2.13.0+cu130 + torchvision ready in ...`，有检查失败时脚本以非 0 退出，并打印失败项数量。
@@ -51,12 +60,12 @@ bash install/install-torch-2.13.0-nccl-2.32.3.sh 2>&1 | tee .tmp/install-torch-n
 
 | 参数 | 作用 |
 | --- | --- |
-| `--python PY` | 目标解释器，默认当前 venv 的 `python` |
+| `--python PY` | 目标环境：torch / torchvision 装进这里，torchvision 也用它编译。默认当前 venv 的 `python` |
 | `--nccl-home DIR` | NCCL 2.32.3 的 build 目录，默认 `nccl/nccl-2.32.3/build` |
 | `--cuda-home DIR` | CUDA toolkit，默认 `CUDA_HOME` 或 `/usr/local/cuda` |
 | `--jobs N` | 编译并发数 `MAX_JOBS`，默认按官方取 `min(nproc - 2, 12)` |
-| `--skip-torch-build` | 复用 wheel 目录里已编好的 torch wheel，只重编 torchvision |
-| `--no-install` | 只编 wheel，不安装 |
+| `--skip-torch-build` | 复用 wheel 目录里已编好的 torch wheel：装进 `--python`，再重编 torchvision |
+| `--no-install` | 只编 torch wheel，不安装（torchvision 需要 torch 先装进 `--python`，所以这时不编） |
 | `--check-only` | 不编译不安装，只对 `--python` 跑检查 |
 
 ## 检查项
@@ -73,6 +82,48 @@ bash install/install-torch-2.13.0-nccl-2.32.3.sh 2>&1 | tee .tmp/install-torch-n
    `NCCL_DEBUG=VERSION` 打印的是 2.32.3。
 
 更完整的报告：`bash install/probe-torch-nccl-version.sh --python "$(which python)"`。
+
+## PNG / JPEG / WebP
+
+torchvision 的 `setup.py` 编译时按下面的方式查找图像编解码库，找不到就跳过对应功能（`torchvision.io` 的
+`decode_png` / `decode_jpeg` / `decode_webp` 等不可用），不会报错：
+
+| 库 | 查找方式 |
+| --- | --- |
+| PNG（libpng ≥ 1.6） | `PATH` 里的 `libpng-config` |
+| JPEG（libjpeg-turbo） | `jpeglib.h`：依次在 `TORCHVISION_INCLUDE`、`$CONDA_PREFIX/include`、`/usr/include`、`/usr/local/include` 中找 |
+| WebP（libwebp ≥ 1.3.2） | `webp/decode.h`：同上 |
+
+**有 root（推荐）**，装好后重跑脚本即可：
+
+```bash
+# Ubuntu / Debian
+sudo apt-get install -y libpng-dev libjpeg-turbo8-dev libwebp-dev   # Debian 上 JPEG 包名是 libjpeg62-turbo-dev
+# RHEL / Rocky / AlmaLinux
+sudo dnf install -y libpng-devel libjpeg-turbo-devel libwebp-devel
+```
+
+**没有 root**：可以用 conda / mamba 装到一个前缀，官方 torchvision 打包也是这么做的（`packaging/pre_build_script.sh`）：
+
+```bash
+conda create -y -p $HOME/tv-codecs -c conda-forge libpng libjpeg-turbo "libwebp>=1.3.2"
+export PREFIX=$HOME/tv-codecs
+export PATH=$PREFIX/bin:$PATH                 # 让 setup.py 找到 libpng-config
+export TORCHVISION_INCLUDE=$PREFIX/include    # jpeglib.h / webp/decode.h
+export TORCHVISION_LIBRARY=$PREFIX/lib
+bash install/install-torch-2.13.0-nccl-2.32.3.sh --skip-torch-build
+```
+
+脚本编 torchvision 时会保留 `TORCHVISION_INCLUDE` / `TORCHVISION_LIBRARY`。注意：编出来的 torchvision **动态链接**这些库，
+官方 wheel 会把它们打包进 wheel，本脚本不会。用系统包时运行时自然能找到；用 conda 前缀时，运行时要设置
+`LD_LIBRARY_PATH=$PREFIX/lib`，否则 `import torchvision` 会报找不到 `libpng16.so` / `libjpeg.so` / `libwebp.so`。
+
+确认是否编进去了：
+
+```bash
+grep -E "Building torchvision with (PNG|JPEG|WEBP)|without" .tmp/torchvision-build.log
+python -c "import torch, torchvision.io as io; x = torch.zeros(3, 8, 8, dtype=torch.uint8); io.decode_png(io.encode_png(x)); io.decode_jpeg(io.encode_jpeg(x)); print('png/jpeg ok')"
+```
 
 ## 装到其他 venv
 

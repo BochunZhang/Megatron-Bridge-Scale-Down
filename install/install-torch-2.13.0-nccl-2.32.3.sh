@@ -31,24 +31,27 @@
 #                  - TORCH_CUDA_ARCH_LIST is only CUDA_ARCH_LIST (10.0, GB200) instead of 8.0;9.0;10.0;11.0;12.0.
 #                  - version 2.13.0+cu130 like the official wheel, but tag linux_aarch64, since the wheel is
 #                    built against the host glibc rather than manylinux_2_28.
-#   torchvision  v0.28.0 with the env pytorch/test-infra release/2.13 sets for CUDA wheels, built against
-#                the torch above (the 0.28.0 wheel on PyPI was built against the official torch), also only
-#                for CUDA_ARCH_LIST.
+#                torch itself is compiled in a build venv under --work-dir with the official build deps
+#                (requirements-build.txt, numpy pin), so they do not change --python.
+#   torchvision  v0.28.0 with the env pytorch/test-infra release/2.13 sets for CUDA wheels, also only for
+#                CUDA_ARCH_LIST. The torch wheel is installed into --python first, and torchvision is compiled
+#                with --python (its setuptools and that torch; the 0.28.0 wheel on PyPI was built against the
+#                official torch), then installed there too.
 #
-# Both wheels are then installed into --python, and the checks confirm torch was compiled against and
-# loads NCCL 2.32.3 (run install/probe-torch-nccl-version.sh for the full report).
+# The checks confirm torch was compiled against and loads NCCL 2.32.3 (run
+# install/probe-torch-nccl-version.sh for the full report).
 #
 # Usage:
 #   ./install/install-torch-2.13.0-nccl-2.32.3.sh [--python PY] [--nccl-home DIR] [--cuda-home DIR]
 #                                                 [--work-dir DIR] [--jobs N] [--no-install] [--check-only]
 #
-#   --python PY      Interpreter to build for, install into and check (default: $VIRTUAL_ENV/bin/python)
+#   --python PY      Env to install into, build torchvision with and check (default: $VIRTUAL_ENV/bin/python)
 #   --nccl-home DIR  NCCL 2.32.3 build (default: <megatron-bridge>/nccl/nccl-2.32.3/build)
 #   --cuda-home DIR  CUDA 13.0 or 13.2 toolkit (default: CUDA_HOME or /usr/local/cuda)
 #   --work-dir DIR   Sources, build venv, NVPL / ACL and wheels (default: <megatron-bridge>/.tmp)
 #   --jobs N         MAX_JOBS (default: the official min(nproc - 2, 12))
 #   --skip-torch-build  Reuse the torch wheel already in the wheel dir; rebuild only torchvision
-#   --no-install     Stop after building the wheels
+#   --no-install     Stop after the torch wheel (torchvision needs that torch installed in --python)
 #   --check-only     Skip clone, build and install; only run the checks against --python
 
 set -euo pipefail
@@ -93,7 +96,7 @@ while [[ $# -gt 0 ]]; do
         --skip-torch-build) skip_torch_build=true; shift ;;
         --no-install) install=false; shift ;;
         --check-only) check_only=true; shift ;;
-        -h|--help) sed -n '16,52p' "$0"; exit 0 ;;
+        -h|--help) sed -n '16,55p' "$0"; exit 0 ;;
         *) die "unknown argument: $1" ;;
     esac
 done
@@ -393,52 +396,72 @@ PY
     fi
 
     ############################################################################
-    # 6. torchvision wheel against that torch
-
-    echo "=== Building torchvision ${VISION_TAG#v} (log: ${work}/torchvision-build.log)"
-    uv pip install --python "$bpy" --reinstall --no-deps "$torch_whl"
-    "$bpy" -c 'import torch; print(f"build venv torch {torch.__version__}")' \
-        || die "torch is not importable in ${build_venv} after installing ${torch_whl}"
-    uv pip install --python "$bpy" setuptools==72.1.0 pyyaml future ninja  # packaging/pre_build_script.sh
-    for header in png.h jpeglib.h webp/decode.h; do
-        [[ -f "/usr/include/${header}" || -f "/usr/local/include/${header}" ]] \
-            || note "${header} not found: torchvision builds without that codec (libpng-dev / libjpeg-turbo8-dev / libwebp-dev)"
-    done
-    (
-        clean_build_env
-        # pytorch/test-infra release/2.13 tools/pkg-helpers/pytorch_pkg_helpers/{cuda,version}.py
-        export CUDA_HOME="$cuda_home" CUDA_PATH="$cuda_home" PATH="${cuda_home}/bin:${build_venv}/bin:${PATH}"
-        export TORCH_CUDA_ARCH_LIST="$CUDA_ARCH_LIST" FORCE_CUDA=1  # official: 8.0;9.0;10.0;11.0;12.0+PTX
-        export BUILD_VERSION="${VISION_TAG#v}+${desired_cuda}" PYTORCH_VERSION="${TORCH_TAG#v}" MAX_JOBS="$jobs"
-        cd "$vision_src"
-        rm -rf build
-        "$bpy" -m build --wheel --no-isolation --outdir "$wheel_dir"
-    ) 2>&1 | tee "${work}/torchvision-build.log"
-    vision_whl="$(ls "${wheel_dir}"/torchvision-*.whl)"
-    echo "wheels:"
-    ls -l "$wheel_dir"
-
-    ############################################################################
-    # 7. Install
+    # 6. Install torch into --python (torchvision is compiled against that torch)
 
     if ! $install; then
-        echo "=== --no-install: install with"
-        echo "  uv pip uninstall --python ${target_py} torch torchvision nvidia-nccl-cu13"
-        echo "  uv pip install --python ${target_py} ${torch_whl} ${vision_whl}"
-        echo "  then: $0 --python ${target_py} --check-only"
+        echo "=== --no-install: torch wheel ${torch_whl}"
+        echo "  torchvision is built against the torch in --python, so it is not built here. Install with"
+        echo "  UV_NO_CONFIG=1 uv pip uninstall --python ${target_py} torch torchvision nvidia-nccl-cu13"
+        echo "  UV_NO_CONFIG=1 uv pip install --python ${target_py} ${torch_whl}"
+        echo "  then: $0 --python ${target_py} --skip-torch-build"
         exit 0
     fi
-    echo "=== Installing into ${target_py}"
+    echo "=== Installing torch into ${target_py}"
     nvshmem_version() {
         "$target_py" -c 'import importlib.metadata as m; print(m.version("nvidia-nvshmem-cu13"))' 2>/dev/null || echo none
     }
     nvshmem_before="$(nvshmem_version)"
     uv pip uninstall --python "$target_py" torch torchvision nvidia-nccl-cu13 || true  # any may be absent
-    uv pip install --python "$target_py" "$torch_whl" "$vision_whl"
+    uv pip install --python "$target_py" "$torch_whl"
     nvshmem_after="$(nvshmem_version)"
     if [[ "$nvshmem_before" != none && "$nvshmem_before" != "$nvshmem_after" ]]; then
         note "nvidia-nvshmem-cu13 ${nvshmem_before} -> ${nvshmem_after} (torch pins it); reinstall ${nvshmem_before} if DeepEP needs it"
     fi
+    "$target_py" -c 'import torch; print(f"torch {torch.__version__} at {torch.__file__}")' \
+        || die "torch is not importable in ${target_py} after installing ${torch_whl}"
+
+    ############################################################################
+    # 7. torchvision: built with --python (its setuptools and the torch just installed), then installed
+
+    echo "=== Building torchvision ${VISION_TAG#v} with ${target_py} (log: ${work}/torchvision-build.log)"
+    # Build frontends and tools only; anything already installed keeps its version (no --upgrade).
+    uv pip install --python "$target_py" build wheel packaging ninja pyyaml
+    if ! "$target_py" -c 'import setuptools' 2>/dev/null; then
+        # A fresh 3.12 venv has no setuptools; < 80 like megatron-bridge's own build-system.
+        uv pip install --python "$target_py" "setuptools<80"
+    fi
+    "$target_py" -c 'import setuptools; print(f"setuptools {setuptools.__version__}")'
+    # torchvision setup.py: PNG via libpng-config; JPEG / WebP headers via TORCHVISION_INCLUDE, CONDA_PREFIX,
+    # /usr/include, /usr/local/include.
+    command -v libpng-config >/dev/null \
+        || note "libpng-config not found: torchvision builds without PNG (see README: PNG / JPEG / WebP)"
+    for header in jpeglib.h webp/decode.h; do
+        found=false
+        IFS=: read -r -a dirs <<<"${TORCHVISION_INCLUDE:-}"
+        for dir in ${dirs[@]+"${dirs[@]}"} "${CONDA_PREFIX:+${CONDA_PREFIX}/include}" /usr/include /usr/local/include; do
+            [[ -n "$dir" && -f "${dir}/${header}" ]] && found=true
+        done
+        $found || note "${header} not found: torchvision builds without that codec (see README: PNG / JPEG / WebP)"
+    done
+    (
+        # Keep the codec search paths across clean_build_env.
+        tv_include="${TORCHVISION_INCLUDE:-}" tv_library="${TORCHVISION_LIBRARY:-}"
+        clean_build_env
+        [[ -n "$tv_include" ]] && export TORCHVISION_INCLUDE="$tv_include"
+        [[ -n "$tv_library" ]] && export TORCHVISION_LIBRARY="$tv_library"
+        # pytorch/test-infra release/2.13 tools/pkg-helpers/pytorch_pkg_helpers/{cuda,version}.py
+        export CUDA_HOME="$cuda_home" CUDA_PATH="$cuda_home" PATH="${cuda_home}/bin:$(dirname -- "$target_py"):${PATH}"
+        export TORCH_CUDA_ARCH_LIST="$CUDA_ARCH_LIST" FORCE_CUDA=1  # official: 8.0;9.0;10.0;11.0;12.0+PTX
+        export BUILD_VERSION="${VISION_TAG#v}+${desired_cuda}" PYTORCH_VERSION="${TORCH_TAG#v}" MAX_JOBS="$jobs"
+        cd "$vision_src"
+        rm -rf build
+        "$target_py" -m build --wheel --no-isolation --outdir "$wheel_dir"
+    ) 2>&1 | tee "${work}/torchvision-build.log"
+    vision_whl="$(ls "${wheel_dir}"/torchvision-*.whl)"
+    echo "wheels:"
+    ls -l "$wheel_dir"
+    echo "=== Installing torchvision into ${target_py}"
+    uv pip install --python "$target_py" "$vision_whl"
 fi
 
 ################################################################################
