@@ -505,7 +505,7 @@ for index in "${!algo_list[@]}"; do
             worker+=(--section="$section")
         done
         worker+=(
-            --output="${ncu_dir}/rank%q{RANK}"
+            --export="${ncu_dir}/rank%q{RANK}"
             python "${script_dir}/nvls_collective_benchmark.py"
         )
     fi
