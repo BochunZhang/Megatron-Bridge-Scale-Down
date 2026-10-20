@@ -37,6 +37,9 @@ single、split（AB-concurrent、AB-cross）场景与其他实现完全相同。
 | TMA / copy engine 的 AllGather 与 symm 对比 | `symm-tma`、`copy-engine` 各跑一遍 ag、ag+rs 的 single 和 split | 两次启动，表 2a |
 | 两个半组同时跑同一负载 | T 卡切成两个 T/2 组（16 卡 8+8，32 卡 16+16）同时跑；单独跑的参照直接取 `single-n<T/2>` | `split` 的 `AB-concurrent` |
 | 两个独立组同时：A 做 AG、B 做 RS | 同一 split，A 组 all-gather 的同时 B 组 reduce-scatter，参照同样取 `single-n<T/2>` 的 ag、rs | `split` 的 `AB-cross` |
+| 链路被 RS 占着时，半路加入的 AG 能否跑满 | `--late-join`：同一组 rank 先发 4S 的 RS，跑到约 1/4 时再发 S 的 AG | `late-join`，表 5 |
+
+split 默认关闭（`--split-totals none`），要测时显式传 `--split-totals 16` 或 `32`。
 
 split 不再单独跑 A 组或 B 组：`single-n<T/2>` 用的是 rank 0..T/2−1，和 contiguous 的 A 组完全相同，
 B 组是另一批同样大小、同样拓扑（每 tray 4 卡、同一 NVL domain）的 rank，单独跑的结果不该有区别。
@@ -265,8 +268,56 @@ bash examples/gb200/nvls-collective/run_nvls_collective_benchmark.sh \
 ```
 
 `--group-sizes` 默认取 4/8/16/32 中不超过 `nnodes × gpus-per-node` 的部分，`--split-totals`
-默认取 16/32 中不超过总卡数的最大值（16 卡切 8+8，32 卡切 16+16），不足 16 卡不跑 split。`--dry-run` 只打印命令和将要使用的输出目录，不创建目录，
-也不要求 GPU 或 torch。
+默认 `none`（不跑 split），要测两组同时就传 16（8+8）或 32（16+16）。`--dry-run` 只打印命令和将要使用的输出目录，不创建目录，
+也不要求 GPU 或 torch。`--launch-delay-ms`（默认 5）是每个 trial 前的 GPU sleep，case 被标 `[HOST-BOUND]` 时调大。
+
+### late join：RS 跑到 1/4 时加入 AG（`--late-join`）
+
+```bash
+bash examples/gb200/nvls-collective/run_nvls_collective_benchmark.sh \
+  --nnodes 8 --algos ring,nvls,symm --late-join
+```
+
+问题：一个 RS 已经在用 NVLink，同一组 rank 再发一个 AG，AG 能不能拿到它单独跑时的带宽？两者合起来能不能超过
+单个 op？multicast 下 AG（`multimem.st`）主要占入方向、RS（`ld_reduce`）主要占出方向
+（`documents/gb200/03-nccl-symmetric-nvls-kernel.md` 6.1 节），理论上可以叠加，但同时发起的 AG+RS 实测基本串行
+（同文 6.3 节）。late join 让 RS 先独占一段时间，再看 AG 加入后的分配。
+
+`--late-join` 只跑这个场景（不跑 single，也不能和 split 同时开），对 `--group-sizes` 的每个 n、`--sizes-mib`
+的每个 S，依次跑三个 case（scenario `late-join-n<n>`）：
+
+| phase | case | 做什么 |
+| --- | --- | --- |
+| `rs-isolated` | `reduce_scatter-<4S>MiB-...-late-join-n<n>` | 单独 RS(4S)，得到 `T_RS iso` |
+| `ag-isolated` | `all_gather-<S>MiB-...-late-join-n<n>` | 单独 AG(S)，得到 `T_AG iso` |
+| `join` | `reduce_scatter_x4+late_all_gather-<S>MiB-...-late-join-n<n>` | RS(4S) 先发；AG 的 stream 先 GPU sleep `0.25 × T_RS iso`，再发 AG(S) |
+
+- **计时**：三个 case 都逐迭代计时（`_run_joined`）。每次迭代先在 main stream 上记一个起点，两条 op stream 都等它，
+  迭代结束 main 等两条 stream 汇合，所以每次迭代都是"RS 从发射开始、AG 中途加入"，参照和 join 用同样的口径。
+  AG 的 stream 在 sleep 之后、发 AG 之前记录 `ag_begin`：`ag_begin_ms` 是实测的放行时刻，`join_fraction` 是它相对
+  `T_RS iso` 的比例，不依赖 sleep 的换算是否准确。sleep 的周期数用的是程序启动时标定的 `_sleep` 速率。
+- **前提：所有 launch 在迭代开始前都已入队。** 否则 GPU 等 host，sleep 结束时 AG 还没发出来，AG 实际晚于
+  `ag_begin` 才开始。launcher 在 `--late-join` 下把默认值改成 `--iters 5 --trials 10`，入队约 2–3 ms，
+  在 5 ms 的 `--launch-delay-ms` 之内；被标 `[HOST-BOUND]`（表 5 的 †）的行不要用，调大 `--launch-delay-ms` 重跑。
+- **默认大小**：S = 64,256,512 MiB（RS 为 256、1024、2048 MiB）。按 03 号文档 symm 8–32 卡的数据，RS(4S) 为
+  0.41–0.44 / 1.58–1.73 / 3.14–3.45 ms，AG 约在 0.1 / 0.4 / 0.8 ms 放行，单独跑时 AG 为 0.11 / 0.39 / 0.76 ms，正常情况下 AG 在 RS 一半左右
+  就结束，整段 AG 都落在 RS 里。可用 `--sizes-mib` 改。
+- **实现校验**照常：RS 每行必须是 `4S/n` 字节，AG 每行 `S/n` 字节（`check_implementation` 的 `op_sizes`）。
+- 所有实现都能跑：symm-tma、copy-engine 的 RS 是 `ReduceScatter_LDMC`，copy-engine 的 AG 不占 SM，
+  可以用来区分 SM / CTA 竞争和链路竞争。
+
+表 5（`compare.md`）读法：
+
+| 列 | 含义 |
+| --- | --- |
+| AG / RS slowdown | join 下 AG 从放行到结束的时间 / `T_AG iso`；RS 从发射到结束的时间 / `T_RS iso` |
+| AG / RS algbw overlap | overlap 窗口 = [AG 放行, min(AG 结束, RS 结束)]。窗口外假设各自按单独跑的速率前进，剩下的字节数在窗口内完成，除以窗口时长 |
+| capacity | 窗口内 AG 速率 / AG 单独速率 + RS 速率 / RS 单独速率：**2 = 两者互不影响、都跑满；1 = 分时共用同一瓶颈** |
+| AG share | AG 那一项 / capacity：0.5 是平分，远小于 0.5 说明先跑的 RS 占着资源，后来的 AG 抢不到 |
+| AG in RS | AG 是否在 RS 结束前完成；否则 AG 后半段是单独跑的，窗口只覆盖它的一部分 |
+
+capacity 和窗口内带宽都是从完成时间推出来的估算。直接证据是 `--nsys` 的 NVLink TX/RX 采样：在 nsys 时间线上
+对齐 RS、AG 两个 kernel，看 AG 加入前后入方向（RX）和出方向（TX）各自是否上升。
 
 ### 输出目录（不需要指定）
 
@@ -571,6 +622,7 @@ busbw = 357.9 × 7/8 = 313.2 GB/s。表 1–4 用 trial 中位数换算，表 0 
 | 2b | 实际执行的内核 | 实现 × 组 | 实测 nNodes、日志里的 `Algo/proto` 或对称内核名 |
 | 3 | 两个 T/2 组同跑同一负载 | 实现 × 布局 × 消息 × 负载 × 组 | isolated busbw（取自 `single-n<T/2>`）、concurrent busbw、`slowdown = T_concurrent / T_isolated`、concurrency |
 | 4 | A 组 AG、B 组 RS 同时跑 | 实现 × 布局 × 消息 | A 的 AG 与 B 的 RS 各自的 isolated / cross busbw、cross ms、slowdown，`A+B cross busbw`、concurrency |
+| 5 | late join（仅 `--late-join`） | 实现 × 组大小 × AG 大小 | 放行时刻、AG / RS 的 isolated 与 join 时间、slowdown、overlap 窗口内 algbw、capacity、AG share |
 
 表 3、表 4 的 isolated 参照都是 `single-n<T/2>` 里同大小、同负载的 case（表 4：A 对 `ag`、B 对 `rs`），
 所以 cross case 只在 `--workloads` 同时包含 `ag` 和 `rs` 时运行（默认包含；`--symm-kernel` 固定内核时不跑）。

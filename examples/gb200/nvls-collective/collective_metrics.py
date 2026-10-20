@@ -63,6 +63,13 @@ SPLIT_PARTS = (CONCURRENT_PART, CROSS_PART)
 CROSS_WORKLOAD = "agA-rsB"
 CROSS_GROUP_WORKLOADS = ("ag", "rs")  # per split group, A then B
 NCCL_ALGO_ENV = {"ring": "Ring", "nvls": "NVLS", "symm": None, "symm-tma": None, "copy-engine": None}
+# Late join (--late-join): one group reduce-scatters a tensor LATE_JOIN_RS_SCALE times the AG size
+# and all-gathers on the same ranks once the RS is LATE_JOIN_FRACTION of its isolated time in.
+# Its two references, AG of size S and RS of size LATE_JOIN_RS_SCALE * S, run alone in the same
+# scenario with the same per-iteration timing.
+LATE_JOIN_RS_SCALE = 4
+LATE_JOIN_FRACTION = 0.25
+LATE_JOIN_WORKLOAD = f"rs-x{LATE_JOIN_RS_SCALE}+late-ag"
 # Spelled-out workloads for case directory and report names.
 WORKLOAD_NAMES = {
     "ag": "all_gather",
@@ -70,11 +77,17 @@ WORKLOAD_NAMES = {
     "ar": "all_reduce",
     "ag+rs": "all_gather+reduce_scatter",
     CROSS_WORKLOAD: "all_gather_A+reduce_scatter_B",
+    LATE_JOIN_WORKLOAD: f"reduce_scatter_x{LATE_JOIN_RS_SCALE}+late_all_gather",
 }
 
 
 def workload_ops(workload: str) -> tuple[str, ...]:
-    """Return the collectives issued by a workload, in launch order."""
+    """Return the collectives issued by a workload, in launch order.
+
+    The late-join workload launches its RS first: the AG joins it later on the same ranks.
+    """
+    if workload == LATE_JOIN_WORKLOAD:
+        return ("rs", "ag")
     if workload not in WORKLOADS:
         raise ValueError(f"unknown workload {workload!r}; expected one of {WORKLOADS}")
     return ("ag", "rs") if workload == "ag+rs" else (workload,)
@@ -107,9 +120,9 @@ def split_groups(total_ranks: int, layout: str) -> tuple[list[int], list[int]]:
 
 
 def scenario_name(scenario: str, *, total_ranks: int, layout: str | None = None) -> str:
-    """Name one set of communicators: ``single-n8`` or ``split-n16-contiguous``."""
-    if scenario == "single" and layout is None:
-        return f"single-n{total_ranks}"
+    """Name one set of communicators: ``single-n8``, ``late-join-n8`` or ``split-n16-contiguous``."""
+    if scenario in ("single", "late-join") and layout is None:
+        return f"{scenario}-n{total_ranks}"
     if scenario == "split" and layout in SPLIT_LAYOUTS:
         return f"split-n{total_ranks}-{layout}"
     raise ValueError(f"unknown scenario {scenario!r} with layout {layout!r}")
@@ -121,7 +134,8 @@ def case_name(scenario: str, *, part: str | None, workload: str, dtype: str, siz
     Prefixed with the algorithm (``case_dir_name``) it is the case directory and the stem of every
     per-rank file in it; ``<algo>/<case>`` is the outer NVTX range of the case's nsys report.
     It must stay a single path component. ``size_mib`` is the full tensor: AG output / RS input /
-    AR input. The cross part takes ``CROSS_WORKLOAD`` (``agA-rsB``), every other case one of ``WORKLOADS``.
+    AR input. The cross part takes ``CROSS_WORKLOAD`` (``agA-rsB``), every other case one of ``WORKLOADS``
+    or ``LATE_JOIN_WORKLOAD``, whose ``size_mib`` is the AG size.
     """
     if part is not None and part not in SPLIT_PARTS:
         raise ValueError(f"unknown split part {part!r}; expected one of {SPLIT_PARTS}")
@@ -211,6 +225,70 @@ def overlap_metrics(*, ag_s: float, rs_s: float, both_s: float) -> dict[str, flo
         "speedup": serial_s / both_s,
         "overlap_fraction": (serial_s - both_s) / min(ag_s, rs_s),
     }
+
+
+def op_size_bytes(record: dict[str, object], op: str) -> int:
+    """Full tensor of ``op`` in a record: ``<op>_size_bytes`` if set (late-join RS), else ``size_bytes``."""
+    return int(record.get(f"{op}_size_bytes") or record["size_bytes"])  # type: ignore[arg-type]
+
+
+def late_join_metrics(
+    *,
+    ag_bytes: int,
+    rs_bytes: int,
+    ag_iso_s: float,
+    rs_iso_s: float,
+    ag_begin_s: float,
+    ag_end_s: float,
+    rs_end_s: float,
+) -> dict[str, float | bool | None]:
+    """Split a late-join iteration into RS alone / AG and RS together / the rest, and rate each op.
+
+    Times are measured from the iteration start, when the RS is launched; the AG is released at
+    ``ag_begin_s``. The overlap window is ``[ag_begin, min(ag_end, rs_end)]``. Outside it each op is
+    assumed to run at its isolated rate (``bytes / iso time``), so the bytes it moved inside the
+    window are the rest. ``*_rel_speed`` is that in-window rate over the isolated rate;
+    ``overlap_capacity`` is their sum: 2 means both ran at full speed together (they do not share
+    a bottleneck), 1 means they time-shared one. ``ag_share`` is the AG's part of that capacity.
+
+    Without an overlap window (the AG started after the RS ended) the in-window values are ``None``.
+    """
+    if min(ag_iso_s, rs_iso_s, rs_end_s) <= 0 or ag_end_s <= ag_begin_s or ag_begin_s < 0:
+        raise ValueError("times must be positive and the AG must end after it begins")
+    ag_rate, rs_rate = ag_bytes / ag_iso_s, rs_bytes / rs_iso_s
+    ag_s = ag_end_s - ag_begin_s
+    overlap_s = min(ag_end_s, rs_end_s) - ag_begin_s
+    result: dict[str, float | bool | None] = {
+        "join_fraction": ag_begin_s / rs_iso_s,
+        "ag_join_ms": ag_s * 1e3,
+        "ag_slowdown": ag_s / ag_iso_s,
+        "rs_slowdown": rs_end_s / rs_iso_s,
+        "ag_inside_rs": ag_end_s <= rs_end_s,
+        "overlap_ms": max(overlap_s, 0.0) * 1e3,
+        "ag_algbw_overlap_gb_s": None,
+        "rs_algbw_overlap_gb_s": None,
+        "ag_rel_speed": None,
+        "rs_rel_speed": None,
+        "overlap_capacity": None,
+        "ag_share": None,
+    }
+    if overlap_s <= 0:
+        return result
+    ag_in = max(ag_bytes - ag_rate * (ag_s - overlap_s), 0.0)
+    rs_in = max(rs_bytes - rs_rate * (rs_end_s - overlap_s), 0.0)
+    ag_rel, rs_rel = ag_in / overlap_s / ag_rate, rs_in / overlap_s / rs_rate
+    capacity = ag_rel + rs_rel
+    result.update(
+        {
+            "ag_algbw_overlap_gb_s": ag_in / overlap_s / BYTES_PER_GB,
+            "rs_algbw_overlap_gb_s": rs_in / overlap_s / BYTES_PER_GB,
+            "ag_rel_speed": ag_rel,
+            "rs_rel_speed": rs_rel,
+            "overlap_capacity": capacity,
+            "ag_share": ag_rel / capacity if capacity > 0 else None,
+        }
+    )
+    return result
 
 
 FUNC_OPS = {"AllGather": "ag", "ReduceScatter": "rs", "AllReduce": "ar"}
@@ -539,6 +617,43 @@ def cross_rows(records: Sequence[dict[str, object]]) -> list[list[str]]:
     return rows
 
 
+def late_join_rows(records: Sequence[dict[str, object]]) -> list[list[str]]:
+    """Question 5: an AG joining a running RS of ``LATE_JOIN_RS_SCALE`` times its size on the same ranks.
+
+    The benchmark stores the isolated references and ``late_join_metrics`` in each join record;
+    the bandwidths are algbw (full tensor / time), the unit of documents/gb200/03-*.
+    """
+    joins = [r for r in records if r["scenario"] == "late-join" and r.get("phase") == "join"]
+    rows = []
+    for r in sorted(joins, key=lambda r: (ALGORITHMS.index(str(r["algo"])), r["group_size"], r["size_bytes"])):
+        ag_bytes, rs_bytes = op_size_bytes(r, "ag"), op_size_bytes(r, "rs")
+        ag_iso_ms, rs_iso_ms = float(r["ag_iso_ms"]), float(r["rs_iso_ms"])  # type: ignore[arg-type]
+        rows.append(
+            [
+                str(r["algo"]),
+                str(r["group_size"]),
+                str(ag_bytes // BYTES_PER_MIB),
+                str(rs_bytes // BYTES_PER_MIB),
+                _fmt(ag_iso_ms, 3),
+                _fmt(rs_iso_ms, 3),
+                f"{_fmt(float(r['ag_begin_ms']), 3)} ({_fmt(_optional_float(r.get('join_fraction')), 2)})",  # type: ignore[arg-type]
+                _fmt(_optional_float(r.get("ag_join_ms")), 3),
+                _fmt(_optional_float(r.get("ag_slowdown")), 2),
+                _fmt(float(r["rs_ms"]), 3),  # type: ignore[arg-type]
+                _fmt(_optional_float(r.get("rs_slowdown")), 2),
+                _fmt(alg_bandwidth_gb_s(total_bytes=ag_bytes, seconds=ag_iso_ms / 1e3)),
+                _fmt(_optional_float(r.get("ag_algbw_overlap_gb_s"))),
+                _fmt(alg_bandwidth_gb_s(total_bytes=rs_bytes, seconds=rs_iso_ms / 1e3)),
+                _fmt(_optional_float(r.get("rs_algbw_overlap_gb_s"))),
+                _fmt(_optional_float(r.get("overlap_capacity")), 2),
+                _fmt(_optional_float(r.get("ag_share")), 2),
+                "yes" if r.get("ag_inside_rs") else "no",
+                "†" if r.get("host_bound") else "",
+            ]
+        )
+    return rows
+
+
 def completion_rows(records: Sequence[dict[str, object]]) -> list[list[str]]:
     """Table 0: every test and group with its completion time per iteration over the trials.
 
@@ -556,9 +671,11 @@ def completion_rows(records: Sequence[dict[str, object]]) -> list[list[str]]:
         mean_ms = float(r.get("mean_makespan_ms") or sum(trials) / len(trials))  # type: ignore[arg-type]
         size_bytes, group_size = int(r["size_bytes"]), int(r["group_size"])  # type: ignore[arg-type]
         ops = workload_ops(str(r["workload"]))
-        algbw = len(ops) * alg_bandwidth_gb_s(total_bytes=size_bytes, seconds=mean_ms / 1e3)
+        algbw = sum(alg_bandwidth_gb_s(total_bytes=op_size_bytes(r, op), seconds=mean_ms / 1e3) for op in ops)
         busbw = sum(
-            op_bus_bandwidth_gb_s(op=op, total_bytes=size_bytes, group_size=group_size, seconds=mean_ms / 1e3)
+            op_bus_bandwidth_gb_s(
+                op=op, total_bytes=op_size_bytes(r, op), group_size=group_size, seconds=mean_ms / 1e3
+            )
             for op in ops
         )
         rows.append(
@@ -767,6 +884,50 @@ def render_report(records: Sequence[dict[str, object]]) -> str:
         ],
         cross_rows(records),
     )
+    join_table = late_join_rows(records)
+    if join_table:
+        lines += [
+            "",
+            f"## 5. late join：RS（{LATE_JOIN_RS_SCALE}×S）跑到约 {LATE_JOIN_FRACTION:g} 时，同一组 rank 加入 AG（S）",
+            "",
+            "每次迭代：RS 先发，AG 的 stream 先 GPU sleep `join_fraction × T_RS iso` 再发 AG，迭代结束两条 stream 汇合；",
+            "isolated 是同一 scenario 里用同样的逐迭代计时单独跑的 AG(S)、RS(4S)。时间都从迭代起点（RS 发射）算，",
+            "trial 内取组内最慢 rank，再取 trial 中位数。带宽是 algbw = 张量大小 / 时间（GB/s，10^9）。",
+            "",
+            "- join：AG 被放行的时刻（括号里是相对 T_RS iso 的比例）；T_AG join：AG 从放行到完成的时间；",
+            "  T_RS join：RS 从迭代起点到完成的时间。slowdown = join 下的时间 / isolated。",
+            "- overlap 窗口 = [AG 放行, min(AG 结束, RS 结束)]。窗口外假设各自按 isolated 速率跑，窗口内的字节数是剩下的，",
+            "  由此得到窗口内的 AG / RS algbw（是估算，nsys 的 NVLink 采样是直接证据）。",
+            "- capacity = 窗口内 AG 速率 / AG isolated 速率 + RS 速率 / RS isolated 速率：2 表示两者互不影响、都跑满，",
+            "  1 表示两者在分时共用同一瓶颈；AG share = AG 那一项 / capacity，0.5 是平分。",
+            "- AG in RS：AG 是否在 RS 结束前完成（否则窗口只覆盖 AG 的一部分）；† 表示 host 入队比 GPU sleep 慢"
+            "（`enqueue_ms > --launch-delay-ms`），AG 可能晚于放行时刻才被发射，该行不可靠。",
+            "",
+        ]
+        lines += _table(
+            [
+                "algo",
+                "ranks",
+                "AG MiB",
+                "RS MiB",
+                "T_AG iso ms",
+                "T_RS iso ms",
+                "join ms (frac)",
+                "T_AG join ms",
+                "AG slowdown",
+                "T_RS join ms",
+                "RS slowdown",
+                "AG algbw iso",
+                "AG algbw overlap",
+                "RS algbw iso",
+                "RS algbw overlap",
+                "capacity",
+                "AG share",
+                "AG in RS",
+                "host",
+            ],
+            join_table,
+        )
     return "\n".join(lines) + "\n"
 
 

@@ -61,17 +61,24 @@ Options:
   --gpus-per-node N       GPUs per node (default: 4, one GB200 compute tray)
   --algos LIST            ring,nvls,symm,symm-tma,copy-engine (default: all five)
   --group-sizes LIST      Single-group sizes (default: 4,8,16,32 capped at nnodes*gpus-per-node)
-  --split-totals LIST     Ranks cut into two concurrent half-groups; T/2 must be in --group-sizes
-                          (default: the largest of 16,32 that fits: 8+8 on 16 GPUs, 16+16 on 32)
+  --split-totals LIST     Ranks cut into two concurrent half-groups; T/2 must be in --group-sizes,
+                          e.g. 16 for 8+8 or 32 for 16+16 (default: none, no split scenario)
   --split-layouts LIST    contiguous,interleaved (default: contiguous)
   --workloads LIST        ag,rs,ar,ag+rs (default: all); ar is an in-place all-reduce of the whole
                           tensor; with both ag and rs, split scenarios also run the cross case
                           (group A all-gathers while group B reduce-scatters)
-  --sizes-mib LIST        Full tensor sizes in MiB (default: 16,32,64,128,256,512,1024,2048)
+  --sizes-mib LIST        Full tensor sizes in MiB (default: 16,32,64,128,256,512,1024,2048;
+                          with --late-join the AG sizes 64,256,512)
+  --late-join             Only the late-join scenario on every --group-sizes group: an RS of 4x each
+                          size runs, and an AG of that size joins on the same ranks once the RS is
+                          1/4 of its isolated time in; AG and RS(4x) alone are measured as references.
+                          Table 5 of compare.md. Defaults --iters 5 --trials 10 unless given
   --dtype bf16|fp32       Payload dtype (default: bf16)
   --warmup N              Untimed iterations per case (default: 5)
   --iters N               Back-to-back iterations per trial (default: 20)
   --trials N              Timed trials, median reported (default: 5)
+  --launch-delay-ms MS    GPU sleep before each trial so every launch is queued first (default: 5);
+                          raise it when cases are flagged HOST-BOUND
   --symm-kernel KERNEL    For the symm pass only: default, ag, rs or ar (pins NCCL_SYM_KERNEL); needs
                           --workloads with that op only, because the pin masks the other op
   --nsys                  One Nsight Systems report per rank per case (capture range = timed trials),
@@ -104,6 +111,10 @@ Examples:
 
   # Eight trays in one NVL72 domain (32 GPUs); run the same command on every node.
   bash examples/gb200/nvls-collective/run_nvls_collective_benchmark.sh --nnodes 8
+
+  # Eight trays: does an AG joining a running RS of 4x its size get the bandwidth? (symm, NVLS, ring)
+  bash examples/gb200/nvls-collective/run_nvls_collective_benchmark.sh --nnodes 8 \
+    --algos ring,nvls,symm --late-join
 
   # One tray: nsys trace plus NVLink / DRAM throughput curves of the symmetric kernels.
   bash examples/gb200/nvls-collective/run_nvls_collective_benchmark.sh \
@@ -147,11 +158,13 @@ group_sizes=""
 split_totals=""
 split_layouts="contiguous"
 workloads="ag,rs,ar,ag+rs"
-sizes_mib="16,32,64,128,256,512,1024,2048"
+sizes_mib=""
 dtype="bf16"
 warmup="5"
-iters="20"
-trials="5"
+iters=""
+trials=""
+launch_delay_ms="5"
+late_join=false
 symm_kernel="default"
 nsys_enabled=false
 nsys_gpu_metrics_set=""
@@ -184,6 +197,8 @@ while [[ $# -gt 0 ]]; do
         --warmup) need_value "$@"; warmup="$2"; shift 2 ;;
         --iters) need_value "$@"; iters="$2"; shift 2 ;;
         --trials) need_value "$@"; trials="$2"; shift 2 ;;
+        --launch-delay-ms) need_value "$@"; launch_delay_ms="$2"; shift 2 ;;
+        --late-join) late_join=true; shift ;;
         --symm-kernel) need_value "$@"; symm_kernel="$2"; shift 2 ;;
         --nsys) nsys_enabled=true; shift ;;
         --nsys-gpu-metrics-set) need_value "$@"; nsys_gpu_metrics_set="$2"; shift 2 ;;
@@ -223,20 +238,29 @@ if $ncu_enabled; then
     split_totals="none"
 fi
 
-# Defaults follow the allocation: every 4/8/16/32 that fits, and one split of the largest of 16/32
-# that fits into two halves (8+8 on 16 GPUs, 16+16 on 32). Each half's isolated reference is the
-# single group of the same size, which the group-size default already includes.
+# Defaults follow the allocation: every 4/8/16/32 that fits. Split runs only when --split-totals
+# is given; each half's isolated reference is the single group of the same size.
 if [[ -z "$group_sizes" ]]; then
     for n in 4 8 16 32; do
         (( n <= world_size )) && group_sizes+="${group_sizes:+,}$n"
     done
     [[ -n "$group_sizes" ]] || group_sizes="$world_size"
 fi
-if [[ -z "$split_totals" ]]; then
-    for n in 16 32; do
-        (( n <= world_size )) && split_totals="$n"
-    done
+[[ -n "$split_totals" ]] || split_totals="none"
+if $late_join; then
+    # The join case replaces single and split. AG sizes whose RS (4x) runs 0.4-3.2 ms on symm keep the
+    # 1/4 release point well above launch jitter (documents/gb200/03-*). Few iterations per trial keep
+    # every launch queued behind the --launch-delay-ms sleep, which the release time relies on.
+    [[ "$split_totals" == none ]] || die "--late-join replaces the split scenario; drop --split-totals"
+    [[ "$symm_kernel" == default ]] || die "--late-join runs an AG and an RS; --symm-kernel would mask one"
+    sizes_mib="${sizes_mib:-64,256,512}"
+    iters="${iters:-5}"
+    trials="${trials:-10}"
 fi
+sizes_mib="${sizes_mib:-16,32,64,128,256,512,1024,2048}"
+iters="${iters:-20}"
+trials="${trials:-5}"
+[[ "$launch_delay_ms" =~ ^[0-9]+([.][0-9]+)?$ ]] || die "--launch-delay-ms must be a non-negative number"
 IFS=, read -r -a algo_list <<<"$algos"
 for algo in "${algo_list[@]}"; do
     case "$algo" in
@@ -326,13 +350,10 @@ bench_args=(
     --warmup "$warmup"
     --iters "$iters"
     --trials "$trials"
+    --launch-delay-ms "$launch_delay_ms"
+    --split-totals "$split_totals"
 )
-if [[ -n "$split_totals" ]]; then
-    bench_args+=(--split-totals "$split_totals")
-else
-    # Fewer than 16 GPUs: no default split; only single-group cases run.
-    bench_args+=(--split-totals none)
-fi
+$late_join && bench_args+=(--late-join)
 
 # TUNING carries the per-collective "Algo ... proto ..." and "[Symmetric] ... Kernel ..." lines
 # that the benchmark parses as evidence of the executed kernel; INIT carries nNodes/MNNVL.
@@ -362,8 +383,42 @@ run() {
     fi
 }
 
+# ncu --communicator=tcp: every ncu instance first tries to listen on 0.0.0.0:<port> of its own
+# host and, if that succeeds, serves a communicator, whatever --communicator-tcp-hostname says. On
+# every node but 0 one local instance would serve a communicator nobody else joins, and all ranks
+# wait forever in "Waiting for TCP clients to attach". Holding the port on those nodes makes their
+# ncu instances fail the bind and connect to node 0 as clients. Sets port_holder_pid.
+port_holder_pid=""
+hold_port() {
+    local port="$1" ready
+    ready="$(mktemp)"
+    python3 -c '
+import socket, sys, time
+s = socket.socket()
+s.bind(("0.0.0.0", int(sys.argv[1])))
+s.listen(1)
+print("ready", flush=True)
+time.sleep(1e9)
+' "$port" >"$ready" &
+    port_holder_pid=$!
+    local tries=0
+    until [[ -s "$ready" ]]; do
+        kill -0 "$port_holder_pid" 2>/dev/null || { rm -f "$ready"; die "cannot hold port ${port} for ncu on node ${node_rank}"; }
+        (( ++tries < 100 )) || { rm -f "$ready"; die "timed out holding port ${port} for ncu on node ${node_rank}"; }
+        sleep 0.1
+    done
+    rm -f "$ready"
+}
+release_port() {
+    [[ -n "$port_holder_pid" ]] || return 0
+    kill "$port_holder_pid" 2>/dev/null || true
+    wait "$port_holder_pid" 2>/dev/null || true
+    port_holder_pid=""
+}
+trap release_port EXIT
+
 echo "world_size=${world_size} nnodes=${nnodes} node_rank=${node_rank} group_sizes=${group_sizes}" \
-    "split_totals=${split_totals:-none} ifname=${gloo_ifname} output_dir=${output_dir}" >&2
+    "split_totals=${split_totals} late_join=${late_join} ifname=${gloo_ifname} output_dir=${output_dir}" >&2
 $DRY_RUN || mkdir -p "$output_dir"
 if $nsys_enabled && ! $DRY_RUN; then
     # Which GPU ids nsys samples (to check against the ranks' pci_bus_id in metadata.json) and which
@@ -508,6 +563,9 @@ for index in "${!algo_list[@]}"; do
             --export="${ncu_dir}/rank%q{RANK}"
             python "${script_dir}/nvls_collective_benchmark.py"
         )
+        if (( node_rank > 0 )) && ! $DRY_RUN; then
+            hold_port "$(( ncu_port + index ))"
+        fi
     fi
 
     echo "=== algo=${algo} (${algo_env[*]})" >&2
@@ -522,6 +580,7 @@ for index in "${!algo_list[@]}"; do
         "${worker[@]}" \
         --algo "$algo" --output-dir "$algo_dir" "${bench_args[@]}" ${algo_args[@]+"${algo_args[@]}"} \
         2>&1 | { $DRY_RUN && cat || tee "${algo_dir}/torchrun-node${node_rank}.log"; }
+    release_port
 
     if $nsys_enabled && ! $DRY_RUN; then
         compgen -G "${nsys_dir}/rank*.nsys-rep" >/dev/null \

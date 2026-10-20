@@ -45,6 +45,7 @@ STDLIB_ONLY_IMPORTS = {
     "collections",
     "contextlib",
     "dataclasses",
+    "functools",
     "json",
     "logging",
     "os",
@@ -133,7 +134,8 @@ def test_benchmark_module_imports_with_stdlib_only():
 def test_defaults_cover_the_requested_matrix():
     args = benchmark.parse_args(["--algo", "ring", "--output-dir", "/tmp/never-used"])
     assert args.group_sizes == [4, 8, 16, 32]
-    assert args.split_totals == [16]
+    assert args.split_totals == []
+    assert args.late_join is False
     assert args.split_layouts == ["contiguous"]
     assert args.workloads == ["ag", "rs", "ar", "ag+rs"]
     assert args.sizes_mib == [16, 32, 64, 128, 256, 512, 1024, 2048]
@@ -1436,3 +1438,130 @@ def test_connect_runs_pinned_families_on_windows(monkeypatch):
     benchmark._connect(groups, gate, 0, windows=True)
     # Only this rank's group connects, AG/RS on a registered window and the AR as before.
     assert calls == [("windows", "A"), ("ar", "ar-A")]
+
+
+@pytest.mark.unit
+def test_late_join_replaces_split_and_keeps_both_ops():
+    base = ["--algo", "symm", "--output-dir", "/tmp/never-used"]
+    assert benchmark.parse_args([*base, "--late-join"]).late_join is True
+    with pytest.raises(SystemExit):
+        benchmark.parse_args([*base, "--late-join", "--split-totals", "16"])
+    with pytest.raises(SystemExit):
+        benchmark.parse_args([*base, "--late-join", "--symm-kernel", "ag"])
+
+
+@pytest.mark.unit
+def test_late_join_workload_launches_rs_first_and_names_its_case():
+    assert metrics.workload_ops(metrics.LATE_JOIN_WORKLOAD) == ("rs", "ag")
+    scenario = metrics.scenario_name("late-join", total_ranks=8)
+    assert scenario == "late-join-n8"
+    assert metrics.case_name(scenario, part=None, workload=metrics.LATE_JOIN_WORKLOAD, dtype="bf16", size_mib=256) == (
+        "reduce_scatter_x4+late_all_gather-256MiB-bf16-late-join-n8"
+    )
+
+
+@pytest.mark.unit
+def test_check_implementation_holds_each_op_to_its_own_size():
+    # Late join: a 32 MiB AG (16 MiB shard on 2 ranks) next to a 4x RS (64 MiB shard).
+    rs_x4 = SYMM_RS.replace("16777216 Bytes", "67108864 Bytes")
+    sizes = {"rs": 4 * 2 * 16777216}
+    lines = [rs_x4, SYMM_AG, rs_x4, SYMM_AG]
+    assert (
+        benchmark.check_implementation(
+            lines,
+            algo="symm",
+            ops=("rs", "ag"),
+            launches=2,
+            size_bytes=2 * 16777216,
+            group_size=2,
+            pinned_kernel=None,
+            op_sizes=sizes,
+        )[1]
+        == []
+    )
+    _, errors = benchmark.check_implementation(
+        [SYMM_RS, SYMM_AG, SYMM_RS, SYMM_AG],
+        algo="symm",
+        ops=("rs", "ag"),
+        launches=2,
+        size_bytes=2 * 16777216,
+        group_size=2,
+        pinned_kernel=None,
+        op_sizes=sizes,
+    )
+    assert errors == ["ReduceScatter: expected 67108864 B per rank, got 16777216 B x2"]
+
+
+def _late_join(**times):
+    # AG of 1 GB in 1 s alone, RS of 4 GB in 4 s alone; the AG is released 1 s into the RS.
+    return metrics.late_join_metrics(ag_bytes=10**9, rs_bytes=4 * 10**9, ag_iso_s=1.0, rs_iso_s=4.0, **times)
+
+
+@pytest.mark.unit
+def test_late_join_metrics_separate_full_speed_from_time_sharing():
+    # Both at full speed: the AG takes its isolated 1 s and the RS still ends at 4 s.
+    full = _late_join(ag_begin_s=1.0, ag_end_s=2.0, rs_end_s=4.0)
+    assert full["join_fraction"] == pytest.approx(0.25)
+    assert full["ag_slowdown"] == pytest.approx(1.0)
+    assert full["rs_slowdown"] == pytest.approx(1.0)
+    assert full["overlap_capacity"] == pytest.approx(2.0)
+    assert full["ag_share"] == pytest.approx(0.5)
+    assert full["ag_algbw_overlap_gb_s"] == pytest.approx(1.0)
+    assert full["ag_inside_rs"] is True
+    # Time-shared halves: the AG takes 2 s, the RS is pushed out by 1 s.
+    shared = _late_join(ag_begin_s=1.0, ag_end_s=3.0, rs_end_s=5.0)
+    assert shared["ag_slowdown"] == pytest.approx(2.0)
+    assert shared["rs_rel_speed"] == pytest.approx(0.5)
+    assert shared["overlap_capacity"] == pytest.approx(1.0)
+    assert shared["ag_share"] == pytest.approx(0.5)
+
+
+@pytest.mark.unit
+def test_late_join_metrics_without_overlap_leave_the_window_empty():
+    late = _late_join(ag_begin_s=4.5, ag_end_s=5.5, rs_end_s=4.0)
+    assert late["overlap_ms"] == 0.0
+    assert late["overlap_capacity"] is None and late["ag_share"] is None
+    # The part of an AG that outlives the RS runs at its isolated rate, outside the window.
+    tail = _late_join(ag_begin_s=3.5, ag_end_s=4.5, rs_end_s=4.0)
+    assert tail["ag_inside_rs"] is False
+    assert tail["ag_rel_speed"] == pytest.approx(1.0)
+
+
+@pytest.mark.unit
+def test_report_adds_the_late_join_table_and_per_op_sizes():
+    size = 256 * 1024 * 1024
+    join = _record(
+        scenario="late-join",
+        phase="join",
+        workload=metrics.LATE_JOIN_WORKLOAD,
+        size_bytes=size,
+        rs_size_bytes=4 * size,
+        makespan_ms=2.0,
+        trial_makespan_ms=[2.0],
+        ag_begin_ms=0.5,
+        ag_ms=1.0,
+        rs_ms=2.0,
+        ag_iso_ms=0.5,
+        rs_iso_ms=2.0,
+        **_late_join(ag_begin_s=1.0, ag_end_s=2.0, rs_end_s=4.0),
+    )
+    (row,) = metrics.late_join_rows([join, _record()])
+    assert row[:4] == ["ring", "8", "256", "1024"]
+    assert row[15:18] == ["2.00", "0.50", "yes"]
+    report = metrics.render_report([join])
+    assert "## 5. late join" in report
+    # Table 0 counts the RS at its own 4x size: (S + 4S) / 2 ms.
+    (completion,) = metrics.completion_rows([join])
+    assert completion[12] == f"{5 * size / 2e-3 / 1e9:.1f}"
+
+
+@pytest.mark.unit
+@pytest.mark.skipif(shutil.which("bash") is None, reason="needs bash")
+def test_launcher_late_join_defaults_and_split_default_off():
+    result = _launcher_dry_run("--late-join")
+    assert result.returncode == 0, result.stderr
+    for option in ("--late-join", "--sizes-mib 64,256,512", "--iters 5", "--trials 10", "--split-totals none"):
+        assert option in result.stdout.replace("\\", "")
+    plain = _launcher_dry_run()
+    assert "--split-totals none" in plain.stdout and "--late-join" not in plain.stdout
+    assert _launcher_dry_run("--late-join", "--split-totals", "16").returncode != 0

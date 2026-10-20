@@ -46,10 +46,16 @@ Scenarios (all inside one torchrun job; ranks outside a group wait at a Gloo bar
 
 * ``single``: ranks ``[0, n)`` for every ``n`` in ``--group-sizes`` run AG, RS and AR alone,
   and AG + RS at the same time on two streams and two communicators.
-* ``split``: ranks ``[0, T)`` for every ``T`` in ``--split-totals`` are cut into two groups of
-  ``T/2``; both run the same workload at the same time, then (``cross``) group A all-gathers
-  while group B reduce-scatters. The isolated reference of each half is ``single`` with
-  ``n = T/2``, so ``T/2`` must be one of ``--group-sizes``.
+* ``split``: ranks ``[0, T)`` for every ``T`` in ``--split-totals`` (default: none) are cut into
+  two groups of ``T/2``; both run the same workload at the same time, then (``cross``) group A
+  all-gathers while group B reduce-scatters. The isolated reference of each half is ``single``
+  with ``n = T/2``, so ``T/2`` must be one of ``--group-sizes``.
+* ``late-join`` (``--late-join``, replaces single and split): ranks ``[0, n)`` reduce-scatter
+  ``LATE_JOIN_RS_SCALE * S`` and, once the RS is ``LATE_JOIN_FRACTION`` of its isolated time in,
+  all-gather ``S`` on a second stream and communicator. Every iteration starts both streams
+  together and ends by joining them; the AG stream sleeps on the GPU before its AG. AG(S) and
+  RS(4S) alone, timed the same way, are measured first in the same scenario: they are the
+  references and the RS time sets the sleep.
 
 Every timed trial opens with a start gate: a one-element all-reduce over all ranks of the
 scenario, after which each rank records its start event. Groups that share no communicator
@@ -63,6 +69,7 @@ from __future__ import annotations
 import argparse
 import contextlib
 import dataclasses
+import functools
 import json
 import logging
 import os
@@ -83,6 +90,9 @@ from collective_metrics import (
     CROSS_GROUP_WORKLOADS,
     CROSS_PART,
     CROSS_WORKLOAD,
+    LATE_JOIN_FRACTION,
+    LATE_JOIN_RS_SCALE,
+    LATE_JOIN_WORKLOAD,
     NCCL_ALGO_ENV,
     OPS,
     SPLIT_LAYOUTS,
@@ -90,6 +100,7 @@ from collective_metrics import (
     alg_bandwidth_gb_s,
     case_dir_name,
     case_name,
+    late_join_metrics,
     measured_workloads,
     op_bus_bandwidth_gb_s,
     per_rank_bytes,
@@ -288,8 +299,16 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--split-totals",
         type=_csv_ints_or_none,
-        default=[16],
-        help="Ranks shared by two concurrent half-groups (T/2 must be in --group-sizes); 'none' skips the split scenario",
+        default=[],
+        help="Ranks shared by two concurrent half-groups (T/2 must be in --group-sizes); default 'none' skips the split scenario",
+    )
+    parser.add_argument(
+        "--late-join",
+        action="store_true",
+        help=(
+            f"Run only the late-join scenario: RS of {LATE_JOIN_RS_SCALE}x each --sizes-mib entry, joined by an AG"
+            f" of that size at {LATE_JOIN_FRACTION:g} of the RS's isolated time; needs --split-totals none"
+        ),
     )
     parser.add_argument("--split-layouts", type=_csv_choices(SPLIT_LAYOUTS), default=["contiguous"])
     parser.add_argument(
@@ -331,6 +350,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         parser.error("--nsys and --ncu are exclusive")
     if args.launch_delay_ms < 0:
         parser.error("--launch-delay-ms must be >= 0")
+    if args.late_join and args.split_totals:
+        parser.error("--late-join replaces the single and split scenarios; pass --split-totals none")
+    if args.late_join and args.symm_kernel != "default":
+        parser.error("--late-join runs an AG and an RS; --symm-kernel would mask one of them")
     return args
 
 
@@ -581,13 +604,15 @@ def check_implementation(
     group_size: int,
     pinned_kernel: str | None,
     gate_launches: int = 0,
+    op_sizes: dict[str, int] | None = None,
 ) -> tuple[str | None, list[str]]:
     """Check every collective launch of one case against the family under test.
 
     ``lines`` are the NCCL log lines comm rank 0 of the group wrote during the case (warmup
     and timed trials). Each op must appear exactly ``launches`` times, every launch must move
-    its own per-rank payload (:func:`collective_metrics.per_rank_bytes`: a shard for AG and RS,
-    the whole tensor for AR) and use the expected implementation, and no other collective may
+    its own per-rank payload (:func:`collective_metrics.per_rank_bytes` of ``op_sizes[op]``, else
+    ``size_bytes``: a shard for AG and RS, the whole tensor for AR) and use the expected
+    implementation, and no other collective may
     run except the start gate: exactly ``gate_launches`` AllReduce lines, which only the gate's
     comm rank 0 logs. Returns the observed implementations
     (``AllGather=Symmetric/AllGather_STMC;...``) and the list of violations; an empty list means
@@ -637,7 +662,8 @@ def check_implementation(
                 want = f"{NCCL_ALGO_ENV[algo]}/*"
             got = ", ".join(f"{impl} x{n}" for impl, n in sorted(wrong.items()))
             errors.append(f"{func}: expected {want}, got {got}")
-        want_bytes = per_rank_bytes(op=op, size_bytes=size_bytes, group_size=group_size)
+        op_size = (op_sizes or {}).get(op, size_bytes)
+        want_bytes = per_rank_bytes(op=op, size_bytes=op_size, group_size=group_size)
         bad_sizes = {size: n for size, n in sizes[func].items() if size != want_bytes}
         if bad_sizes:
             got = ", ".join(f"{size} B x{n}" for size, n in sorted(bad_sizes.items()))
@@ -747,8 +773,18 @@ def _register_pool(group: CollectiveGroup, pool: torch.cuda.MemPool | None) -> N
     torch.cuda.synchronize()
 
 
-def _make_buffers(group: CollectiveGroup, rank: int, size_bytes: int, dtype: torch.dtype, *, symm: bool) -> Buffers:
+def _make_buffers(
+    group: CollectiveGroup,
+    rank: int,
+    size_bytes: int,
+    dtype: torch.dtype,
+    *,
+    symm: bool,
+    rs_size_bytes: int | None = None,
+) -> Buffers:
     """Allocate one group's inputs and outputs, inside a registered MemPool when ``symm``.
+
+    ``rs_size_bytes`` (late join) sizes the RS input; every other buffer uses ``size_bytes``.
 
     For the symmetric path every buffer must live in a ``torch.cuda.MemPool`` that has been
     registered on the communicator as an ``NCCL_WIN_COLL_SYMMETRIC`` window; NCCL only
@@ -763,10 +799,13 @@ def _make_buffers(group: CollectiveGroup, rank: int, size_bytes: int, dtype: tor
     uses expandable segments.
     """
     elem = torch.empty((), dtype=dtype).element_size()
-    if size_bytes % (group.size * elem):
-        raise ValueError(f"{size_bytes} bytes cannot be split into {group.size} {dtype} shards")
+    rs_size_bytes = rs_size_bytes or size_bytes
+    for nbytes in (size_bytes, rs_size_bytes):
+        if nbytes % (group.size * elem):
+            raise ValueError(f"{nbytes} bytes cannot be split into {group.size} {dtype} shards")
     numel = size_bytes // elem
     shard = numel // group.size
+    rs_numel = rs_size_bytes // elem
     index = group.ranks.index(rank)
     pool = None
     if symm:
@@ -778,8 +817,8 @@ def _make_buffers(group: CollectiveGroup, rank: int, size_bytes: int, dtype: tor
             # order. An all-reduce overwrites its input, hence a buffer of its own.
             ag_in=torch.full((shard,), float(index + 1), dtype=dtype, device="cuda"),
             ag_out=torch.empty(numel, dtype=dtype, device="cuda"),
-            rs_in=torch.full((numel,), float(index % 2 + 1), dtype=dtype, device="cuda"),
-            rs_out=torch.empty(shard, dtype=dtype, device="cuda"),
+            rs_in=torch.full((rs_numel,), float(index % 2 + 1), dtype=dtype, device="cuda"),
+            rs_out=torch.empty(rs_numel // group.size, dtype=dtype, device="cuda"),
             ar_buf=torch.full((numel,), float(index % 2 + 1), dtype=dtype, device="cuda"),
             pool=pool,
         )
@@ -854,8 +893,12 @@ def _timed_trial(
     delay_cycles: int,
     gate: StartGate,
     trial: int,
+    join_cycles: int | None = None,
 ) -> dict[str, float] | None:
     """Pass the start gate, run ``iters`` back-to-back launches and return per-iteration times in ms.
+
+    With ``join_cycles`` (late join) every iteration is timed on its own instead, see
+    :func:`_run_joined`.
 
     The GPU sleep keeps the gate and every launch queued before any of them runs, so host
     enqueue time is not measured. Every rank of the scenario passes the gate, including the idle
@@ -874,6 +917,10 @@ def _timed_trial(
     host_start = time.perf_counter()
     dist.all_reduce(gate.tensor, group=gate.pg)
     with nvtx.range(f"trial{trial}"):
+        if join_cycles is not None:
+            return _run_joined(
+                group, buffers, ops, streams, main=main, iters=iters, host_start=host_start, join_cycles=join_cycles
+            )
         return _run_timed(group, buffers, ops, streams, main=main, iters=iters, host_start=host_start)
 
 
@@ -907,6 +954,62 @@ def _run_timed(
     end.synchronize()
     result = {"makespan_ms": start.elapsed_time(end) / iters, "enqueue_ms": enqueue_ms}
     result.update({f"{op}_ms": start.elapsed_time(op_end[op]) / iters for op in ops})
+    return result
+
+
+def _run_joined(
+    group: CollectiveGroup | None,
+    buffers: Buffers | None,
+    ops: tuple[str, ...],
+    streams: dict[str, torch.cuda.Stream],
+    *,
+    main: torch.cuda.Stream,
+    iters: int,
+    host_start: float,
+    join_cycles: int,
+) -> dict[str, float] | None:
+    """Time ``iters`` iterations that each start every op together and end by joining them.
+
+    Every iteration records its start on ``main``, every op's stream waits for it, and ``main``
+    waits for every op before the next start, so each iteration measures one RS from its launch.
+    With ``join_cycles > 0`` the AG stream first sleeps that many GPU cycles and records
+    ``ag_begin`` right before its AG: the AG is released while the RS is running. Times are per
+    iteration from its start, averaged over ``iters``: ``<op>_ms`` is when the op ended,
+    ``ag_begin_ms`` when the AG was released, ``makespan_ms`` when the last op ended.
+
+    The sleep only delays the AG if every launch is already queued when its iteration starts,
+    i.e. the host is not the bottleneck (``enqueue_ms`` below ``--launch-delay-ms``).
+    """
+    if group is None:
+        main.synchronize()
+        return None
+    timing = functools.partial(torch.cuda.Event, enable_timing=True)
+    starts = [timing() for _ in range(iters)]
+    ends = [{op: timing() for op in ops} for _ in range(iters)]
+    ag_begins = [timing() for _ in range(iters)] if join_cycles and "ag" in ops else None
+    for i in range(iters):
+        starts[i].record(main)
+        for op in ops:
+            stream = streams[op]
+            stream.wait_event(starts[i])
+            with torch.cuda.stream(stream):
+                if op == "ag" and ag_begins is not None:
+                    torch.cuda._sleep(join_cycles)
+                    ag_begins[i].record(stream)
+                _launch(group, buffers, (op,), streams)
+            ends[i][op].record(stream)
+            main.wait_event(ends[i][op])
+    enqueue_ms = (time.perf_counter() - host_start) * 1e3
+    done = timing()
+    done.record(main)
+    done.synchronize()
+    result = {
+        "makespan_ms": sum(max(starts[i].elapsed_time(e) for e in ends[i].values()) for i in range(iters)) / iters,
+        "enqueue_ms": enqueue_ms,
+    }
+    result.update({f"{op}_ms": sum(starts[i].elapsed_time(ends[i][op]) for i in range(iters)) / iters for op in ops})
+    if ag_begins is not None:
+        result["ag_begin_ms"] = sum(starts[i].elapsed_time(ag_begins[i]) for i in range(iters)) / iters
     return result
 
 
@@ -977,6 +1080,9 @@ def run_case(
     streams: dict[str, torch.cuda.Stream],
     captures: CaptureWindows,
     nccl_log: NcclLog,
+    rs_size_bytes: int | None = None,
+    join_cycles: int | None = None,
+    reference: dict[str, float] | None = None,
 ) -> list[dict[str, object]]:
     """Run ``workloads[i]`` on ``topology.groups[i]``, all at the same time; return records on rank 0.
 
@@ -987,6 +1093,11 @@ def run_case(
     of its NCCL debug log, rank 0's ``case.json`` and, after ``analyse_nsys.py``, the nsys reports.
     The case fails on every rank if the result is wrong or if comm rank 0 of any group logged a
     launch that is not the implementation this pass measures.
+
+    Late join: ``rs_size_bytes`` sizes the RS apart from ``size_bytes`` (the AG), ``join_cycles``
+    switches to per-iteration timing (:func:`_run_joined`, 0 for the references), and
+    ``reference`` (``ag_iso_ms``, ``rs_iso_ms``) adds :func:`collective_metrics.late_join_metrics`
+    to the record.
     """
     if len(workloads) != len(topology.groups):
         raise ValueError(f"{case}: {len(workloads)} workloads for {len(topology.groups)} groups")
@@ -1000,7 +1111,12 @@ def run_case(
     label = f"{args.algo}/{case}"
     probe: dict[str, object] = dict(topology.comm_info)
     windows = args.algo in WINDOW_ALGOS
-    buffers = _make_buffers(group, rank, size_bytes, DTYPES[args.dtype], symm=windows) if group else None
+    buffers = (
+        _make_buffers(group, rank, size_bytes, DTYPES[args.dtype], symm=windows, rs_size_bytes=rs_size_bytes)
+        if group
+        else None
+    )
+    op_sizes = {"rs": rs_size_bytes or size_bytes}
     if group:
         _register_pool(group, buffers.pool)
     torch.cuda.synchronize()
@@ -1029,6 +1145,7 @@ def run_case(
                     delay_cycles=delay_cycles,
                     gate=gate,
                     trial=trial,
+                    join_cycles=join_cycles,
                 )
                 if result is not None:
                     trials.append(result)
@@ -1052,6 +1169,7 @@ def run_case(
             pinned_kernel=(os.environ.get("NCCL_SYM_KERNEL") or None) if args.algo == "symm" else None,
             # Gate comm rank 0 is the scenario's first rank; it logs one AllReduce per trial.
             gate_launches=args.trials if rank == gate.ranks[0] else 0,
+            op_sizes=op_sizes,
         )
     local = {
         "rank": rank,
@@ -1123,6 +1241,7 @@ def run_case(
             "ranks": g.ranks,
             "size_bytes": size_bytes,
             "size_mib": size_bytes // BYTES_PER_MIB,
+            **({"rs_size_bytes": rs_size_bytes} if rs_size_bytes else {}),
             "dtype": args.dtype,
             "workload": workload,
             "iters": args.iters,
@@ -1144,16 +1263,31 @@ def run_case(
         }
         aggregate_bus = 0.0
         for op in group_ops[g.name]:
-            seconds = stats[f"{op}_ms"] / 1e3
-            record[f"{op}_algbw_gb_s"] = alg_bandwidth_gb_s(total_bytes=size_bytes, seconds=seconds)
+            op_bytes = op_sizes.get(op, size_bytes)
+            # A late-joining AG runs from its release, not from the iteration start.
+            seconds = (stats[f"{op}_ms"] - stats.get(f"{op}_begin_ms", 0.0)) / 1e3
+            record[f"{op}_algbw_gb_s"] = alg_bandwidth_gb_s(total_bytes=op_bytes, seconds=seconds)
             record[f"{op}_busbw_gb_s"] = op_bus_bandwidth_gb_s(
-                op=op, total_bytes=size_bytes, group_size=g.size, seconds=seconds
+                op=op, total_bytes=op_bytes, group_size=g.size, seconds=seconds
             )
             # An all-reduce counts both directions, so its busbw already carries the factor 2.
             aggregate_bus += op_bus_bandwidth_gb_s(
-                op=op, total_bytes=size_bytes, group_size=g.size, seconds=stats["makespan_ms"] / 1e3
+                op=op, total_bytes=op_bytes, group_size=g.size, seconds=stats["makespan_ms"] / 1e3
             )
         record["aggregate_busbw_gb_s"] = aggregate_bus
+        if reference is not None:
+            record.update(reference)
+            record.update(
+                late_join_metrics(
+                    ag_bytes=size_bytes,
+                    rs_bytes=op_sizes["rs"],
+                    ag_iso_s=reference["ag_iso_ms"] / 1e3,
+                    rs_iso_s=reference["rs_iso_ms"] / 1e3,
+                    ag_begin_s=stats["ag_begin_ms"] / 1e3,
+                    ag_end_s=stats["ag_ms"] / 1e3,
+                    rs_end_s=stats["rs_ms"] / 1e3,
+                )
+            )
         records.append(record)
     case_dir.mkdir(parents=True, exist_ok=True)
     (case_dir / "case.json").write_text(json.dumps({"label": label, "records": records}, indent=2), encoding="utf-8")
@@ -1295,7 +1429,35 @@ def main(argv: list[str] | None = None) -> None:
         if comm_log:
             _write_lines(comm_log, lines)
 
-    for n in args.group_sizes:
+    for n in args.group_sizes if args.late_join else []:
+        scenario = scenario_name("late-join", total_ranks=n)
+        group = _new_group(f"late-join{n}", list(range(n)), eager=pinned)
+        topology, comm_log = connect(scenario, [group])
+        common = {"scenario": "late-join", "total_ranks": n, "layout": None, "group_index": 0}
+        for size_bytes in sizes:
+            rs_bytes = LATE_JOIN_RS_SCALE * size_bytes
+            # The references, timed like the join case (join_cycles=0: no sleep): RS(4S) and AG(S) alone.
+            rs_alone = run_case(topology, join_cycles=0, **case_kwargs(scenario, None, rs_bytes, "rs", ["rs"]))
+            emit(rs_alone, phase="rs-isolated", **common)
+            ag_alone = run_case(topology, join_cycles=0, **case_kwargs(scenario, None, size_bytes, "ag", ["ag"]))
+            emit(ag_alone, phase="ag-isolated", **common)
+            # Only rank 0 holds the records; every rank needs the RS time to size its AG sleep.
+            reference: list[dict[str, float] | None] = [None]
+            if rank == 0:
+                reference[0] = {"ag_iso_ms": ag_alone[0]["makespan_ms"], "rs_iso_ms": rs_alone[0]["makespan_ms"]}
+            dist.broadcast_object_list(reference, src=0)
+            join_cycles = max(1, int(cycles_per_ms * LATE_JOIN_FRACTION * reference[0]["rs_iso_ms"]))
+            joined = run_case(
+                topology,
+                rs_size_bytes=rs_bytes,
+                join_cycles=join_cycles,
+                reference=reference[0],
+                **case_kwargs(scenario, None, size_bytes, LATE_JOIN_WORKLOAD, [LATE_JOIN_WORKLOAD]),
+            )
+            emit(joined, phase="join", **common)
+        destroy(topology, comm_log)
+
+    for n in [] if args.late_join else args.group_sizes:
         scenario = scenario_name("single", total_ranks=n)
         group = _new_group(f"single{n}", list(range(n)), eager=pinned)
         topology, comm_log = connect(scenario, [group])
