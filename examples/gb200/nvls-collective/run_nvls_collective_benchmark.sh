@@ -532,6 +532,11 @@ for index in "${!algo_list[@]}"; do
         if ! $DRY_RUN && compgen -G "${ncu_dir}/*.ncu-rep" >/dev/null; then
             die "${ncu_dir} already contains Nsight Compute reports; ${output_dir} was not a fresh run directory"
         fi
+        # On first use ncu copies its stock sections to $HOME/Documents/NVIDIA Nsight Compute/<ver>/Sections
+        # and reads them from there. All workers of a node (or of every node, on a shared $HOME) copy
+        # at the same time, and a worker that reads the half-copied folder fails with "Option
+        # '--section ...' did not match any section". Read the installation's sections instead.
+        algo_env+=(NV_COMPUTE_PROFILER_DISABLE_STOCK_FILE_DEPLOYMENT=1)
         # One ncu instance per worker, joined through a TCP communicator on node 0, launching and
         # replaying every profiled kernel in lockstep: a symmetric kernel waits on its peers in an
         # LSA barrier, so a rank replaying alone would hang. Profiled: NCCL collective kernels in

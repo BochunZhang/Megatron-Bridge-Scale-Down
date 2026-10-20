@@ -210,6 +210,8 @@ def test_launcher_ncu_profiles_trial0_of_one_full_group_in_lockstep():
     # Every rank is in the one group, so lockstep never waits on an idle rank.
     assert "--group-sizes 4 " in result.stdout and "--split-totals none" in result.stdout
     assert " --ncu " in result.stdout
+    # Workers read the installed sections instead of racing to copy them into a shared $HOME.
+    assert "NV_COMPUTE_PROFILER_DISABLE_STOCK_FILE_DEPLOYMENT=1" in result.stdout
 
 
 @pytest.mark.unit
