@@ -573,7 +573,6 @@ for index in "${!algo_list[@]}"; do
             --communicator-tcp-num-peers="$world_size"
             --lockstep-kernel-launch
             --lockstep-nvtx-include="trial0/"
-            --profile-from-start=off
             --nvtx
             --nvtx-include="trial0/"
             --replay-mode=app-range

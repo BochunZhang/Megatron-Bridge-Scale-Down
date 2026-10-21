@@ -1126,8 +1126,14 @@ def run_case(
 
     # The only all-reduce launch with a checkable result; it counts as one extra launch below.
     first_ar_ok = _first_all_reduce_ok(group, buffers, streams["ar"]) if group and "ar" in ops else True
+    # Under ncu (app-range replay) the entire program is re-run once per counter pass, so every
+    # launch before cudaProfilerStart is profiled too.  Skip warmup entirely so ncu does not
+    # capture extra iterations before the capture window opens.
+    ncu_trials = 1 if args.ncu else args.trials
+    ncu_iters = 1 if args.ncu else args.iters
+    effective_warmup = 0 if args.ncu else args.warmup
     if group:
-        for _ in range(args.warmup):
+        for _ in range(effective_warmup):
             _launch(group, buffers, ops, streams)
         torch.cuda.synchronize()
     trials: list[dict[str, float]] = []
@@ -1135,8 +1141,6 @@ def run_case(
     # Under ncu (app-range replay) the window covers a single trial with a single iteration so
     # that each collective fires exactly once per replay pass; more launches would multiply the
     # save/restore cost and serialise concurrent AG+RS pairs.
-    ncu_trials = 1 if args.ncu else args.trials
-    ncu_iters = 1 if args.ncu else args.iters
     with captures.case(label) as capture_index:
         for trial in range(ncu_trials):
             torch.distributed.barrier()
@@ -1168,7 +1172,7 @@ def run_case(
             algo=args.algo,
             ops=ops,
             # "ar" is a workload of its own, so its extra checked launch never skews another op.
-            launches=args.warmup + ncu_trials * ncu_iters + int("ar" in ops),
+            launches=effective_warmup + ncu_trials * ncu_iters + int("ar" in ops),
             size_bytes=size_bytes,
             group_size=group.size,
             pinned_kernel=(os.environ.get("NCCL_SYM_KERNEL") or None) if args.algo == "symm" else None,
