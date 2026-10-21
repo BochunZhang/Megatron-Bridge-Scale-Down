@@ -576,7 +576,6 @@ for index in "${!algo_list[@]}"; do
             --profile-from-start=off
             --nvtx
             --nvtx-include="trial0/"
-            --kernel-name="regex:^nccl(Symk)?DevKernel_(AllGather|ReduceScatter|AllReduce)"
             --replay-mode=app-range
             --clock-control=none
             --cache-control=none
