@@ -71,7 +71,17 @@ REQUIRED_COLUMNS = {
     "StringIds": {"id", "value"},
     "NVTX_EVENTS": {"start", "end", "text", "textId", "globalTid"},
     "CUPTI_ACTIVITY_KIND_RUNTIME": {"start", "globalTid", "correlationId"},
-    "CUPTI_ACTIVITY_KIND_KERNEL": {"start", "end", "deviceId", "streamId", "correlationId", "globalPid", "shortName"},
+    "CUPTI_ACTIVITY_KIND_KERNEL": {
+        "start",
+        "end",
+        "deviceId",
+        "streamId",
+        "correlationId",
+        "globalPid",
+        "shortName",
+        "gridX",
+        "blockX",
+    },
     "GPU_METRICS": {"timestamp", "metricId", "value"},
     "TARGET_INFO_GPU_METRICS": {"metricId", "metricName"},
 }
@@ -108,6 +118,19 @@ class KernelRow:
     first_start_ns: int
     last_end_ns: int
     streams: int
+    grid_min: int
+    grid_max: int
+    block_x: int
+
+
+# Ops of the kernels query: the collectives, and "p2p" for ncclDevKernel_SendRecv (read / write).
+KERNEL_OPS = ("ag", "rs", "ar", "p2p")
+P2P_WORKLOAD_OPS = frozenset({"read", "write"})
+
+
+def _workload_has(workload: str, op: str) -> bool:
+    ops = workload_ops(workload)
+    return bool(P2P_WORKLOAD_OPS & set(ops)) if op == "p2p" else op in ops
 
 
 @dataclass(frozen=True)
@@ -310,20 +333,23 @@ def summarize(
     records = _rank_records(results)
     per_trial: dict[tuple[str, str, str, str], dict[int, dict[str, float]]] = defaultdict(dict)
     names: dict[tuple[str, str, str], set[str]] = defaultdict(set)
+    grids: dict[tuple[str, str, str], dict[str, set[int]]] = defaultdict(lambda: defaultdict(set))
     for row in kernels:
         record = records.get((row.label, row.rank))
         if record is None:
             continue  # idle rank of a split case, or a label with no results row
-        if row.op not in workload_ops(str(record["workload"])):
+        if not _workload_has(str(record["workload"]), row.op):
             continue  # e.g. the start gate's AllReduce inside an AG/RS trial
         group = str(record["group_name"])
         sample = per_trial[(row.algo, row.label, group, row.trial)].setdefault(
-            row.rank, {"ag": 0.0, "rs": 0.0, "ar": 0.0, "first": float("inf"), "last": 0.0}
+            row.rank, {**dict.fromkeys(KERNEL_OPS, 0.0), "first": float("inf"), "last": 0.0}
         )
         sample[row.op] += row.busy_ns
         sample["first"] = min(sample["first"], row.first_start_ns)
         sample["last"] = max(sample["last"], row.last_end_ns)
         names[(row.algo, row.label, group)].add(row.kernel)
+        for count in {row.grid_min, row.grid_max}:
+            grids[(row.algo, row.label, group)][row.op].add(count)
 
     cases: dict[tuple[str, str, str], list[dict[str, float]]] = defaultdict(list)
     for (algo, label, group, trial), ranks in per_trial.items():
@@ -336,6 +362,7 @@ def summarize(
                 "ag_ms": sample["ag"] / iters / NS_PER_MS,
                 "rs_ms": sample["rs"] / iters / NS_PER_MS,
                 "ar_ms": sample["ar"] / iters / NS_PER_MS,
+                "p2p_ms": sample["p2p"] / iters / NS_PER_MS,
                 "overlap_ms": ov / iters / NS_PER_MS,
                 "span_ms": (sample["last"] - sample["first"]) / iters / NS_PER_MS,
             }
@@ -359,6 +386,13 @@ def summarize(
                 "phase": record.get("phase"),
                 "trials": len(trials),
                 "kernels": ";".join(sorted(names[(algo, label, group)])),
+                # CTAs per launch from gridX, e.g. "ag=6;p2p=16" ("3|6" when launches differ).
+                "grid": ";".join(
+                    f"{op}={'|'.join(map(str, sorted(counts)))}"
+                    for op, counts in sorted(
+                        grids[(algo, label, group)].items(), key=lambda kv: KERNEL_OPS.index(kv[0])
+                    )
+                ),
                 **stats,
                 "overlap_fraction": stats["overlap_ms"] / shorter if shorter > 0 else None,
                 "event_makespan_ms": event_ms,
@@ -430,18 +464,22 @@ def render(rows: Sequence[dict[str, object]]) -> str:
         "AG kernel ms/iter",
         "RS kernel ms/iter",
         "AR kernel ms/iter",
+        "P2P kernel ms/iter",
         "AG∩RS ms/iter",
         "overlap_fraction",
         "kernel span ms/iter",
         "CUDA-event ms/iter",
         "span/event",
+        "CTAs (gridX)",
         "kernels",
     ]
     lines = [
-        "# AG / RS / AR kernel cost from nsys (SQL)",
+        "# AG / RS / AR / P2P kernel cost from nsys (SQL)",
         "",
         "每格：trial 中位数，trial 内取组内最慢 rank；ms/iter = 该 trial 内 kernel 时长之和 / iters。",
         "kernel 时长含等待对端的时间。经典 NCCL kernel 名不反映算法（NVLS 也显示 *_RING_LL），算法看 compare.md 2b。",
+        "CTAs (gridX)：每个 op 每次 launch 的 grid 大小 = NCCL channel 数 = CTA 数；P2P 是 ncclDevKernel_SendRecv，",
+        "NCCL 不为 send/recv 打 CTA 日志，这一列就是实测值（compare.md 表 6 的 `~N` 是推算值）。",
         "以下数字来自 --nsys 采集，含 Nsight 开销，只用于和同一次运行的 CUDA-event 时间对照。",
         "",
         "| " + " | ".join(header) + " |",
@@ -456,11 +494,13 @@ def render(rows: Sequence[dict[str, object]]) -> str:
             _fmt(row["ag_ms"]),
             _fmt(row["rs_ms"]),
             _fmt(row["ar_ms"]),
+            _fmt(row["p2p_ms"]),
             _fmt(row["overlap_ms"]),
             _fmt(row["overlap_fraction"], 2),
             _fmt(row["span_ms"]),
             _fmt(row["event_makespan_ms"]),
             _fmt(row["span_over_event"], 2),
+            row["grid"] or "-",
             row["kernels"],
         ]
         lines.append("| " + " | ".join(str(cell) for cell in cells) + " |")
@@ -562,7 +602,9 @@ def analyse_algo(
         metrics += query_gpu_metrics(sqlite_path, queries, algo=algo, rank=rank)
     _write_csv(algo_dir / "nsys" / "kernels.csv", KernelRow, kernels)
     if not kernels:
-        LOGGER.warning("%s: no AllGather/ReduceScatter/AllReduce kernels found in %d reports", algo, len(filed))
+        LOGGER.warning(
+            "%s: no AllGather/ReduceScatter/AllReduce/SendRecv kernels found in %d reports", algo, len(filed)
+        )
     if metrics:
         _write_csv(algo_dir / "nsys" / "gpu_metrics.csv", MetricRow, metrics)
         if not any(REPORTED_METRICS.search(row.metric) for row in metrics):

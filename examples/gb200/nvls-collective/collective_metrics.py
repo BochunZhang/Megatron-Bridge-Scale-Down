@@ -27,7 +27,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
-from collections.abc import Iterable, Sequence
+from collections.abc import Iterable, Mapping, Sequence
 from pathlib import Path
 
 
@@ -94,6 +94,27 @@ WORKLOAD_NAMES = {
     LATE_JOIN_WORKLOAD: f"reduce_scatter_x{LATE_JOIN_RS_SCALE}+late_all_gather",
 }
 
+# --cta-configs: one entry sets the CTA count of each op's communicator through ncclConfig_t
+# (minCTAs/maxCTAs, passed per process group as ProcessGroupNCCL.Options.config). ag2/rs2 follow
+# ag/rs; read and write share the "p2p" key. An op without a key keeps NCCL's own choice.
+DEFAULT_CTA_CONFIG = "default"
+CTA_KEYS = ("ag", "rs", "ar", "p2p")
+CTA_KEY_OF_OP = {"ag": "ag", "ag2": "ag", "rs": "rs", "rs2": "rs", "ar": "ar", "read": "p2p", "write": "p2p"}
+# ncclConfig_t minCTAs/maxCTAs are capped at MAXCHANNELS (src/include/device.h).
+NCCL_MAX_CTAS = 64
+# NCCL rounds the P2P channel counts up to powers of two (paths.cc ncclTopoComputeP2pChannels).
+P2P_CTAS = (1, 2, 4, 8, 16, 32)
+# Every communicator of this benchmark on a GB200 NVL72 domain logs "32 coll channels, ...,
+# 32 p2p channels, 32 p2p channels per peer" at init (NCCL 2.29.7 init.cc), with or without MNNVL.
+GB200_COMM_CHANNELS = 32
+GB200_P2P_CHANNELS_PER_PEER = 32
+# P2P step sizes (init.cc): NCCL_P2P_NVL_CHUNKSIZE within one node; across nodes
+# NCCL_P2P_NET_CHUNKSIZE, doubled on ARM Blackwell (GB200 trays have only 4 GPUs per host).
+P2P_NVL_CHUNK_BYTES = 512 * 1024
+P2P_NET_CHUNK_BYTES = 2 * 128 * 1024
+# A send/recv pair is spread over at most NCCL_MAX_DEV_WORK_P2P_PER_BATCH peers per round.
+P2P_PEERS_PER_ROUND = 8
+
 
 def workload_ops(workload: str) -> tuple[str, ...]:
     """Return the collectives issued by a workload, in launch order.
@@ -127,6 +148,107 @@ def measured_workloads(algo: str, requested: Sequence[str]) -> list[str]:
     return [workload for workload in requested if workload in ALGO_WORKLOADS[algo]]
 
 
+def parse_cta_config(text: str) -> dict[str, int]:
+    """Parse one ``--cta-configs`` entry: ``default`` or ``ag=3,rs=6,p2p=32`` (keys from ``CTA_KEYS``).
+
+    A collective value N is the CTA count of every launch of that op (1..``NCCL_MAX_CTAS``; NCCL
+    may cap it lower, which the benchmark then reports as an error). A ``p2p`` value is the CTA
+    count of one send/recv and must be one of ``P2P_CTAS``.
+    """
+    text = text.strip()
+    if text == DEFAULT_CTA_CONFIG:
+        return {}
+    ctas: dict[str, int] = {}
+    for item in text.split(","):
+        key, sep, value = item.strip().partition("=")
+        if not sep or key not in CTA_KEYS:
+            raise ValueError(f"CTA entry {item!r} must be <op>=<ctas> with <op> in {CTA_KEYS}")
+        if key in ctas:
+            raise ValueError(f"CTA config {text!r} sets {key} twice")
+        if not value.isdigit() or not 1 <= int(value) <= NCCL_MAX_CTAS:
+            raise ValueError(f"{key}={value!r}: CTAs must be an integer in 1..{NCCL_MAX_CTAS}")
+        if key == "p2p" and int(value) not in P2P_CTAS:
+            raise ValueError(f"p2p={value}: NCCL uses power-of-two P2P channel counts, pick one of {P2P_CTAS}")
+        ctas[key] = int(value)
+    return ctas
+
+
+def cta_config_name(ctas: Mapping[str, int]) -> str:
+    """``default``, or the case-name suffix of a CTA config, e.g. ``cta-ag3-rs6-p2p32``."""
+    if not ctas:
+        return DEFAULT_CTA_CONFIG
+    return "cta-" + "-".join(f"{key}{ctas[key]}" for key in CTA_KEYS if key in ctas)
+
+
+def p2p_comm_ctas(target: int) -> tuple[int | None, int | None]:
+    """``(min_ctas, max_ctas)`` of the P2P communicator that makes a large send/recv use ``target`` CTAs.
+
+    Up to the per-peer limit, ``maxCTAs = target`` caps the communicator at ``target`` channels,
+    so a send that is large enough to need more than half of them uses exactly ``target``. The
+    per-peer limit itself (32) is only reached when the communicator has twice as many P2P
+    channels as a 2-rank send/recv starts with, hence ``minCTAs = 64``. ``None`` keeps NCCL's default.
+    See :func:`predicted_p2p_ctas` for what a given size actually gets.
+    """
+    if target not in P2P_CTAS:
+        raise ValueError(f"p2p CTAs must be one of {P2P_CTAS}, got {target}")
+    if target >= GB200_P2P_CHANNELS_PER_PEER:
+        return NCCL_MAX_CTAS, None
+    return None, target
+
+
+def _pow2_up(value: int) -> int:
+    return 1 << max(0, value - 1).bit_length()
+
+
+def predicted_p2p_ctas(
+    nbytes: int, *, n_ranks: int, multi_node: bool, min_ctas: int | None, max_ctas: int | None
+) -> int:
+    """CTAs (= channels) of one ncclSend/ncclRecv of ``nbytes``, replaying NCCL 2.29.7 on GB200.
+
+    NCCL logs no channel count for send/recv, so the benchmark predicts it; nsys ``gridX`` of
+    ``ncclDevKernel_SendRecv`` is the measurement. Steps, with ``min_ctas``/``max_ctas`` the
+    communicator's ncclConfig_t (``None`` = NCCL default 1 / 64):
+
+    1. channels = clamp(32 topology channels, max_ctas), then duplicated up to min_ctas (connect.cc).
+    2. p2pnChannels = pow2Up(channels); channels per peer = 32, capped by p2pnChannels within a
+       node, or halved until every peer fits one round across nodes (paths.cc).
+    3. Per op (enqueue.cc): start with the per-peer count halved until ``start * n_ranks <=
+       p2pnChannels``, then double while a channel's part exceeds 32 chunks (one chunk across
+       nodes) and the per-peer count allows it.
+
+    Args:
+        nbytes: Bytes of the send (the benchmark sends one AG shard).
+        n_ranks: Ranks of the communicator that runs the send: 2 for torch's lazily created
+            pair communicator, the group size for an eagerly initialized group.
+        multi_node: Whether that communicator spans more than one tray (NCCL ``nNodes > 1``).
+        min_ctas: ncclConfig_t.minCTAs of that communicator.
+        max_ctas: ncclConfig_t.maxCTAs of that communicator.
+    """
+    if nbytes <= 0 or n_ranks < 2:
+        raise ValueError("nbytes must be positive and n_ranks at least 2")
+    channels = min(GB200_COMM_CHANNELS, max_ctas or NCCL_MAX_CTAS)
+    channels = min(max(channels, min_ctas or 1), NCCL_MAX_CTAS)
+    p2p_channels = _pow2_up(channels)
+    per_peer = GB200_P2P_CHANNELS_PER_PEER
+    if multi_node:
+        rounds = -(-n_ranks // P2P_PEERS_PER_ROUND)
+        while per_peer * rounds > p2p_channels and per_peer > 1:
+            per_peer //= 2
+    else:
+        per_peer = min(p2p_channels, per_peer)
+    start = per_peer
+    while start * n_ranks > p2p_channels and start > 1:
+        start //= 2
+    chunk = P2P_NET_CHUNK_BYTES if multi_node else P2P_NVL_CHUNK_BYTES
+    min_part, max_part = (chunk // 2, chunk) if multi_node else (chunk // 8, chunk * 32)
+    count = min(start, -(-nbytes // min_part))
+    part = max(min_part, -(-nbytes // count))
+    while part > max_part and count <= per_peer // 2:
+        count *= 2
+        part = -(-nbytes // count)
+    return count
+
+
 def split_groups(total_ranks: int, layout: str) -> tuple[list[int], list[int]]:
     """Split ``range(total_ranks)`` into two equal, disjoint groups.
 
@@ -157,14 +279,23 @@ def scenario_name(scenario: str, *, total_ranks: int, layout: str | None = None)
     raise ValueError(f"unknown scenario {scenario!r} with layout {layout!r}")
 
 
-def case_name(scenario: str, *, part: str | None, workload: str, dtype: str, size_mib: int) -> str:
+def case_name(
+    scenario: str,
+    *,
+    part: str | None,
+    workload: str,
+    dtype: str,
+    size_mib: int,
+    cta_config: str = DEFAULT_CTA_CONFIG,
+) -> str:
     """Name one test, e.g. ``all_gather+reduce_scatter-1024MiB-bf16-split-n16-contiguous-AB-concurrent``.
 
     Prefixed with the algorithm (``case_dir_name``) it is the case directory and the stem of every
     per-rank file in it; ``<algo>/<case>`` is the outer NVTX range of the case's nsys report.
     It must stay a single path component. ``size_mib`` is the full tensor: AG output / RS input /
     AR input. The cross part takes ``CROSS_WORKLOAD`` (``agA-rsB``), every other case one of ``WORKLOADS``
-    or ``LATE_JOIN_WORKLOAD``, whose ``size_mib`` is the AG size.
+    or ``LATE_JOIN_WORKLOAD``, whose ``size_mib`` is the AG size. A CTA config other than the
+    default (:func:`cta_config_name`) is appended, e.g. ``...-single-n4-cta-ag3-p2p32``.
     """
     if part is not None and part not in SPLIT_PARTS:
         raise ValueError(f"unknown split part {part!r}; expected one of {SPLIT_PARTS}")
@@ -173,6 +304,10 @@ def case_name(scenario: str, *, part: str | None, workload: str, dtype: str, siz
     if workload != CROSS_WORKLOAD:
         workload_ops(workload)
     suffix = scenario if part is None else f"{scenario}-{part}"
+    if cta_config != DEFAULT_CTA_CONFIG:
+        if not cta_config.startswith("cta-"):
+            raise ValueError(f"unknown CTA config name {cta_config!r}; expected default or cta-...")
+        suffix += f"-{cta_config}"
     return f"{WORKLOAD_NAMES[workload]}-{size_mib}MiB-{dtype}-{suffix}"
 
 
@@ -683,6 +818,69 @@ def late_join_rows(records: Sequence[dict[str, object]]) -> list[list[str]]:
     return rows
 
 
+def record_cta_config(record: Mapping[str, object]) -> str:
+    """The ``--cta-configs`` entry of a record; records from before the option are ``default``."""
+    return str(record.get("cta_config") or DEFAULT_CTA_CONFIG)
+
+
+# Op columns of table 6, in launch order of every workload that has them.
+CTA_TABLE_OPS = ("ag", "ag2", "rs", "rs2", "ar", "read", "write")
+
+
+def cta_rows(records: Sequence[dict[str, object]]) -> list[list[str]]:
+    """Table 6: every non-default ``--cta-configs`` case against the default config of the same case.
+
+    For each op of the workload: its CTAs (NCCL's TUNING log for collectives, the prediction for
+    a send/recv), its per-iteration time, and that time relative to the same op in the default
+    config. The pairing key is (algo, scenario, phase, ranks, layout, group, size, workload).
+    """
+    fields = ("algo", "scenario", "phase", "group_size", "layout", "group_index", "size_bytes", "workload")
+
+    def key(record: Mapping[str, object]) -> tuple[object, ...]:
+        return tuple(record.get(field) for field in fields)
+
+    defaults = {key(r): r for r in records if record_cta_config(r) == DEFAULT_CTA_CONFIG}
+    if len({record_cta_config(r) for r in records}) < 2:
+        return []
+    rows = []
+    for r in sorted(
+        records,
+        key=lambda r: (ALGORITHMS.index(str(r["algo"])), *(str(r.get(f)) for f in fields[1:]), record_cta_config(r)),
+    ):
+        base = defaults.get(key(r))
+        cells: list[str] = []
+        for op in CTA_TABLE_OPS:
+            if op not in workload_ops(str(r["workload"])):
+                cells.append("-")
+                continue
+            ctas = (r.get("observed_ctas") or {}).get(op)  # type: ignore[union-attr]
+            if op in ("read", "write"):
+                ctas = r.get("predicted_p2p_ctas")
+                ctas = None if ctas is None else f"~{ctas}"
+            ms = _optional_float(r.get(f"{op}_ms"))
+            base_ms = _optional_float(base.get(f"{op}_ms")) if base else None
+            ratio = f" ({ms / base_ms:.2f}x)" if ms and base_ms and base is not r else ""
+            cells.append(f"{ctas or '?'} CTA / {_fmt(ms, 3)} ms{ratio}")
+        makespan = float(r["makespan_ms"])  # type: ignore[arg-type]
+        base_makespan = float(base["makespan_ms"]) if base else None  # type: ignore[arg-type]
+        rows.append(
+            [
+                str(r["algo"]),
+                str(r["scenario"]),
+                str(r["group_size"]),
+                str(int(r["size_bytes"]) // BYTES_PER_MIB),  # type: ignore[arg-type]
+                str(r["workload"]),
+                str(r.get("group_name") or "-"),
+                record_cta_config(r),
+                *cells,
+                _fmt(makespan, 3),
+                _fmt(makespan / base_makespan if base_makespan and base is not r else None, 2),
+                _fmt(float(r["aggregate_busbw_gb_s"])),  # type: ignore[arg-type]
+            ]
+        )
+    return rows
+
+
 def completion_rows(records: Sequence[dict[str, object]]) -> list[list[str]]:
     """Table 0: every test and group with its completion time per iteration over the trials.
 
@@ -700,13 +898,23 @@ def completion_rows(records: Sequence[dict[str, object]]) -> list[list[str]]:
         mean_ms = float(r.get("mean_makespan_ms") or sum(trials) / len(trials))  # type: ignore[arg-type]
         size_bytes, group_size = int(r["size_bytes"]), int(r["group_size"])  # type: ignore[arg-type]
         ops = workload_ops(str(r["workload"]))
-        algbw = sum(alg_bandwidth_gb_s(total_bytes=op_size_bytes(r, op), seconds=mean_ms / 1e3) for op in ops)
-        busbw = sum(
-            op_bus_bandwidth_gb_s(
-                op=op, total_bytes=op_size_bytes(r, op), group_size=group_size, seconds=mean_ms / 1e3
+        algbw = busbw = 0.0
+        for op in ops:
+            # Same accounting as the benchmark's per-op columns: ag2/rs2 are a second AG/RS, and a
+            # read/write moves one AG shard between two ranks (algbw = busbw, no fan-out).
+            if op in ("read", "write"):
+                shard = alg_bandwidth_gb_s(
+                    total_bytes=per_rank_bytes("ag", size_bytes, group_size), seconds=mean_ms / 1e3
+                )
+                algbw += shard
+                busbw += shard
+                continue
+            canonical = {"ag2": "ag", "rs2": "rs"}.get(op, op)
+            total = op_size_bytes(r, canonical)
+            algbw += alg_bandwidth_gb_s(total_bytes=total, seconds=mean_ms / 1e3)
+            busbw += op_bus_bandwidth_gb_s(
+                op=canonical, total_bytes=total, group_size=group_size, seconds=mean_ms / 1e3
             )
-            for op in ops
-        )
         rows.append(
             [
                 str(r["algo"]),
@@ -731,8 +939,14 @@ def completion_rows(records: Sequence[dict[str, object]]) -> list[list[str]]:
 
 
 def render_report(records: Sequence[dict[str, object]]) -> str:
-    """Render the comparison tables as Markdown."""
-    profiled = sorted({str(r["algo"]) for r in records if r.get("profiled")})
+    """Render the comparison tables as Markdown.
+
+    Table 0 lists every case; tables 1-5 compare implementations at NCCL's own CTA choice (the
+    ``default`` CTA config) and table 6 compares every other ``--cta-configs`` entry with it.
+    """
+    all_records = list(records)
+    records = [r for r in all_records if record_cta_config(r) == DEFAULT_CTA_CONFIG]
+    profiled = sorted({str(r["algo"]) for r in all_records if r.get("profiled")})
     lines = [
         "# AG / RS / AR: ring vs NVLS vs symmetric memory (register / TMA / copy engine)",
         "",
@@ -787,7 +1001,7 @@ def render_report(records: Sequence[dict[str, object]]) -> str:
             "concurrency",
             "kernel",
         ],
-        completion_rows(records),
+        completion_rows(all_records),
     )
     lines += [
         "",
@@ -956,6 +1170,35 @@ def render_report(records: Sequence[dict[str, object]]) -> str:
                 "host",
             ],
             join_table,
+        )
+    cta_table = cta_rows(all_records)
+    if cta_table:
+        lines += [
+            "",
+            "## 6. 不同 CTA 配置（`--cta-configs`）相对 default",
+            "",
+            "表 1–5 只用 `default`（NCCL 自己选 CTA 数）的结果；本表列出其余每个 CTA 配置的 case，和同一 case 的",
+            "default 结果配对（algo、scenario、phase、组、大小、负载都相同）。每个 op 一格：`CTA 数 / 每次迭代 ms (相对 default)`。",
+            "集合通信的 CTA 数是该组 comm rank 0 的 TUNING 日志里每次 launch 的实测值（多种时用 `|` 列出）；",
+            "send/recv 的 NCCL 不打日志，`~N` 是按 NCCL 2.29.7 源码推算的值，以 nsys 里 `ncclDevKernel_SendRecv` 的",
+            "`gridX`（`nsys_kernels.md` 的 grid 列）为准。makespan / default < 1 表示整体变快。",
+            "",
+        ]
+        lines += _table(
+            [
+                "algo",
+                "scenario",
+                "ranks",
+                "MiB",
+                "workload",
+                "group",
+                "cta config",
+                *(f"{op}" for op in CTA_TABLE_OPS),
+                "makespan ms",
+                "makespan / default",
+                "aggregate busbw",
+            ],
+            cta_table,
         )
     return "\n".join(lines) + "\n"
 

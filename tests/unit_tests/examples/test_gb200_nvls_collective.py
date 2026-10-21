@@ -1590,3 +1590,252 @@ def test_launcher_late_join_defaults_and_split_default_off():
     plain = _launcher_dry_run()
     assert "--split-totals none" in plain.stdout and "--late-join" not in plain.stdout
     assert _launcher_dry_run("--late-join", "--split-totals", "16").returncode != 0
+
+
+# --cta-configs: per-communicator CTA counts (ncclConfig_t minCTAs/maxCTAs).
+SYMM_AG_6 = SYMM_AG.replace("nchannels 8", "nchannels 6")
+SYMM_RS_3 = SYMM_RS.replace("nchannels 8", "nchannels 3")
+
+
+@pytest.mark.unit
+def test_cta_config_entries_parse_and_name_in_a_fixed_key_order():
+    assert metrics.parse_cta_config("default") == {}
+    assert metrics.parse_cta_config(" p2p=32, ag=3 ") == {"p2p": 32, "ag": 3}
+    assert metrics.cta_config_name({}) == "default"
+    assert metrics.cta_config_name({"p2p": 32, "rs": 6, "ag": 3}) == "cta-ag3-rs6-p2p32"
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    ("text", "message"),
+    [
+        ("ag2=3", "must be <op>=<ctas>"),
+        ("ag", "must be <op>=<ctas>"),
+        ("ag=0", "integer in 1..64"),
+        ("ag=65", "integer in 1..64"),
+        ("ag=x", "integer in 1..64"),
+        ("ag=3,ag=4", "sets ag twice"),
+        ("p2p=12", "power-of-two"),
+    ],
+)
+def test_cta_config_entries_reject_what_nccl_cannot_honor(text, message):
+    with pytest.raises(ValueError, match=message):
+        metrics.parse_cta_config(text)
+
+
+@pytest.mark.unit
+def test_cta_configs_option_keeps_order_drops_duplicates_and_defaults_to_nccl_choice():
+    base = ["--algo", "symm", "--output-dir", "/tmp/x"]
+    assert benchmark.parse_args(base).cta_configs == [{}]
+    args = benchmark.parse_args([*base, "--cta-configs", "default;ag=3,rs=3;p2p=32;rs=3,ag=3;"])
+    assert args.cta_configs == [{}, {"ag": 3, "rs": 3}, {"p2p": 32}]
+    with pytest.raises(SystemExit):
+        benchmark.parse_args([*base, "--cta-configs", "ag=3;rs=100"])
+
+
+@pytest.mark.unit
+def test_cta_config_is_appended_to_the_case_name_only_when_not_default():
+    kwargs = {"part": None, "workload": "ag+write", "dtype": "bf16", "size_mib": 1024}
+    assert metrics.case_name("single-n4", **kwargs) == "all_gather+write-1024MiB-bf16-single-n4"
+    assert metrics.case_name("single-n4", cta_config="default", **kwargs) == "all_gather+write-1024MiB-bf16-single-n4"
+    assert metrics.case_name("single-n4", cta_config="cta-ag3-p2p32", **kwargs) == (
+        "all_gather+write-1024MiB-bf16-single-n4-cta-ag3-p2p32"
+    )
+    with pytest.raises(ValueError, match="unknown CTA config name"):
+        metrics.case_name("single-n4", cta_config="ag3", **kwargs)
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    ("target", "comm", "ctas_256mib"),
+    [
+        # 4 GPUs, 1024 MiB: every send is one 256 MiB AG shard on torch's 2-rank pair communicator.
+        (None, (None, None), 16),
+        (4, (None, 4), 4),
+        (8, (None, 8), 8),
+        (16, (None, 16), 16),
+        # The per-peer limit (32) is only reached with 64 P2P channels on the communicator.
+        (32, (64, None), 32),
+    ],
+)
+def test_p2p_cta_targets_map_to_a_communicator_config_that_reaches_them(target, comm, ctas_256mib):
+    assert (metrics.p2p_comm_ctas(target) if target else (None, None)) == comm
+    min_ctas, max_ctas = comm
+    got = metrics.predicted_p2p_ctas(256 << 20, n_ranks=2, multi_node=False, min_ctas=min_ctas, max_ctas=max_ctas)
+    assert got == ctas_256mib
+
+
+@pytest.mark.unit
+def test_predicted_p2p_ctas_follow_nccl_size_and_topology_rules():
+    def predict(nbytes, **kw):
+        return metrics.predicted_p2p_ctas(
+            nbytes, **{"n_ranks": 2, "multi_node": False, "min_ctas": None, "max_ctas": None, **kw}
+        )
+
+    # Within a tray a channel takes up to 32 x 512 KiB = 16 MiB before NCCL doubles the count.
+    assert predict(256 << 20) == 16
+    assert predict((256 << 20) + 1) == 32
+    assert predict(64 << 10) == 1  # one 64 KiB part
+    # Across trays a channel takes one 256 KiB chunk, so even 8 MiB fills all 32 channels.
+    assert predict(8 << 20, multi_node=True) == 32
+    # An eager 32-rank communicator across trays: 32 / ceil(32/8) = 8 channels per peer.
+    assert predict(8 << 20, n_ranks=32, multi_node=True) == 8
+    with pytest.raises(ValueError):
+        predict(0)
+
+
+@pytest.mark.unit
+def test_comm_ctas_pins_collectives_and_shapes_the_p2p_communicator():
+    ctas = {"ag": 3, "rs": 6, "p2p": 32}
+    assert benchmark.comm_ctas("ag", ctas) == (3, 3)
+    assert benchmark.comm_ctas("ag2", ctas) == (3, 3)  # the second AG communicator follows ag
+    assert benchmark.comm_ctas("rs2", ctas) == (6, 6)
+    assert benchmark.comm_ctas("ar", ctas) == (None, None)  # not requested: NCCL's choice
+    assert benchmark.comm_ctas("read", ctas) == (64, None)
+    assert benchmark.comm_ctas("write", {"p2p": 8}) == (None, 8)
+
+
+class _FakeNcclOptions:
+    def __init__(self):
+        self.config = types.SimpleNamespace(min_ctas=None, max_ctas=None)
+
+
+@pytest.mark.unit
+def test_new_group_passes_each_communicator_its_own_cta_config(monkeypatch):
+    calls = []
+    monkeypatch.setattr(
+        benchmark.dist, "ProcessGroupNCCL", types.SimpleNamespace(Options=_FakeNcclOptions), raising=False
+    )
+    monkeypatch.setattr(benchmark.dist, "get_rank", lambda: 0, raising=False)
+
+    def new_group(**kwargs):
+        calls.append(kwargs["pg_options"])
+        return f"pg{len(calls)}"
+
+    monkeypatch.setattr(benchmark.dist, "new_group", new_group, raising=False)
+    group = benchmark._new_group("single4", [0, 1, 2, 3], extended=True, ctas={"ag": 3, "p2p": 32})
+    configs = [None if o is None else (o.config.min_ctas, o.config.max_ctas) for o in calls]
+    # ag, rs, ar, ag2, rs2, p2p
+    assert configs == [(3, 3), None, None, (3, 3), None, (64, None)]
+    assert group.ctas == {"ag": 3, "p2p": 32}
+    calls.clear()
+    benchmark._new_group("single4", [0, 1, 2, 3])
+    assert calls == [None, None, None]  # default: torch's own options, as before
+
+
+@pytest.mark.unit
+def test_launch_ctas_reads_symmetric_and_classic_tuning_lines():
+    assert benchmark.launch_ctas(SYMM_AG_6) == 6
+    assert benchmark.launch_ctas(CLASSIC_AG) == 16  # channel{Lo..Hi}={0..15}
+    assert benchmark.launch_ctas(CE_AG) is None
+
+
+@pytest.mark.unit
+def test_check_ctas_reports_every_op_and_holds_requested_ones_to_their_count():
+    lines = [GATE, SYMM_AG_6, SYMM_RS_3, SYMM_AG_6, SYMM_RS_3]
+    assert benchmark.check_ctas(lines, algo="symm", ops=("ag", "rs"), ctas={}) == ({"ag": "6", "rs": "3"}, [])
+    assert benchmark.check_ctas(lines, algo="symm", ops=("ag", "rs"), ctas={"rs": 3}) == ({"ag": "6", "rs": "3"}, [])
+    observed, errors = benchmark.check_ctas(lines + [SYMM_AG], algo="symm", ops=("ag", "write"), ctas={"ag": 6})
+    assert observed == {"ag": "6|8"}
+    assert errors == ["AllGather: requested 6 CTAs, NCCL launched 8 x1"]
+
+
+@pytest.mark.unit
+def test_check_ctas_fails_when_the_cap_moves_symm_off_its_multicast_kernel():
+    unicast = SYMM_AG_6.replace("AllGather_STMC", "AllGather_ST")
+    _, errors = benchmark.check_ctas([SYMM_AG_6, unicast], algo="symm", ops=("ag",), ctas={"ag": 6})
+    assert errors == ["AllGather: 6 CTAs moved NCCL off Symmetric/AllGather_STMC: Symmetric/AllGather_ST x1"]
+    # Without a request for that op the kernel choice is check_implementation's business only.
+    assert benchmark.check_ctas([unicast], algo="symm", ops=("ag",), ctas={"rs": 3})[1] == []
+
+
+def _symm_env(monkeypatch):
+    _debug_env(monkeypatch, ce_threshold="9223372036854775807")
+    monkeypatch.delenv("NCCL_ALGO", raising=False)
+    monkeypatch.setenv("NCCL_WIN_ENABLE", "1")
+    for name in (*benchmark.CTA_ENV_OVERRIDES, benchmark.SYM_CTAS_ENV):
+        monkeypatch.delenv(name, raising=False)
+
+
+@pytest.mark.unit
+def test_cta_configs_refuse_environment_that_overrides_them(monkeypatch):
+    _symm_env(monkeypatch)
+    args = benchmark.parse_args(
+        ["--algo", "symm", "--output-dir", "/tmp/x", "--group-sizes", "4", "--cta-configs", "default;p2p=32"]
+    )
+    benchmark._check_environment("symm", 4, args)
+    monkeypatch.setenv("NCCL_MAX_CTAS", "16")
+    with pytest.raises(RuntimeError, match=r"unset \['NCCL_MAX_CTAS'\]"):
+        benchmark._check_environment("symm", 4, args)
+    # The default config alone leaves the environment as the user set it.
+    benchmark._check_environment(
+        "symm", 4, benchmark.parse_args(["--algo", "symm", "--output-dir", "/tmp/x", "--group-sizes", "4"])
+    )
+
+
+@pytest.mark.unit
+def test_cta_configs_respect_the_multicast_cap_and_nccl_sym_ctas(monkeypatch):
+    _symm_env(monkeypatch)
+    base = ["--algo", "symm", "--output-dir", "/tmp/x", "--group-sizes", "4"]
+    benchmark._check_environment("symm", 4, benchmark.parse_args([*base, "--cta-configs", "ag=8,rs=3"]))
+    with pytest.raises(ValueError, match=r"ag=12 exceeds .* divUp\(32, 4\) = 8"):
+        benchmark._check_environment("symm", 4, benchmark.parse_args([*base, "--cta-configs", "ag=12"]))
+    monkeypatch.setenv("NCCL_SYM_CTAS", "12")
+    with pytest.raises(RuntimeError, match="NCCL_SYM_CTAS fixes"):
+        benchmark._check_environment("symm", 4, benchmark.parse_args([*base, "--cta-configs", "ag=12"]))
+    # NCCL_SYM_CTAS together with a P2P-only config is fine: it leaves the P2P communicator alone.
+    benchmark._check_environment("symm", 4, benchmark.parse_args([*base, "--cta-configs", "p2p=32"]))
+
+
+@pytest.mark.unit
+def test_cta_table_pairs_every_config_with_the_default_case():
+    default = _record(
+        algo="symm",
+        workload="ag+write",
+        group_size=4,
+        ag_ms=2.0,
+        write_ms=2.0,
+        makespan_ms=2.0,
+        observed_ctas={"ag": "6"},
+        predicted_p2p_ctas=16,
+    )
+    doubled = _record(
+        algo="symm",
+        workload="ag+write",
+        group_size=4,
+        ag_ms=2.4,
+        write_ms=1.5,
+        makespan_ms=2.4,
+        observed_ctas={"ag": "6"},
+        predicted_p2p_ctas=32,
+        cta_config="cta-p2p32",
+        case="all_gather+write-256MiB-bf16-single-n4-cta-p2p32",
+    )
+    rows = metrics.cta_rows([default, doubled])
+    assert [row[6] for row in rows] == ["cta-p2p32", "default"]
+    ops = dict(zip(metrics.CTA_TABLE_OPS, rows[0][7:14]))
+    assert ops["ag"] == "6 CTA / 2.400 ms (1.20x)"
+    assert ops["write"] == "~32 CTA / 1.500 ms (0.75x)"
+    assert ops["rs"] == "-"
+    assert rows[0][14:16] == ["2.400", "1.20"]
+    assert rows[1][15] == "-"  # the default row is its own reference
+    report = metrics.render_report([default, doubled])
+    assert "## 6. 不同 CTA 配置" in report
+    # Tables 1-5 keep to the default config: one single-group row, not one per config.
+    assert len(metrics.single_rows([default])) == 1
+    assert "cta-p2p32" in report.split("## 1.")[0]  # table 0 lists every case
+    assert metrics.cta_rows([default]) == []
+    assert "## 6." not in metrics.render_report([default])
+
+
+@pytest.mark.unit
+@pytest.mark.skipif(shutil.which("bash") is None, reason="needs bash")
+def test_launcher_passes_cta_configs_and_refuses_overriding_environment(monkeypatch):
+    result = _launcher_dry_run("--cta-configs", "default;ag=3;p2p=32")
+    assert result.returncode == 0, result.stderr
+    assert "--cta-configs default\;ag=3\;p2p=32" in result.stdout
+    assert "--cta-configs default " in _launcher_dry_run().stdout
+    monkeypatch.setenv("NCCL_MAX_P2P_NCHANNELS", "8")
+    refused = _launcher_dry_run("--cta-configs", "p2p=32")
+    assert refused.returncode != 0
+    assert "unset NCCL_MAX_P2P_NCHANNELS" in refused.stderr

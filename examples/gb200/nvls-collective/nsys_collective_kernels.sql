@@ -33,6 +33,9 @@
 -- ncclDevKernel_AllGather_RING_LL and the algorithm must be read from the NCCL TUNING log.
 -- Symmetric kernels (ncclSymkDevKernel_AllGather_STMC, ...) do carry the variant in their name.
 -- The torch.cuda._sleep launch-delay kernel is not an NCCL kernel and is excluded.
+-- ncclDevKernel_SendRecv (the read / write workloads) is counted as op "p2p". gridX is the CTA
+-- count of each launch (one CTA per NCCL channel): the only measurement of a send/recv's CTAs,
+-- because NCCL logs none for point-to-point operations.
 --
 -- Run: sqlite3 -header -csv report.sqlite < nsys_collective_kernels.sql
 -- The first result set is per (trial, op, kernel); the second is per trial AG/RS overlap; the third
@@ -62,12 +65,15 @@ collective_kernels AS (
         k.end,
         k.deviceId,
         k.streamId,
+        k.gridX,
+        k.blockX,
         r.start AS launch_start,
         (r.globalTid >> 24) & 16777215 AS pid,
         s.value AS kernel,
         CASE
             WHEN s.value LIKE '%AllGather%' THEN 'ag'
             WHEN s.value LIKE '%ReduceScatter%' THEN 'rs'
+            WHEN s.value LIKE '%SendRecv%' THEN 'p2p'
             ELSE 'ar'
         END AS op
     FROM CUPTI_ACTIVITY_KIND_KERNEL AS k
@@ -76,7 +82,10 @@ collective_kernels AS (
         AND ((r.globalTid >> 24) & 16777215) = ((k.globalPid >> 24) & 16777215)
     JOIN StringIds AS s ON s.id = k.shortName
     WHERE s.value LIKE 'nccl%'
-        AND (s.value LIKE '%AllGather%' OR s.value LIKE '%ReduceScatter%' OR s.value LIKE '%AllReduce%')
+        AND (
+            s.value LIKE '%AllGather%' OR s.value LIKE '%ReduceScatter%' OR s.value LIKE '%AllReduce%'
+            OR s.value LIKE '%SendRecv%'
+        )
 )
 SELECT
     t.label,
@@ -90,7 +99,10 @@ SELECT
     MAX(ck.end - ck.start) AS max_ns,
     MIN(ck.start) AS first_start_ns,
     MAX(ck.end) AS last_end_ns,
-    COUNT(DISTINCT ck.streamId) AS streams
+    COUNT(DISTINCT ck.streamId) AS streams,
+    MIN(ck.gridX) AS grid_min,
+    MAX(ck.gridX) AS grid_max,
+    MAX(ck.blockX) AS block_x
 FROM trials AS t
 JOIN collective_kernels AS ck ON ck.pid = t.pid AND ck.launch_start BETWEEN t.start AND t.end
 GROUP BY t.label, t.trial, ck.op, ck.kernel, ck.deviceId
@@ -157,7 +169,7 @@ WHERE n.end IS NOT NULL AND COALESCE(n.text, s.value) LIKE '%/%MiB-%';
 -- percent of peak) averaged over each trial's GPU window: first start to last end of the
 -- collective kernels launched in the trial. Each report samples only its rank's own GPU, and
 -- GPU_METRICS shares the kernels' timebase. The window covers every collective kernel of the
--- trial; in a C++ report it therefore also starts at the start gate's tiny AllReduce.
+-- trial, send/recv included; in a C++ report it therefore also starts at the start gate's tiny AllReduce.
 WITH
 ranges AS (
     SELECT n.start, n.end, (n.globalTid >> 24) & 16777215 AS pid, COALESCE(n.text, s.value) AS name
@@ -182,7 +194,10 @@ collective_kernels AS (
         AND ((r.globalTid >> 24) & 16777215) = ((k.globalPid >> 24) & 16777215)
     JOIN StringIds AS s ON s.id = k.shortName
     WHERE s.value LIKE 'nccl%'
-        AND (s.value LIKE '%AllGather%' OR s.value LIKE '%ReduceScatter%' OR s.value LIKE '%AllReduce%')
+        AND (
+            s.value LIKE '%AllGather%' OR s.value LIKE '%ReduceScatter%' OR s.value LIKE '%AllReduce%'
+            OR s.value LIKE '%SendRecv%'
+        )
 ),
 windows AS (
     SELECT t.label, t.trial, MIN(ck.start) AS start, MAX(ck.end) AS end

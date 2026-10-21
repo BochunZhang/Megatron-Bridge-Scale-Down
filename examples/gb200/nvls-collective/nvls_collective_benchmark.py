@@ -76,8 +76,8 @@ import os
 import re
 import socket
 import time
-from collections import Counter
-from collections.abc import Callable, Iterator
+from collections import Counter, defaultdict
+from collections.abc import Callable, Iterator, Mapping
 from pathlib import Path
 from statistics import mean, median
 
@@ -90,6 +90,7 @@ from collective_metrics import (
     CROSS_GROUP_WORKLOADS,
     CROSS_PART,
     CROSS_WORKLOAD,
+    CTA_KEY_OF_OP,
     EXTENDED_OPS,
     LATE_JOIN_FRACTION,
     LATE_JOIN_RS_SCALE,
@@ -101,10 +102,14 @@ from collective_metrics import (
     alg_bandwidth_gb_s,
     case_dir_name,
     case_name,
+    cta_config_name,
     late_join_metrics,
     measured_workloads,
     op_bus_bandwidth_gb_s,
+    p2p_comm_ctas,
+    parse_cta_config,
     per_rank_bytes,
+    predicted_p2p_ctas,
     rank_file,
     scenario_name,
     split_groups,
@@ -130,6 +135,15 @@ SYMM_KERNELS = {
     "ag": ["AllGather_ST", "AllGather_LL", "AllGather_STMC", "AllGather_LLMC"],
     "rs": ["ReduceScatter_LD", "ReduceScatter_LL", "ReduceScatter_LDMC"],
     "ar": ["AllReduce_RSxLDMC_AGxSTMC"],
+}
+# The multicast kernel of each op, the one the symm pass runs at 16 MiB and above. A CTA config
+# must not move NCCL off it, or the case would compare kernels instead of CTA counts.
+SYMM_MC_KERNELS = {
+    "ag": "AllGather_STMC",
+    "ag2": "AllGather_STMC",
+    "rs": "ReduceScatter_LDMC",
+    "rs2": "ReduceScatter_LDMC",
+    "ar": "AllReduce_RSxLDMC_AGxSTMC",
 }
 # ncclSymkInitOnce sets hasLsaMultimem only for an LSA team of more than two ranks; without it the
 # RSxLDMC_AGxSTMC kernel is masked out (sym_kernels.cc ncclSymkMask).
@@ -188,6 +202,31 @@ WINDOW_ALGOS = ("symm", *PINNED_IMPLEMENTATIONS)
 GATE_FUNC = "AllReduce"
 GATE_BYTES = 4
 
+# CTA (= channel = thread block) count of one launch, from its TUNING line: symmetric kernels log
+# "nchannels <n>" (scheduler/symmetric_sched.cc), classic ones "channel{Lo..Hi}={<lo>..<hi>}"
+# (enqueue.cc). The copy-engine path launches no kernel and logs neither.
+_SYMM_CHANNELS = re.compile(r" nchannels (\d+) ")
+_CLASSIC_CHANNELS = re.compile(r"channel\{Lo\.\.Hi\}=\{(\d+)\.\.(\d+)\}")
+# Process-wide NCCL variables that override the per-communicator ncclConfig_t minCTAs/maxCTAs of
+# --cta-configs (init.cc, connect.cc, transport/nvls.cc, graph/paths.cc).
+CTA_ENV_OVERRIDES = (
+    "NCCL_MIN_CTAS",
+    "NCCL_MAX_CTAS",
+    "NCCL_MIN_NCHANNELS",
+    "NCCL_MAX_NCHANNELS",
+    "NCCL_MIN_NRINGS",
+    "NCCL_MAX_NRINGS",
+    "NCCL_NVLS_NCHANNELS",
+    "NCCL_MIN_P2P_NCHANNELS",
+    "NCCL_MAX_P2P_NCHANNELS",
+)
+# NCCL_SYM_CTAS fixes the CTA count of every symmetric kernel of the process and, unlike
+# minCTAs/maxCTAs, also lifts the multicast cap below (sym_kernels.cc queryModel_lsa).
+SYM_CTAS_ENV = "NCCL_SYM_CTAS"
+# The multicast symmetric kernels (AllGather_STMC, ReduceScatter_LDMC, AllReduce_RSxLDMC_AGxSTMC)
+# run on at most divUp(32, nRanks) CTAs on Blackwell, whatever minCTAs/maxCTAs say.
+SYMM_MC_CTA_BUDGET = 32
+
 SLEEP_CALIBRATION_CYCLES = 10_000_000
 
 
@@ -198,6 +237,7 @@ class CollectiveGroup:
     ``ag2_pg`` and ``rs2_pg`` are second communicators for concurrent AG+AG and RS+RS workloads.
     ``p2p_pg`` is a communicator spanning all ranks in the group used for NCCL P2P send/recv.
     The extended communicators are ``None`` unless the group was created with ``extended=True``.
+    ``ctas`` is the ``--cta-configs`` entry the communicators were created with (empty: NCCL's choice).
     """
 
     name: str
@@ -208,6 +248,7 @@ class CollectiveGroup:
     ag2_pg: dist.ProcessGroup | None = None
     rs2_pg: dist.ProcessGroup | None = None
     p2p_pg: dist.ProcessGroup | None = None
+    ctas: dict[str, int] = dataclasses.field(default_factory=dict)
 
     @property
     def size(self) -> int:
@@ -294,6 +335,22 @@ def _csv_ints_or_none(value: str) -> list[int]:
     return [] if value == "none" else _csv_ints(value)
 
 
+def _cta_configs(value: str) -> list[dict[str, int]]:
+    """``--cta-configs``: ``;``-separated entries for :func:`collective_metrics.parse_cta_config`."""
+    configs: list[dict[str, int]] = []
+    try:
+        for entry in value.split(";"):
+            if entry.strip():
+                config = parse_cta_config(entry)
+                if config not in configs:
+                    configs.append(config)
+    except ValueError as error:
+        raise argparse.ArgumentTypeError(str(error)) from error
+    if not configs and value.strip():
+        raise argparse.ArgumentTypeError(f"no CTA config in {value!r}")
+    return configs or [{}]
+
+
 def _csv_choices(choices: tuple[str, ...]) -> Callable[[str], list[str]]:
     def parse(value: str) -> list[str]:
         parsed = list(dict.fromkeys(item for item in value.split(",") if item))
@@ -348,6 +405,16 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=[16, 32, 64, 128, 256, 512, 1024, 2048],
         help="Full tensor: AG output / RS input / AR input per rank",
     )
+    parser.add_argument(
+        "--cta-configs",
+        type=_cta_configs,
+        default=[{}],
+        help=(
+            "';'-separated CTA configs, each 'default' or '<op>=<ctas>,...' with <op> in ag,rs,ar,p2p"
+            " (ag2/rs2 follow ag/rs), e.g. 'default;ag=3,rs=6;p2p=32'. Every config rebuilds the"
+            " communicators with ncclConfig_t minCTAs/maxCTAs and runs every case again"
+        ),
+    )
     parser.add_argument("--dtype", choices=sorted(DTYPES), default="bf16")
     parser.add_argument("--warmup", type=int, default=5, help="Untimed iterations before every trial set")
     parser.add_argument("--iters", type=int, default=20, help="Back-to-back iterations per timed trial")
@@ -380,6 +447,38 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     if args.late_join and args.symm_kernel != "default":
         parser.error("--late-join runs an AG and an RS; --symm-kernel would mask one of them")
     return args
+
+
+def _check_cta_environment(algo: str, args: argparse.Namespace, group_sizes: list[int]) -> None:
+    """Refuse CTA configs the environment or NCCL would silently override.
+
+    ``NCCL_MIN_CTAS`` and friends replace every communicator's ncclConfig_t, so a run with them
+    set would report the requested CTA counts while measuring others. A multicast symmetric kernel
+    never runs on more than ``divUp(32, n)`` CTAs, so a larger ``ag``/``rs``/``ar`` request on
+    the window path is rejected here instead of failing the first case.
+    """
+    custom = [config for config in args.cta_configs if config]
+    if not custom:
+        return
+    overrides = sorted(name for name in CTA_ENV_OVERRIDES if os.environ.get(name))
+    if overrides:
+        raise RuntimeError(f"--cta-configs sets CTAs per communicator; unset {overrides}, which override them")
+    if os.environ.get(SYM_CTAS_ENV) and any(set(config) & {"ag", "rs", "ar"} for config in custom):
+        raise RuntimeError(f"{SYM_CTAS_ENV} fixes every symmetric kernel's CTAs; unset it to set ag/rs/ar per op")
+    if algo == "copy-engine" and any("ag" in config for config in custom):
+        raise ValueError("--algo copy-engine runs its AllGather on the copy engines, which use no CTAs; drop ag=")
+    # symm runs every op on a multicast kernel; symm-tma and copy-engine only their RS (LDMC).
+    multicast_keys = ("ag", "rs", "ar") if algo == "symm" else ("rs",) if algo in WINDOW_ALGOS else ()
+    if not os.environ.get(SYM_CTAS_ENV):
+        for config in custom:
+            for key in multicast_keys:
+                limit = -(-SYMM_MC_CTA_BUDGET // max(group_sizes))
+                if config.get(key, 0) > limit:
+                    raise ValueError(
+                        f"--cta-configs {cta_config_name(config)}: {key}={config[key]} exceeds the multicast"
+                        f" symmetric kernels' cap divUp({SYMM_MC_CTA_BUDGET}, {max(group_sizes)}) = {limit}"
+                        f" CTAs on groups of {max(group_sizes)}; only {SYM_CTAS_ENV} lifts it (process-wide)"
+                    )
 
 
 def _check_environment(algo: str, world_size: int, args: argparse.Namespace) -> None:
@@ -449,6 +548,7 @@ def _check_environment(algo: str, world_size: int, args: argparse.Namespace) -> 
         raise RuntimeError("NCCL_DEBUG_SUBSYS must include TUNING: it carries the per-launch algorithm/kernel line")
     if "%p" not in os.environ.get("NCCL_DEBUG_FILE", ""):
         raise RuntimeError("NCCL_DEBUG_FILE must be set and contain %p so every process reads only its own log")
+    _check_cta_environment(algo, args, args.group_sizes)
     too_large = [n for n in args.group_sizes + args.split_totals if n > world_size]
     if too_large:
         raise ValueError(f"group sizes {too_large} exceed WORLD_SIZE={world_size}")
@@ -504,17 +604,60 @@ def _check_pinned_environment(algo: str, args: argparse.Namespace) -> None:
         raise ValueError(f"--algo {algo} needs multicast, i.e. groups of >= {SYMM_AR_MIN_RANKS} ranks; got {small}")
 
 
-def _new_group(name: str, ranks: list[int], *, eager: bool = False, extended: bool = False) -> CollectiveGroup:
+def comm_ctas(op: str, ctas: Mapping[str, int]) -> tuple[int | None, int | None]:
+    """``(min_ctas, max_ctas)`` for the communicator of ``op`` under one ``--cta-configs`` entry.
+
+    A collective's communicator gets ``min = max = N``: NCCL then picks exactly N channels for a
+    classic kernel and N CTAs for a symmetric one (within the multicast cap). The P2P communicator
+    is shaped by :func:`collective_metrics.p2p_comm_ctas`. ``(None, None)`` keeps NCCL's default.
+    """
+    target = ctas.get(CTA_KEY_OF_OP[op])
+    if target is None:
+        return None, None
+    if CTA_KEY_OF_OP[op] == "p2p":
+        return p2p_comm_ctas(target)
+    return target, target
+
+
+def _nccl_options(min_ctas: int | None, max_ctas: int | None) -> dist.ProcessGroupNCCL.Options | None:
+    """ProcessGroupNCCL options carrying ncclConfig_t minCTAs/maxCTAs, or ``None`` for the default.
+
+    torch passes ``options.config`` to every ncclCommInitRankConfig of the group, including the
+    2-rank communicator it creates on the first unbatched send/recv of a lazily created group.
+    """
+    if min_ctas is None and max_ctas is None:
+        return None
+    options = dist.ProcessGroupNCCL.Options()
+    if min_ctas is not None:
+        options.config.min_ctas = min_ctas
+    if max_ctas is not None:
+        options.config.max_ctas = max_ctas
+    return options
+
+
+def _new_group(
+    name: str,
+    ranks: list[int],
+    *,
+    eager: bool = False,
+    extended: bool = False,
+    ctas: Mapping[str, int] | None = None,
+) -> CollectiveGroup:
     # new_group is collective over the default (Gloo) group: every rank calls it in the same order.
     # With a device_id torch creates the members' NCCL communicator right away instead of at the
     # first collective, so a window can be registered before any collective runs.
     device_id = torch.device("cuda", torch.cuda.current_device()) if eager else None
-    ag_pg = dist.new_group(ranks=ranks, backend="nccl", device_id=device_id)
-    rs_pg = dist.new_group(ranks=ranks, backend="nccl", device_id=device_id)
-    ar_pg = dist.new_group(ranks=ranks, backend="nccl", device_id=device_id)
-    ag2_pg = dist.new_group(ranks=ranks, backend="nccl", device_id=device_id) if extended else None
-    rs2_pg = dist.new_group(ranks=ranks, backend="nccl", device_id=device_id) if extended else None
-    p2p_pg = dist.new_group(ranks=ranks, backend="nccl", device_id=device_id) if extended else None
+
+    def new(op: str) -> dist.ProcessGroup:
+        options = _nccl_options(*comm_ctas(op, ctas or {}))
+        return dist.new_group(ranks=ranks, backend="nccl", device_id=device_id, pg_options=options)
+
+    ag_pg = new("ag")
+    rs_pg = new("rs")
+    ar_pg = new("ar")
+    ag2_pg = new("ag2") if extended else None
+    rs2_pg = new("rs2") if extended else None
+    p2p_pg = new("read") if extended else None
     member = dist.get_rank() in ranks
     return CollectiveGroup(
         name=name,
@@ -525,6 +668,7 @@ def _new_group(name: str, ranks: list[int], *, eager: bool = False, extended: bo
         ag2_pg=ag2_pg if (extended and member) else None,
         rs2_pg=rs2_pg if (extended and member) else None,
         p2p_pg=p2p_pg if (extended and member) else None,
+        ctas=dict(ctas or {}),
     )
 
 
@@ -721,6 +865,65 @@ def check_implementation(
             errors.append(f"{func}: expected {want_bytes} B per rank, got {got}")
     observed = ";".join(f"{func}={'|'.join(sorted(seen[func]))}" for func in sorted(seen) if seen[func])
     return observed or None, errors
+
+
+def launch_ctas(line: str) -> int | None:
+    """CTAs of the launch one TUNING line describes, or ``None`` (copy engine, or not a launch line)."""
+    match = _SYMM_CHANNELS.search(line)
+    if match:
+        return int(match.group(1))
+    match = _CLASSIC_CHANNELS.search(line)
+    if match:
+        return int(match.group(2)) - int(match.group(1)) + 1
+    return None
+
+
+def check_ctas(
+    lines: list[str], *, algo: str, ops: tuple[str, ...], ctas: Mapping[str, int]
+) -> tuple[dict[str, str], list[str]]:
+    """Read every collective launch's CTA count and hold the ops of a CTA config to it.
+
+    Returns ``{op: "6"}`` (several counts as ``"3|6"``) for each collective op that logged one,
+    and the violations: a launch on another CTA count than ``ctas`` requests for its op, or, on
+    the symm path, a requested op that NCCL moved off its multicast kernel (the CTA cap changes
+    its kernel choice, which would make the comparison one of kernels, not of CTAs). The start
+    gate (4-byte AllReduce) and P2P ops, which log no CTA count, are skipped.
+    """
+    funcs: dict[str, str] = {}
+    for op in ops:
+        if op not in P2P_OPS:
+            funcs.setdefault(OP_FUNCS[op], op)
+    seen: dict[str, Counter[int]] = defaultdict(Counter)
+    kernels: dict[str, Counter[str]] = defaultdict(Counter)
+    for line in lines:
+        launch = parse_tuning_line(line)
+        if launch is None:
+            continue
+        func, implementation, nbytes = launch
+        if (func == GATE_FUNC and nbytes == GATE_BYTES) or func not in funcs:
+            continue
+        count = launch_ctas(line)
+        if count is not None:
+            seen[func][count] += 1
+        kernels[func][implementation] += 1
+    observed: dict[str, str] = {}
+    errors: list[str] = []
+    for func, op in funcs.items():
+        if seen[func]:
+            observed[op] = "|".join(str(count) for count in sorted(seen[func]))
+        want = ctas.get(CTA_KEY_OF_OP[op])
+        if want is None:
+            continue
+        wrong = {count: n for count, n in seen[func].items() if count != want}
+        if wrong:
+            got = ", ".join(f"{count} x{n}" for count, n in sorted(wrong.items()))
+            errors.append(f"{func}: requested {want} CTAs, NCCL launched {got}")
+        if algo == "symm":
+            off_mc = {impl: n for impl, n in kernels[func].items() if impl != f"Symmetric/{SYMM_MC_KERNELS[op]}"}
+            if off_mc:
+                got = ", ".join(f"{impl} x{n}" for impl, n in sorted(off_mc.items()))
+                errors.append(f"{func}: {want} CTAs moved NCCL off Symmetric/{SYMM_MC_KERNELS[op]}: {got}")
+    return observed, errors
 
 
 class NcclLog:
@@ -1192,6 +1395,28 @@ def _deregister_pool(group: CollectiveGroup, pool: torch.cuda.MemPool | None) ->
     torch.cuda.synchronize()
 
 
+def _predicted_p2p_ctas(group: CollectiveGroup, *, size_bytes: int, eager: bool, n_nodes: object) -> int:
+    """CTAs of one read/write send of an AG shard in ``group`` (:func:`collective_metrics.predicted_p2p_ctas`).
+
+    A lazily created group sends through the 2-rank communicator torch builds for the pair
+    (ProcessGroupNCCL getKeySendRecv), which spans two trays when the pair does; an eagerly
+    initialized one (symm-tma, copy-engine) sends through the group's own communicator.
+    """
+    per_node = int(os.environ.get("LOCAL_WORLD_SIZE", "4"))
+    if eager:
+        n_ranks, multi_node = group.size, bool(n_nodes and int(n_nodes) > 1)  # type: ignore[arg-type]
+    else:
+        n_ranks, multi_node = 2, group.ranks[0] // per_node != group.ranks[1] // per_node
+    min_ctas, max_ctas = comm_ctas("read", group.ctas)
+    return predicted_p2p_ctas(
+        per_rank_bytes("ag", size_bytes, group.size),
+        n_ranks=n_ranks,
+        multi_node=multi_node,
+        min_ctas=min_ctas,
+        max_ctas=max_ctas,
+    )
+
+
 def _write_lines(path: Path, lines: list[str]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("a", encoding="utf-8") as handle:
@@ -1289,6 +1514,7 @@ def run_case(
     case_lines += nccl_log.consume()
     passed = first_ar_ok and (_verify(group, buffers, ops) if group else True)
     implementation, impl_errors = None, []
+    observed_ctas: dict[str, str] | None = None
     if group:
         tuned = parse_nccl_lines(case_lines)
         probe.update({key: tuned[key] for key in ("nccl_algo", "nccl_kernel")})
@@ -1310,6 +1536,8 @@ def run_case(
             gate_launches=ncu_trials if rank == gate.ranks[0] else 0,
             op_sizes=op_sizes,
         )
+        observed_ctas, cta_errors = check_ctas(case_lines, algo=args.algo, ops=check_ops, ctas=group.ctas)
+        impl_errors += cta_errors
     local = {
         "rank": rank,
         "group": group.name if group else None,
@@ -1317,6 +1545,7 @@ def run_case(
         "passed": passed,
         "nccl_impl": implementation,
         "impl_errors": impl_errors,
+        "observed_ctas": observed_ctas,
         **{key: probe.get(key) for key in PROBE_FIELDS},
     }
     gathered: list[dict[str, object] | None] = [None] * world_size
@@ -1371,14 +1600,24 @@ def run_case(
         means = {f"mean_{key}": mean(trial[key] for trial in per_trial) for key in per_trial[0]}
         evidence = {
             key: next((m[key] for m in members if m.get(key) is not None), None)
-            for key in (*PROBE_FIELDS, "nccl_impl")
+            for key in (*PROBE_FIELDS, "nccl_impl", "observed_ctas")
         }
+        p2p_ctas = None
+        if any(op in P2P_OPS for op in group_ops[g.name]):
+            p2p_ctas = _predicted_p2p_ctas(
+                g, size_bytes=size_bytes, eager=args.algo in PINNED_IMPLEMENTATIONS, n_nodes=evidence["n_nodes"]
+            )
         record: dict[str, object] = {
             "case": case,
             "case_dir": str(case_dir.relative_to(args.output_dir)),
             "group_name": g.name,
             "group_size": g.size,
             "ranks": g.ranks,
+            # The --cta-configs entry this case ran with, the CTAs NCCL logged for every collective
+            # launch (comm rank 0's TUNING lines), and the CTAs one send/recv gets (NCCL logs none).
+            "cta_config": cta_config_name(g.ctas),
+            "requested_ctas": dict(g.ctas),
+            "predicted_p2p_ctas": p2p_ctas,
             "size_bytes": size_bytes,
             "size_mib": size_bytes // BYTES_PER_MIB,
             **({"rs_size_bytes": rs_size_bytes} if rs_size_bytes else {}),
@@ -1542,7 +1781,7 @@ def main(argv: list[str] | None = None) -> None:
                             f"\t{start:.3f}\t{end:.3f}\n"
                         )
                 LOGGER.info(
-                    "%s %-6s %-11s n=%-2d %5d MiB %-5s %-10s makespan %7.3f ms  busbw %7.1f GB/s  %s%s",
+                    "%s %-6s %-11s n=%-2d %5d MiB %-5s %-10s %s makespan %7.3f ms  busbw %7.1f GB/s  %s ctas=%s%s",
                     args.algo,
                     fields["scenario"],
                     fields.get("phase", ""),
@@ -1550,21 +1789,28 @@ def main(argv: list[str] | None = None) -> None:
                     record["size_mib"],
                     record["workload"],
                     record["group_name"],
+                    record["cta_config"],
                     record["makespan_ms"],
                     record["aggregate_busbw_gb_s"],
                     record["nccl_impl"] or "kernel=?",
+                    record["observed_ctas"],
                     "  [HOST-BOUND]" if record["host_bound"] else "",
                 )
 
     # Every group of one scenario exists at the same time: torch builds a group one rank at a
     # time, so group A must be joined before creating group B on the ranks that belong to both.
     def case_kwargs(
-        scenario: str, part: str | None, size_bytes: int, workload: str, workloads: list[str]
+        scenario: str, part: str | None, size_bytes: int, workload: str, workloads: list[str], ctas: dict[str, int]
     ) -> dict[str, object]:
         """``workload`` names the case; ``workloads`` is what each group of the topology runs."""
         return {
             "case": case_name(
-                scenario, part=part, workload=workload, dtype=args.dtype, size_mib=size_bytes // BYTES_PER_MIB
+                scenario,
+                part=part,
+                workload=workload,
+                dtype=args.dtype,
+                size_mib=size_bytes // BYTES_PER_MIB,
+                cta_config=cta_config_name(ctas),
             ),
             "size_bytes": size_bytes,
             "workloads": workloads,
@@ -1575,7 +1821,7 @@ def main(argv: list[str] | None = None) -> None:
             "nccl_log": nccl_log,
         }
 
-    def connect(scenario: str, groups: list[CollectiveGroup]) -> tuple[Topology, Path | None]:
+    def connect(scenario: str, groups: list[CollectiveGroup], ctas: dict[str, int]) -> tuple[Topology, Path | None]:
         """Create the scenario's communicators and start gate; keep their init lines in ``comm/``."""
         gate = _new_gate(sorted(member for group in groups for member in group.ranks))
         _connect(groups, gate, rank, windows=pinned)
@@ -1585,8 +1831,12 @@ def main(argv: list[str] | None = None) -> None:
         topology = Topology(groups, rank, comm_info, gate)
         comm_log = None
         if topology.mine:
-            name = rank_file(args.algo, scenario, rank=rank, world_size=world_size, suffix=".nccl.log")
-            comm_log = args.output_dir / "comm" / name
+            name = scenario if not ctas else f"{scenario}-{cta_config_name(ctas)}"
+            comm_log = (
+                args.output_dir
+                / "comm"
+                / rank_file(args.algo, name, rank=rank, world_size=world_size, suffix=".nccl.log")
+            )
             _write_lines(comm_log, lines)
         return topology, comm_log
 
@@ -1596,76 +1846,91 @@ def main(argv: list[str] | None = None) -> None:
         if comm_log:
             _write_lines(comm_log, lines)
 
-    for n in args.group_sizes if args.late_join else []:
-        scenario = scenario_name("late-join", total_ranks=n)
-        group = _new_group(f"late-join{n}", list(range(n)), eager=pinned)
-        topology, comm_log = connect(scenario, [group])
-        common = {"scenario": "late-join", "total_ranks": n, "layout": None, "group_index": 0}
-        for size_bytes in sizes:
-            rs_bytes = LATE_JOIN_RS_SCALE * size_bytes
-            # The references, timed like the join case (join_cycles=0: no sleep): RS(4S) and AG(S) alone.
-            rs_alone = run_case(topology, join_cycles=0, **case_kwargs(scenario, None, rs_bytes, "rs", ["rs"]))
-            emit(rs_alone, phase="rs-isolated", **common)
-            ag_alone = run_case(topology, join_cycles=0, **case_kwargs(scenario, None, size_bytes, "ag", ["ag"]))
-            emit(ag_alone, phase="ag-isolated", **common)
-            # Only rank 0 holds the records; every rank needs the RS time to size its AG sleep.
-            reference: list[dict[str, float] | None] = [None]
-            if rank == 0:
-                reference[0] = {"ag_iso_ms": ag_alone[0]["makespan_ms"], "rs_iso_ms": rs_alone[0]["makespan_ms"]}
-            dist.broadcast_object_list(reference, src=0)
-            join_cycles = max(1, int(cycles_per_ms * LATE_JOIN_FRACTION * reference[0]["rs_iso_ms"]))
-            joined = run_case(
-                topology,
-                rs_size_bytes=rs_bytes,
-                join_cycles=join_cycles,
-                reference=reference[0],
-                **case_kwargs(scenario, None, size_bytes, LATE_JOIN_WORKLOAD, [LATE_JOIN_WORKLOAD]),
-            )
-            emit(joined, phase="join", **common)
-        destroy(topology, comm_log)
+    # CTA counts are fixed when a communicator is created, so every --cta-configs entry rebuilds
+    # the scenario's communicators and runs all of its cases again; the entry is in every case name.
+    for ctas in args.cta_configs:
+        cta_fields = {"cta_config": cta_config_name(ctas)}
+        for n in args.group_sizes if args.late_join else []:
+            scenario = scenario_name("late-join", total_ranks=n)
+            group = _new_group(f"late-join{n}", list(range(n)), eager=pinned, ctas=ctas)
+            topology, comm_log = connect(scenario, [group], ctas)
+            common = {"scenario": "late-join", "total_ranks": n, "layout": None, "group_index": 0, **cta_fields}
+            for size_bytes in sizes:
+                rs_bytes = LATE_JOIN_RS_SCALE * size_bytes
+                # The references, timed like the join case (join_cycles=0: no sleep): RS(4S) and AG(S) alone.
+                rs_alone = run_case(
+                    topology, join_cycles=0, **case_kwargs(scenario, None, rs_bytes, "rs", ["rs"], ctas)
+                )
+                emit(rs_alone, phase="rs-isolated", **common)
+                ag_alone = run_case(
+                    topology, join_cycles=0, **case_kwargs(scenario, None, size_bytes, "ag", ["ag"], ctas)
+                )
+                emit(ag_alone, phase="ag-isolated", **common)
+                # Only rank 0 holds the records; every rank needs the RS time to size its AG sleep.
+                reference: list[dict[str, float] | None] = [None]
+                if rank == 0:
+                    reference[0] = {
+                        "ag_iso_ms": ag_alone[0]["makespan_ms"],
+                        "rs_iso_ms": rs_alone[0]["makespan_ms"],
+                    }
+                dist.broadcast_object_list(reference, src=0)
+                join_cycles = max(1, int(cycles_per_ms * LATE_JOIN_FRACTION * reference[0]["rs_iso_ms"]))
+                joined = run_case(
+                    topology,
+                    rs_size_bytes=rs_bytes,
+                    join_cycles=join_cycles,
+                    reference=reference[0],
+                    **case_kwargs(scenario, None, size_bytes, LATE_JOIN_WORKLOAD, [LATE_JOIN_WORKLOAD], ctas),
+                )
+                emit(joined, phase="join", **common)
+            destroy(topology, comm_log)
 
-    for n in [] if args.late_join else args.group_sizes:
-        scenario = scenario_name("single", total_ranks=n)
-        extended = _needs_extended(workloads)
-        group = _new_group(f"single{n}", list(range(n)), eager=pinned, extended=extended)
-        topology, comm_log = connect(scenario, [group])
-        for size_bytes in sizes:
-            for workload in workloads:
-                records = run_case(topology, **case_kwargs(scenario, None, size_bytes, workload, [workload]))
-                emit(records, scenario="single", phase="isolated", total_ranks=n, layout=None, group_index=0)
-        destroy(topology, comm_log)
-
-    for total in args.split_totals:
-        for layout in args.split_layouts:
-            scenario = scenario_name("split", total_ranks=total, layout=layout)
-            ranks_a, ranks_b = split_groups(total, layout)
+        for n in [] if args.late_join else args.group_sizes:
+            scenario = scenario_name("single", total_ranks=n)
             extended = _needs_extended(workloads)
-            groups = [
-                _new_group(f"{layout}{total}-A", ranks_a, eager=pinned, extended=extended),
-                _new_group(f"{layout}{total}-B", ranks_b, eager=pinned, extended=extended),
-            ]
-            topology, comm_log = connect(scenario, groups)
-            common = {"scenario": "split", "total_ranks": total, "layout": layout}
-            # Neither half runs alone here: its isolated reference is single-n<total/2>, which
-            # runs the same rank count (ranks 0..total/2-1) on the same sizes and workloads.
+            group = _new_group(f"single{n}", list(range(n)), eager=pinned, extended=extended, ctas=ctas)
+            topology, comm_log = connect(scenario, [group], ctas)
+            single = {"scenario": "single", "phase": "isolated", "total_ranks": n, "layout": None, "group_index": 0}
             for size_bytes in sizes:
                 for workload in workloads:
-                    concurrent = run_case(
-                        topology, **case_kwargs(scenario, CONCURRENT_PART, size_bytes, workload, [workload] * 2)
-                    )
-                    for index, record in enumerate(concurrent):
-                        emit([record], phase="concurrent", group_index=index, **common)
-                # A all-gathers while B reduce-scatters; its references are single-n<total/2> ag
-                # and rs, so it runs only when both of those are requested (symm-tma and
-                # copy-engine still run it, without measuring the rs reference themselves).
-                if set(CROSS_GROUP_WORKLOADS) <= set(args.workloads):
-                    cross = run_case(
-                        topology,
-                        **case_kwargs(scenario, CROSS_PART, size_bytes, CROSS_WORKLOAD, list(CROSS_GROUP_WORKLOADS)),
-                    )
-                    for index, record in enumerate(cross):
-                        emit([record], phase="cross", group_index=index, **common)
+                    records = run_case(topology, **case_kwargs(scenario, None, size_bytes, workload, [workload], ctas))
+                    emit(records, **single, **cta_fields)
             destroy(topology, comm_log)
+
+        for total in args.split_totals:
+            for layout in args.split_layouts:
+                scenario = scenario_name("split", total_ranks=total, layout=layout)
+                ranks_a, ranks_b = split_groups(total, layout)
+                extended = _needs_extended(workloads)
+                groups = [
+                    _new_group(f"{layout}{total}-A", ranks_a, eager=pinned, extended=extended, ctas=ctas),
+                    _new_group(f"{layout}{total}-B", ranks_b, eager=pinned, extended=extended, ctas=ctas),
+                ]
+                topology, comm_log = connect(scenario, groups, ctas)
+                common = {"scenario": "split", "total_ranks": total, "layout": layout, **cta_fields}
+                # Neither half runs alone here: its isolated reference is single-n<total/2>, which
+                # runs the same rank count (ranks 0..total/2-1) on the same sizes and workloads.
+                for size_bytes in sizes:
+                    for workload in workloads:
+                        concurrent = run_case(
+                            topology,
+                            **case_kwargs(scenario, CONCURRENT_PART, size_bytes, workload, [workload] * 2, ctas),
+                        )
+                        for index, record in enumerate(concurrent):
+                            emit([record], phase="concurrent", group_index=index, **common)
+                    # A all-gathers while B reduce-scatters; its references are single-n<total/2> ag
+                    # and rs, so it runs only when both of those are requested (symm-tma and
+                    # copy-engine still run it, without measuring the rs reference themselves).
+                    if set(CROSS_GROUP_WORKLOADS) <= set(args.workloads):
+                        cross = run_case(
+                            topology,
+                            **case_kwargs(
+                                scenario, CROSS_PART, size_bytes, CROSS_WORKLOAD, list(CROSS_GROUP_WORKLOADS), ctas
+                            ),
+                        )
+                        for index, record in enumerate(cross):
+                            emit([record], phase="cross", group_index=index, **common)
+                destroy(topology, comm_log)
 
     torch.distributed.barrier()
     dist.destroy_process_group()

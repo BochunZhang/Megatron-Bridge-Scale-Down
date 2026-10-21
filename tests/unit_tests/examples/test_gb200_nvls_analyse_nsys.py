@@ -43,13 +43,16 @@ AR = "ncclDevKernel_AllReduce_Sum_bf16_RING_LL"
 CASE = "all_gather+reduce_scatter-64MiB-bf16-single-n2"
 IDLE_CASE = "all_gather-64MiB-bf16-single-n2"
 RS = "ncclDevKernel_ReduceScatter_Sum_bf16_RING_LL"
+SENDRECV = "ncclDevKernel_SendRecv"
+# gridX of every launch in the fixtures, i.e. the CTA count NCCL launched it with.
+GRID = {AG: 6, RS: 6, AR: 8, SENDRECV: 16}
 SCHEMA = """
 CREATE TABLE StringIds(id INTEGER PRIMARY KEY, value TEXT);
 CREATE TABLE NVTX_EVENTS(start INT, end INT, text TEXT, textId INT, globalTid INT, eventType INT);
 CREATE TABLE CUPTI_ACTIVITY_KIND_RUNTIME(start INT, end INT, globalTid INT, correlationId INT, nameId INT);
 CREATE TABLE CUPTI_ACTIVITY_KIND_KERNEL(
     start INT, end INT, deviceId INT, streamId INT, correlationId INT, globalPid INT,
-    shortName INT, demangledName INT);
+    shortName INT, demangledName INT, gridX INT, blockX INT);
 """
 
 
@@ -61,7 +64,7 @@ def _make_report(path: Path, *, label: str, trials: list[list[tuple[str, int, in
     trial are added so the tests also prove they are excluded.
     """
     tid, gpid = (pid << 24) | 7, pid << 24
-    strings = {AG: 1, RS: 2, "sleep_kernel": 3, label: 4, AR: 5}
+    strings = {AG: 1, RS: 2, "sleep_kernel": 3, label: 4, AR: 5, SENDRECV: 6}
     db = sqlite3.connect(path)
     db.executescript(SCHEMA)
     db.executemany("INSERT INTO StringIds VALUES (?, ?)", [(i, s) for s, i in strings.items()])
@@ -79,8 +82,8 @@ def _make_report(path: Path, *, label: str, trials: list[list[tuple[str, int, in
             (launch_ns, launch_ns + 5, tid, correlation),
         )
         db.execute(
-            "INSERT INTO CUPTI_ACTIVITY_KIND_KERNEL VALUES (?, ?, 0, ?, ?, ?, ?, 0)",
-            (start_ns, end_ns, stream, correlation, gpid, strings[name]),
+            "INSERT INTO CUPTI_ACTIVITY_KIND_KERNEL VALUES (?, ?, 0, ?, ?, ?, ?, 0, ?, 512)",
+            (start_ns, end_ns, stream, correlation, gpid, strings[name], GRID.get(name, 1)),
         )
 
     launch(AG, base - 500, base - 400, base - 300, 1)  # warmup, outside the window
@@ -92,7 +95,7 @@ def _make_report(path: Path, *, label: str, trials: list[list[tuple[str, int, in
         )
         launch("sleep_kernel", start + 2, start + 3, start + 10, 9)
         for name, at, k_start, k_end in kernels:
-            launch(name, start + at, start + k_start, start + k_end, {AG: 1, RS: 2, AR: 3}[name])
+            launch(name, start + at, start + k_start, start + k_end, {AG: 1, RS: 2, AR: 3, SENDRECV: 4}[name])
     db.commit()
     db.close()
 
@@ -423,8 +426,8 @@ def test_one_failing_pass_does_not_stop_the_others(tmp_path):
 @pytest.mark.unit
 def test_summary_values_are_per_iteration_and_overlap_is_relative_to_the_shorter_op():
     kernels = [
-        analyse.KernelRow("symm", 0, "r", "L", "trial0", "ag", AG, 0, 4, 4_000_000, 1, 1, 0, 6_000_000, 1),
-        analyse.KernelRow("symm", 0, "r", "L", "trial0", "rs", RS, 0, 4, 2_000_000, 1, 1, 0, 5_000_000, 1),
+        analyse.KernelRow("symm", 0, "r", "L", "trial0", "ag", AG, 0, 4, 4_000_000, 1, 1, 0, 6_000_000, 1, 6, 6, 512),
+        analyse.KernelRow("symm", 0, "r", "L", "trial0", "rs", RS, 0, 4, 2_000_000, 1, 1, 0, 5_000_000, 1, 6, 6, 512),
     ]
     results = [
         {
@@ -449,7 +452,7 @@ def test_summary_values_are_per_iteration_and_overlap_is_relative_to_the_shorter
 
 @pytest.mark.unit
 def test_summary_ignores_ranks_outside_every_group():
-    kernels = [analyse.KernelRow("ring", 5, "r", "L", "trial0", "ag", AG, 0, 1, 10, 10, 10, 0, 10, 1)]
+    kernels = [analyse.KernelRow("ring", 5, "r", "L", "trial0", "ag", AG, 0, 1, 10, 10, 10, 0, 10, 1, 6, 6, 512)]
     results = [
         {"nsys_label": "L", "ranks": [0, 1], "group_name": "g", "group_size": 2, "iters": 1, "makespan_ms": 1.0}
     ]
@@ -489,7 +492,9 @@ def test_kernels_query_classifies_all_reduce_and_the_gate_stays_outside_trials(t
     # The torch benchmark launches its start gate (an AllReduce) before the trial range opens.
     db = sqlite3.connect(path)
     db.execute("INSERT INTO CUPTI_ACTIVITY_KIND_RUNTIME VALUES (10000, 10005, ?, 999, 0)", ((4242 << 24) | 7,))
-    db.execute("INSERT INTO CUPTI_ACTIVITY_KIND_KERNEL VALUES (10006, 10010, 0, 3, 999, ?, 5, 0)", (4242 << 24,))
+    db.execute(
+        "INSERT INTO CUPTI_ACTIVITY_KIND_KERNEL VALUES (10006, 10010, 0, 3, 999, ?, 5, 0, 1, 64)", (4242 << 24,)
+    )
     db.commit()
     db.close()
     kernels, overlap = _query(path, label)
@@ -503,8 +508,8 @@ def test_kernels_query_classifies_all_reduce_and_the_gate_stays_outside_trials(t
 def test_summary_counts_only_the_ops_of_the_case_workload():
     # A trial range that still contains the gate (C++ benchmark) shows an AllReduce in an AG case.
     kernels = [
-        analyse.KernelRow("ce", 0, "r", "L", "trial0", "ag", AG, 0, 2, 2_000_000, 1, 1, 0, 2_000_000, 1),
-        analyse.KernelRow("ce", 0, "r", "L", "trial0", "ar", AR, 0, 1, 5_000, 5_000, 5_000, 0, 5_000, 1),
+        analyse.KernelRow("ce", 0, "r", "L", "trial0", "ag", AG, 0, 2, 2_000_000, 1, 1, 0, 2_000_000, 1, 6, 6, 512),
+        analyse.KernelRow("ce", 0, "r", "L", "trial0", "ar", AR, 0, 1, 5_000, 5_000, 5_000, 0, 5_000, 1, 6, 6, 512),
     ]
     results = [
         {
@@ -616,3 +621,44 @@ def test_main_writes_the_gpu_metric_report_only_for_runs_with_metrics(tmp_path):
     csv_lines = (run / "symm" / "nsys" / "gpu_metrics.csv").read_text(encoding="utf-8").splitlines()
     assert csv_lines[0] == "algo,rank,report,label,trial,metric,samples,mean,peak,window_ns"
     assert len(csv_lines) == 1 + 2 * 2  # header + ranks × metrics
+
+
+@pytest.mark.unit
+def test_kernels_query_counts_send_recv_as_p2p_and_reports_the_grid(tmp_path):
+    path = tmp_path / "r.sqlite"
+    label = "symm/all_gather+write-1024MiB-bf16-single-n4-cta-p2p32"
+    _make_report(path, label=label, trials=[[(AG, 20, 100, 1100), (SENDRECV, 21, 100, 900)]])
+    kernels, overlap = _query(path, label)
+    got = {row.op: (row.kernel, row.grid_min, row.grid_max, row.block_x) for row in kernels}
+    assert got == {"ag": (AG, 6, 6, 512), "p2p": (SENDRECV, 16, 16, 512)}
+    assert overlap == {}  # the AG x RS overlap ignores send/recv
+
+
+@pytest.mark.unit
+def test_summary_keeps_p2p_kernels_of_read_write_workloads_and_lists_their_ctas():
+    kernels = [
+        analyse.KernelRow("symm", 0, "r", "L", "trial0", "ag", AG, 0, 2, 2_000_000, 1, 1, 0, 2_000_000, 1, 6, 6, 512),
+        analyse.KernelRow(
+            "symm", 0, "r", "L", "trial0", "p2p", SENDRECV, 0, 2, 1_000_000, 1, 1, 0, 1_000_000, 1, 16, 32, 640
+        ),
+    ]
+    results = [
+        {
+            "nsys_label": "L",
+            "ranks": [0],
+            "group_name": "g",
+            "group_size": 4,
+            "workload": "ag+write",
+            "phase": "isolated",
+            "iters": 2,
+            "makespan_ms": 1.0,
+        }
+    ]
+    (row,) = analyse.summarize(kernels, {}, results)
+    assert row["p2p_ms"] == pytest.approx(0.5)
+    assert row["grid"] == "ag=6;p2p=16|32"
+    # In an AG-only case a stray send/recv is not part of the workload.
+    results[0]["workload"] = "ag"
+    (row,) = analyse.summarize(kernels, {}, results)
+    assert row["p2p_ms"] == 0.0 and row["grid"] == "ag=6"
+    assert "CTAs (gridX)" in analyse.render([row])

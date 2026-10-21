@@ -319,6 +319,62 @@ bash examples/gb200/nvls-collective/run_nvls_collective_benchmark.sh \
 capacity 和窗口内带宽都是从完成时间推出来的估算。直接证据是 `--nsys` 的 NVLink TX/RX 采样：在 nsys 时间线上
 对齐 RS、AG 两个 kernel，看 AG 加入前后入方向（RX）和出方向（TX）各自是否上升。
 
+### 分别指定 AG / RS / AR / P2P 的 CTA 数（`--cta-configs`）
+
+```bash
+bash examples/gb200/nvls-collective/run_nvls_collective_benchmark.sh --algos symm --group-sizes 4 \
+  --sizes-mib 1024 --workloads ag+write,rs+write,ag+rs \
+  --cta-configs 'default;ag=3,rs=3;p2p=32;ag=3,rs=6' --nsys
+```
+
+问题：AG/RS 和 P2P（或者 AG 和 RS）同时跑时，给它们分配不同数量的 SM，流量怎么变化？
+
+**怎么限制。** NCCL 每个 channel 一个 CTA（thread block），CTA 数在 communicator 创建时由 `ncclConfig_t` 的
+`minCTAs` / `maxCTAs` 决定。torch 通过 `dist.new_group(..., pg_options=ProcessGroupNCCL.Options())` 的
+`options.config.min_ctas / max_ctas` 把它传给这个 process group 下的**每一个** NCCL communicator（包括 symm
+懒初始化时 torch 为 send/recv 单独建的 2 卡 communicator）。benchmark 里 AG、RS、AR、AG2、RS2、P2P 本来就是
+各自独立的 group，所以**同一个 case 里每个 op 可以用不同的 CTA 数**，例如 `ag+rs` 里 AG 3 个、RS 6 个。
+
+| 键 | 作用于 | 设置方式 | 说明 |
+| --- | --- | --- | --- |
+| `ag=N` | AG 的 comm（`ag+ag` 的第二个 AG 也跟随） | `min_ctas = max_ctas = N` | 经典 kernel：channel 数 = N；symm：对称 kernel 的 CTA 数 = N |
+| `rs=N` | RS 的 comm（`rs+rs` 的第二个 RS 也跟随） | 同上 | |
+| `ar=N` | AR 的 comm | 同上 | |
+| `p2p=N` | read / write 的 comm，N ∈ 1,2,4,8,16,32 | N ≤ 16：`max_ctas = N`；N = 32：`min_ctas = 64` | 见下 |
+
+- 每个 `;` 分隔的条目是一组配置；`default` 是 NCCL 自己选。每组配置都会**重建所有 communicator**，把所有 case
+  再跑一遍（同一个 torchrun 进程内循环，不是多次调用 Python），case 名追加 `-cta-ag3-rs6-p2p32` 这样的后缀，
+  `comm/` 日志也带同样的后缀。结果写进同一个 `results.jsonl`，每行带 `cta_config`、`requested_ctas`、
+  `observed_ctas`、`predicted_p2p_ctas`。
+- **symm 的上限**：multicast 对称 kernel（`AllGather_STMC`、`ReduceScatter_LDMC`、`AllReduce_RSxLDMC_AGxSTMC`）
+  在 Blackwell 上最多 `divUp(32, n)` 个 CTA（`sym_kernels.cc` `queryModel_lsa`），`minCTAs/maxCTAs` 突破不了：
+  4 卡最多 8（默认 6），8 卡 4，16 卡 2，32 卡 1。超过上限的配置启动前就报错。唯一能突破的是进程级的
+  `NCCL_SYM_CTAS`，它同时作用于所有对称 kernel，所以不能和 `ag=/rs=/ar=` 一起用（可以和 `p2p=` 一起用）。
+- **P2P**：send/recv 的 CTA 数由两层决定（`paths.cc`、`enqueue.cc`）：comm 的 P2P channel 数
+  `pow2Up(nChannels)`，以及每次 send 按大小在 `[起始值, 每 peer 上限 32]` 之间翻倍（同 tray 每个 channel 最多
+  32 × 512 KiB = 16 MiB，跨 tray 每个 channel 一个 256 KiB chunk）。4 卡 1024 MiB 时每次 send 256 MiB，默认 16 个；
+  `max_ctas = N` 把它压到 N；要翻倍到 32 必须让 comm 有 64 个 P2P channel，即 `min_ctas = 64`。消息太小时达不到目标值，
+  `predicted_p2p_ctas` 会如实给出推算值。
+- **校验**：集合通信每次 launch 的 CTA 数都从 comm rank 0 的 TUNING 日志读（对称 kernel 的 `nchannels`，经典 kernel 的
+  `channel{Lo..Hi}`），和请求值不一致、或者 symm 因为 CTA 上限换掉了 multicast kernel（比如 `AllGather_STMC` 变成
+  `AllGather_ST`），case 直接失败——否则比较的是 kernel 而不是 CTA 数。NCCL 不为 send/recv 打 CTA 日志，P2P 的 CTA 数是
+  按源码推算的（compare.md 里写成 `~N`），**实测值看 `--nsys` 后 `nsys_kernels.md` 的 `CTAs (gridX)` 列**。
+- 进程级的 `NCCL_MIN_CTAS`、`NCCL_MAX_CTAS`、`NCCL_{MIN,MAX}_NCHANNELS`、`NCCL_{MIN,MAX}_NRINGS`、
+  `NCCL_NVLS_NCHANNELS`、`NCCL_{MIN,MAX}_P2P_NCHANNELS` 会覆盖每个 comm 的 config，设了它们再用 `--cta-configs`
+  会报错。copy-engine 的 AG 不用 SM，不接受 `ag=`。
+- 读结果：`compare.md` 表 1–5 只用 `default` 的结果，新增的**表 6** 把每个非 default 配置和同一 case 的 default
+  配对，每个 op 给出 `CTA 数 / 每次迭代 ms (相对 default)`。
+
+**看实际用了多少 SM。** CTA 数 ≈ 占用的 SM 数（CTA 数远小于 SM 数时调度器会把它们分散到不同 SM；一个 SM 理论上能放多个
+CTA，所以只是近似）。证据从强到弱：
+
+1. nsys `CUPTI_ACTIVITY_KIND_KERNEL.gridX`：每个 kernel 的 grid 大小，`nsys_kernels.md` 的 `CTAs (gridX)` 列（含 P2P 的
+   `ncclDevKernel_SendRecv`）。
+2. nsys GPU metrics 的 `SMs Active`：整卡随时间的 SM 占用比例，重叠阶段约等于（AG CTA + P2P CTA）/ SM 总数；在
+   `gpu_metrics.csv` 里（`nsys_gpu_metrics.md` 只列 NVLink / DRAM / C2C）。
+3. 集合通信：TUNING 日志的 `nchannels` / `channel{Lo..Hi}`，即 `results.jsonl` 的 `observed_ctas`。
+4. ncu 的 `LaunchStats` / `Occupancy`：Grid Size 和每个 SM 能放的 CTA 数；ncu 串行重放，看不到重叠。
+
 ### 输出目录（不需要指定）
 
 固定为仓库内 `results/gb200/nvls-collective/gpu-num-<总卡数>/<yyyymmdd-hhmmss>`，时间戳由
@@ -434,7 +490,8 @@ sqlite3 -header -csv rank0.1.sqlite < examples/gb200/nvls-collective/nsys_collec
 | 找 case 和 trial | `NVTX_EVENTS` + `StringIds` | 外层 range 名形如 `symm/all_gather+reduce_scatter-256MiB-bf16-single-n4`，内层为 `trial0..N`；`text` 与 `textId` 两种导出格式都支持 |
 | kernel → 发射它的 API | `CUPTI_ACTIVITY_KIND_KERNEL` ⋈ `CUPTI_ACTIVITY_KIND_RUNTIME` | `correlationId` 相同且同一进程（`globalTid >> 24`） |
 | kernel → trial | 上面两者 | **发射时刻**落在 trial 的 NVTX range 内（与 `mbench/build_csv.py` 相同），不看 GPU 何时执行 |
-| 只保留集合通信 | `StringIds.value` | 名字以 `nccl` 开头且含 `AllGather` / `ReduceScatter` / `AllReduce`，分别记为 `ag`/`rs`/`ar`；`_sleep` 延迟 kernel、warmup、trial range 外的 start gate 都被排除 |
+| 只保留通信 kernel | `StringIds.value` | 名字以 `nccl` 开头且含 `AllGather` / `ReduceScatter` / `AllReduce` / `SendRecv`，分别记为 `ag`/`rs`/`ar`/`p2p`；`_sleep` 延迟 kernel、warmup、trial range 外的 start gate 都被排除 |
+| 每次 launch 的 CTA 数 | `CUPTI_ACTIVITY_KIND_KERNEL.gridX` | grid 大小 = NCCL channel 数 = CTA 数，每个 op 列出出现过的值（`nsys_kernels.md` 的 `CTAs (gridX)` 列） |
 | 只算本负载的 op | `analyse_nsys.py` | 每行只统计 case 的 workload 里有的 op；C++ 版的 trial range 仍包含 gate，AG/RS case 里的 gate AllReduce 由此剔除 |
 | AG∩RS 重叠 | 同 trial 的 AG × RS kernel 两两求交 | 同一 collective 在自己的 stream 上串行，所以两两交集之和就是精确的重叠时长 |
 
@@ -625,6 +682,9 @@ busbw = 357.9 × 7/8 = 313.2 GB/s。表 1–4 用 trial 中位数换算，表 0 
 | 3 | 两个 T/2 组同跑同一负载 | 实现 × 布局 × 消息 × 负载 × 组 | isolated busbw（取自 `single-n<T/2>`）、concurrent busbw、`slowdown = T_concurrent / T_isolated`、concurrency |
 | 4 | A 组 AG、B 组 RS 同时跑 | 实现 × 布局 × 消息 | A 的 AG 与 B 的 RS 各自的 isolated / cross busbw、cross ms、slowdown，`A+B cross busbw`、concurrency |
 | 5 | late join（仅 `--late-join`） | 实现 × 组大小 × AG 大小 | 放行时刻、AG / RS 的 isolated 与 join 时间、slowdown、overlap 窗口内 algbw、capacity、AG share |
+| 6 | CTA 配置（仅 `--cta-configs` 有非 default 条目） | 实现 × case × CTA 配置 | 每个 op 的 CTA 数（P2P 为推算 `~N`）、每次迭代 ms 及相对 default 的比值、makespan / default |
+
+表 1–5 只用 `default` CTA 配置的结果；表 0 列出所有 case（含各 CTA 配置）。
 
 表 3、表 4 的 isolated 参照都是 `single-n<T/2>` 里同大小、同负载的 case（表 4：A 对 `ag`、B 对 `rs`），
 所以 cross case 只在 `--workloads` 同时包含 `ag` 和 `rs` 时运行（默认包含；`--symm-kernel` 固定内核时不跑）。

@@ -81,6 +81,11 @@ Options:
                           raise it when cases are flagged HOST-BOUND
   --symm-kernel KERNEL    For the symm pass only: default, ag, rs or ar (pins NCCL_SYM_KERNEL); needs
                           --workloads with that op only, because the pin masks the other op
+  --cta-configs LIST      ';'-separated CTA configs, each 'default' or '<op>=<ctas>,...' with <op> in
+                          ag,rs,ar,p2p (ag2/rs2 follow ag/rs), e.g. 'default;ag=3,rs=6;p2p=32'
+                          (default: default). Each entry rebuilds every communicator with ncclConfig_t
+                          minCTAs/maxCTAs and reruns all cases, named ...-cta-ag3-rs6; compare.md
+                          table 6 compares them with default. Quote it: ';' ends a shell command
   --nsys                  One Nsight Systems report per rank per case (capture range = timed trials),
                           with GPU metrics (NVLink RX/TX, DRAM, ...) sampled on the rank's own GPU;
                           node 0 files them under cases/ after each pass (renames only);
@@ -119,6 +124,10 @@ Examples:
   # One tray: nsys trace plus NVLink / DRAM throughput curves of the symmetric kernels.
   bash examples/gb200/nvls-collective/run_nvls_collective_benchmark.sh \
     --algos symm --sizes-mib 256,1024 --trials 3 --nsys
+
+  # One tray: AG/RS + P2P with fewer AG/RS CTAs or twice the P2P CTAs, plus nsys gridX evidence.
+  bash examples/gb200/nvls-collective/run_nvls_collective_benchmark.sh --algos symm --group-sizes 4 \
+    --sizes-mib 1024 --workloads ag+write,rs+write,ag+rs --cta-configs 'default;ag=3,rs=3;p2p=32' --nsys
 
   # One tray: Nsight Compute details of the symmetric AG kernel (keep the case count small:
   # trial0 of every case is replayed once per counter pass).
@@ -166,6 +175,7 @@ trials=""
 launch_delay_ms="5"
 late_join=false
 symm_kernel="default"
+cta_configs="default"
 nsys_enabled=false
 nsys_gpu_metrics_set=""
 nsys_freq="50000"
@@ -200,6 +210,7 @@ while [[ $# -gt 0 ]]; do
         --launch-delay-ms) need_value "$@"; launch_delay_ms="$2"; shift 2 ;;
         --late-join) late_join=true; shift ;;
         --symm-kernel) need_value "$@"; symm_kernel="$2"; shift 2 ;;
+        --cta-configs) need_value "$@"; cta_configs="$2"; shift 2 ;;
         --nsys) nsys_enabled=true; shift ;;
         --nsys-gpu-metrics-set) need_value "$@"; nsys_gpu_metrics_set="$2"; shift 2 ;;
         --nsys-freq) need_value "$@"; nsys_freq="$2"; shift 2 ;;
@@ -305,6 +316,14 @@ fi
 if (( nnodes > 1 )) && [[ "$master_addr" == 127.0.0.1 ]]; then
     die "multi-node runs require --master-addr or MASTER_ADDR"
 fi
+# Process-wide CTA variables override the per-communicator ncclConfig_t of --cta-configs; fail
+# here instead of in every pass (the benchmark checks the same list).
+if [[ "$cta_configs" != default ]]; then
+    for name in NCCL_MIN_CTAS NCCL_MAX_CTAS NCCL_MIN_NCHANNELS NCCL_MAX_NCHANNELS NCCL_MIN_NRINGS \
+        NCCL_MAX_NRINGS NCCL_NVLS_NCHANNELS NCCL_MIN_P2P_NCHANNELS NCCL_MAX_P2P_NCHANNELS; do
+        [[ -z "${!name:-}" ]] || die "--cta-configs sets CTAs per communicator; unset ${name}, which overrides them"
+    done
+fi
 if [[ -n "${NCCL_ALGO:-}" || -n "${NCCL_NVLS_ENABLE:-}" ]]; then
     echo "WARNING: NCCL_ALGO / NCCL_NVLS_ENABLE from the environment are overridden per algorithm" >&2
 fi
@@ -372,6 +391,7 @@ bench_args=(
     --trials "$trials"
     --launch-delay-ms "$launch_delay_ms"
     --split-totals "$split_totals"
+    --cta-configs "$cta_configs"
 )
 $late_join && bench_args+=(--late-join)
 
