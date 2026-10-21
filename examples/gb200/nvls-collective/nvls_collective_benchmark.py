@@ -90,6 +90,7 @@ from collective_metrics import (
     CROSS_GROUP_WORKLOADS,
     CROSS_PART,
     CROSS_WORKLOAD,
+    EXTENDED_OPS,
     LATE_JOIN_FRACTION,
     LATE_JOIN_RS_SCALE,
     LATE_JOIN_WORKLOAD,
@@ -133,7 +134,16 @@ SYMM_KERNELS = {
 # ncclSymkInitOnce sets hasLsaMultimem only for an LSA team of more than two ranks; without it the
 # RSxLDMC_AGxSTMC kernel is masked out (sym_kernels.cc ncclSymkMask).
 SYMM_AR_MIN_RANKS = 3
-OP_FUNCS = {"ag": "AllGather", "rs": "ReduceScatter", "ar": "AllReduce"}
+OP_FUNCS = {
+    "ag": "AllGather",
+    "rs": "ReduceScatter",
+    "ar": "AllReduce",
+    "ag2": "AllGather",
+    "rs2": "ReduceScatter",
+}
+# p2p_read and p2p_write use NCCL Send/Recv, which log in a different format;
+# they are excluded from check_implementation's TUNING-line checks.
+P2P_OPS = frozenset({"p2p_read", "p2p_write"})
 PROBE_FIELDS = ("nccl_algo", "nccl_kernel", "n_nodes", "mnnvl")
 # The three INFO(NCCL_TUNING, ...) lines NCCL 2.29 prints on comm rank 0 for every launch:
 #   "<Func>: <n> Bytes -> Algo <algo> proto <proto> ..."      enqueue.cc, classic kernels
@@ -183,13 +193,21 @@ SLEEP_CALIBRATION_CYCLES = 10_000_000
 
 @dataclasses.dataclass
 class CollectiveGroup:
-    """One rank set with a dedicated communicator per collective so AG, RS and AR can overlap."""
+    """One rank set with a dedicated communicator per collective so AG, RS and AR can overlap.
+
+    ``ag2_pg`` and ``rs2_pg`` are second communicators for concurrent AG+AG and RS+RS workloads.
+    ``p2p_pg`` is a communicator spanning all ranks in the group used for NCCL P2P send/recv.
+    The extended communicators are ``None`` unless the group was created with ``extended=True``.
+    """
 
     name: str
     ranks: list[int]
     ag_pg: dist.ProcessGroup | None
     rs_pg: dist.ProcessGroup | None
     ar_pg: dist.ProcessGroup | None
+    ag2_pg: dist.ProcessGroup | None = None
+    rs2_pg: dist.ProcessGroup | None = None
+    p2p_pg: dist.ProcessGroup | None = None
 
     @property
     def size(self) -> int:
@@ -197,8 +215,8 @@ class CollectiveGroup:
         return len(self.ranks)
 
     def communicators(self) -> tuple[dist.ProcessGroup | None, ...]:
-        """Every communicator of the group, in a fixed order."""
-        return (self.ag_pg, self.rs_pg, self.ar_pg)
+        """Every communicator of the group, in a fixed order (including extended ones)."""
+        return (self.ag_pg, self.rs_pg, self.ar_pg, self.ag2_pg, self.rs2_pg, self.p2p_pg)
 
 
 @dataclasses.dataclass
@@ -207,6 +225,10 @@ class Buffers:
 
     An all-reduce is in-place, so it gets its own buffer holding the small-integer input that
     the reduction overwrites; ``rs_out`` cannot be reused because its contents are verified.
+
+    ``ag2_out`` and ``rs2_out`` are outputs of the second AG/RS communicator used by the
+    concurrent ``ag+ag`` / ``rs+rs`` workloads; they are full-size / shard-size like ``ag_out``
+    / ``rs_out``. ``p2p_buf`` is the receive buffer for P2P workloads (shard-sized, like ``ag_in``).
     """
 
     ag_in: torch.Tensor
@@ -214,6 +236,9 @@ class Buffers:
     rs_in: torch.Tensor
     rs_out: torch.Tensor
     ar_buf: torch.Tensor
+    ag2_out: torch.Tensor | None = None
+    rs2_out: torch.Tensor | None = None
+    p2p_buf: torch.Tensor | None = None
     pool: torch.cuda.MemPool | None = None
 
 
@@ -468,7 +493,10 @@ def _check_pinned_environment(algo: str, args: argparse.Namespace) -> None:
                 f" to the multicast address, got {multicast!r}"
             )
     if not measured_workloads(algo, args.workloads):
-        raise ValueError(f"--algo {algo} measures only ag and ag+rs; got --workloads {args.workloads}")
+        raise ValueError(
+            f"--algo {algo} measures ag, ag+rs and the AG-based concurrent workloads;"
+            f" got --workloads {args.workloads}"
+        )
     # TmaSTMC, LDMC and the multicast CE all need LSA multimem, which ncclSymkInitOnce grants only
     # to an LSA team of more than two ranks.
     small = sorted({n for n in args.group_sizes + [n // 2 for n in args.split_totals] if n < SYMM_AR_MIN_RANKS})
@@ -476,7 +504,7 @@ def _check_pinned_environment(algo: str, args: argparse.Namespace) -> None:
         raise ValueError(f"--algo {algo} needs multicast, i.e. groups of >= {SYMM_AR_MIN_RANKS} ranks; got {small}")
 
 
-def _new_group(name: str, ranks: list[int], *, eager: bool = False) -> CollectiveGroup:
+def _new_group(name: str, ranks: list[int], *, eager: bool = False, extended: bool = False) -> CollectiveGroup:
     # new_group is collective over the default (Gloo) group: every rank calls it in the same order.
     # With a device_id torch creates the members' NCCL communicator right away instead of at the
     # first collective, so a window can be registered before any collective runs.
@@ -484,6 +512,9 @@ def _new_group(name: str, ranks: list[int], *, eager: bool = False) -> Collectiv
     ag_pg = dist.new_group(ranks=ranks, backend="nccl", device_id=device_id)
     rs_pg = dist.new_group(ranks=ranks, backend="nccl", device_id=device_id)
     ar_pg = dist.new_group(ranks=ranks, backend="nccl", device_id=device_id)
+    ag2_pg = dist.new_group(ranks=ranks, backend="nccl", device_id=device_id) if extended else None
+    rs2_pg = dist.new_group(ranks=ranks, backend="nccl", device_id=device_id) if extended else None
+    p2p_pg = dist.new_group(ranks=ranks, backend="nccl", device_id=device_id) if extended else None
     member = dist.get_rank() in ranks
     return CollectiveGroup(
         name=name,
@@ -491,6 +522,9 @@ def _new_group(name: str, ranks: list[int], *, eager: bool = False) -> Collectiv
         ag_pg=ag_pg if member else None,
         rs_pg=rs_pg if member else None,
         ar_pg=ar_pg if member else None,
+        ag2_pg=ag2_pg if (extended and member) else None,
+        rs2_pg=rs2_pg if (extended and member) else None,
+        p2p_pg=p2p_pg if (extended and member) else None,
     )
 
 
@@ -622,7 +656,16 @@ def check_implementation(
     same function name as the start gate. The gate is recognized by its 4-byte size first, so an
     ``ar`` case only accepts all-reduce lines of its own payload size.
     """
-    expected_funcs = {OP_FUNCS[op]: op for op in ops}
+    # Build the expected function map, allowing multiple ops to share the same NCCL function
+    # (e.g. ag+ag: both "ag" and "ag2" map to "AllGather").  For p2p ops (Send/Recv) the
+    # TUNING log format differs, so they are excluded from the check entirely.
+    expected_funcs: dict[str, list[str]] = {}
+    for op in ops:
+        if op in P2P_OPS:
+            continue
+        if op in OP_FUNCS:
+            func = OP_FUNCS[op]
+            expected_funcs.setdefault(func, []).append(op)
     seen: dict[str, Counter[str]] = {func: Counter() for func in expected_funcs}
     sizes: dict[str, Counter[int]] = {func: Counter() for func in expected_funcs}
     foreign: Counter[str] = Counter()
@@ -644,10 +687,18 @@ def check_implementation(
     errors = [f"unexpected collective {name} x{count}" for name, count in sorted(foreign.items())]
     if gates != gate_launches:
         errors.append(f"start gate: {gates} {GATE_FUNC} launches in the NCCL log, expected {gate_launches}")
-    for func, op in expected_funcs.items():
+    for func, op_list in expected_funcs.items():
+        # Expect launches per op that maps to this function.
+        expected_count = launches * len(op_list)
+        # For ar: the first launch is checked separately but still counted in the log.
+        if "ar" in op_list:
+            expected_count += 1
         total = sum(seen[func].values())
-        if total != launches:
-            errors.append(f"{func}: {total} launches in the NCCL log, expected {launches}")
+        if total != expected_count:
+            errors.append(f"{func}: {total} launches in the NCCL log, expected {expected_count}")
+        # Check implementation correctness using the first op in the list (all share the same
+        # collective type, so the implementation constraint is identical for each).
+        op = op_list[0]
         wrong = {
             impl: n
             for impl, n in seen[func].items()
@@ -725,6 +776,18 @@ def _connect(groups: list[CollectiveGroup], gate: StartGate, rank: int, *, windo
                 reduced = torch.empty(1024, device="cuda")
                 dist.reduce_scatter_tensor(reduced, gathered, group=group.rs_pg)
                 torch.cuda.synchronize()
+                # Warm up the extended communicators if they exist.
+                if group.ag2_pg is not None:
+                    ag2_gathered = torch.empty(1024 * group.size, device="cuda")
+                    dist.all_gather_into_tensor(ag2_gathered, shard, group=group.ag2_pg)
+                    torch.cuda.synchronize()
+                if group.rs2_pg is not None:
+                    rs2_reduced = torch.empty(1024, device="cuda")
+                    dist.reduce_scatter_tensor(rs2_reduced, gathered, group=group.rs2_pg)
+                    torch.cuda.synchronize()
+                if group.p2p_pg is not None:
+                    dist.barrier(group=group.p2p_pg)
+                    torch.cuda.synchronize()
             reduced_inplace = torch.ones(1024, device="cuda")
             dist.all_reduce(reduced_inplace, group=group.ar_pg)
             torch.cuda.synchronize()
@@ -745,6 +808,16 @@ def _connect_windows(group: CollectiveGroup, rank: int) -> None:
     torch.cuda.synchronize()
     dist.reduce_scatter_tensor(buffers.rs_out, buffers.rs_in, group=group.rs_pg)
     torch.cuda.synchronize()
+    # Warm up the extended communicators on the same window.
+    if group.ag2_pg is not None and buffers.ag2_out is not None:
+        dist.all_gather_into_tensor(buffers.ag2_out, buffers.ag_in, group=group.ag2_pg)
+        torch.cuda.synchronize()
+    if group.rs2_pg is not None and buffers.rs2_out is not None:
+        dist.reduce_scatter_tensor(buffers.rs2_out, buffers.rs_in, group=group.rs2_pg)
+        torch.cuda.synchronize()
+    if group.p2p_pg is not None:
+        dist.barrier(group=group.p2p_pg)
+        torch.cuda.synchronize()
     _deregister_pool(group, buffers.pool)
 
 
@@ -769,7 +842,8 @@ def _register_pool(group: CollectiveGroup, pool: torch.cuda.MemPool | None) -> N
         return
     torch.cuda.synchronize()
     for pg in group.communicators():
-        _nccl_backend(pg).register_mem_pool(pool, symm=True)
+        if pg is not None:
+            _nccl_backend(pg).register_mem_pool(pool, symm=True)
     torch.cuda.synchronize()
 
 
@@ -820,6 +894,12 @@ def _make_buffers(
             rs_in=torch.full((rs_numel,), float(index % 2 + 1), dtype=dtype, device="cuda"),
             rs_out=torch.empty(rs_numel // group.size, dtype=dtype, device="cuda"),
             ar_buf=torch.full((numel,), float(index % 2 + 1), dtype=dtype, device="cuda"),
+            # Second AG/RS communicators write to their own outputs so two AGs do not race on the
+            # same tensor; both are full-size / shard-size like ag_out / rs_out. p2p_buf is the
+            # receive buffer for P2P workloads (shard-sized, like ag_in).
+            ag2_out=torch.empty(numel, dtype=dtype, device="cuda"),
+            rs2_out=torch.empty(rs_numel // group.size, dtype=dtype, device="cuda"),
+            p2p_buf=torch.empty(shard, dtype=dtype, device="cuda"),
             pool=pool,
         )
 
@@ -846,16 +926,36 @@ def _verify(group: CollectiveGroup, buffers: Buffers, ops: tuple[str, ...]) -> b
 
     The all-reduce result was already checked by ``_first_all_reduce_ok``; afterwards it only
     reduces zeros, so anything but zeros here means a launch read or wrote the wrong memory.
+
+    ``ag2_out`` / ``rs2_out`` are checked like ``ag_out`` / ``rs_out``: the second communicator
+    runs the same collective on the same inputs, so it must produce the same result. For P2P
+    workloads the receiving rank's ``p2p_buf`` is checked against the sending rank's ``ag_in``:
+    every rank fills ``ag_in`` with ``float(index + 1)``, so rank 0 sends 1.0 and rank 1 sends 2.0.
     """
     ok = True
+    my_rank = dist.get_rank()
     if "ag" in ops:
         expected = torch.arange(1, group.size + 1, device="cuda", dtype=torch.float32)
         ok &= bool(torch.all(buffers.ag_out.view(group.size, -1).float() == expected[:, None]).item())
+    if "ag2" in ops and buffers.ag2_out is not None:
+        expected = torch.arange(1, group.size + 1, device="cuda", dtype=torch.float32)
+        ok &= bool(torch.all(buffers.ag2_out.view(group.size, -1).float() == expected[:, None]).item())
     if "rs" in ops:
         expected_sum = group.size + group.size // 2
         ok &= bool(torch.all(buffers.rs_out.float() == expected_sum).item())
+    if "rs2" in ops and buffers.rs2_out is not None:
+        expected_sum = group.size + group.size // 2
+        ok &= bool(torch.all(buffers.rs2_out.float() == expected_sum).item())
     if "ar" in ops:
         ok &= bool(torch.all(buffers.ar_buf == 0).item())
+    if "p2p_read" in ops and buffers.p2p_buf is not None:
+        # p2p_read: rank 0 receives rank 1's ag_in = full of float(1+1) = 2.0.
+        if my_rank == group.ranks[0]:
+            ok &= bool(torch.all(buffers.p2p_buf.float() == 2.0).item())
+    if "p2p_write" in ops and buffers.p2p_buf is not None:
+        # p2p_write: rank 1 receives rank 0's ag_in = full of float(0+1) = 1.0.
+        if my_rank == group.ranks[1]:
+            ok &= bool(torch.all(buffers.p2p_buf.float() == 1.0).item())
     return ok
 
 
@@ -863,14 +963,37 @@ def _launch(
     group: CollectiveGroup, buffers: Buffers, ops: tuple[str, ...], streams: dict[str, torch.cuda.Stream]
 ) -> None:
     for op in ops:
-        with torch.cuda.stream(streams[op]):
+        stream_key = "p2p" if op in P2P_OPS else op
+        with torch.cuda.stream(streams[stream_key]):
             # async_op=False runs NCCL on the current stream and does not block the host.
             if op == "ag":
                 dist.all_gather_into_tensor(buffers.ag_out, buffers.ag_in, group=group.ag_pg)
+            elif op == "ag2" and group.ag2_pg is not None and buffers.ag2_out is not None:
+                dist.all_gather_into_tensor(buffers.ag2_out, buffers.ag_in, group=group.ag2_pg)
             elif op == "rs":
                 dist.reduce_scatter_tensor(buffers.rs_out, buffers.rs_in, group=group.rs_pg)
-            else:
+            elif op == "rs2" and group.rs2_pg is not None and buffers.rs2_out is not None:
+                dist.reduce_scatter_tensor(buffers.rs2_out, buffers.rs_in, group=group.rs2_pg)
+            elif op == "ar":
                 dist.all_reduce(buffers.ar_buf, group=group.ar_pg)
+            elif op == "p2p_read" and group.p2p_pg is not None and buffers.p2p_buf is not None:
+                # rank 0 receives from rank 1; rank 1 sends to rank 0.
+                rank_index = group.ranks.index(dist.get_rank()) if dist.get_rank() in group.ranks else -1
+                if rank_index == 0:
+                    req = dist.irecv(buffers.p2p_buf, src=group.ranks[1], group=group.p2p_pg)
+                    req.wait()
+                elif rank_index == 1:
+                    req = dist.isend(buffers.ag_in, dst=group.ranks[0], group=group.p2p_pg)
+                    req.wait()
+            elif op == "p2p_write" and group.p2p_pg is not None and buffers.p2p_buf is not None:
+                # rank 0 sends to rank 1; rank 1 receives from rank 0.
+                rank_index = group.ranks.index(dist.get_rank()) if dist.get_rank() in group.ranks else -1
+                if rank_index == 0:
+                    req = dist.isend(buffers.ag_in, dst=group.ranks[1], group=group.p2p_pg)
+                    req.wait()
+                elif rank_index == 1:
+                    req = dist.irecv(buffers.p2p_buf, src=group.ranks[0], group=group.p2p_pg)
+                    req.wait()
 
 
 def _calibrate_sleep_cycles_per_ms() -> float:
@@ -924,6 +1047,11 @@ def _timed_trial(
         return _run_timed(group, buffers, ops, streams, main=main, iters=iters, host_start=host_start)
 
 
+def _stream_key(op: str) -> str:
+    """Return the streams-dict key for ``op``; p2p ops share the ``"p2p"`` stream."""
+    return "p2p" if op in P2P_OPS else op
+
+
 def _run_timed(
     group: CollectiveGroup | None,
     buffers: Buffers | None,
@@ -943,12 +1071,12 @@ def _run_timed(
     end = torch.cuda.Event(enable_timing=True)
     start.record(main)
     for op in ops:
-        streams[op].wait_event(start)
+        streams[_stream_key(op)].wait_event(start)
     for _ in range(iters):
         _launch(group, buffers, ops, streams)
     enqueue_ms = (time.perf_counter() - host_start) * 1e3
     for op in ops:
-        op_end[op].record(streams[op])
+        op_end[op].record(streams[_stream_key(op)])
         main.wait_event(op_end[op])
     end.record(main)
     end.synchronize()
@@ -990,7 +1118,7 @@ def _run_joined(
     for i in range(iters):
         starts[i].record(main)
         for op in ops:
-            stream = streams[op]
+            stream = streams[_stream_key(op)]
             stream.wait_event(starts[i])
             with torch.cuda.stream(stream):
                 if op == "ag" and ag_begins is not None:
@@ -1059,7 +1187,8 @@ def _deregister_pool(group: CollectiveGroup, pool: torch.cuda.MemPool | None) ->
         return
     torch.cuda.synchronize()
     for pg in group.communicators():
-        _nccl_backend(pg).deregister_mem_pool(pool)
+        if pg is not None:
+            _nccl_backend(pg).deregister_mem_pool(pool)
     torch.cuda.synchronize()
 
 
@@ -1167,10 +1296,12 @@ def run_case(
     if group and rank == group.ranks[0]:
         # dist.new_group keeps the rank order, so the group's first rank is comm rank 0 of every
         # communicator, the only rank NCCL writes TUNING lines on.
+        # P2P ops (Send/Recv) log in a different format: exclude them from the TUNING-line check.
+        check_ops = tuple(op for op in ops if op not in P2P_OPS)
         implementation, impl_errors = check_implementation(
             case_lines,
             algo=args.algo,
-            ops=ops,
+            ops=check_ops,
             # "ar" is a workload of its own, so its extra checked launch never skews another op.
             launches=effective_warmup + ncu_trials * ncu_iters + int("ar" in ops),
             size_bytes=size_bytes,
@@ -1275,14 +1406,34 @@ def run_case(
             op_bytes = op_sizes.get(op, size_bytes)
             # A late-joining AG runs from its release, not from the iteration start.
             seconds = (stats[f"{op}_ms"] - stats.get(f"{op}_begin_ms", 0.0)) / 1e3
-            record[f"{op}_algbw_gb_s"] = alg_bandwidth_gb_s(total_bytes=op_bytes, seconds=seconds)
-            record[f"{op}_busbw_gb_s"] = op_bus_bandwidth_gb_s(
-                op=op, total_bytes=op_bytes, group_size=g.size, seconds=seconds
-            )
-            # An all-reduce counts both directions, so its busbw already carries the factor 2.
-            aggregate_bus += op_bus_bandwidth_gb_s(
-                op=op, total_bytes=op_bytes, group_size=g.size, seconds=stats["makespan_ms"] / 1e3
-            )
+            if op in P2P_OPS:
+                # P2P uses the AG shard size (one shard exchanged between two ranks).
+                p2p_bytes = per_rank_bytes("ag", size_bytes, g.size)
+                record[f"{op}_algbw_gb_s"] = alg_bandwidth_gb_s(total_bytes=p2p_bytes, seconds=seconds)
+                # Bus bandwidth for P2P: same formula as AG (one direction, no fan-out factor).
+                record[f"{op}_busbw_gb_s"] = alg_bandwidth_gb_s(total_bytes=p2p_bytes, seconds=seconds)
+                aggregate_bus += alg_bandwidth_gb_s(
+                    total_bytes=p2p_bytes, seconds=stats["makespan_ms"] / 1e3
+                )
+            elif op in ("ag2", "rs2"):
+                # ag2/rs2 are the same collective as ag/rs; use the canonical op name for helpers.
+                canonical = "ag" if op == "ag2" else "rs"
+                record[f"{op}_algbw_gb_s"] = alg_bandwidth_gb_s(total_bytes=op_bytes, seconds=seconds)
+                record[f"{op}_busbw_gb_s"] = op_bus_bandwidth_gb_s(
+                    op=canonical, total_bytes=op_bytes, group_size=g.size, seconds=seconds
+                )
+                aggregate_bus += op_bus_bandwidth_gb_s(
+                    op=canonical, total_bytes=op_bytes, group_size=g.size, seconds=stats["makespan_ms"] / 1e3
+                )
+            else:
+                record[f"{op}_algbw_gb_s"] = alg_bandwidth_gb_s(total_bytes=op_bytes, seconds=seconds)
+                record[f"{op}_busbw_gb_s"] = op_bus_bandwidth_gb_s(
+                    op=op, total_bytes=op_bytes, group_size=g.size, seconds=seconds
+                )
+                # An all-reduce counts both directions, so its busbw already carries the factor 2.
+                aggregate_bus += op_bus_bandwidth_gb_s(
+                    op=op, total_bytes=op_bytes, group_size=g.size, seconds=stats["makespan_ms"] / 1e3
+                )
         record["aggregate_busbw_gb_s"] = aggregate_bus
         if reference is not None:
             record.update(reference)
@@ -1327,6 +1478,12 @@ def _metadata(args: argparse.Namespace, rank: int, world_size: int) -> dict[str,
     }
 
 
+def _needs_extended(workloads: list[str]) -> bool:
+    """Return True if any workload in the list needs ag2_pg, rs2_pg, or p2p_pg."""
+    extended_workloads = frozenset({"ag+ag", "rs+rs", "ag+p2p_read", "ag+p2p_write", "rs+p2p_read", "rs+p2p_write"})
+    return any(w in extended_workloads for w in workloads)
+
+
 def main(argv: list[str] | None = None) -> None:
     """Run the benchmark under torchrun."""
     args = parse_args(argv)
@@ -1348,7 +1505,8 @@ def main(argv: list[str] | None = None) -> None:
 
     cycles_per_ms = _calibrate_sleep_cycles_per_ms()
     delay_cycles = int(cycles_per_ms * args.launch_delay_ms)
-    streams = {op: torch.cuda.Stream() for op in OPS}
+    # Streams for all standard and extended ops; p2p_read/p2p_write share the "p2p" stream.
+    streams = {op: torch.cuda.Stream() for op in (*OPS, *EXTENDED_OPS, "p2p")}
     # ncu (--profile-from-start off) profiles only inside these windows too; the case NVTX range
     # then names the case of every kernel in its report.
     captures = CaptureWindows(args.nsys or args.ncu)
@@ -1468,7 +1626,8 @@ def main(argv: list[str] | None = None) -> None:
 
     for n in [] if args.late_join else args.group_sizes:
         scenario = scenario_name("single", total_ranks=n)
-        group = _new_group(f"single{n}", list(range(n)), eager=pinned)
+        extended = _needs_extended(workloads)
+        group = _new_group(f"single{n}", list(range(n)), eager=pinned, extended=extended)
         topology, comm_log = connect(scenario, [group])
         for size_bytes in sizes:
             for workload in workloads:
@@ -1480,9 +1639,10 @@ def main(argv: list[str] | None = None) -> None:
         for layout in args.split_layouts:
             scenario = scenario_name("split", total_ranks=total, layout=layout)
             ranks_a, ranks_b = split_groups(total, layout)
+            extended = _needs_extended(workloads)
             groups = [
-                _new_group(f"{layout}{total}-A", ranks_a, eager=pinned),
-                _new_group(f"{layout}{total}-B", ranks_b, eager=pinned),
+                _new_group(f"{layout}{total}-A", ranks_a, eager=pinned, extended=extended),
+                _new_group(f"{layout}{total}-B", ranks_b, eager=pinned, extended=extended),
             ]
             topology, comm_log = connect(scenario, groups)
             common = {"scenario": "split", "total_ranks": total, "layout": layout}
