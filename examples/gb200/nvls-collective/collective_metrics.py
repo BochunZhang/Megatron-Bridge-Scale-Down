@@ -44,13 +44,13 @@ ALGORITHMS = ("ring", "nvls", "symm", "symm-tma", "copy-engine")
 # tensor, so it moves twice the payload of one AG or RS shard exchange (see bus_bandwidth_gb_s).
 OPS = ("ag", "rs", "ar")
 # Extended ops used by the dual-collective workloads: ag2/rs2 are second communicators running
-# the same collective concurrently; p2p_read/p2p_write are NCCL point-to-point sends/receives.
-EXTENDED_OPS = ("ag2", "rs2", "p2p_read", "p2p_write")
+# the same collective concurrently; read/write are NCCL point-to-point sends/receives.
+EXTENDED_OPS = ("ag2", "rs2", "read", "write")
 WORKLOADS = (
     "ag", "rs", "ar", "ag+rs",
     "ag+ag", "rs+rs",
-    "ag+p2p_read", "ag+p2p_write",
-    "rs+p2p_read", "rs+p2p_write",
+    "ag+read", "ag+write",
+    "rs+read", "rs+write",
 )
 # Workloads each family measures. symm-tma and copy-engine only differ from symm in the
 # AllGather: their RS alone would be symm's ReduceScatter_LDMC again, and they have no all-reduce.
@@ -58,8 +58,8 @@ ALGO_WORKLOADS = {
     "ring": WORKLOADS,
     "nvls": WORKLOADS,
     "symm": WORKLOADS,
-    "symm-tma": ("ag", "ag+rs", "ag+ag", "ag+p2p_read", "ag+p2p_write"),
-    "copy-engine": ("ag", "ag+rs", "ag+ag", "ag+p2p_read", "ag+p2p_write"),
+    "symm-tma": ("ag", "ag+rs", "ag+ag", "ag+read", "ag+write"),
+    "copy-engine": ("ag", "ag+rs", "ag+ag", "ag+read", "ag+write"),
 }
 SPLIT_LAYOUTS = ("contiguous", "interleaved")
 # Split cases: both half-groups running the same workload at the same time, and "cross": group A
@@ -86,10 +86,10 @@ WORKLOAD_NAMES = {
     "ag+rs": "all_gather+reduce_scatter",
     "ag+ag": "all_gather+all_gather",
     "rs+rs": "reduce_scatter+reduce_scatter",
-    "ag+p2p_read": "all_gather+p2p_read",
-    "ag+p2p_write": "all_gather+p2p_write",
-    "rs+p2p_read": "reduce_scatter+p2p_read",
-    "rs+p2p_write": "reduce_scatter+p2p_write",
+    "ag+read": "all_gather+read",
+    "ag+write": "all_gather+write",
+    "rs+read": "reduce_scatter+read",
+    "rs+write": "reduce_scatter+write",
     CROSS_WORKLOAD: "all_gather_A+reduce_scatter_B",
     LATE_JOIN_WORKLOAD: f"reduce_scatter_x{LATE_JOIN_RS_SCALE}+late_all_gather",
 }
@@ -109,14 +109,14 @@ def workload_ops(workload: str) -> tuple[str, ...]:
         return ("ag", "ag2")
     if workload == "rs+rs":
         return ("rs", "rs2")
-    if workload == "ag+p2p_read":
-        return ("ag", "p2p_read")
-    if workload == "ag+p2p_write":
-        return ("ag", "p2p_write")
-    if workload == "rs+p2p_read":
-        return ("rs", "p2p_read")
-    if workload == "rs+p2p_write":
-        return ("rs", "p2p_write")
+    if workload == "ag+read":
+        return ("ag", "read")
+    if workload == "ag+write":
+        return ("ag", "write")
+    if workload == "rs+read":
+        return ("rs", "read")
+    if workload == "rs+write":
+        return ("rs", "write")
     if workload not in WORKLOADS:
         raise ValueError(f"unknown workload {workload!r}; expected one of {WORKLOADS}")
     return ("ag", "rs") if workload == "ag+rs" else (workload,)

@@ -141,9 +141,9 @@ OP_FUNCS = {
     "ag2": "AllGather",
     "rs2": "ReduceScatter",
 }
-# p2p_read and p2p_write use NCCL Send/Recv, which log in a different format;
+# read and write use NCCL Send/Recv, which log in a different format;
 # they are excluded from check_implementation's TUNING-line checks.
-P2P_OPS = frozenset({"p2p_read", "p2p_write"})
+P2P_OPS = frozenset({"read", "write"})
 PROBE_FIELDS = ("nccl_algo", "nccl_kernel", "n_nodes", "mnnvl")
 # The three INFO(NCCL_TUNING, ...) lines NCCL 2.29 prints on comm rank 0 for every launch:
 #   "<Func>: <n> Bytes -> Algo <algo> proto <proto> ..."      enqueue.cc, classic kernels
@@ -948,12 +948,12 @@ def _verify(group: CollectiveGroup, buffers: Buffers, ops: tuple[str, ...]) -> b
         ok &= bool(torch.all(buffers.rs2_out.float() == expected_sum).item())
     if "ar" in ops:
         ok &= bool(torch.all(buffers.ar_buf == 0).item())
-    if "p2p_read" in ops and buffers.p2p_buf is not None:
-        # p2p_read: rank 0 receives rank 1's ag_in = full of float(1+1) = 2.0.
+    if "read" in ops and buffers.p2p_buf is not None:
+        # read: rank 0 receives rank 1's ag_in = full of float(1+1) = 2.0.
         if my_rank == group.ranks[0]:
             ok &= bool(torch.all(buffers.p2p_buf.float() == 2.0).item())
-    if "p2p_write" in ops and buffers.p2p_buf is not None:
-        # p2p_write: rank 1 receives rank 0's ag_in = full of float(0+1) = 1.0.
+    if "write" in ops and buffers.p2p_buf is not None:
+        # write: rank 1 receives rank 0's ag_in = full of float(0+1) = 1.0.
         if my_rank == group.ranks[1]:
             ok &= bool(torch.all(buffers.p2p_buf.float() == 1.0).item())
     return ok
@@ -976,7 +976,7 @@ def _launch(
                 dist.reduce_scatter_tensor(buffers.rs2_out, buffers.rs_in, group=group.rs2_pg)
             elif op == "ar":
                 dist.all_reduce(buffers.ar_buf, group=group.ar_pg)
-            elif op == "p2p_read" and group.p2p_pg is not None and buffers.p2p_buf is not None:
+            elif op == "read" and group.p2p_pg is not None and buffers.p2p_buf is not None:
                 # rank 0 receives from rank 1; rank 1 sends to rank 0.
                 rank_index = group.ranks.index(dist.get_rank()) if dist.get_rank() in group.ranks else -1
                 if rank_index == 0:
@@ -985,7 +985,7 @@ def _launch(
                 elif rank_index == 1:
                     req = dist.isend(buffers.ag_in, dst=group.ranks[0], group=group.p2p_pg)
                     req.wait()
-            elif op == "p2p_write" and group.p2p_pg is not None and buffers.p2p_buf is not None:
+            elif op == "write" and group.p2p_pg is not None and buffers.p2p_buf is not None:
                 # rank 0 sends to rank 1; rank 1 receives from rank 0.
                 rank_index = group.ranks.index(dist.get_rank()) if dist.get_rank() in group.ranks else -1
                 if rank_index == 0:
@@ -1480,7 +1480,7 @@ def _metadata(args: argparse.Namespace, rank: int, world_size: int) -> dict[str,
 
 def _needs_extended(workloads: list[str]) -> bool:
     """Return True if any workload in the list needs ag2_pg, rs2_pg, or p2p_pg."""
-    extended_workloads = frozenset({"ag+ag", "rs+rs", "ag+p2p_read", "ag+p2p_write", "rs+p2p_read", "rs+p2p_write"})
+    extended_workloads = frozenset({"ag+ag", "rs+rs", "ag+read", "ag+write", "rs+read", "rs+write"})
     return any(w in extended_workloads for w in workloads)
 
 
@@ -1505,7 +1505,7 @@ def main(argv: list[str] | None = None) -> None:
 
     cycles_per_ms = _calibrate_sleep_cycles_per_ms()
     delay_cycles = int(cycles_per_ms * args.launch_delay_ms)
-    # Streams for all standard and extended ops; p2p_read/p2p_write share the "p2p" stream.
+    # Streams for all standard and extended ops; read/write share the "p2p" stream.
     streams = {op: torch.cuda.Stream() for op in (*OPS, *EXTENDED_OPS, "p2p")}
     # ncu (--profile-from-start off) profiles only inside these windows too; the case NVTX range
     # then names the case of every kernel in its report.
