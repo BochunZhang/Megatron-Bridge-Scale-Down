@@ -1132,8 +1132,13 @@ def run_case(
         torch.cuda.synchronize()
     trials: list[dict[str, float]] = []
     # Warmup and setup stay outside the window: the report holds exactly the timed trials.
+    # Under ncu (app-range replay) the window covers a single trial with a single iteration so
+    # that each collective fires exactly once per replay pass; more launches would multiply the
+    # save/restore cost and serialise concurrent AG+RS pairs.
+    ncu_trials = 1 if args.ncu else args.trials
+    ncu_iters = 1 if args.ncu else args.iters
     with captures.case(label) as capture_index:
-        for trial in range(args.trials):
+        for trial in range(ncu_trials):
             torch.distributed.barrier()
             if gate.pg is not None:
                 result = _timed_trial(
@@ -1141,7 +1146,7 @@ def run_case(
                     buffers,
                     ops,
                     streams,
-                    iters=args.iters,
+                    iters=ncu_iters,
                     delay_cycles=delay_cycles,
                     gate=gate,
                     trial=trial,
@@ -1163,12 +1168,12 @@ def run_case(
             algo=args.algo,
             ops=ops,
             # "ar" is a workload of its own, so its extra checked launch never skews another op.
-            launches=args.warmup + args.trials * args.iters + int("ar" in ops),
+            launches=args.warmup + ncu_trials * ncu_iters + int("ar" in ops),
             size_bytes=size_bytes,
             group_size=group.size,
             pinned_kernel=(os.environ.get("NCCL_SYM_KERNEL") or None) if args.algo == "symm" else None,
             # Gate comm rank 0 is the scenario's first rank; it logs one AllReduce per trial.
-            gate_launches=args.trials if rank == gate.ranks[0] else 0,
+            gate_launches=ncu_trials if rank == gate.ranks[0] else 0,
             op_sizes=op_sizes,
         )
     local = {

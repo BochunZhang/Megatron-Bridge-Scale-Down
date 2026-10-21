@@ -577,7 +577,7 @@ for index in "${!algo_list[@]}"; do
             --nvtx
             --nvtx-include="trial0/"
             --kernel-name="regex:^nccl(Symk)?DevKernel_(AllGather|ReduceScatter|AllReduce)"
-            --replay-mode=kernel
+            --replay-mode=app-range
             --clock-control=none
             --cache-control=none
         )
