@@ -88,8 +88,8 @@ Options:
   --nsys-gpu-metrics-set SET
                           nsys GPU metric set alias (default: nsys picks the first set for the GPU);
                           the choices are saved to nsys-gpu-metrics.node<N>.txt in the run directory
-  --nsys-gpu-metrics-frequency HZ
-                          GPU metric sampling rate, 10..200000 (default: 50000, one sample per 20 us)
+  --nsys-freq HZ|high      GPU metric sampling rate (default: 50000, one sample per 20 us); a number
+                          is clamped into nsys's range 10..200000, high takes 200000
   --ncu                   One Nsight Compute report per rank (<algo>/ncu/rank<R>.ncu-rep): every
                           NCCL collective kernel of trial0 of every case, all ranks in lockstep;
                           needs one group of every rank (--group-sizes = all GPUs, no split);
@@ -168,7 +168,7 @@ late_join=false
 symm_kernel="default"
 nsys_enabled=false
 nsys_gpu_metrics_set=""
-nsys_gpu_metrics_frequency="50000"
+nsys_freq="50000"
 ncu_enabled=false
 # Kernel-level detail for the symmetric kernels: throughput and memory-chart (HBM, L2, peer) of
 # the kernel, NVLink totals and per-link tables, the Grace C2C link, where warps stall (per SASS
@@ -202,7 +202,8 @@ while [[ $# -gt 0 ]]; do
         --symm-kernel) need_value "$@"; symm_kernel="$2"; shift 2 ;;
         --nsys) nsys_enabled=true; shift ;;
         --nsys-gpu-metrics-set) need_value "$@"; nsys_gpu_metrics_set="$2"; shift 2 ;;
-        --nsys-gpu-metrics-frequency) need_value "$@"; nsys_gpu_metrics_frequency="$2"; shift 2 ;;
+        --nsys-freq) need_value "$@"; nsys_freq="$2"; shift 2 ;;
+        --nsys-gpu-metrics-frequency) need_value "$@"; nsys_freq="$2"; shift 2 ;;  # alias for --nsys-freq
         --ncu) ncu_enabled=true; shift ;;
         --ncu-sections) need_value "$@"; ncu_sections="$2"; shift 2 ;;
         --ncu-port) need_value "$@"; ncu_port="$2"; shift 2 ;;
@@ -212,13 +213,32 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
-for name in nnodes gpus_per_node master_port nsys_gpu_metrics_frequency ncu_port; do
+for name in nnodes gpus_per_node master_port ncu_port; do
     [[ "${!name}" =~ ^[1-9][0-9]*$ ]] || die "--${name//_/-} must be a positive integer"
 done
 [[ "$node_rank" =~ ^[0-9]+$ ]] && (( node_rank < nnodes )) || die "--node-rank must be in [0, nnodes)"
 world_size=$(( nnodes * gpus_per_node ))
-(( nsys_gpu_metrics_frequency >= 10 && nsys_gpu_metrics_frequency <= 200000 )) \
-    || die "--nsys-gpu-metrics-frequency must be in [10, 200000] Hz"
+# --nsys-freq: nsys accepts --gpu-metrics-frequency in [10, 200000] Hz; "high" is the top of that
+# range and a number outside it is clamped instead of rejected.
+nsys_freq_min=10
+nsys_freq_max=200000
+nsys_freq_arg="$nsys_freq"
+if [[ "$nsys_freq" == high ]]; then
+    nsys_freq=$nsys_freq_max
+elif [[ "$nsys_freq" =~ ^-[0-9]+$ ]]; then
+    nsys_freq=0
+elif [[ "$nsys_freq" =~ ^0*([0-9]{1,9})$ ]]; then
+    nsys_freq=$(( 10#${BASH_REMATCH[1]} ))
+elif [[ "$nsys_freq" =~ ^[0-9]+$ ]]; then
+    # Too many digits for shell arithmetic, and far above the range anyway.
+    nsys_freq=$(( nsys_freq_max + 1 ))
+else
+    die "--nsys-freq must be an integer number of Hz or high, got: ${nsys_freq_arg}"
+fi
+if (( nsys_freq < nsys_freq_min || nsys_freq > nsys_freq_max )); then
+    (( nsys_freq < nsys_freq_min )) && nsys_freq=$nsys_freq_min || nsys_freq=$nsys_freq_max
+    warn "--nsys-freq ${nsys_freq_arg} is outside [${nsys_freq_min}, ${nsys_freq_max}] Hz; using ${nsys_freq}"
+fi
 # Both profilers own the GPU performance counters; nsys GPU metrics cannot run under ncu.
 if $nsys_enabled && $ncu_enabled; then
     die "--nsys and --ncu are exclusive: both need the GPU performance counters"
@@ -511,7 +531,7 @@ for index in "${!algo_list[@]}"; do
             --trace=cuda,nvtx
             --sample=none
             --cpuctxsw=none
-            --gpu-metrics-frequency="$nsys_gpu_metrics_frequency"
+            --gpu-metrics-frequency="$nsys_freq"
         )
         [[ -n "$nsys_gpu_metrics_set" ]] && worker+=(--gpu-metrics-set="$nsys_gpu_metrics_set")
         worker+=(

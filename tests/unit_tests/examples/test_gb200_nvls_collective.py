@@ -175,7 +175,7 @@ def _worker_command(stdout: str) -> list[str]:
 @pytest.mark.unit
 @pytest.mark.skipif(shutil.which("bash") is None, reason="needs bash")
 def test_launcher_nsys_samples_gpu_metrics_on_each_workers_own_gpu():
-    result = _launcher_dry_run("--nsys", "--nsys-gpu-metrics-set", "gb10x", "--nsys-gpu-metrics-frequency", "20000")
+    result = _launcher_dry_run("--nsys", "--nsys-gpu-metrics-set", "gb10x", "--nsys-freq", "20000")
     assert result.returncode == 0, result.stderr
     worker = _worker_command(result.stdout)
     # nsys_worker.sh resolves --gpu-metrics-devices from LOCAL_RANK, so one session per GPU.
@@ -185,6 +185,27 @@ def test_launcher_nsys_samples_gpu_metrics_on_each_workers_own_gpu():
     assert "--capture-range=cudaProfilerApi" in worker
     assert "CUDA_DEVICE_ORDER=PCI_BUS_ID" in result.stdout
     assert " --nsys " in result.stdout
+
+
+@pytest.mark.unit
+@pytest.mark.skipif(shutil.which("bash") is None, reason="needs bash")
+@pytest.mark.parametrize(
+    ("value", "expected", "clamped"),
+    [
+        (None, 50000, False),
+        ("high", 200000, False),
+        ("300000", 200000, True),
+        ("99999999999999999999", 200000, True),
+        ("1", 10, True),
+        ("-5", 10, True),
+        ("010", 10, False),
+    ],
+)
+def test_launcher_nsys_freq_defaults_clamps_and_accepts_high(value, expected, clamped):
+    result = _launcher_dry_run("--nsys", *(() if value is None else ("--nsys-freq", value)))
+    assert result.returncode == 0, result.stderr
+    assert f"--gpu-metrics-frequency={expected}" in _worker_command(result.stdout)
+    assert ("is outside [10, 200000] Hz" in result.stderr) == clamped
 
 
 @pytest.mark.unit
@@ -222,7 +243,7 @@ def test_launcher_ncu_profiles_trial0_of_one_full_group_in_lockstep():
         (("--nsys", "--ncu"), "exclusive"),
         (("--ncu", "--group-sizes", "2"), "--group-sizes must be 4"),
         (("--ncu", "--split-totals", "4"), "split scenarios leave ranks idle"),
-        (("--nsys", "--nsys-gpu-metrics-frequency", "300000"), r"\[10, 200000\]"),
+        (("--nsys", "--nsys-freq", "fast"), "integer number of Hz or high"),
     ],
 )
 def test_launcher_rejects_profiler_options_it_cannot_honor(options, message):

@@ -460,7 +460,7 @@ trial 取中位数。
 
 | 选项 | 默认 | 说明 |
 | --- | --- | --- |
-| `--nsys-gpu-metrics-frequency HZ` | 50000 | 10..200000；50 kHz 即每 20 µs 一个点。频率太高时 nsys 报告的 Diagnostics 页会出现 “Buffer overflow”，要调低 |
+| `--nsys-freq HZ\|high` | 50000 | GPU metrics 采样频率，50 kHz 即每 20 µs 一个点。数字超出 nsys 的合法区间 10..200000 时钳位到边界（打一条 warning）；`high` 取最高的 200000（每 5 µs 一个点）。频率太高时 nsys 报告的 Diagnostics 页会出现 “Buffer overflow”，要调低 |
 | `--nsys-gpu-metrics-set SET` | 不传，由 nsys 选第一个支持该 GPU 的 metric set | 可选值和 GPU 编号在运行目录的 `nsys-gpu-metrics.node<N>.txt` 里（launcher 跑 `--gpu-metrics-devices=help` 和 `--gpu-metrics-set=help` 存下的）。默认 set 没有 NVLink 行时，`analyse_nsys.py` 会打 warning，换一个含 NVLink 的 set |
 
 实现要点：
