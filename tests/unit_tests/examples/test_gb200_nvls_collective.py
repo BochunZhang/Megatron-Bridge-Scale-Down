@@ -220,7 +220,9 @@ def test_launcher_ncu_profiles_trial0_of_one_full_group_in_lockstep():
         "--communicator-tcp-num-peers=4",
         "--communicator-tcp-port=50000",
         "--lockstep-kernel-launch",
-        "--profile-from-start=off",
+        "--lockstep-nvtx-include=trial0/",
+        # Lockstep supports kernel and range replay only; app-range hung in the second range.
+        "--replay-mode=range",
         "--nvtx-include=trial0/",
         "--clock-control=none",
         "--cache-control=none",

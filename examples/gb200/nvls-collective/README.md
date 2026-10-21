@@ -502,35 +502,37 @@ trial 取中位数。
 
 ```bash
 bash examples/gb200/nvls-collective/run_nvls_collective_benchmark.sh \
-  --algos symm --workloads ag --sizes-mib 1024 --iters 2 --trials 1 --ncu
+  --algos symm --workloads ag --sizes-mib 1024 --ncu
 ```
 
 `--ncu` 给每个 worker 套一个 `ncu`（和 `--nsys` 互斥：两者用同一组计数器），每个 rank 写一份
 `<algo>/ncu/rank<R>.ncu-rep`，用 `ncu-ui` 打开。
 
-**profile 哪些 kernel。** 只 profile 每个 case **trial0** 里的 NCCL 集合通信 kernel：
+**profile 什么。** 用 range replay（`--replay-mode=range`），只采每个 case **trial0** 这个 NVTX range：
 
 | 选项 | 作用 |
 | --- | --- |
-| `--profile-from-start=off` | 只在 benchmark 每个 case 的 `cudaProfilerStart/Stop` 窗口内（和 `--nsys` 是同一套窗口），warmup 不在内 |
-| `--nvtx --nvtx-include=trial0/` | 只要 trial0 这个 push/pop range 内的 kernel；start gate 在 range 打开前发射，被排除 |
-| `--kernel-name=regex:^nccl(Symk)?DevKernel_(AllGather\|ReduceScatter\|AllReduce)` | 排除 `_sleep` 延迟 kernel |
+| `--replay-mode=range` | 把 range 内的 CUDA API 调用和 kernel 整段录下，每个计数器 pass 在**同一进程内**重放一次（必要时保存/恢复显存）；指标属于整个 range，不是单个 kernel，range 内的 kernel 照常并发 |
+| `--nvtx --nvtx-include=trial0/` | range 的边界 = trial0 这个 push/pop range；start gate 在 range 打开前发射，被排除 |
 
-每个 kernel 的 NVTX 上下文里能看到 case 标签 `<algo>/<case>`。每个被 profile 的 kernel 每个计数器 pass
-都要重放一次，一个 case 的 trial0 有 `iters × op 数` 个 kernel，所以**用 `--iters 1~2 --trials 1` 并限制
-`--sizes-mib`**。
+`--ncu` 下 benchmark 每个 case 只跑 **1 个 trial × 1 次 iteration**（忽略 `--trials`/`--iters`），warmup
+照常在 range 之外跑一次、不被 profile。每个 case 的 trial0 被重放 pass 数那么多次，所以**限制
+`--sizes-mib` 和 section 数**。
+
+不用 app-range：app-range 每个 pass 重启整个 worker 进程，lockstep 不支持它（只支持 kernel/range），
+4 卡实测卡在第二个 range（watchdog 480 s 心跳超时）。
 
 **为什么要 lockstep。** symmetric kernel 在 LSA barrier（`multimem.red`）上等所有对端，单个 rank 自己重放
 会卡死。所以用 `--communicator=tcp`（server 在 `--master-addr`，端口 `--ncu-port + algo 序号`，默认从
-49217 起）加 `--lockstep-kernel-launch`，所有 rank 同步发射、同步重放同一个 kernel。lockstep 要等所有
+49217 起）加 `--lockstep-kernel-launch --lockstep-nvtx-include=trial0/`，所有 rank 同步进入、同步重放同一个 range。lockstep 要等所有
 ncu 实例，因此 `--ncu` 只允许**一个包含全部 rank 的组**：
 
 - `--group-sizes` 必须等于总卡数（不传时自动设成总卡数）。
 - 不跑 split，否则闲置的那半边永远不发 kernel，lockstep 会一直等。
 
 **失真控制。** `--clock-control=none`、`--cache-control=none`：ncu 默认锁 base 频率、每个 pass 前刷 L2，
-这里都关掉，让 kernel 在和计时运行相同的频率和缓存状态下跑。即使这样，ncu 仍然会串行化所有 kernel
-（AG+RS 的重叠在 ncu 下不存在），kernel 时长也包含等待最慢 rank 的时间。时间和带宽以不带 profiler 的
+这里都关掉，让 kernel 在和计时运行相同的频率和缓存状态下跑。即使这样，range 的时长包含重放开销和等待
+最慢 rank 的时间。时间和带宽以不带 profiler 的
 运行和 nsys 为准，ncu 只用来看 kernel 内部。
 
 **默认 section**（`--ncu-sections` 可改，逗号分隔）：

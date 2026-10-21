@@ -366,7 +366,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--ncu",
         action="store_true",
-        help="Open the same capture windows for ncu --profile-from-start off (no nsys/index.tsv)",
+        help="Open the same capture windows for ncu range replay of trial0, one trial of one iteration (no nsys/index.tsv)",
     )
     args = parser.parse_args(argv)
     if min(args.warmup + 1, args.iters, args.trials) < 1:
@@ -1255,21 +1255,20 @@ def run_case(
 
     # The only all-reduce launch with a checkable result; it counts as one extra launch below.
     first_ar_ok = _first_all_reduce_ok(group, buffers, streams["ar"]) if group and "ar" in ops else True
-    # Under ncu (app-range replay) the entire program is re-run once per counter pass, so every
-    # launch before cudaProfilerStart is profiled too.  Skip warmup entirely so ncu does not
-    # capture extra iterations before the capture window opens.
+    # Under ncu (range replay) only the trial0 NVTX range is captured and replayed, so the warmup
+    # before it runs once and is not profiled.
     ncu_trials = 1 if args.ncu else args.trials
     ncu_iters = 1 if args.ncu else args.iters
-    effective_warmup = 0 if args.ncu else args.warmup
+    effective_warmup = args.warmup
     if group:
         for _ in range(effective_warmup):
             _launch(group, buffers, ops, streams)
         torch.cuda.synchronize()
     trials: list[dict[str, float]] = []
     # Warmup and setup stay outside the window: the report holds exactly the timed trials.
-    # Under ncu (app-range replay) the window covers a single trial with a single iteration so
-    # that each collective fires exactly once per replay pass; more launches would multiply the
-    # save/restore cost and serialise concurrent AG+RS pairs.
+    # Under ncu (range replay) the window covers a single trial with a single iteration so that
+    # each collective fires exactly once per replay pass; more launches would multiply the
+    # save/restore cost of every pass.
     with captures.case(label) as capture_index:
         for trial in range(ncu_trials):
             torch.distributed.barrier()
@@ -1354,7 +1353,8 @@ def run_case(
         members = [item for item in gathered if item and item["group"] == g.name]
         group_trials[g.name] = [
             {key: max(item["trials"][t][key] for item in members) for key in members[0]["trials"][t]}
-            for t in range(args.trials)
+            # --ncu runs a single trial whatever --trials says.
+            for t in range(len(members[0]["trials"]))
         ]
     # All groups start at the gate, so their makespans share an origin: min/max is the share of
     # the longer group's time during which the other group was also moving data.
@@ -1507,7 +1507,7 @@ def main(argv: list[str] | None = None) -> None:
     delay_cycles = int(cycles_per_ms * args.launch_delay_ms)
     # Streams for all standard and extended ops; read/write share the "p2p" stream.
     streams = {op: torch.cuda.Stream() for op in (*OPS, *EXTENDED_OPS, "p2p")}
-    # ncu (--profile-from-start off) profiles only inside these windows too; the case NVTX range
+    # ncu range-replays the trial0 NVTX range inside these windows; the case NVTX range
     # then names the case of every kernel in its report.
     captures = CaptureWindows(args.nsys or args.ncu)
     nccl_log = NcclLog()

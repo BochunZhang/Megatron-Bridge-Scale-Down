@@ -91,7 +91,7 @@ Options:
   --nsys-freq HZ|high      GPU metric sampling rate (default: 50000, one sample per 20 us); a number
                           is clamped into nsys's range 10..200000, high takes 200000
   --ncu                   One Nsight Compute report per rank (<algo>/ncu/rank<R>.ncu-rep): every
-                          NCCL collective kernel of trial0 of every case, all ranks in lockstep;
+                          trial0 range of every case (range replay), all ranks in lockstep;
                           needs one group of every rank (--group-sizes = all GPUs, no split);
                           exclusive with --nsys
   --ncu-sections LIST     Comma-separated ncu section identifiers (default: SpeedOfLight, memory
@@ -121,9 +121,9 @@ Examples:
     --algos symm --sizes-mib 256,1024 --trials 3 --nsys
 
   # One tray: Nsight Compute details of the symmetric AG kernel (keep the case count small:
-  # every profiled kernel is replayed once per counter pass).
+  # trial0 of every case is replayed once per counter pass).
   bash examples/gb200/nvls-collective/run_nvls_collective_benchmark.sh \
-    --algos symm --workloads ag --sizes-mib 1024 --iters 2 --trials 1 --ncu
+    --algos symm --workloads ag --sizes-mib 1024 --ncu
 USAGE
 }
 
@@ -557,12 +557,14 @@ for index in "${!algo_list[@]}"; do
         # at the same time, and a worker that reads the half-copied folder fails with "Option
         # '--section ...' did not match any section". Read the installation's sections instead.
         algo_env+=(NV_COMPUTE_PROFILER_DISABLE_STOCK_FILE_DEPLOYMENT=1)
-        # One ncu instance per worker, joined through a TCP communicator on node 0, launching and
-        # replaying every profiled kernel in lockstep: a symmetric kernel waits on its peers in an
-        # LSA barrier, so a rank replaying alone would hang. Profiled: NCCL collective kernels in
-        # the trial0 NVTX range of each case (the start gate runs before that range opens, warmup
-        # outside the capture window). Clocks and caches are left alone so the kernel runs as in
-        # the timed passes: ncu would otherwise lock base clocks and flush L2 before every pass.
+        # One ncu instance per worker, joined through a TCP communicator on node 0, replaying in
+        # lockstep: a symmetric kernel waits on its peers in an LSA barrier, so a rank replaying
+        # alone would hang. Range replay captures the trial0 NVTX range of each case (the start gate
+        # runs before that range opens) and replays it in-process once per counter pass, so the
+        # range's kernels run concurrently as in the timed passes. Lockstep supports only kernel and
+        # range replay: app-range relaunches the whole worker per pass and hung in the second range.
+        # Clocks and caches are left alone so the kernels run as in the timed passes: ncu would
+        # otherwise lock base clocks and flush L2 before every pass.
         IFS=, read -r -a ncu_section_list <<<"$ncu_sections"
         torchrun_extra=(--no-python)
         worker=(
@@ -575,7 +577,7 @@ for index in "${!algo_list[@]}"; do
             --lockstep-nvtx-include="trial0/"
             --nvtx
             --nvtx-include="trial0/"
-            --replay-mode=app-range
+            --replay-mode=range
             --clock-control=none
             --cache-control=none
         )
