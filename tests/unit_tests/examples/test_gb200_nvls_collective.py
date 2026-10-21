@@ -1830,12 +1830,18 @@ def test_cta_table_pairs_every_config_with_the_default_case():
 
 @pytest.mark.unit
 @pytest.mark.skipif(shutil.which("bash") is None, reason="needs bash")
-def test_launcher_passes_cta_configs_and_refuses_overriding_environment(monkeypatch):
+def test_launcher_passes_cta_configs_and_unsets_overriding_environment(monkeypatch):
     result = _launcher_dry_run("--cta-configs", "default;ag=3;p2p=32")
     assert result.returncode == 0, result.stderr
-    assert "--cta-configs default\;ag=3\;p2p=32" in result.stdout
+    assert "--cta-configs default\\;ag=3\\;p2p=32" in result.stdout
+    assert " -u " not in result.stdout
     assert "--cta-configs default " in _launcher_dry_run().stdout
-    monkeypatch.setenv("NCCL_MAX_P2P_NCHANNELS", "8")
-    refused = _launcher_dry_run("--cta-configs", "p2p=32")
-    assert refused.returncode != 0
-    assert "unset NCCL_MAX_P2P_NCHANNELS" in refused.stderr
+    # GB200 images export NCCL_MIN_CTAS=4 and NCCL_MIN_NCHANNELS=16: unset for the workers, with a warning.
+    monkeypatch.setenv("NCCL_MIN_CTAS", "4")
+    monkeypatch.setenv("NCCL_MIN_NCHANNELS", "16")
+    unset = _launcher_dry_run("--cta-configs", "default;p2p=32")
+    assert unset.returncode == 0, unset.stderr
+    assert "env -u NCCL_MIN_CTAS -u NCCL_MIN_NCHANNELS " in unset.stdout
+    assert "unsetting NCCL_MIN_CTAS=4" in unset.stderr
+    # Without a CTA config the environment is passed through untouched.
+    assert " -u " not in _launcher_dry_run().stdout

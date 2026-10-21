@@ -85,7 +85,9 @@ Options:
                           ag,rs,ar,p2p (ag2/rs2 follow ag/rs), e.g. 'default;ag=3,rs=6;p2p=32'
                           (default: default). Each entry rebuilds every communicator with ncclConfig_t
                           minCTAs/maxCTAs and reruns all cases, named ...-cta-ag3-rs6; compare.md
-                          table 6 compares them with default. Quote it: ';' ends a shell command
+                          table 6 compares them with default. Quote it: ';' ends a shell command.
+                          Process-wide NCCL_MIN_CTAS / NCCL_MIN_NCHANNELS / ... would override the
+                          configs, so they are unset for the workers (with a warning)
   --nsys                  One Nsight Systems report per rank per case (capture range = timed trials),
                           with GPU metrics (NVLink RX/TX, DRAM, ...) sampled on the rank's own GPU;
                           node 0 files them under cases/ after each pass (renames only);
@@ -316,12 +318,19 @@ fi
 if (( nnodes > 1 )) && [[ "$master_addr" == 127.0.0.1 ]]; then
     die "multi-node runs require --master-addr or MASTER_ADDR"
 fi
-# Process-wide CTA variables override the per-communicator ncclConfig_t of --cta-configs; fail
-# here instead of in every pass (the benchmark checks the same list).
+# Process-wide CTA variables override the per-communicator ncclConfig_t of --cta-configs. GB200
+# images export some of them (NCCL_MIN_CTAS=4, NCCL_MIN_NCHANNELS=16), so instead of failing they are
+# removed from the workers' environment; every config of the run, default included, then starts from
+# NCCL's own choice. The benchmark still refuses to run if one of them reaches it.
+cta_unset=()
 if [[ "$cta_configs" != default ]]; then
     for name in NCCL_MIN_CTAS NCCL_MAX_CTAS NCCL_MIN_NCHANNELS NCCL_MAX_NCHANNELS NCCL_MIN_NRINGS \
         NCCL_MAX_NRINGS NCCL_NVLS_NCHANNELS NCCL_MIN_P2P_NCHANNELS NCCL_MAX_P2P_NCHANNELS; do
-        [[ -z "${!name:-}" ]] || die "--cta-configs sets CTAs per communicator; unset ${name}, which overrides them"
+        if [[ -n "${!name:-}" ]]; then
+            warn "--cta-configs sets CTAs per communicator; unsetting ${name}=${!name} for the benchmark," \
+                "so its default config is NCCL's own choice, not this environment's"
+            cta_unset+=(-u "$name")
+        fi
     done
 fi
 if [[ -n "${NCCL_ALGO:-}" || -n "${NCCL_NVLS_ENABLE:-}" ]]; then
@@ -614,7 +623,7 @@ for index in "${!algo_list[@]}"; do
     fi
 
     echo "=== algo=${algo} (${algo_env[*]})" >&2
-    run env "${algo_env[@]}" \
+    run env ${cta_unset[@]+"${cta_unset[@]}"} "${algo_env[@]}" \
         uv run --no-sync python -m torch.distributed.run \
         --nproc_per_node="$gpus_per_node" \
         --nnodes="$nnodes" \

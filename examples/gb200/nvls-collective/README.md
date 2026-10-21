@@ -360,8 +360,11 @@ bash examples/gb200/nvls-collective/run_nvls_collective_benchmark.sh --algos sym
   `AllGather_ST`），case 直接失败——否则比较的是 kernel 而不是 CTA 数。NCCL 不为 send/recv 打 CTA 日志，P2P 的 CTA 数是
   按源码推算的（compare.md 里写成 `~N`），**实测值看 `--nsys` 后 `nsys_kernels.md` 的 `CTAs (gridX)` 列**。
 - 进程级的 `NCCL_MIN_CTAS`、`NCCL_MAX_CTAS`、`NCCL_{MIN,MAX}_NCHANNELS`、`NCCL_{MIN,MAX}_NRINGS`、
-  `NCCL_NVLS_NCHANNELS`、`NCCL_{MIN,MAX}_P2P_NCHANNELS` 会覆盖每个 comm 的 config，设了它们再用 `--cta-configs`
-  会报错。copy-engine 的 AG 不用 SM，不接受 `ag=`。
+  `NCCL_NVLS_NCHANNELS`、`NCCL_{MIN,MAX}_P2P_NCHANNELS` 会覆盖每个 comm 的 config。GB200 镜像默认导出了
+  `NCCL_MIN_CTAS=4`、`NCCL_MIN_NCHANNELS=16`（见历次 `metadata.json`），所以 launcher 在 `--cta-configs` 含非 default
+  条目时用 `env -u` 把它们从 worker 环境里去掉，并打 warning：**这次运行里的 `default` 是 NCCL 自己的选择，和以前
+  带着这两个变量跑出来的结果不完全同口径**，对比请用同一次运行里的 default。直接调用 benchmark 时它们仍会被拒绝。
+  copy-engine 的 AG 不用 SM，不接受 `ag=`。
 - 读结果：`compare.md` 表 1–5 只用 `default` 的结果，新增的**表 6** 把每个非 default 配置和同一 case 的 default
   配对，每个 op 给出 `CTA 数 / 每次迭代 ms (相对 default)`。
 
