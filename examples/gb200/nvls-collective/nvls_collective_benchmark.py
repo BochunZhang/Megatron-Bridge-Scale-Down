@@ -823,10 +823,8 @@ def check_implementation(
         errors.append(f"start gate: {gates} {GATE_FUNC} launches in the NCCL log, expected {gate_launches}")
     for func, op_list in expected_funcs.items():
         # Expect launches per op that maps to this function.
+        # ``launches`` already includes the extra checked all-reduce launch (see run_case).
         expected_count = launches * len(op_list)
-        # For ar: the first launch is checked separately but still counted in the log.
-        if "ar" in op_list:
-            expected_count += 1
         total = sum(seen[func].values())
         if total != expected_count:
             errors.append(f"{func}: {total} launches in the NCCL log, expected {expected_count}")
