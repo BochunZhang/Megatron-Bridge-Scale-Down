@@ -127,6 +127,9 @@ command -v uv >/dev/null || die "uv not found"
     || die "no NCCL build in ${nccl_home}; run install/install-nccl-${NCCL_VERSION}.sh or pass --nccl-home"
 nccl_code="$(sed -n 's/^#define NCCL_VERSION_CODE \([0-9]*\).*/\1/p' "${nccl_home}/include/nccl.h")"
 [[ "$nccl_code" == "$NCCL_VERSION_CODE" ]] || die "${nccl_home}/include/nccl.h is NCCL_VERSION_CODE ${nccl_code}, expected ${NCCL_VERSION_CODE}"
+# Empty for stock NCCL, "-cta" for install-nccl-2.32.3-cta.sh. torch reports it next to the version
+# (torch.cuda.nccl.version() appends it as a 4th element) and NCCL prints it in its banner.
+nccl_suffix="$(sed -n 's/^#define NCCL_SUFFIX "\(.*\)".*/\1/p' "${nccl_home}/include/nccl.h")"
 nccl_home="$(cd -- "$nccl_home" && pwd -P)"
 nccl_lib="${nccl_home}/lib"
 mkdir -p "$work"
@@ -141,7 +144,7 @@ deps="${work}/torch-${TORCH_TAG#v}-build-deps"
 wheel_dir="${work}/wheels/torch-${TORCH_TAG#v}-nccl-${NCCL_VERSION}"
 
 echo "target python: ${target_py} (${py_ver})"
-echo "NCCL: ${nccl_home} (${NCCL_VERSION})"
+echo "NCCL: ${nccl_home} (${NCCL_VERSION}${nccl_suffix})"
 
 if ! $check_only; then
     [[ -x "${cuda_home}/bin/nvcc" ]] || die "nvcc not found under ${cuda_home}; pass --cuda-home"
@@ -489,7 +492,9 @@ version="$(field torch.version)"
 # The version matches the official cu13 wheel; the NCCL checks below tell the two apart.
 [[ "$version" == "${TORCH_TAG#v}+cu13"* ]] && ok "torch ${version}" || bad "torch ${version}, expected ${TORCH_TAG#v}+cu13x"
 value="$(field build.torch_cuda_nccl_version)"
-[[ "$value" == "$NCCL_VERSION" ]] && ok "compiled against NCCL ${value}" || bad "compiled against NCCL ${value}"
+# probe-torch-nccl-version.sh joins torch.cuda.nccl.version() with ".", suffix included: 2.32.3.-cta
+expected="${NCCL_VERSION}${nccl_suffix:+.${nccl_suffix}}"
+[[ "$value" == "$expected" ]] && ok "compiled against NCCL ${value}" || bad "compiled against NCCL ${value}, expected ${expected}"
 value="$(field runtime.get_runtime_nccl_version)"
 [[ "$value" == "$NCCL_VERSION" ]] && ok "loads NCCL ${value} (ncclGetVersion)" || bad "loads NCCL ${value}"
 mapfile -t loaded < <(field runtime.libnccl_realpath)
@@ -595,7 +600,8 @@ PY
         bad "smoke run failed"
     fi
     banner="$(grep -m1 -o "NCCL version [^ ]*" <<<"$output" || true)"
-    [[ "$banner" == "NCCL version ${NCCL_VERSION}"* ]] && ok "${banner} (NCCL_DEBUG=VERSION)" \
+    # "+cuda" ends the version in the banner, so a stock 2.32.3 does not pass for 2.32.3-cta or the reverse.
+    [[ "$banner" == "NCCL version ${NCCL_VERSION}${nccl_suffix}+"* ]] && ok "${banner} (NCCL_DEBUG=VERSION)" \
         || { bad "NCCL banner: ${banner:-none}"; tail -n 20 <<<"$output" | sed 's/^/    /'; }
 else
     note "${gpus} GPU(s) visible; skipped the 2-GPU collective run (run this on the GB200 node)"
@@ -605,5 +611,5 @@ echo
 if (( failures )); then
     die "${failures} check(s) failed"
 fi
-echo "=== torch ${version} + torchvision ready in ${target_py}, NCCL ${NCCL_VERSION} from ${nccl_lib}"
+echo "=== torch ${version} + torchvision ready in ${target_py}, NCCL ${NCCL_VERSION}${nccl_suffix} from ${nccl_lib}"
 echo "  Transformer Engine has to be rebuilt against the same NCCL: NCCL_HOME=${nccl_home}"

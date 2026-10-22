@@ -1,0 +1,39 @@
+--- a/makefiles/version.mk
++++ b/makefiles/version.mk
+@@ -9,5 +9,7 @@
+ NCCL_MAJOR   := 2
+ NCCL_MINOR   := 32
+ NCCL_PATCH   := 3
+-NCCL_SUFFIX  :=
++# nccl-2.32.3-cta: "NCCL version 2.32.3-cta+cudaX.Y" in the NCCL_DEBUG=VERSION banner and NCCL_SUFFIX in nccl.h,
++# so a run shows which libnccl it loaded. NCCL_VERSION_CODE (ncclGetVersion) and the soname are unchanged.
++NCCL_SUFFIX  := -cta
+ PKG_REVISION := 1
+--- a/src/tuning/sym_model/gin.cc
++++ b/src/tuning/sym_model/gin.cc
+@@ -101,7 +101,10 @@ ncclResult_t ncclSymkGinModel(struct ncclTuningInput_t* input, enum ncclSymkKern
+   // minCTAs/maxCTAs are resolved (env > per-call > comm) at task-append time.
+   int nMaxBlocks = std::min<int>(input->maxCTAs, ncclSymkMaxBlocks);
+   if (kernelId == ncclSymkKernelId_AllGather_RailRing_LsaSTMC) {
+-    nMaxBlocks = std::min<int>(nMaxBlocks, divUp((comm->cudaArch < 1000 ? 16 : 32), comm->nvlsResources->nHeads));
++    // nccl-2.32.3-cta: as in lsa.cc, a minCTAs above the multicast cap raises it.
++    nMaxBlocks = std::min<int>(nMaxBlocks, std::max<int>(divUp((comm->cudaArch < 1000 ? 16 : 32),
++                                                               comm->nvlsResources->nHeads),
++                                                         input->minCTAs));
+   }
+   int nMinBlocks = input->minCTAs;
+   nMinBlocks = std::min(nMinBlocks, nMaxBlocks);
+--- a/src/tuning/sym_model/lsa.cc
++++ b/src/tuning/sym_model/lsa.cc
+@@ -45,7 +45,10 @@ static bool evaluateLsaEstimate(struct ncclTuningInput_t* input, enum ncclSymkKe
+ ncclResult_t ncclSymkLsaModel(struct ncclTuningInput_t* input, enum ncclSymkKernelId kernelId, size_t nBytes,
+                               float* timeUs, float* selectionTimeUs, int* nBlocks) {
+   struct ncclComm* comm = input->comm;
+-  int nMaxBlocks = std::min<int>(maxBlocksLsa(comm, kernelId), input->maxCTAs);
++  // nccl-2.32.3-cta: maxBlocksLsa()'s multicast cap divUp(32, nRanks) only bounds NCCL's own choice. A minCTAs
++  // above it (ncclConfig_t, per-call config or NCCL_MIN_CTAS) raises the bound, up to maxCTAs.
++  int nMaxBlocks = std::min<int>(std::max<int>(maxBlocksLsa(comm, kernelId), input->minCTAs),
++                                 std::min<int>(input->maxCTAs, ncclSymkMaxBlocks));
+   int nMinBlocks = std::min(input->minCTAs, nMaxBlocks);
+ 
+   *timeUs = FLT_MAX;
