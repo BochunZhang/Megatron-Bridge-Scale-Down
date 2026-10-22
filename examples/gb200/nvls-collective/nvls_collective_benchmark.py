@@ -220,12 +220,13 @@ CTA_ENV_OVERRIDES = (
     "NCCL_MIN_P2P_NCHANNELS",
     "NCCL_MAX_P2P_NCHANNELS",
 )
-# NCCL_SYM_CTAS fixes the CTA count of every symmetric kernel of the process and, unlike
-# minCTAs/maxCTAs, also lifts the multicast cap below (sym_kernels.cc queryModel_lsa).
+# NCCL_SYM_CTAS fixes the CTA count of every symmetric kernel of the process.
 SYM_CTAS_ENV = "NCCL_SYM_CTAS"
-# The multicast symmetric kernels (AllGather_STMC, ReduceScatter_LDMC, AllReduce_RSxLDMC_AGxSTMC)
-# run on at most divUp(32, nRanks) CTAs on Blackwell, whatever minCTAs/maxCTAs say.
-SYMM_MC_CTA_BUDGET = 32
+# Stock NCCL runs the multicast symmetric kernels (AllGather_STMC, AllGather_TmaSTMC, ReduceScatter_LDMC,
+# AllReduce_RSxLDMC_AGxSTMC) on at most divUp(32, nRanks) CTAs on Blackwell whatever minCTAs/maxCTAs say
+# (2.32.3 tuning/sym_model/lsa.cc maxBlocksLsa); only NCCL_SYM_CTAS lifts it there. nccl-2.32.3-cta
+# (install/install-nccl-2.32.3-cta.sh) lets a minCTAs above the cap through, up to 64. ag/rs/ar above it
+# are therefore not refused up front: check_ctas() fails a case whose launches NCCL clamped.
 
 SLEEP_CALIBRATION_CYCLES = 10_000_000
 
@@ -449,13 +450,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     return args
 
 
-def _check_cta_environment(algo: str, args: argparse.Namespace, group_sizes: list[int]) -> None:
+def _check_cta_environment(algo: str, args: argparse.Namespace) -> None:
     """Refuse CTA configs the environment or NCCL would silently override.
 
     ``NCCL_MIN_CTAS`` and friends replace every communicator's ncclConfig_t, so a run with them
-    set would report the requested CTA counts while measuring others. A multicast symmetric kernel
-    never runs on more than ``divUp(32, n)`` CTAs, so a larger ``ag``/``rs``/``ar`` request on
-    the window path is rejected here instead of failing the first case.
+    set would report the requested CTA counts while measuring others. ``ag``/``rs``/``ar`` above the
+    multicast symmetric kernels' ``divUp(32, n)`` cap pass: nccl-2.32.3-cta runs them, and on stock
+    NCCL, which clamps them, :func:`check_ctas` fails the case.
     """
     custom = [config for config in args.cta_configs if config]
     if not custom:
@@ -467,18 +468,6 @@ def _check_cta_environment(algo: str, args: argparse.Namespace, group_sizes: lis
         raise RuntimeError(f"{SYM_CTAS_ENV} fixes every symmetric kernel's CTAs; unset it to set ag/rs/ar per op")
     if algo == "copy-engine" and any("ag" in config for config in custom):
         raise ValueError("--algo copy-engine runs its AllGather on the copy engines, which use no CTAs; drop ag=")
-    # symm runs every op on a multicast kernel; symm-tma and copy-engine only their RS (LDMC).
-    multicast_keys = ("ag", "rs", "ar") if algo == "symm" else ("rs",) if algo in WINDOW_ALGOS else ()
-    if not os.environ.get(SYM_CTAS_ENV):
-        for config in custom:
-            for key in multicast_keys:
-                limit = -(-SYMM_MC_CTA_BUDGET // max(group_sizes))
-                if config.get(key, 0) > limit:
-                    raise ValueError(
-                        f"--cta-configs {cta_config_name(config)}: {key}={config[key]} exceeds the multicast"
-                        f" symmetric kernels' cap divUp({SYMM_MC_CTA_BUDGET}, {max(group_sizes)}) = {limit}"
-                        f" CTAs on groups of {max(group_sizes)}; only {SYM_CTAS_ENV} lifts it (process-wide)"
-                    )
 
 
 def _check_environment(algo: str, world_size: int, args: argparse.Namespace) -> None:
@@ -548,7 +537,7 @@ def _check_environment(algo: str, world_size: int, args: argparse.Namespace) -> 
         raise RuntimeError("NCCL_DEBUG_SUBSYS must include TUNING: it carries the per-launch algorithm/kernel line")
     if "%p" not in os.environ.get("NCCL_DEBUG_FILE", ""):
         raise RuntimeError("NCCL_DEBUG_FILE must be set and contain %p so every process reads only its own log")
-    _check_cta_environment(algo, args, args.group_sizes)
+    _check_cta_environment(algo, args)
     too_large = [n for n in args.group_sizes + args.split_totals if n > world_size]
     if too_large:
         raise ValueError(f"group sizes {too_large} exceed WORLD_SIZE={world_size}")
@@ -608,7 +597,8 @@ def comm_ctas(op: str, ctas: Mapping[str, int]) -> tuple[int | None, int | None]
     """``(min_ctas, max_ctas)`` for the communicator of ``op`` under one ``--cta-configs`` entry.
 
     A collective's communicator gets ``min = max = N``: NCCL then picks exactly N channels for a
-    classic kernel and N CTAs for a symmetric one (within the multicast cap). The P2P communicator
+    classic kernel and N CTAs for a symmetric one (a multicast one only up to divUp(32, n) on stock
+    NCCL, any N on nccl-2.32.3-cta). The P2P communicator
     is shaped by :func:`collective_metrics.p2p_comm_ctas`. ``(None, None)`` keeps NCCL's default.
     """
     target = ctas.get(CTA_KEY_OF_OP[op])

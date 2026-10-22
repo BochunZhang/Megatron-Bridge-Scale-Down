@@ -346,10 +346,13 @@ bash examples/gb200/nvls-collective/run_nvls_collective_benchmark.sh --algos sym
   再跑一遍（同一个 torchrun 进程内循环，不是多次调用 Python），case 名追加 `-cta-ag3-rs6-p2p32` 这样的后缀，
   `comm/` 日志也带同样的后缀。结果写进同一个 `results.jsonl`，每行带 `cta_config`、`requested_ctas`、
   `observed_ctas`、`predicted_p2p_ctas`。
-- **symm 的上限**：multicast 对称 kernel（`AllGather_STMC`、`ReduceScatter_LDMC`、`AllReduce_RSxLDMC_AGxSTMC`）
-  在 Blackwell 上最多 `divUp(32, n)` 个 CTA（`sym_kernels.cc` `queryModel_lsa`），`minCTAs/maxCTAs` 突破不了：
-  4 卡最多 8（默认 6），8 卡 4，16 卡 2，32 卡 1。超过上限的配置启动前就报错。唯一能突破的是进程级的
-  `NCCL_SYM_CTAS`，它同时作用于所有对称 kernel，所以不能和 `ag=/rs=/ar=` 一起用（可以和 `p2p=` 一起用）。
+- **symm 的上限**：原版 NCCL 的 multicast 对称 kernel（`AllGather_STMC`、`AllGather_TmaSTMC`、`ReduceScatter_LDMC`、
+  `AllReduce_RSxLDMC_AGxSTMC`）在 Blackwell 上最多 `divUp(32, n)` 个 CTA（2.32.3 `tuning/sym_model/lsa.cc`
+  `maxBlocksLsa`），`minCTAs/maxCTAs` 突破不了：4 卡最多 8（默认 6），8 卡 4，16 卡 2，32 卡 1，超出的请求会被静默截断。
+  `install/install-nccl-2.32.3-cta.sh` 编出的 nccl-2.32.3-cta（横幅 `NCCL version 2.32.3-cta+...`）允许大于上限的
+  `minCTAs` 生效，最多 64，所以 benchmark 不再在启动前拒绝超过上限的 `ag=/rs=/ar=`。用原版 NCCL 跑这类配置时，
+  下面的校验会以「requested N CTAs, NCCL launched 4」让 case 失败。进程级的 `NCCL_SYM_CTAS` 同样能突破上限，但它同时作用于
+  所有对称 kernel，所以不能和 `ag=/rs=/ar=` 一起用（可以和 `p2p=` 一起用）。
 - **P2P**：send/recv 的 CTA 数由两层决定（`paths.cc`、`enqueue.cc`）：comm 的 P2P channel 数
   `pow2Up(nChannels)`，以及每次 send 按大小在 `[起始值, 每 peer 上限 32]` 之间翻倍（同 tray 每个 channel 最多
   32 × 512 KiB = 16 MiB，跨 tray 每个 channel 一个 256 KiB chunk）。4 卡 1024 MiB 时每次 send 256 MiB，默认 16 个；

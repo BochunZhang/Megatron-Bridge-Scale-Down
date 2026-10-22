@@ -1774,12 +1774,13 @@ def test_cta_configs_refuse_environment_that_overrides_them(monkeypatch):
 
 
 @pytest.mark.unit
-def test_cta_configs_respect_the_multicast_cap_and_nccl_sym_ctas(monkeypatch):
+def test_cta_configs_pass_the_multicast_cap_but_not_nccl_sym_ctas(monkeypatch):
     _symm_env(monkeypatch)
     base = ["--algo", "symm", "--output-dir", "/tmp/x", "--group-sizes", "4"]
     benchmark._check_environment("symm", 4, benchmark.parse_args([*base, "--cta-configs", "ag=8,rs=3"]))
-    with pytest.raises(ValueError, match=r"ag=12 exceeds .* divUp\(32, 4\) = 8"):
-        benchmark._check_environment("symm", 4, benchmark.parse_args([*base, "--cta-configs", "ag=12"]))
+    # Above divUp(32, 4) = 8: nccl-2.32.3-cta runs it, stock NCCL clamps it and check_ctas fails the case.
+    benchmark._check_environment("symm", 4, benchmark.parse_args([*base, "--cta-configs", "ag=12,rs=64"]))
+    benchmark._check_environment("symm", 8, benchmark.parse_args([*base[:-1], "8", "--cta-configs", "ag=1,rs=5"]))
     monkeypatch.setenv("NCCL_SYM_CTAS", "12")
     with pytest.raises(RuntimeError, match="NCCL_SYM_CTAS fixes"):
         benchmark._check_environment("symm", 4, benchmark.parse_args([*base, "--cta-configs", "ag=12"]))
