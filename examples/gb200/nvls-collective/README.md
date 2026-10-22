@@ -376,7 +376,7 @@ bash examples/gb200/nvls-collective/run_nvls_collective_benchmark.sh --algos sym
 bash examples/gb200/nvls-collective/run_symm_cta_sweep.sh --nnodes 8 --group-sizes 32
 ```
 
-- `--venv` 默认是 `.venv/python3.12-torch2.13-engin2.17-nccl2.32.3`，`--nccl-lib` 默认是
+- `--venv` 默认是 `.venv/python3.12-torch2.13-nccl2.32.3`，`--nccl-lib` 默认是
   `nccl/nccl-2.32.3-cta/build/lib/libnccl.so.2`；`--` 之后的参数原样传给 `run_nvls_collective_benchmark.sh`，并覆盖上面的默认值。
 - 只有不带 `nvidia-nccl-cu13` 的 torch（`install/install-torch-2.13.0-nccl-2.32.3.sh` 编出的）能被 `LD_PRELOAD` 干净替换：
   官方 wheel 在 `import torch` 时会按路径再加载一份 NCCL。所以启动前会检查 python 里只映射了 preload 的那一份 libnccl，

@@ -41,7 +41,7 @@ Options:
   --group-sizes LIST  Single-group sizes (default: 32)
   --max-ctas N        Largest ag / rs CTA count of the sweep (default: 8)
   --venv DIR          Virtualenv to activate, or 'none' to keep the current one
-                      (default: <repo>/.venv/python3.12-torch2.13-engin2.17-nccl2.32.3)
+                      (default: <repo>/.venv/python3.12-torch2.13-nccl2.32.3)
   --nccl-lib PATH     libnccl.so.2 to preload (default: <repo>/nccl/nccl-2.32.3-cta/build/lib/libnccl.so.2)
   -h, --help          Show this help
 
@@ -62,7 +62,7 @@ repo_root="$(cd -- "${script_dir}/../../.." && pwd)"
 nnodes=8
 group_sizes=32
 max_ctas=8
-venv="${repo_root}/.venv/python3.12-torch2.13-engin2.17-nccl2.32.3"
+venv="${repo_root}/.venv/python3.12-torch2.13-nccl2.32.3"
 nccl_lib="${repo_root}/nccl/nccl-2.32.3-cta/build/lib/libnccl.so.2"
 nccl_suffix="-cta"
 passthrough=()
