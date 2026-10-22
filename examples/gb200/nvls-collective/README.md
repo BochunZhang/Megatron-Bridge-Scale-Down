@@ -367,6 +367,20 @@ bash examples/gb200/nvls-collective/run_nvls_collective_benchmark.sh --algos sym
   `NCCL_MIN_CTAS=4`、`NCCL_MIN_NCHANNELS=16`（见历次 `metadata.json`），所以 launcher 在 `--cta-configs` 含非 default
   条目时用 `env -u` 把它们从 worker 环境里去掉，并打 warning：**这次运行里的 `default` 是 NCCL 自己的选择，和以前
   带着这两个变量跑出来的结果不完全同口径**，对比请用同一次运行里的 default。直接调用 benchmark 时它们仍会被拒绝。
+
+**AG / RS CTA 扫描（`run_symm_cta_sweep.sh`）**：用 `LD_PRELOAD` 换上 nccl-2.32.3-cta，在 symm 上跑
+`--workloads ar,ag,rs,ag+rs --sizes-mib 1024 --nsys`，`--cta-configs` 是 `default` 加上所有 `1 <= ag <= rs <= --max-ctas`
+（默认 8，共 37 组）。每个节点运行同一条命令：
+
+```bash
+bash examples/gb200/nvls-collective/run_symm_cta_sweep.sh --nnodes 8 --group-sizes 32
+```
+
+- `--venv` 默认是 `.venv/python3.12-torch2.13-engin2.17-nccl2.32.3`，`--nccl-lib` 默认是
+  `nccl/nccl-2.32.3-cta/build/lib/libnccl.so.2`；`--` 之后的参数原样传给 `run_nvls_collective_benchmark.sh`，并覆盖上面的默认值。
+- 只有不带 `nvidia-nccl-cu13` 的 torch（`install/install-torch-2.13.0-nccl-2.32.3.sh` 编出的）能被 `LD_PRELOAD` 干净替换：
+  官方 wheel 在 `import torch` 时会按路径再加载一份 NCCL。所以启动前会检查 python 里只映射了 preload 的那一份 libnccl，
+  跑完后会检查 `<run>/*/nccl-raw/` 里每个进程的横幅都是 `NCCL version 2.32.3-cta+...`（worker 由 nsys 拉起），否则以失败退出。
   copy-engine 的 AG 不用 SM，不接受 `ag=`。
 - 读结果：`compare.md` 表 1–5 只用 `default` 的结果，新增的**表 6** 把每个非 default 配置和同一 case 的 default
   配对，每个 op 给出 `CTA 数 / 每次迭代 ms (相对 default)`。
