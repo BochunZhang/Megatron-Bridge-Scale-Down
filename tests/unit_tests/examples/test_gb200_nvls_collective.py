@@ -361,6 +361,45 @@ def test_symm_pass_accepts_a_pinned_kernel_only_when_it_matches(monkeypatch):
 
 
 @pytest.mark.unit
+def test_symm_kernel_mc_pins_both_multicast_kernels_for_every_workload(monkeypatch):
+    # Unlike ag / rs / ar, the per-function pin leaves every workload measurable.
+    args = benchmark.parse_args(
+        ["--algo", "symm", "--output-dir", "/tmp/x", "--symm-kernel", "mc", "--workloads", "ar,ag,rs,ag+rs"]
+    )
+    _debug_env(monkeypatch, ce_threshold="9223372036854775807")
+    monkeypatch.delenv("NCCL_ALGO", raising=False)
+    monkeypatch.setenv("NCCL_WIN_ENABLE", "1")
+    monkeypatch.setattr(benchmark.torch.cuda.nccl, "version", lambda: (2, 32, 3))
+    monkeypatch.setenv("NCCL_SYM_KERNEL", benchmark.SYMM_MC_PIN)
+    benchmark._check_environment("symm", 32, args)
+    monkeypatch.setenv("NCCL_SYM_KERNEL", "AllGather_STMC")
+    with pytest.raises(RuntimeError, match="--symm-kernel mc requires NCCL_SYM_KERNEL="):
+        benchmark._check_environment("symm", 32, args)
+    # 2.29 reads NCCL_SYM_KERNEL as one kernel name, so the per-function pin would mask everything.
+    monkeypatch.setenv("NCCL_SYM_KERNEL", benchmark.SYMM_MC_PIN)
+    monkeypatch.setattr(benchmark.torch.cuda.nccl, "version", lambda: (2, 29, 7))
+    with pytest.raises(RuntimeError, match="NCCL >= 2.32"):
+        benchmark._check_environment("symm", 32, args)
+
+
+@pytest.mark.unit
+def test_check_implementation_holds_symm_mc_to_stmc_and_ldmc_only():
+    pin = benchmark.SYMM_MC_PIN
+    assert _check([SYMM_AG, SYMM_RS, SYMM_AG, SYMM_RS], ops=("ag", "rs"), pinned_kernel=pin)[1] == []
+    unicast = SYMM_AG.replace("AllGather_STMC", "AllGather_ST")
+    rs_ld = SYMM_RS.replace("ReduceScatter_LDMC", "ReduceScatter_LD")
+    _, errors = _check([unicast, SYMM_AG, rs_ld, SYMM_RS], ops=("ag", "rs"), pinned_kernel=pin)
+    assert errors == [
+        "AllGather: expected Symmetric/AllGather_STMC, got Symmetric/AllGather_ST x1",
+        "ReduceScatter: expected Symmetric/ReduceScatter_LDMC, got Symmetric/ReduceScatter_LD x1",
+    ]
+    # AllReduce is not in the pin; SYMM_KERNELS["ar"] still holds it to the multicast kernel.
+    assert benchmark.pinned_symm_kernel("ar", pin) is None
+    assert benchmark.pinned_symm_kernel("ag2", pin) == "AllGather_STMC"
+    assert benchmark.implementation_matches("symm", "ar", "Symmetric/AllReduce_RSxLDMC_AGxSTMC", pinned_kernel=pin)
+
+
+@pytest.mark.unit
 def test_symm_kernel_pins_are_real_nccl_kernel_names():
     # Names as defined in NCCL's src/sym_kernels.cc kernel table.
     assert benchmark.SYMM_KERNELS["ag"] == ["AllGather_ST", "AllGather_LL", "AllGather_STMC", "AllGather_LLMC"]

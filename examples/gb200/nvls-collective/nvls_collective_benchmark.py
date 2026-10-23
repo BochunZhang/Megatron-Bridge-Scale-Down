@@ -136,6 +136,12 @@ SYMM_KERNELS = {
     "rs": ["ReduceScatter_LD", "ReduceScatter_LL", "ReduceScatter_LDMC"],
     "ar": ["AllReduce_RSxLDMC_AGxSTMC"],
 }
+# --symm-kernel mc: the multicast AG and RS kernels, pinned per function (NCCL 2.32 only; 2.29's
+# NCCL_SYM_KERNEL takes one kernel name). Without it the 2.32 cost model picks the unicast
+# AllGather_ST for a 1 GiB AllGather on 4 GPUs (sym_model/lsa_a2a.cc). AllReduce stays unpinned:
+# it is the start gate, and SYMM_KERNELS["ar"] already holds the measured one to RSxLDMC_AGxSTMC.
+SYMM_MC_PIN = "allgather:AllGather_STMC;reducescatter:ReduceScatter_LDMC"
+SYMM_MC_MIN_NCCL = (2, 32, 0)
 # The multicast kernel of each op, the one the symm pass runs at 16 MiB and above. A CTA config
 # must not move NCCL off it, or the case would compare kernels instead of CTA counts.
 SYMM_MC_KERNELS = {
@@ -373,9 +379,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument(
         "--symm-kernel",
-        choices=["default", *SYMM_KERNELS],
+        choices=["default", *SYMM_KERNELS, "mc"],
         default="default",
-        help="For --algo symm: assert the pinned NCCL_SYM_KERNEL matches SYMM_KERNELS[...]",
+        help="For --algo symm: assert the pinned NCCL_SYM_KERNEL matches SYMM_KERNELS[...]; mc pins"
+        f" AG and RS to their multicast kernels ({SYMM_MC_PIN}, NCCL >= 2.32)",
     )
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--group-sizes", type=_csv_ints, default=[4, 8, 16, 32], help="Single-group sizes")
@@ -445,7 +452,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         parser.error("--launch-delay-ms must be >= 0")
     if args.late_join and args.split_totals:
         parser.error("--late-join replaces the single and split scenarios; pass --split-totals none")
-    if args.late_join and args.symm_kernel != "default":
+    if args.late_join and args.symm_kernel not in ("default", "mc"):
         parser.error("--late-join runs an AG and an RS; --symm-kernel would mask one of them")
     return args
 
@@ -482,14 +489,22 @@ def _check_environment(algo: str, world_size: int, args: argparse.Namespace) -> 
         if os.environ.get("NCCL_WIN_ENABLE") != "1":
             raise RuntimeError("--algo symm requires NCCL_WIN_ENABLE=1 to register symmetric windows")
         pinned = os.environ.get("NCCL_SYM_KERNEL")
-        if args.symm_kernel != "default" and pinned not in SYMM_KERNELS[args.symm_kernel]:
+        if args.symm_kernel == "mc":
+            if pinned != SYMM_MC_PIN:
+                raise RuntimeError(f"--symm-kernel mc requires NCCL_SYM_KERNEL={SYMM_MC_PIN!r}, got {pinned!r}")
+            if torch.cuda.nccl.version() < SYMM_MC_MIN_NCCL:
+                raise RuntimeError(
+                    "--symm-kernel mc needs NCCL >= 2.32 for the per-function NCCL_SYM_KERNEL;"
+                    f" got {'.'.join(map(str, torch.cuda.nccl.version()))}"
+                )
+        elif args.symm_kernel != "default" and pinned not in SYMM_KERNELS[args.symm_kernel]:
             raise RuntimeError(
                 f"--symm-kernel {args.symm_kernel} requires NCCL_SYM_KERNEL in"
                 f" {SYMM_KERNELS[args.symm_kernel]}, got {pinned!r}"
             )
         # NCCL_SYM_KERNEL is a single-kernel mask: pinning an AG kernel leaves RS with no
         # symmetric kernel at all, so RS would silently run a classic kernel.
-        if args.symm_kernel != "default" and args.workloads != [args.symm_kernel]:
+        if args.symm_kernel not in ("default", "mc") and args.workloads != [args.symm_kernel]:
             raise ValueError(
                 f"--symm-kernel {args.symm_kernel} masks every other symmetric kernel;"
                 f" run it with --workloads {args.symm_kernel}, got {args.workloads}"
@@ -750,11 +765,23 @@ def parse_nccl_lines(lines: list[str]) -> dict[str, object]:
     return result
 
 
+def pinned_symm_kernel(op: str, pinned_kernel: str | None) -> str | None:
+    """The kernel ``NCCL_SYM_KERNEL`` pins ``op`` to, or None when it leaves ``op`` free.
+
+    Accepts a single kernel name (2.29) or the 2.32 per-function form ``<func>:<kernel>;...``.
+    """
+    if pinned_kernel is None or ":" not in pinned_kernel:
+        return pinned_kernel
+    pins = dict(entry.split(":", 1) for entry in pinned_kernel.split(";") if entry)
+    return {func.lower(): kernel for func, kernel in pins.items()}.get(OP_FUNCS[op].lower())
+
+
 def implementation_matches(algo: str, op: str, implementation: str, *, pinned_kernel: str | None) -> bool:
     """Whether one launch ran the implementation the ``algo`` pass is meant to measure."""
     if algo == "symm":
         family, _, kernel = implementation.partition("/")
-        return family == "Symmetric" and kernel in SYMM_KERNELS[op] and pinned_kernel in (None, kernel)
+        pin = pinned_symm_kernel(op, pinned_kernel)
+        return family == "Symmetric" and kernel in SYMM_KERNELS[op] and pin in (None, kernel)
     if algo in PINNED_IMPLEMENTATIONS:
         return implementation == PINNED_IMPLEMENTATIONS[algo].get(op)
     # 2.29 logs ncclAlgoToString() ("RING", "NVLS"); older releases used ncclAlgoStr ("Ring").
@@ -838,7 +865,7 @@ def check_implementation(
         }
         if wrong:
             if algo == "symm":
-                want = f"Symmetric/{pinned_kernel or '|'.join(SYMM_KERNELS[op])}"
+                want = f"Symmetric/{pinned_symm_kernel(op, pinned_kernel) or '|'.join(SYMM_KERNELS[op])}"
             elif algo in PINNED_IMPLEMENTATIONS:
                 want = PINNED_IMPLEMENTATIONS[algo].get(op, "nothing")
             else:
@@ -947,7 +974,7 @@ def _connect(groups: list[CollectiveGroup], gate: StartGate, rank: int, *, windo
     while another communicator's kernel waits for peers can deadlock, so it happens here,
     one communicator at a time, with a device sync in between. The start gate goes first.
 
-    With ``windows`` (symm-tma, copy-engine) the AG and RS run on a registered window
+    With ``windows`` (symm-tma, copy-engine, symm with ``--symm-kernel mc``) the AG and RS run on a registered window
     instead (:func:`_connect_windows`); the groups must have been created with ``eager=True``.
     """
     if gate.pg is not None:
@@ -1593,7 +1620,10 @@ def run_case(
         p2p_ctas = None
         if any(op in P2P_OPS for op in group_ops[g.name]):
             p2p_ctas = _predicted_p2p_ctas(
-                g, size_bytes=size_bytes, eager=args.algo in PINNED_IMPLEMENTATIONS, n_nodes=evidence["n_nodes"]
+                g,
+                size_bytes=size_bytes,
+                eager=args.algo in PINNED_IMPLEMENTATIONS or args.symm_kernel == "mc",
+                n_nodes=evidence["n_nodes"],
             )
         record: dict[str, object] = {
             "case": case,
@@ -1743,7 +1773,8 @@ def main(argv: list[str] | None = None) -> None:
     # symm-tma / copy-engine measure only ag and ag+rs; the cross case below still runs when
     # ag and rs are both requested, because group B's RS is their pinned ReduceScatter_LDMC.
     workloads = measured_workloads(args.algo, args.workloads)
-    pinned = args.algo in PINNED_IMPLEMENTATIONS
+    # A pinned AG / RS has no classic fallback, so its communicators connect on a window.
+    pinned = args.algo in PINNED_IMPLEMENTATIONS or args.symm_kernel == "mc"
 
     nsys_index = args.output_dir / "nsys" / "index.tsv"
     indexed_captures: set[int] = set()

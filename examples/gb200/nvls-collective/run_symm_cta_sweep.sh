@@ -24,8 +24,10 @@ with --cta-configs 'default;ag=A,rs=R;...' for every 1 <= A <= R <= --max-ctas. 
 the multicast symmetric kernels to divUp(32, group size) CTAs (1 on 32 GPUs), so the benchmark's
 libnccl.so.2 is replaced through LD_PRELOAD by the nccl-2.32.3-cta build
 (install/install-nccl-2.32.3-cta.sh), which lets a minCTAs above that cap through, up to 64.
-NCCL_SYM_TMA_ENABLE=0 keeps NCCL off the 2.32 TMA symmetric kernels (e.g. AllGather_TmaST), so
-AG / RS stay on the multicast kernels the sweep sizes.
+NCCL_SYM_TMA_ENABLE=0 keeps NCCL off the 2.32 TMA symmetric kernels (e.g. AllGather_TmaST), and
+--symm-kernel mc pins AG / RS to AllGather_STMC / ReduceScatter_LDMC, so the default config is the
+multicast kernels at NCCL's own CTA count too (otherwise 4 GPUs at 1 GiB pick the unicast
+AllGather_ST). Pass -- --symm-kernel default to let NCCL choose the kernel again.
 
 LD_PRELOAD only swaps the library cleanly for a torch that loads one libnccl.so.2 through its
 soname, i.e. the torch built by install/install-torch-2.13.0-nccl-2.32.3.sh: the official wheel
@@ -143,6 +145,7 @@ set +e
 # AllGather_TmaST/TmaSTMC, ReduceScatter_TmaLD, AllReduce_RSxTmaLD_AGxTmaST). Otherwise the cost
 # model picks AllGather_TmaST at 1 GiB, which is outside the symm pass's SYMM_KERNELS, and the
 # sweep would leave the multicast kernels (AllGather_STMC, ReduceScatter_LDMC) it is meant to size.
+# --symm-kernel mc does the same for the default config, which the CTA checks do not cover.
 NCCL_SYM_TMA_ENABLE=0 LD_PRELOAD="$preload" bash "${script_dir}/run_nvls_collective_benchmark.sh" \
     --nnodes "$nnodes" \
     --group-sizes "$group_sizes" \
@@ -151,6 +154,7 @@ NCCL_SYM_TMA_ENABLE=0 LD_PRELOAD="$preload" bash "${script_dir}/run_nvls_collect
     --workloads ar,ag,rs,ag+rs \
     --nsys \
     --cta-configs "$cta_configs" \
+    --symm-kernel mc \
     ${passthrough[@]+"${passthrough[@]}"} 2>&1 | tee "$log"
 status="${PIPESTATUS[0]}"
 set -e

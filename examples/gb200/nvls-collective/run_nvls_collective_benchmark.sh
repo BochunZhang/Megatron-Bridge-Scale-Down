@@ -79,8 +79,10 @@ Options:
   --trials N              Timed trials, median reported (default: 5)
   --launch-delay-ms MS    GPU sleep before each trial so every launch is queued first (default: 5);
                           raise it when cases are flagged HOST-BOUND
-  --symm-kernel KERNEL    For the symm pass only: default, ag, rs or ar (pins NCCL_SYM_KERNEL); needs
-                          --workloads with that op only, because the pin masks the other op
+  --symm-kernel KERNEL    For the symm pass only: default, ag, rs, ar or mc (pins NCCL_SYM_KERNEL).
+                          ag / rs / ar pin one kernel and need --workloads with that op only, because
+                          the pin masks the other op. mc (NCCL >= 2.32) pins AG to AllGather_STMC and
+                          RS to ReduceScatter_LDMC per function and works with every workload
   --cta-configs LIST      ';'-separated CTA configs, each 'default' or '<op>=<ctas>,...' with <op> in
                           ag,rs,ar,p2p (ag2/rs2 follow ag/rs), e.g. 'default;ag=3,rs=6;p2p=32'
                           (default: default). Each entry rebuilds every communicator with ncclConfig_t
@@ -285,7 +287,8 @@ if $late_join; then
     # 1/4 release point well above launch jitter (documents/gb200/03-*). Few iterations per trial keep
     # every launch queued behind the --launch-delay-ms sleep, which the release time relies on.
     [[ "$split_totals" == none ]] || die "--late-join replaces the split scenario; drop --split-totals"
-    [[ "$symm_kernel" == default ]] || die "--late-join runs an AG and an RS; --symm-kernel would mask one"
+    [[ "$symm_kernel" == default || "$symm_kernel" == mc ]] \
+        || die "--late-join runs an AG and an RS; --symm-kernel would mask one"
     sizes_mib="${sizes_mib:-64,256,512}"
     iters="${iters:-5}"
     trials="${trials:-10}"
@@ -309,10 +312,13 @@ case "$symm_kernel" in
     rs) symm_kernel_env="ReduceScatter_LDMC" ;;
     # Reduce-scatter + all-gather through multicast: the only symmetric AR the benchmark accepts.
     ar) symm_kernel_env="AllReduce_RSxLDMC_AGxSTMC" ;;
-    *) die "--symm-kernel accepts default, ag, rs or ar; got $symm_kernel" ;;
+    # NCCL 2.32 "<func>:<kernel>;..." form: AG and RS each keep only their multicast kernel, and
+    # AllReduce (the start gate; the measured AR is held to RSxLDMC_AGxSTMC anyway) is left alone.
+    mc) symm_kernel_env="allgather:AllGather_STMC;reducescatter:ReduceScatter_LDMC" ;;
+    *) die "--symm-kernel accepts default, ag, rs, ar or mc; got $symm_kernel" ;;
 esac
 # Fail before the ring/nvls passes run: the benchmark rejects this in the symm pass anyway.
-if [[ "$symm_kernel" != default && "$workloads" != "$symm_kernel" ]]; then
+if [[ "$symm_kernel" != default && "$symm_kernel" != mc && "$workloads" != "$symm_kernel" ]]; then
     die "--symm-kernel ${symm_kernel} masks the other op's symmetric kernels; pass --workloads ${symm_kernel}"
 fi
 if (( nnodes > 1 )) && [[ "$master_addr" == 127.0.0.1 ]]; then

@@ -69,7 +69,7 @@ launcher 为每个实现固定了（`symm-tma` 简写为 tma，`copy-engine` 简
 | `NCCL_ALGO` | `Ring` | `NVLS` | 空（=不设） | 空 | 空 | 前两者强制算法；window 路径不设，否则会屏蔽掉 window 分发 |
 | `NCCL_NVLS_ENABLE` | `0` | `1` | `1` | `1` | `1` | ring 不申请 multicast buffer；其余保留 multicast（MC）内核 / CE multicast 可选 |
 | `NCCL_WIN_ENABLE` | 不设 | 不设 | `1` | `1` | `1` | 允许 `ncclCommWindowRegister`，这是 window 路径的开关 |
-| `NCCL_SYM_KERNEL` | 不设 | 不设 | 可选 | `allgather:AllGather_TmaSTMC;reducescatter:ReduceScatter_LDMC` | `reducescatter:ReduceScatter_LDMC` | symm：`--symm-kernel ag\|rs\|ar` 固定到单个内核（`AllGather_STMC` / `ReduceScatter_LDMC` / `AllReduce_RSxLDMC_AGxSTMC`），只能配同名的单个 `--workloads`；tma、ce 按 func 分别固定（见下文） |
+| `NCCL_SYM_KERNEL` | 不设 | 不设 | 可选 | `allgather:AllGather_TmaSTMC;reducescatter:ReduceScatter_LDMC` | `reducescatter:ReduceScatter_LDMC` | symm：`--symm-kernel ag\|rs\|ar` 固定到单个内核（`AllGather_STMC` / `ReduceScatter_LDMC` / `AllReduce_RSxLDMC_AGxSTMC`），只能配同名的单个 `--workloads`；`--symm-kernel mc`（NCCL ≥ 2.32）按 func 固定为 `allgather:AllGather_STMC;reducescatter:ReduceScatter_LDMC`，可配任意 workload，`run_symm_cta_sweep.sh` 默认使用；tma、ce 按 func 分别固定（见下文） |
 | `NCCL_SYM_CE_THRESHOLD` | 不设 | 不设 | `INT64_MAX` | `INT64_MAX` | `0` | symm/tma 关掉 AllGather 的 copy engine 分支；ce 反过来让每个 AllGather 都走 copy engine |
 | `NCCL_CE_COLL_AG_MULTICAST_THRESHOLD` | 不设 | 不设 | 不设 | 不设 | `2^62` | ce：分片不超过它就写 multicast 地址，而不是 N−1 份 unicast 拷贝 |
 | `NCCL_LAUNCH_ORDER_IMPLICIT` | `1` | `1` | `1` | `1` | `1` | 两个 communicator 并发时保证 kernel 发射顺序一致 |
