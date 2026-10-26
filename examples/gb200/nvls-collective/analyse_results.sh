@@ -51,7 +51,7 @@ done
 [[ -d "$output_dir" ]] || die "${output_dir} is not a directory"
 
 compare_args=()
-for algo in ring nvls symm symm-tma copy-engine; do
+for algo in ring nvls symm symm-p2p symm-tma copy-engine; do
     [[ -f "${output_dir}/${algo}/results.jsonl" ]] && compare_args+=(--input "${algo}=${output_dir}/${algo}/results.jsonl")
 done
 (( ${#compare_args[@]} )) || die "no <algo>/results.jsonl under ${output_dir}; cannot write compare.md"

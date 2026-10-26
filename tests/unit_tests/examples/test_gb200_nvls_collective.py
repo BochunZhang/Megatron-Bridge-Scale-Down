@@ -260,10 +260,12 @@ def test_launcher_rejects_profiler_options_it_cannot_honor(options, message):
 
 
 @pytest.mark.unit
-def test_algo_choice_is_the_five_algorithm_families():
-    assert metrics.ALGORITHMS == ("ring", "nvls", "symm", "symm-tma", "copy-engine")
+def test_algo_choice_is_the_six_algorithm_families():
+    assert metrics.ALGORITHMS == ("ring", "nvls", "symm", "symm-p2p", "symm-tma", "copy-engine")
     assert set(metrics.NCCL_ALGO_ENV) == set(metrics.ALGORITHMS)
-    for family in ("symm", "symm-tma", "copy-engine"):
+    assert set(metrics.ALGO_WORKLOADS) == set(metrics.ALGORITHMS)
+    assert set(benchmark.WINDOW_ALGOS) == {"symm", "symm-p2p", "symm-tma", "copy-engine"}
+    for family in benchmark.WINDOW_ALGOS:
         assert metrics.NCCL_ALGO_ENV[family] is None  # the window paths do not set NCCL_ALGO
     for family in metrics.ALGORITHMS:
         benchmark.parse_args(["--algo", family, "--output-dir", "/tmp/never-used"])
@@ -821,7 +823,7 @@ def test_algo_rows_pair_ring_and_nvls_on_the_same_workload():
     rows = metrics.algo_rows(records)
     assert len(rows) == 2
     # columns: ranks, MiB, workload, ring, then <family>, <family>/ring for every other family
-    assert rows[0] == ["8", "256", "ag", "100.0", "250.0", "2.50", "-", "-", "-", "-", "-", "-"]
+    assert rows[0] == ["8", "256", "ag", "100.0", "250.0", "2.50", *["-"] * 8]
     assert rows[1][-1] == "-"  # no ring record at this size/workload
 
 
@@ -833,7 +835,7 @@ def test_best_of_ranks_every_family_and_names_the_winner():
         _record(algo="symm", aggregate_busbw_gb_s=310.0),
     ]
     rows = metrics._best_of(records)
-    assert rows[0] == ["8", "256", "ag", "100.0", "250.0", "310.0", "-", "-", "symm"]
+    assert rows[0] == ["8", "256", "ag", "100.0", "250.0", "310.0", "-", "-", "-", "symm"]
 
 
 @pytest.mark.unit
@@ -1474,6 +1476,124 @@ def test_check_implementation_holds_copy_engine_to_the_multicast_synchronized_ce
     unicast_sync = CE_AG.removesuffix("; CE synchronization with NVLS")
     _, errors = _check([CE_AG, unicast_sync, SYMM_AG], algo="copy-engine", launches=3)
     assert errors == ["AllGather: expected CopyEngine+NVLSSync, got CopyEngine x1, Symmetric/AllGather_STMC x1"]
+
+
+def _symm_p2p_env(monkeypatch):
+    """The environment run_nvls_collective_benchmark.sh sets for a symm-p2p pass."""
+    _debug_env(monkeypatch, ce_threshold="9223372036854775807")
+    monkeypatch.delenv("NCCL_ALGO", raising=False)
+    monkeypatch.delenv("NCCL_SYM_KERNEL", raising=False)
+    monkeypatch.setenv("NCCL_WIN_ENABLE", "1")
+    monkeypatch.setenv("NCCL_NVLS_ENABLE", "0")
+
+
+@pytest.mark.unit
+def test_symm_p2p_environment_accepts_what_the_launcher_sets(monkeypatch):
+    _symm_p2p_env(monkeypatch)
+    # Every workload symm measures, and 2-rank groups: the unicast kernels need no multicast.
+    assert metrics.measured_workloads("symm-p2p", list(metrics.WORKLOADS)) == list(metrics.WORKLOADS)
+    args = benchmark.parse_args(["--algo", "symm-p2p", "--output-dir", "/tmp/x", "--group-sizes", "2,4"])
+    benchmark._check_environment("symm-p2p", 32, args)
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    ("name", "value", "message"),
+    [
+        # Multicast on: hasLsaMultimem would bring back the *MC kernels.
+        ("NCCL_NVLS_ENABLE", "1", "NCCL_NVLS_ENABLE=0"),
+        ("NCCL_WIN_ENABLE", "0", "NCCL_WIN_ENABLE=1"),
+        ("NCCL_ALGO", "Ring", "requires NCCL_ALGO to be unset"),
+        ("NCCL_SYM_KERNEL", "AllGather_ST", "requires NCCL_SYM_KERNEL to be unset"),
+        # Not fixed up like symm: a copy-engine AllGather would be measured under this name.
+        ("NCCL_SYM_CE_THRESHOLD", "8388608", "large AllGathers go to the copy engines"),
+    ],
+)
+def test_symm_p2p_environment_rejects_anything_that_changes_the_implementation(monkeypatch, name, value, message):
+    _symm_p2p_env(monkeypatch)
+    monkeypatch.setenv(name, value)
+    args = benchmark.parse_args(["--algo", "symm-p2p", "--output-dir", "/tmp/x"])
+    with pytest.raises(RuntimeError, match=re.escape(message)):
+        benchmark._check_environment("symm-p2p", 32, args)
+
+
+@pytest.mark.unit
+def test_symm_p2p_refuses_a_symm_kernel_pin(monkeypatch):
+    _symm_p2p_env(monkeypatch)
+    args = benchmark.parse_args(["--algo", "symm-p2p", "--output-dir", "/tmp/x", "--symm-kernel", "mc"])
+    with pytest.raises(ValueError, match="--symm-kernel applies to --algo symm only"):
+        benchmark._check_environment("symm-p2p", 32, args)
+
+
+@pytest.mark.unit
+def test_symm_p2p_kernels_are_the_unicast_half_of_the_symmetric_table():
+    for op, kernels in benchmark.SYMM_P2P_KERNELS.items():
+        assert not any(kernel.endswith("MC") or "MC_" in kernel for kernel in kernels)
+        # symm's unicast entries are all reachable under symm-p2p too.
+        assert {k for k in benchmark.SYMM_KERNELS[op] if "MC" not in k} <= set(kernels)
+
+
+@pytest.mark.unit
+def test_check_implementation_holds_symm_p2p_to_unicast_symmetric_kernels():
+    p2p_ag = SYMM_AG.replace("Kernel AllGather_STMC", "Kernel AllGather_ST")
+    p2p_rs = SYMM_RS.replace("Kernel ReduceScatter_LDMC", "Kernel ReduceScatter_LD")
+    assert _check([p2p_ag, p2p_rs, p2p_ag, p2p_rs], algo="symm-p2p", ops=("ag", "rs")) == (
+        "AllGather=Symmetric/AllGather_ST;ReduceScatter=Symmetric/ReduceScatter_LD",
+        [],
+    )
+    # A multicast kernel means NVLS was on after all; a classic or CE launch left the windows' kernels.
+    _, errors = _check([p2p_ag, SYMM_AG, p2p_rs, SYMM_RS], algo="symm-p2p", ops=("ag", "rs"))
+    assert errors == [
+        "AllGather: expected Symmetric/AllGather_ST|AllGather_LL|AllGather_TmaST, got Symmetric/AllGather_STMC x1",
+        "ReduceScatter: expected Symmetric/ReduceScatter_LD|ReduceScatter_LL|ReduceScatter_TmaLD,"
+        " got Symmetric/ReduceScatter_LDMC x1",
+    ]
+    _, errors = _check([p2p_ag, CE_AG, CLASSIC_AG], algo="symm-p2p", launches=3)
+    assert errors == [
+        "AllGather: expected Symmetric/AllGather_ST|AllGather_LL|AllGather_TmaST,"
+        " got CopyEngine+NVLSSync x1, NVLS/SIMPLE x1"
+    ]
+    for kernel in ("AllReduce_RSxLD_AGxST", "AllReduce_AGxLL_R"):
+        assert benchmark.implementation_matches("symm-p2p", "ar", f"Symmetric/{kernel}", pinned_kernel=None)
+    assert not benchmark.implementation_matches(
+        "symm-p2p", "ar", "Symmetric/AllReduce_RSxLDMC_AGxSTMC", pinned_kernel=None
+    )
+
+
+@pytest.mark.unit
+def test_symm_p2p_rows_compare_the_unicast_kernels_with_ring_and_multicast():
+    records = [
+        _record(algo="ring", aggregate_busbw_gb_s=100.0),
+        _record(algo="symm-p2p", aggregate_busbw_gb_s=200.0),
+        _record(algo="symm", aggregate_busbw_gb_s=500.0),
+        _record(algo="symm-p2p", workload="ar", ar_ms=1.0, ar_busbw_gb_s=150.0, aggregate_busbw_gb_s=150.0),
+        # Shapes symm-p2p did not measure are not part of this table.
+        _record(algo="ring", workload="rs"),
+    ]
+    assert metrics.symm_p2p_rows(records) == [
+        ["8", "256", "ag", "100.0", "200.0", "2.00", "500.0", "2.50"],
+        ["8", "256", "ar", "-", "150.0", "-", "-", "-"],
+    ]
+    report = metrics.render_report(records)
+    assert "### 2c." in report
+    assert "| ranks | MiB | workload | ring | symm-p2p | symm-p2p/ring | symm | symm/symm-p2p |" in report
+    assert "### 2c." not in metrics.render_report([_record(algo="ring")])
+
+
+@pytest.mark.unit
+@pytest.mark.skipif(shutil.which("bash") is None, reason="needs bash")
+def test_launcher_runs_symm_p2p_on_windows_with_multicast_off():
+    result = _launcher_dry_run("--algos", "symm-p2p")
+    assert result.returncode == 0, result.stderr
+    (line,) = [line for line in result.stdout.splitlines() if "torch.distributed.run" in line]
+    env = line.split(" uv run ", 1)[0].split()
+    assert "NCCL_NVLS_ENABLE=0" in env
+    assert "NCCL_WIN_ENABLE=1" in env
+    assert "NCCL_SYM_CE_THRESHOLD=9223372036854775807" in env
+    assert "NCCL_ALGO=" in env
+    assert not any(word.startswith("NCCL_SYM_KERNEL=") for word in env)
+    assert "--algo symm-p2p " in line
+    assert "--symm-kernel" not in line
 
 
 @pytest.mark.unit

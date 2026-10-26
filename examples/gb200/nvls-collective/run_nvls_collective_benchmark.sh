@@ -19,10 +19,12 @@ usage() {
     cat <<'USAGE'
 Benchmark torch all-gather / reduce-scatter / all-reduce with ring and NVLS on GB200.
 
-Five passes (families), each its own torchrun job:
+Six passes (families), each its own torchrun job:
   ring            NCCL_ALGO=Ring on plain buffers; ag, rs, ar, ag+rs
   nvls            NCCL_ALGO=NVLS on plain buffers; ag, rs, ar, ag+rs
   symm            symmetric kernels on registered windows; ag, rs, ar, ag+rs
+  symm-p2p        the same windows with multicast off (NVLS_ENABLE=0): unicast AllGather_ST,
+                  ReduceScatter_LD, AllReduce_RSxLD_AGxST (LL for small sizes); ag, rs, ar, ag+rs
   symm-tma   AG = AllGather_TmaSTMC (TMA -> multicast), RS = ReduceScatter_LDMC; ag, ag+rs
   copy-engine     AG = copy engine writing the multicast address, RS = ReduceScatter_LDMC; ag, ag+rs
 symm-tma and copy-engine skip rs and ar: NCCL has no TMA multicast or CE reduce-scatter, so
@@ -59,7 +61,7 @@ Options:
   --master-addr ADDR      Rendezvous host (default: MASTER_ADDR, DLC_MASTER_ADDR or 127.0.0.1)
   --master-port PORT      First rendezvous port; algorithm i uses PORT+i (default: 29611)
   --gpus-per-node N       GPUs per node (default: 4, one GB200 compute tray)
-  --algos LIST            ring,nvls,symm,symm-tma,copy-engine (default: all five)
+  --algos LIST            ring,nvls,symm,symm-p2p,symm-tma,copy-engine (default: all six)
   --group-sizes LIST      Single-group sizes (default: 4,8,16,32 capped at nnodes*gpus-per-node)
   --split-totals LIST     Ranks cut into two concurrent half-groups; T/2 must be in --group-sizes,
                           e.g. 16 for 8+8 or 32 for 16+16 (default: none, no split scenario)
@@ -166,7 +168,7 @@ node_rank="${NODE_RANK:-${RANK:-0}}"
 master_addr="${MASTER_ADDR:-${DLC_MASTER_ADDR:-127.0.0.1}}"
 master_port="29611"
 gpus_per_node="4"
-algos="ring,nvls,symm,symm-tma,copy-engine"
+algos="ring,nvls,symm,symm-p2p,symm-tma,copy-engine"
 group_sizes=""
 split_totals=""
 split_layouts="contiguous"
@@ -300,8 +302,8 @@ trials="${trials:-5}"
 IFS=, read -r -a algo_list <<<"$algos"
 for algo in "${algo_list[@]}"; do
     case "$algo" in
-        ring|nvls|symm|symm-tma|copy-engine) ;;
-        *) die "--algos accepts ring,nvls,symm,symm-tma,copy-engine; got $algo" ;;
+        ring|nvls|symm|symm-p2p|symm-tma|copy-engine) ;;
+        *) die "--algos accepts ring,nvls,symm,symm-p2p,symm-tma,copy-engine; got $algo" ;;
     esac
 done
 case "$symm_kernel" in
@@ -508,6 +510,10 @@ for index in "${!algo_list[@]}"; do
             sym_kernel="$symm_kernel_env"
             algo_args=(--symm-kernel "$symm_kernel")
             ;;
+        # Same windows, multicast off: with NVLS_ENABLE=0 nvlsSupport stays 0, so hasLsaMultimem is
+        # false and ncclSymkMask drops every *MC kernel. The symmetric path itself does not need
+        # NVLS, so NCCL picks the unicast LSA kernels (ST / LD / LL) from its cost model; no pin.
+        symm-p2p) nccl_algo=""; nvls_enable=0; win_enable=1; sym_ce_threshold="$int64_max" ;;
         # Same windows; NCCL 2.32 takes "<func>:<kernel>;..." in NCCL_SYM_KERNEL, so AG and RS are
         # pinned separately and AllReduce (the start gate) is left alone.
         symm-tma)

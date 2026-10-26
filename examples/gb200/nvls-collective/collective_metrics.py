@@ -36,10 +36,13 @@ BYTES_PER_MIB = 1024 * 1024
 BYTES_PER_GB = 1_000_000_000
 # Algorithm families. "symm" is the window-registered symmetric-memory path; its report rows
 # sit alongside ring and nvls because it answers the same questions with a third implementation.
+# "symm-p2p" runs the same symmetric kernels with multicast off (NCCL_NVLS_ENABLE=0), so NCCL
+# picks their unicast LSA load/store variants (AllGather_ST, ReduceScatter_LD, AllReduce_RSxLD_AGxST,
+# and the LL ones for small sizes): a direct all-to-all over NVLink, against ring's n-1 hop chain.
 # "symm-tma" (AllGather_TmaSTMC) and "copy-engine" (CE AllGather to the multicast address)
 # are two more AllGather implementations on the same windows; both pair them with the multicast
 # ReduceScatter_LDMC, because NCCL has neither a TMA multicast nor a CE reduce-scatter.
-ALGORITHMS = ("ring", "nvls", "symm", "symm-tma", "copy-engine")
+ALGORITHMS = ("ring", "nvls", "symm", "symm-p2p", "symm-tma", "copy-engine")
 # Collectives, in launch order of the ag+rs pair. "ar" is an all-reduce of the whole per-rank
 # tensor, so it moves twice the payload of one AG or RS shard exchange (see bus_bandwidth_gb_s).
 OPS = ("ag", "rs", "ar")
@@ -61,6 +64,7 @@ ALGO_WORKLOADS = {
     "ring": WORKLOADS,
     "nvls": WORKLOADS,
     "symm": WORKLOADS,
+    "symm-p2p": WORKLOADS,
     "symm-tma": ("ag", "ag+rs", "ag+ag", "ag+read", "ag+write", "read", "write"),
     "copy-engine": ("ag", "ag+rs", "ag+ag", "ag+read", "ag+write", "read", "write"),
 }
@@ -84,7 +88,14 @@ CROSS_PART = "AB-cross"
 SPLIT_PARTS = (CONCURRENT_PART, CROSS_PART)
 CROSS_WORKLOAD = "agA-rsB"
 CROSS_GROUP_WORKLOADS = ("ag", "rs")  # per split group, A then B
-NCCL_ALGO_ENV = {"ring": "Ring", "nvls": "NVLS", "symm": None, "symm-tma": None, "copy-engine": None}
+NCCL_ALGO_ENV = {
+    "ring": "Ring",
+    "nvls": "NVLS",
+    "symm": None,
+    "symm-p2p": None,
+    "symm-tma": None,
+    "copy-engine": None,
+}
 # Late join (--late-join): one group reduce-scatters a tensor LATE_JOIN_RS_SCALE times the AG size
 # and all-gathers on the same ranks once the RS is LATE_JOIN_FRACTION of its isolated time in.
 # Its two references, AG of size S and RS of size LATE_JOIN_RS_SCALE * S, run alone in the same
@@ -678,6 +689,39 @@ def algo_rows(records: Sequence[dict[str, object]]) -> list[list[str]]:
     return rows
 
 
+def symm_p2p_rows(records: Sequence[dict[str, object]]) -> list[list[str]]:
+    """symm-p2p against ring and against symm, as aggregate bus bandwidth, per shape.
+
+    Ring and the unicast symmetric kernels move the same bytes per rank ((n-1)/n of the tensor for
+    AG and RS, twice that for AR), so symm-p2p/ring isolates the cost of ring's n-1 store-and-forward
+    steps. symm/symm-p2p is what multicast adds on top of the same windows. Only shapes symm-p2p
+    measured appear.
+    """
+    index = _single_index(records)
+    shapes = {k[1:] for k in index if k[0] == "symm-p2p"}
+    rows = []
+    for group_size, size_bytes, workload in sorted(shapes, key=lambda k: (k[0], k[1], WORKLOADS.index(str(k[2])))):
+        ring, p2p, symm = (
+            index.get((algo, group_size, size_bytes, workload)) for algo in ("ring", "symm-p2p", "symm")
+        )
+        ring_bw = ring and float(ring["aggregate_busbw_gb_s"])
+        p2p_bw = p2p and float(p2p["aggregate_busbw_gb_s"])
+        symm_bw = symm and float(symm["aggregate_busbw_gb_s"])
+        rows.append(
+            [
+                str(group_size),
+                str(int(size_bytes) // BYTES_PER_MIB),
+                str(workload),
+                _fmt(ring_bw),
+                _fmt(p2p_bw),
+                _fmt(p2p_bw / ring_bw if ring_bw and p2p_bw else None, 2),
+                _fmt(symm_bw),
+                _fmt(symm_bw / p2p_bw if p2p_bw and symm_bw else None, 2),
+            ]
+        )
+    return rows
+
+
 # The families that replace symm's AllGather; table 2a compares them with symm.
 SYMM_VARIANTS = ("symm-tma", "copy-engine")
 
@@ -1088,6 +1132,7 @@ def render_report(records: Sequence[dict[str, object]]) -> str:
         "## 2. 各实现相对 ring（aggregate busbw）",
         "",
         "symm 是 window 注册的对称内存路径，与 ring/NVLS 走不同内核家族；它的绝对列见 1b，",
+        "symm-p2p 是同一套对称内核关掉 multicast（`NCCL_NVLS_ENABLE=0`）后的单播 load/store 变体。",
         "上面的比值只是和 ring 放在同一口径下的对照。",
         "",
     ]
@@ -1118,11 +1163,32 @@ def render_report(records: Sequence[dict[str, object]]) -> str:
             "### 2b. 实际执行的内核（来自 NCCL TUNING 日志，非环境变量推断）",
             "",
             "每个 case 的每次 launch 都已核对：ring 只能是 Ring/*，nvls 只能是 NVLS/*，symm 只能是对称内核；"
+            "symm-p2p 只能是不带 multicast 的对称内核（`*_ST`、`*_LD`、`*_LL`、`*_TmaST`、`*_TmaLD` 及其 AR 组合）；"
             "symm-tma 的 AG 只能是 `AllGather_TmaSTMC`，copy-engine 的 AG 只能是带 NVLS 同步的 CopyEngine，"
             "二者的 RS 只能是 `ReduceScatter_LDMC`。不符合的 launch 会让该 case 失败，不会出现在这里。",
             "",
         ]
         lines += _table(["algo", "group", "nNodes", "kernel evidence"], kernel_table)
+    p2p_table = symm_p2p_rows(records)
+    if p2p_table:
+        lines += [
+            "",
+            "### 2c. 对称内核的 P2P 方案：相对 ring 与相对 multicast（aggregate busbw）",
+            "",
+            "symm-p2p 关掉 multicast，对称内核退回单播 LSA load/store：AG 是 `AllGather_ST`（每卡把自己的 shard "
+            "直接写进其余 n−1 卡），RS 是 `ReduceScatter_LD`（每卡从其余 n−1 卡直接读自己那份再归约），"
+            "AR 是 `AllReduce_RSxLD_AGxST`（两者串起来），小尺寸是对应的 LL 变体。",
+            "ST/LD 下 AG/RS 每卡收发 (n−1)/n·size、AR 每卡 2·(n−1)/n·size，与 ring 完全相同"
+            "（LL 变体每 8 字节带 8 字节 flag，线上字节约翻倍；`AllReduce_AGxLL_R` 把整块发给每张卡再本地归约，"
+            "每卡收 (n−1)·size，只用于小尺寸），"
+            "所以 symm-p2p/ring 只反映 ring 的 n−1 步逐跳转发（每步多一次 HBM 读写和步间同步）与直接全互连的差别；"
+            "symm/symm-p2p 是 multicast（`multimem.st` / `multimem.ld_reduce` 让一侧只需 size/n）带来的增益。",
+            "",
+        ]
+        lines += _table(
+            ["ranks", "MiB", "workload", "ring", "symm-p2p", "symm-p2p/ring", "symm", "symm/symm-p2p"],
+            p2p_table,
+        )
     lines += [
         "",
         "## 3. 两个半组同时运行",

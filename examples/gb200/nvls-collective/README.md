@@ -1,4 +1,4 @@
-# GB200：基于 torch 的 AG / RS / AR 吞吐对比（ring / NVLS / 对称内存 / TMA / copy engine）
+# GB200：基于 torch 的 AG / RS / AR 吞吐对比（ring / NVLS / 对称内存 / 对称 P2P / TMA / copy engine）
 
 日期：2026-10-13。这个目录用 **torch** 在 4/8/16/32 卡上测 all-gather（AG）、reduce-scatter（RS）、
 all-reduce（AR）以及 AG、RS 同时发起的吞吐，并对照 ring 与 NVLS 两种算法。已有的
@@ -17,6 +17,11 @@ NVLS 的 collective 在 NCCL 里有**两套独立实现**，本目录把两套�
 两者在内核、同步协议、buffer 要求上都不同，训练侧（FSDP/DP 通信）在 2.28+ 走的是后者，
 所以只测 NVLS 不足以代表实际训练路径。
 
+对称内核本身还有一套不用 multicast 的 P2P 方案：`symm-p2p` pass 用同样的 window，但设
+`NCCL_NVLS_ENABLE=0`，NCCL 只能选单播 load/store 的 `AllGather_ST` / `ReduceScatter_LD` /
+`AllReduce_RSxLD_AGxST`（小尺寸为 LL 变体）。它与 ring 每卡收发的字节数相同，用来区分
+“直接全互连 vs 逐跳 ring”和“multicast vs 单播”两个因素（见下文“symm-p2p”）。
+
 在对称内存之上，NCCL 2.32.3 还有两种 AllGather 实现，本目录各用一个 pass 测（见下文
 “symm-tma 与 copy-engine”）：
 
@@ -34,6 +39,7 @@ single、split（AB-concurrent、AB-cross）场景与其他实现完全相同。
 | 分别发起 AG、RS，和同时发起 AG+RS 的吞吐 | 单组（同一批 rank）依次跑 AG、RS、AG+RS | `single` |
 | 单独 all-reduce 的吞吐 | 同一单组跑原地 AR（`dist.all_reduce`，整块张量） | `single` 的 `ar` |
 | ring 与 nvls 方案对比 | 同一矩阵用 `NCCL_ALGO=Ring` 和 `NCCL_ALGO=NVLS` 各跑一遍 | 两次启动 |
+| 对称内核的 P2P 方案与 ring、multicast 对比 | `symm-p2p` 跑与 symm 相同的全部负载，只是关掉 multicast | 一次启动，表 2c |
 | TMA / copy engine 的 AllGather 与 symm 对比 | `symm-tma`、`copy-engine` 各跑一遍 ag、ag+rs 的 single 和 split | 两次启动，表 2a |
 | 两个半组同时跑同一负载 | T 卡切成两个 T/2 组（16 卡 8+8，32 卡 16+16）同时跑；单独跑的参照直接取 `single-n<T/2>` | `split` 的 `AB-concurrent` |
 | 两个独立组同时：A 做 AG、B 做 RS | 同一 split，A 组 all-gather 的同时 B 组 reduce-scatter，参照同样取 `single-n<T/2>` 的 ag、rs | `split` 的 `AB-cross` |
@@ -60,23 +66,23 @@ overlap_fraction = (T_AG + T_RS - T_AG+RS) / min(T_AG, T_RS)   # 1 = 短的操�
 
 `NCCL_ALGO` 在 communicator 创建时读取并固化，进程内无法改；对称内存路径还要在创建
 communicator 之后注册 window，`NCCL_SYM_KERNEL`、`NCCL_SYM_CE_THRESHOLD` 等也是进程级的，
-所以五种实现必须分成五个独立的 torchrun job，用不同的 `--master-port` 串行执行，结果都留在同一个输出目录下。
+所以六种实现必须分成六个独立的 torchrun job，用不同的 `--master-port` 串行执行，结果都留在同一个输出目录下。
 
-launcher 为每个实现固定了（`symm-tma` 简写为 tma，`copy-engine` 简写为 ce）：
+launcher 为每个实现固定了（`symm-p2p` 简写为 p2p，`symm-tma` 简写为 tma，`copy-engine` 简写为 ce）：
 
-| 变量 | ring | nvls | symm | tma | ce | 作用 |
-| --- | --- | --- | --- | --- | --- | --- |
-| `NCCL_ALGO` | `Ring` | `NVLS` | 空（=不设） | 空 | 空 | 前两者强制算法；window 路径不设，否则会屏蔽掉 window 分发 |
-| `NCCL_NVLS_ENABLE` | `0` | `1` | `1` | `1` | `1` | ring 不申请 multicast buffer；其余保留 multicast（MC）内核 / CE multicast 可选 |
-| `NCCL_WIN_ENABLE` | 不设 | 不设 | `1` | `1` | `1` | 允许 `ncclCommWindowRegister`，这是 window 路径的开关 |
-| `NCCL_SYM_KERNEL` | 不设 | 不设 | 可选 | `allgather:AllGather_TmaSTMC;reducescatter:ReduceScatter_LDMC` | `reducescatter:ReduceScatter_LDMC` | symm：`--symm-kernel ag\|rs\|ar` 固定到单个内核（`AllGather_STMC` / `ReduceScatter_LDMC` / `AllReduce_RSxLDMC_AGxSTMC`），只能配同名的单个 `--workloads`；`--symm-kernel mc`（NCCL ≥ 2.32）按 func 固定为 `allgather:AllGather_STMC;reducescatter:ReduceScatter_LDMC`，可配任意 workload，`run_symm_cta_sweep.sh` 默认使用；tma、ce 按 func 分别固定（见下文） |
-| `NCCL_SYM_CE_THRESHOLD` | 不设 | 不设 | `INT64_MAX` | `INT64_MAX` | `0` | symm/tma 关掉 AllGather 的 copy engine 分支；ce 反过来让每个 AllGather 都走 copy engine |
-| `NCCL_CE_COLL_AG_MULTICAST_THRESHOLD` | 不设 | 不设 | 不设 | 不设 | `2^62` | ce：分片不超过它就写 multicast 地址，而不是 N−1 份 unicast 拷贝 |
-| `NCCL_LAUNCH_ORDER_IMPLICIT` | `1` | `1` | `1` | `1` | `1` | 两个 communicator 并发时保证 kernel 发射顺序一致 |
-| `NCCL_MNNVL_ENABLE` | 多机才设 | 多机才设 | 多机才设 | 多机才设 | 多机才设 | 跨 tray 强制走 NVLink fabric，禁止静默回退到 IB |
-| `NCCL_DEBUG_SUBSYS` | `INIT,ENV,TUNING` | 同左 | 同左 | 同左 | 同左 | INIT/ENV 记录 communicator 建立，TUNING 是逐 launch 的算法/内核行，实现校验靠它 |
+| 变量 | ring | nvls | symm | p2p | tma | ce | 作用 |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| `NCCL_ALGO` | `Ring` | `NVLS` | 空（=不设） | 空 | 空 | 空 | 前两者强制算法；window 路径不设，否则会屏蔽掉 window 分发 |
+| `NCCL_NVLS_ENABLE` | `0` | `1` | `1` | `0` | `1` | `1` | ring 不申请 multicast buffer；p2p 借它关掉对称内核的 multicast；其余保留 multicast（MC）内核 / CE multicast 可选 |
+| `NCCL_WIN_ENABLE` | 不设 | 不设 | `1` | `1` | `1` | `1` | 允许 `ncclCommWindowRegister`，这是 window 路径的开关 |
+| `NCCL_SYM_KERNEL` | 不设 | 不设 | 可选 | 不设 | `allgather:AllGather_TmaSTMC;reducescatter:ReduceScatter_LDMC` | `reducescatter:ReduceScatter_LDMC` | symm：`--symm-kernel ag\|rs\|ar` 固定到单个内核（`AllGather_STMC` / `ReduceScatter_LDMC` / `AllReduce_RSxLDMC_AGxSTMC`），只能配同名的单个 `--workloads`；`--symm-kernel mc`（NCCL ≥ 2.32）按 func 固定为 `allgather:AllGather_STMC;reducescatter:ReduceScatter_LDMC`，可配任意 workload，`run_symm_cta_sweep.sh` 默认使用；tma、ce 按 func 分别固定（见下文） |
+| `NCCL_SYM_CE_THRESHOLD` | 不设 | 不设 | `INT64_MAX` | `INT64_MAX` | `INT64_MAX` | `0` | symm/p2p/tma 关掉 AllGather 的 copy engine 分支；ce 反过来让每个 AllGather 都走 copy engine |
+| `NCCL_CE_COLL_AG_MULTICAST_THRESHOLD` | 不设 | 不设 | 不设 | 不设 | 不设 | `2^62` | ce：分片不超过它就写 multicast 地址，而不是 N−1 份 unicast 拷贝 |
+| `NCCL_LAUNCH_ORDER_IMPLICIT` | `1` | `1` | `1` | `1` | `1` | `1` | 两个 communicator 并发时保证 kernel 发射顺序一致 |
+| `NCCL_MNNVL_ENABLE` | 多机才设 | 多机才设 | 多机才设 | 多机才设 | 多机才设 | 多机才设 | 跨 tray 强制走 NVLink fabric，禁止静默回退到 IB |
+| `NCCL_DEBUG_SUBSYS` | `INIT,ENV,TUNING` | 同左 | 同左 | 同左 | 同左 | 同左 | INIT/ENV 记录 communicator 建立，TUNING 是逐 launch 的算法/内核行，实现校验靠它 |
 
-`--symm-kernel` 只传给 symm pass。tma、ce 的环境由 benchmark 逐项核对，任何一项不符都拒绝启动，
+`--symm-kernel` 只传给 symm pass。p2p、tma、ce 的环境由 benchmark 逐项核对，任何一项不符都拒绝启动，
 不会像 symm 的 `NCCL_SYM_CE_THRESHOLD` 那样自动改写：这几个变量本身就决定了跑的是哪种 AllGather。
 
 symm 的实现细节（都按 2.28.9 源码确认）：
@@ -185,6 +191,43 @@ RS kernel 同为 `ReduceScatter_LDMC` 的行。
 
 **nsys。** CE AllGather 是 memcpy 不是 kernel，`nsys_kernels.md` 里 ce 的 AG 没有 kernel 时间，只有 RS 的。
 
+### symm-p2p：关掉 multicast 的对称内核（NCCL 2.32.3）
+
+**怎么选中。** 对称路径的开关 `comm->symmetricSupport` 只看 `isAllCudaP2p`、`NCCL_WIN_ENABLE`、cuMem
+和 LSA team，与 NVLS 无关；multicast 内核则要 `hasLsaMultimem = ncclNvlsSymmetricMultimemEnabled(comm)
+&& LSA team > 2 rank && !p2pCrossClique`，前者要求 `comm->nvlsSupport`。`NCCL_NVLS_ENABLE=0` 让
+`ncclNvlsInit` 保持 `nvlsSupport = 0`，于是 `ncclSymkMask` 去掉所有 `*STMC` / `*LDMC` 内核，cost model 只能在
+单播内核里选，无需 `NCCL_SYM_KERNEL`：
+
+| op | 单播对称内核（`SYMM_P2P_KERNELS`） | 数据怎么走 |
+| --- | --- | --- |
+| AG | `AllGather_ST`、`AllGather_LL`、`AllGather_TmaST` | 每卡把自己的 shard 直接 store 进其余 n−1 卡的 window |
+| RS | `ReduceScatter_LD`、`ReduceScatter_LL`、`ReduceScatter_TmaLD` | 每卡从其余 n−1 卡的 window 直接 load 自己那段再归约 |
+| AR | `AllReduce_RSxLD_AGxST`、`AllReduce_AGxLL_R`、`AllReduce_RSxTmaLD_AGxTmaST` | RSxLD + AGxST 串起来；`AGxLL_R` 只用于小尺寸 |
+
+`NCCL_SYM_CE_THRESHOLD` 仍设 `INT64_MAX`，让 AllGather 不走 copy engine。benchmark 要求 `NCCL_NVLS_ENABLE=0`、
+`NCCL_WIN_ENABLE=1`、`NCCL_ALGO` 与 `NCCL_SYM_KERNEL` 不设、CE 阈值不小于最大 payload，不自动改写；
+逐 launch 校验时任何 `*MC` 内核、经典内核或 copy engine 都让 case 失败。p2p 不需要 multicast，所以没有
+symm 那样“组至少 3 rank”的限制，建组和连接方式与 symm 默认相同。
+
+**与 ring 的通信量。** 设完整张量 S、n 卡，只数 NVLink 上每卡发出（= 收到）的有效字节：
+
+| op | ring | symm-p2p（ST/LD） | symm（multicast） |
+| --- | --- | --- | --- |
+| AG | (n−1)/n·S，n−1 步逐跳转发 | (n−1)/n·S，一步直接写 n−1 个 peer | 发 S/n（`multimem.st` 由交换机扇出），收 (n−1)/n·S |
+| RS | (n−1)/n·S，n−1 步逐跳“收-加-发” | (n−1)/n·S，一步直接读 n−1 个 peer | 收 S/n（`multimem.ld_reduce` 在交换机归约），发 (n−1)/n·S |
+| AR | 2(n−1)/n·S（RS + AG） | `RSxLD_AGxST`：2(n−1)/n·S | RS 收 + AG 发各 S/n |
+
+所以 AG、RS、AR 上 symm-p2p 的总通信量与 ring **相等**，都等于 busbw 定义里的那一份，busbw 可以直接比。
+差别不在字节数而在路径：ring 每个分片要经 n−1 跳，每跳多一次本地 HBM 读写和步间同步，链路上同一时刻
+只用到 1 个前驱 / 1 个后继；p2p 在 NVSwitch 上一步全互连，没有中间转发。两个例外：LL 协议（`*_LL`、
+`AllReduce_AGxLL_R`）每 8 字节带 8 字节 flag，线上字节约翻倍；`AllReduce_AGxLL_R` 是每卡把整块 S 发给每个
+peer 再本地归约，每卡收 (n−1)·S，远多于 ring，只在小尺寸被选中。multicast 把一侧缩到 S/n，这正是
+symm 相对 p2p 的增益来源。
+
+表 2c 并排列出 ring、symm-p2p、symm：`symm-p2p/ring` 是相同字节数下直接全互连 vs 逐跳 ring，
+`symm/symm-p2p` 是同一套 window 上 multicast 的增益。
+
 ### 实现校验
 
 TUNING 行在 2.29.7 里**每次 launch 都打、只在 comm rank 0 上打**，debug 文件是行缓冲
@@ -204,7 +247,8 @@ TUNING 行在 2.29.7 里**每次 launch 都打、只在 comm rank 0 上打**，d
 1. 每个 op 的行数恰好等于 `warmup + trials × iters`，即 warmup 和计时区间里的每一次 launch（AR 另加 1 次正确性校验 launch）；
 2. 每行字节数等于该 op 的每卡 payload：AG/RS 为 `size / n`，AR 为 `size`；
 3. 实现符合本轮：ring 只能 `Ring/*`，nvls 只能 `NVLS/*`，symm 只能 `SYMM_KERNELS` 里的对称内核
-   （固定了 `NCCL_SYM_KERNEL` 时只能是它），`CopyEngine` 和回退到经典内核都算错；symm-tma 的 AG 只能是
+   （固定了 `NCCL_SYM_KERNEL` 时只能是它），`CopyEngine` 和回退到经典内核都算错；symm-p2p 只能是
+   `SYMM_P2P_KERNELS` 里的单播对称内核，出现 `*MC` 内核即失败；symm-tma 的 AG 只能是
    `Symmetric/AllGather_TmaSTMC`，copy-engine 的 AG 只能是 `CopyEngine+NVLSSync`，二者的 RS 只能是
    `Symmetric/ReduceScatter_LDMC`（`PINNED_IMPLEMENTATIONS`）；
 4. 不能出现本负载以外的 collective。start gate 也是 AllReduce，靠 4 字节这个大小区分：gate comm rank 0
@@ -722,10 +766,11 @@ busbw = 357.9 × 7/8 = 313.2 GB/s。表 1–4 用 trial 中位数换算，表 0 
 | --- | --- | --- | --- |
 | 0 | 每个测试的完成时间 | 实现 × case × 组 | mean / median / min / max ms、由 mean 算的 algbw / busbw、concurrency、**kernel** |
 | 1 | AG / RS / AR / AG+RS | 实现 × 组大小 × 消息 | AG busbw、RS busbw、AR busbw、AG+RS 中各自 busbw、pair aggregate、`speedup`、`overlap_fraction`、**AG / RS / AR kernel** |
-| 1b | 各实现的绝对吞吐 | 组大小 × 消息 × 负载 | ring、nvls、symm、symm-tma、copy-engine 的 aggregate busbw，及最高者 |
+| 1b | 各实现的绝对吞吐 | 组大小 × 消息 × 负载 | ring、nvls、symm、symm-p2p、symm-tma、copy-engine 的 aggregate busbw，及最高者 |
 | 2 | 相对 ring | 组大小 × 消息 × 负载 | 每个实现的 aggregate busbw 与 /ring |
 | 2a | TMA / CE 相对 symm | 组大小 × 消息 × 负载（只有 tma/ce 测过的 ag、ag+rs） | symm、symm-tma、copy-engine 的 aggregate busbw 与 /symm |
 | 2b | 实际执行的内核 | 实现 × 组 | 实测 nNodes、日志里的 `Algo/proto` 或对称内核名 |
+| 2c | 对称 P2P 相对 ring 与 multicast | 组大小 × 消息 × 负载（symm-p2p 测过的） | ring、symm-p2p、symm 的 aggregate busbw，`symm-p2p/ring`、`symm/symm-p2p` |
 | 3 | 两个 T/2 组同跑同一负载 | 实现 × 布局 × 消息 × 负载 × 组 | isolated busbw（取自 `single-n<T/2>`）、concurrent busbw、`slowdown = T_concurrent / T_isolated`、concurrency |
 | 4 | A 组 AG、B 组 RS 同时跑 | 实现 × 布局 × 消息 | A 的 AG 与 B 的 RS 各自的 isolated / cross busbw、cross ms、slowdown，`A+B cross busbw`、concurrency |
 | 5 | late join（仅 `--late-join`） | 实现 × 组大小 × AG 大小 | 放行时刻、AG / RS 的 isolated 与 join 时间、slowdown、overlap 窗口内 algbw、capacity、AG share |
@@ -769,6 +814,7 @@ results/gb200/nvls-collective/gpu-num-<W>/<yyyymmdd-hhmmss>/
     ncu/rank<R>.ncu-rep                        # 仅 --ncu：每个 rank 一份，trial0 的集合通信 kernel
   nvls/ ...
   symm/ ...                                    # window 注册的对称内存路径
+  symm-p2p/ ...                                # 同样的 window，关掉 multicast 的单播对称内核
   symm-tma/ ...                                # AllGather_TmaSTMC + ReduceScatter_LDMC
   copy-engine/ ...                             # CE multicast AllGather + ReduceScatter_LDMC
   compare.md                                   # node 0 合并各 pass 的 results.jsonl
@@ -804,7 +850,7 @@ results/gb200/nvls-collective/gpu-num-<W>/<yyyymmdd-hhmmss>/
 4. 每个进程只写自己名字的文件：`nccl-raw/nccl-<host>-<pid>.log`、`comm/` 与 `cases/<algo>-<case>/` 下带
    `.rank_<RR>` 的日志、`nsys/rank<R>.<K>.nsys-rep`（`R` 是 torchrun 设置的全局 `RANK`），以及每个节点的
    `torchrun-node<k>.log`。`case.json` 只由 rank 0 写。
-5. 每个实现是一次独立的 torchrun，结果在 `ring/`、`nvls/`、`symm/`、`symm-tma/`、`copy-engine/` 各自的 `results.jsonl` 里。
+5. 每个实现是一次独立的 torchrun，结果在 `ring/`、`nvls/`、`symm/`、`symm-p2p/`、`symm-tma/`、`copy-engine/` 各自的 `results.jsonl` 里。
    node 0 的 torchrun 只有在 rank 0 退出后才返回，而 rank 0 退出前已经写完 `results.jsonl`，
    所以随后执行的 `collective_metrics.py` 读到的是完整数据，合并成一份 `compare.md`；合并时会
    检查每个文件里的 `algo` 与目录一致。
@@ -887,8 +933,9 @@ bash examples/gb200/nvls-collective/run_p2p_push_pull_benchmark.sh --dry-run
 uv run --no-sync ruff check examples/gb200/nvls-collective
 ```
 
-单测覆盖算法族/布局/负载的解析与默认值、五套环境约束（含 symm 必须不设
-`NCCL_ALGO`、必须开 `NCCL_WIN_ENABLE`、`NCCL_SYM_KERNEL` 必须与内核名一致；symm-tma/copy-engine 的
+单测覆盖算法族/布局/负载的解析与默认值、六套环境约束（含 symm 必须不设
+`NCCL_ALGO`、必须开 `NCCL_WIN_ENABLE`、`NCCL_SYM_KERNEL` 必须与内核名一致；symm-p2p 必须
+`NCCL_NVLS_ENABLE=0`；symm-tma/copy-engine 的
 `NCCL_SYM_KERNEL`、CE 阈值和 multicast 阈值）、tma/ce 逐 launch 的实现校验、NCCL 日志探针
 （algo/kernel/nNodes/MNNVL）、两个半组划分、带宽与重叠公式、报告四张表、nsys GPU metric 查询与汇总、
 launcher `--nsys` / `--ncu` 的 dry-run 命令行和选项校验，以及两个入口只用标准库可导入（torch 除外）。

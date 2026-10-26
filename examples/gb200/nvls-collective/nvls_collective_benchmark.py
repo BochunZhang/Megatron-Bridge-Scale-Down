@@ -30,14 +30,20 @@ communicator is created and the symmetric-memory path needs its own buffer regis
   the CE, ``NCCL_CE_COLL_AG_MULTICAST_THRESHOLD`` above every shard makes it multicast). NCCL
   has neither a TMA multicast nor a CE reduce-scatter, so the RS of both is the multicast
   symmetric kernel ``ReduceScatter_LDMC``. ``NCCL_SYM_KERNEL`` pins both kernels (NCCL 2.32).
+* ``symm-p2p``: the symm windows with multicast off (``NCCL_NVLS_ENABLE=0``). Without NVLS
+  ``hasLsaMultimem`` is false, so ``ncclSymkMask`` drops every multicast kernel and NCCL picks the
+  unicast LSA load/store ones (``AllGather_ST`` / ``ReduceScatter_LD`` /
+  ``AllReduce_RSxLD_AGxST``, the LL variants for small sizes): each rank reads or writes every
+  peer's window directly, moving the same bytes per rank as ring without its n-1 hop chain.
 
 ``run_nvls_collective_benchmark.sh`` launches one pass per family and merges them with
 ``collective_metrics.py``.
 
 Every launch is checked against NCCL's own TUNING log on comm rank 0: a case fails unless
 each op ran exactly warmup + trials * iters times, with the expected shard size, on the
-family's implementation (``Ring/*``, ``NVLS/*``, a symmetric kernel or, for symm-tma and
-copy-engine, exactly the pinned one; ``CopyEngine`` only in copy-engine).
+family's implementation (``Ring/*``, ``NVLS/*``, a symmetric kernel, a unicast symmetric kernel
+for symm-p2p or, for symm-tma and copy-engine, exactly the pinned one; ``CopyEngine`` only in
+copy-engine).
 Each case gets ``<output-dir>/cases/<algo>-<case>/`` (e.g. ``cases/nvls-all_reduce-1024MiB-bf16-single-n16/``)
 holding every member rank's slice of its NCCL log, ``case.json`` and, once filed by
 ``analyse_nsys.py``, the case's nsys reports ``<algo>-<case>.rank_<RR>.nsys-rep``.
@@ -150,6 +156,14 @@ SYMM_KERNELS = {
     "rs": ["ReduceScatter_LD", "ReduceScatter_LL", "ReduceScatter_LDMC"],
     "ar": ["AllReduce_RSxLDMC_AGxSTMC"],
 }
+# symm-p2p: the symmetric kernels that need no multicast, i.e. every kernel ncclSymkMask keeps
+# when hasLsaMultimem is false (sym_kernels.cc). Any *MC kernel in a symm-p2p case means
+# multicast was on after all and the case fails.
+SYMM_P2P_KERNELS = {
+    "ag": ["AllGather_ST", "AllGather_LL", "AllGather_TmaST"],
+    "rs": ["ReduceScatter_LD", "ReduceScatter_LL", "ReduceScatter_TmaLD"],
+    "ar": ["AllReduce_RSxLD_AGxST", "AllReduce_AGxLL_R", "AllReduce_RSxTmaLD_AGxTmaST"],
+}
 # --symm-kernel mc: the multicast AG and RS kernels, pinned per function (NCCL 2.32 only; 2.29's
 # NCCL_SYM_KERNEL takes one kernel name). Without it the 2.32 cost model picks the unicast
 # AllGather_ST for a 1 GiB AllGather on 4 GPUs (sym_model/lsa_a2a.cc). AllReduce stays unpinned:
@@ -215,7 +229,7 @@ PINNED_IMPLEMENTATIONS = {
     "copy-engine": {"ag": COPY_ENGINE_NVLS_SYNC, "rs": "Symmetric/ReduceScatter_LDMC"},
 }
 # Families whose payload buffers live in a registered NCCL_WIN_COLL_SYMMETRIC window.
-WINDOW_ALGOS = ("symm", *PINNED_IMPLEMENTATIONS)
+WINDOW_ALGOS = ("symm", "symm-p2p", *PINNED_IMPLEMENTATIONS)
 
 # The start gate: a one-element fp32 all-reduce; its TUNING line is "AllReduce: 4 Bytes -> ...".
 GATE_FUNC = "AllReduce"
@@ -625,6 +639,8 @@ def _check_environment(algo: str, world_size: int, args: argparse.Namespace) -> 
                     f"--algo symm measures AllReduce_RSxLDMC_AGxSTMC, which NCCL only offers to groups of"
                     f" >= {SYMM_AR_MIN_RANKS} ranks (multicast needs an LSA team of more than 2); got groups of {small}"
                 )
+    elif algo == "symm-p2p":
+        _check_symm_p2p_environment(args)
     elif algo in PINNED_IMPLEMENTATIONS:
         _check_pinned_environment(algo, args)
     else:
@@ -654,6 +670,36 @@ def _check_environment(algo: str, world_size: int, args: argparse.Namespace) -> 
     # be measured in the same pass.
     if any(n < 2 for n in args.group_sizes):
         raise ValueError("--group-sizes entries must be >= 2")
+
+
+def _check_symm_p2p_environment(args: argparse.Namespace) -> None:
+    """Check the environment that keeps symm-p2p on the windows' unicast symmetric kernels.
+
+    Like symm-tma, nothing is fixed up silently: NCCL_NVLS_ENABLE=0 is what turns multicast off,
+    and a copy-engine AllGather would be measured under this family's name.
+    """
+    if os.environ.get("NCCL_ALGO", "").strip():
+        raise RuntimeError("--algo symm-p2p requires NCCL_ALGO to be unset")
+    if os.environ.get("NCCL_WIN_ENABLE") != "1":
+        raise RuntimeError("--algo symm-p2p requires NCCL_WIN_ENABLE=1 to register symmetric windows")
+    # ncclNvlsInit leaves nvlsSupport at 0, so hasLsaMultimem is false and ncclSymkMask removes
+    # every *MC kernel; the symmetric path itself (comm->symmetricSupport) does not need NVLS.
+    if os.environ.get("NCCL_NVLS_ENABLE") != "0":
+        raise RuntimeError(
+            "--algo symm-p2p requires NCCL_NVLS_ENABLE=0 so the symmetric kernels run without multicast"
+        )
+    if args.symm_kernel != "default":
+        raise ValueError("--symm-kernel applies to --algo symm only; --algo symm-p2p lets NCCL pick a unicast kernel")
+    pinned = os.environ.get("NCCL_SYM_KERNEL")
+    if pinned:
+        raise RuntimeError(f"--algo symm-p2p requires NCCL_SYM_KERNEL to be unset, got {pinned!r}")
+    largest = max(args.sizes_mib) * BYTES_PER_MIB
+    ce_threshold = os.environ.get(SYM_CE_THRESHOLD_ENV, "")
+    if not ce_threshold.isdigit() or int(ce_threshold) < largest:
+        raise RuntimeError(
+            f"--algo symm-p2p requires {SYM_CE_THRESHOLD_ENV} >= {largest}, got {ce_threshold!r}; otherwise"
+            " large AllGathers go to the copy engines"
+        )
 
 
 def _check_pinned_environment(algo: str, args: argparse.Namespace) -> None:
@@ -886,6 +932,9 @@ def implementation_matches(algo: str, op: str, implementation: str, *, pinned_ke
         family, _, kernel = implementation.partition("/")
         pin = pinned_symm_kernel(op, pinned_kernel)
         return family == "Symmetric" and kernel in SYMM_KERNELS[op] and pin in (None, kernel)
+    if algo == "symm-p2p":
+        family, _, kernel = implementation.partition("/")
+        return family == "Symmetric" and kernel in SYMM_P2P_KERNELS[op]
     if algo in PINNED_IMPLEMENTATIONS:
         return implementation == PINNED_IMPLEMENTATIONS[algo].get(op)
     # 2.29 logs ncclAlgoToString() ("RING", "NVLS"); older releases used ncclAlgoStr ("Ring").
@@ -970,6 +1019,8 @@ def check_implementation(
         if wrong:
             if algo == "symm":
                 want = f"Symmetric/{pinned_symm_kernel(op, pinned_kernel) or '|'.join(SYMM_KERNELS[op])}"
+            elif algo == "symm-p2p":
+                want = f"Symmetric/{'|'.join(SYMM_P2P_KERNELS[op])}"
             elif algo in PINNED_IMPLEMENTATIONS:
                 want = PINNED_IMPLEMENTATIONS[algo].get(op, "nothing")
             else:
