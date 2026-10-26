@@ -73,6 +73,9 @@ def _load(name: str, path: Path, *, stub_torch: bool = False) -> types.ModuleTyp
         cuda_stub.__path__ = []  # type: ignore[attr-defined]
         cuda_stub.profiler = types.ModuleType("torch.cuda.profiler")  # type: ignore[attr-defined]
         cuda_stub.nvtx = types.ModuleType("torch.cuda.nvtx")  # type: ignore[attr-defined]
+        # --symm-kernel mc checks the NCCL version; tests monkeypatch version() per case.
+        cuda_stub.nccl = types.ModuleType("torch.cuda.nccl")  # type: ignore[attr-defined]
+        cuda_stub.nccl.version = lambda: (2, 32, 3)  # type: ignore[attr-defined]
         torch_stub.cuda = cuda_stub  # type: ignore[attr-defined]
         stub_modules = {
             "torch": torch_stub,
@@ -80,6 +83,7 @@ def _load(name: str, path: Path, *, stub_torch: bool = False) -> types.ModuleTyp
             "torch.cuda": cuda_stub,
             "torch.cuda.profiler": cuda_stub.profiler,
             "torch.cuda.nvtx": cuda_stub.nvtx,
+            "torch.cuda.nccl": cuda_stub.nccl,
         }
         sys.modules.update(stub_modules)
     try:
@@ -137,7 +141,8 @@ def test_defaults_cover_the_requested_matrix():
     assert args.split_totals == []
     assert args.late_join is False
     assert args.split_layouts == ["contiguous"]
-    assert args.workloads == ["ag", "rs", "ar", "ag+rs"]
+    # The worker runs every workload by default; the launcher narrows it to ag,rs,ar,ag+rs.
+    assert args.workloads == list(metrics.WORKLOADS)
     assert args.sizes_mib == [16, 32, 64, 128, 256, 512, 1024, 2048]
     assert args.dtype == "bf16"
     assert args.symm_kernel == "default"
@@ -1064,17 +1069,17 @@ def test_split_parts_are_only_the_concurrent_and_cross_cases():
 
 
 @pytest.mark.unit
-def test_split_needs_its_half_as_a_single_group(monkeypatch):
+def test_split_runs_without_its_half_as_a_single_group(monkeypatch):
     monkeypatch.setenv("NCCL_ALGO", "NVLS")
     monkeypatch.setenv("NCCL_NVLS_ENABLE", "1")
     _debug_env(monkeypatch)
     ok = benchmark.parse_args(["--algo", "nvls", "--output-dir", "/tmp/x", "--split-totals", "32"])
     benchmark._check_environment("nvls", 32, ok)  # 16+16, and 16 is a default group size
-    missing = benchmark.parse_args(
+    # A split pass need not also measure its isolated half group.
+    without_half = benchmark.parse_args(
         ["--algo", "nvls", "--output-dir", "/tmp/x", "--group-sizes", "4,8", "--split-totals", "32"]
     )
-    with pytest.raises(ValueError, match=re.escape("--split-totals [32] need their half ([16]) in --group-sizes")):
-        benchmark._check_environment("nvls", 32, missing)
+    benchmark._check_environment("nvls", 32, without_half)
 
 
 class _FakeEvent:
@@ -1436,7 +1441,7 @@ def test_pinned_environment_rejects_anything_that_changes_the_implementation(mon
 @pytest.mark.parametrize(
     ("extra", "message"),
     [
-        (["--workloads", "rs,ar"], "measures only ag and ag+rs"),
+        (["--workloads", "rs,ar"], "measures ag, ag+rs and the AG-based concurrent workloads"),
         (["--group-sizes", "2,4", "--split-totals", "none"], "groups of >= 3 ranks; got [2]"),
         (["--workloads", "ag", "--symm-kernel", "ag"], "--symm-kernel applies to --algo symm only"),
     ],
@@ -1885,3 +1890,24 @@ def test_launcher_passes_cta_configs_and_unsets_overriding_environment(monkeypat
     assert "unsetting NCCL_MIN_CTAS=4" in unset.stderr
     # Without a CTA config the environment is passed through untouched.
     assert " -u " not in _launcher_dry_run().stdout
+
+
+@pytest.mark.unit
+def test_every_read_write_workload_gets_the_p2p_communicators():
+    assert benchmark._needs_extended(["read"]) and benchmark._needs_extended(["ag", "rs+write"])
+    assert benchmark._needs_extended(["ag+ag"])
+    assert not benchmark._needs_extended(["ag", "rs", "ar", "ag+rs"])
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    ("extra", "message"),
+    [
+        (["--outside-p2p-sizes", "4", "--workloads", "ag+read"], "--outside-p2p-sizes is not wired"),
+        (["--p2p-modes", "push,pull"], "--p2p-modes pull is not wired"),
+    ],
+)
+def test_unwired_p2p_options_are_refused(extra, message, capsys):
+    with pytest.raises(SystemExit):
+        benchmark.parse_args(["--algo", "symm", "--output-dir", "/tmp/x", *extra])
+    assert message in capsys.readouterr().err

@@ -46,11 +46,14 @@ OPS = ("ag", "rs", "ar")
 # Extended ops used by the dual-collective workloads: ag2/rs2 are second communicators running
 # the same collective concurrently; read/write are NCCL point-to-point sends/receives.
 EXTENDED_OPS = ("ag2", "rs2", "read", "write")
+# read: the pair's first rank receives one AG shard from the second; write: it sends one to it.
+P2P_OPS = frozenset({"read", "write"})
 WORKLOADS = (
     "ag", "rs", "ar", "ag+rs",
     "ag+ag", "rs+rs",
     "ag+read", "ag+write",
     "rs+read", "rs+write",
+    "read", "write",
 )
 # Workloads each family measures. symm-tma and copy-engine only differ from symm in the
 # AllGather: their RS alone would be symm's ReduceScatter_LDMC again, and they have no all-reduce.
@@ -58,9 +61,20 @@ ALGO_WORKLOADS = {
     "ring": WORKLOADS,
     "nvls": WORKLOADS,
     "symm": WORKLOADS,
-    "symm-tma": ("ag", "ag+rs", "ag+ag", "ag+read", "ag+write"),
-    "copy-engine": ("ag", "ag+rs", "ag+ag", "ag+read", "ag+write"),
+    "symm-tma": ("ag", "ag+rs", "ag+ag", "ag+read", "ag+write", "read", "write"),
+    "copy-engine": ("ag", "ag+rs", "ag+ag", "ag+read", "ag+write", "read", "write"),
 }
+# How a read/write moves its bytes over NVLink. push: the rank that owns the data stores it into
+# the peer (NCCL's P2P write, its default on Blackwell): NVLink TX/RX *Requests* Data. pull: the
+# rank that needs the data loads it from the peer (NCCL_P2P_READ_ENABLE=1, transport/p2p.cc): the
+# owner's TX and the reader's RX *Responses* Data. Only the Simple protocol reads; LL always writes.
+P2P_MODES = ("push", "pull")
+DEFAULT_P2P_MODE = "push"
+# NCCL_P2P_LL_THRESHOLD default (enqueue.cc): a send of at most nChannels * this many bytes uses LL.
+P2P_LL_THRESHOLD = 16384
+# Outside-P2P scenario (--outside-p2p-sizes): ranks [0, n) run the collective while rank 0 also
+# exchanges with rank n, the first rank outside the collective group.
+OUTSIDE_P2P_SCENARIO = "outside-p2p"
 SPLIT_LAYOUTS = ("contiguous", "interleaved")
 # Split cases: both half-groups running the same workload at the same time, and "cross": group A
 # all-gathers while group B reduce-scatters, at the same time. Neither half runs alone: the
@@ -90,6 +104,8 @@ WORKLOAD_NAMES = {
     "ag+write": "all_gather+write",
     "rs+read": "reduce_scatter+read",
     "rs+write": "reduce_scatter+write",
+    "read": "read",
+    "write": "write",
     CROSS_WORKLOAD: "all_gather_A+reduce_scatter_B",
     LATE_JOIN_WORKLOAD: f"reduce_scatter_x{LATE_JOIN_RS_SCALE}+late_all_gather",
 }
@@ -141,6 +157,18 @@ def workload_ops(workload: str) -> tuple[str, ...]:
     if workload not in WORKLOADS:
         raise ValueError(f"unknown workload {workload!r}; expected one of {WORKLOADS}")
     return ("ag", "rs") if workload == "ag+rs" else (workload,)
+
+
+def has_p2p(workload: str) -> bool:
+    """Whether ``workload`` issues a read or write (the late-join and cross workloads never do)."""
+    return workload in WORKLOADS and bool(P2P_OPS & set(workload_ops(workload)))
+
+
+def record_p2p_mode(record: Mapping[str, object]) -> str | None:
+    """The P2P mode of a record with a read/write; records from before ``--p2p-modes`` were push."""
+    if not has_p2p(str(record["workload"])):
+        return None
+    return str(record.get("p2p_mode") or DEFAULT_P2P_MODE)
 
 
 def measured_workloads(algo: str, requested: Sequence[str]) -> list[str]:
@@ -249,6 +277,17 @@ def predicted_p2p_ctas(
     return count
 
 
+def predicted_p2p_protocol(nbytes: int, *, ctas: int) -> str:
+    """``LL`` if NCCL 2.29.7 may send ``nbytes`` over ``ctas`` channels with LL, else ``Simple``.
+
+    ``enqueue.cc`` keeps LL only while ``nbytes <= nChannels * NCCL_P2P_LL_THRESHOLD``. Only Simple
+    honors P2P read: LL always writes into the receiver's buffer, so a ``pull`` send must be Simple.
+    """
+    if nbytes <= 0 or ctas < 1:
+        raise ValueError("nbytes and ctas must be positive")
+    return "LL" if nbytes <= ctas * P2P_LL_THRESHOLD else "Simple"
+
+
 def split_groups(total_ranks: int, layout: str) -> tuple[list[int], list[int]]:
     """Split ``range(total_ranks)`` into two equal, disjoint groups.
 
@@ -271,8 +310,9 @@ def split_groups(total_ranks: int, layout: str) -> tuple[list[int], list[int]]:
 
 
 def scenario_name(scenario: str, *, total_ranks: int, layout: str | None = None) -> str:
-    """Name one set of communicators: ``single-n8``, ``late-join-n8`` or ``split-n16-contiguous``."""
-    if scenario in ("single", "late-join") and layout is None:
+    """Name one set of communicators: ``single-n8``, ``late-join-n8``, ``split-n16-contiguous`` or
+    ``outside-p2p-n4`` (``total_ranks`` is the collective group there; the P2P peer is one more rank)."""
+    if scenario in ("single", "late-join", OUTSIDE_P2P_SCENARIO) and layout is None:
         return f"{scenario}-n{total_ranks}"
     if scenario == "split" and layout in SPLIT_LAYOUTS:
         return f"split-n{total_ranks}-{layout}"
@@ -287,6 +327,7 @@ def case_name(
     dtype: str,
     size_mib: int,
     cta_config: str = DEFAULT_CTA_CONFIG,
+    p2p_mode: str | None = None,
 ) -> str:
     """Name one test, e.g. ``all_gather+reduce_scatter-1024MiB-bf16-split-n16-contiguous-AB-concurrent``.
 
@@ -294,8 +335,9 @@ def case_name(
     per-rank file in it; ``<algo>/<case>`` is the outer NVTX range of the case's nsys report.
     It must stay a single path component. ``size_mib`` is the full tensor: AG output / RS input /
     AR input. The cross part takes ``CROSS_WORKLOAD`` (``agA-rsB``), every other case one of ``WORKLOADS``
-    or ``LATE_JOIN_WORKLOAD``, whose ``size_mib`` is the AG size. A CTA config other than the
-    default (:func:`cta_config_name`) is appended, e.g. ``...-single-n4-cta-ag3-p2p32``.
+    or ``LATE_JOIN_WORKLOAD``, whose ``size_mib`` is the AG size. A read/write workload in ``pull``
+    mode gets ``-pull`` (``push``, NCCL's default, adds nothing), and a CTA config other than the
+    default (:func:`cta_config_name`) is appended last, e.g. ``...-single-n4-pull-cta-ag3-p2p32``.
     """
     if part is not None and part not in SPLIT_PARTS:
         raise ValueError(f"unknown split part {part!r}; expected one of {SPLIT_PARTS}")
@@ -303,7 +345,13 @@ def case_name(
         raise ValueError(f"workload {CROSS_WORKLOAD!r} belongs to part {CROSS_PART!r} only, got {part!r}/{workload!r}")
     if workload != CROSS_WORKLOAD:
         workload_ops(workload)
+    if p2p_mode is not None and p2p_mode not in P2P_MODES:
+        raise ValueError(f"unknown P2P mode {p2p_mode!r}; expected one of {P2P_MODES}")
+    if p2p_mode is not None and not has_p2p(workload):
+        raise ValueError(f"workload {workload!r} has no read/write, so it takes no P2P mode")
     suffix = scenario if part is None else f"{scenario}-{part}"
+    if p2p_mode == "pull":
+        suffix += "-pull"
     if cta_config != DEFAULT_CTA_CONFIG:
         if not cta_config.startswith("cta-"):
             raise ValueError(f"unknown CTA config name {cta_config!r}; expected default or cta-...")

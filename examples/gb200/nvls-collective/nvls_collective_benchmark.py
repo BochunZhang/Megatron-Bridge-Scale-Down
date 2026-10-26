@@ -56,6 +56,17 @@ Scenarios (all inside one torchrun job; ranks outside a group wait at a Gloo bar
   together and ends by joining them; the AG stream sleeps on the GPU before its AG. AG(S) and
   RS(4S) alone, timed the same way, are measured first in the same scenario: they are the
   references and the RS time sets the sleep.
+* ``outside-p2p`` (``--outside-p2p-sizes``): ranks ``[0, n)`` run the collectives while rank 0
+  also reads from / writes to rank ``n``, which is outside the collective group (e.g. GPUs 0-3
+  all-gather while GPU 0 exchanges with GPU 4). Every workload runs, so the collective alone,
+  the read/write alone and both together share one set of communicators.
+
+read and write move one AG shard between the pair (``ranks[0], ranks[1]`` of a single group).
+``--p2p-mode push`` keeps NCCL's P2P write: the data owner stores into the peer (NVLink
+Requests Data). ``pull`` connects the pair's P2P channels with ``NCCL_P2P_READ_ENABLE=1``, so the
+receiver loads from the sender (NVLink Responses Data). The variable is set only while those
+channels connect (``NCCL_NO_CACHE`` makes NCCL re-read it), so the collectives' own P2P
+connections keep NCCL's default, and every connection's ``/read`` suffix in the INIT log is checked.
 
 Every timed trial opens with a start gate: a one-element all-reduce over all ranks of the
 scenario, after which each rank records its start event. Groups that share no communicator
@@ -97,12 +108,15 @@ from collective_metrics import (
     LATE_JOIN_WORKLOAD,
     NCCL_ALGO_ENV,
     OPS,
+    P2P_MODES,
+    P2P_OPS,
     SPLIT_LAYOUTS,
     WORKLOADS,
     alg_bandwidth_gb_s,
     case_dir_name,
     case_name,
     cta_config_name,
+    has_p2p,
     late_join_metrics,
     measured_workloads,
     op_bus_bandwidth_gb_s,
@@ -161,9 +175,8 @@ OP_FUNCS = {
     "ag2": "AllGather",
     "rs2": "ReduceScatter",
 }
-# read and write use NCCL Send/Recv, which log in a different format;
+# read and write (P2P_OPS) use NCCL Send/Recv, which log in a different format;
 # they are excluded from check_implementation's TUNING-line checks.
-P2P_OPS = frozenset({"read", "write"})
 PROBE_FIELDS = ("nccl_algo", "nccl_kernel", "n_nodes", "mnnvl")
 # The three INFO(NCCL_TUNING, ...) lines NCCL 2.29 prints on comm rank 0 for every launch:
 #   "<Func>: <n> Bytes -> Algo <algo> proto <proto> ..."      enqueue.cc, classic kernels
@@ -234,6 +247,16 @@ SYM_CTAS_ENV = "NCCL_SYM_CTAS"
 # (install/install-nccl-2.32.3-cta.sh) lets a minCTAs above the cap through, up to 64. ag/rs/ar above it
 # are therefore not refused up front: check_ctas() fails a case whose launches NCCL clamped.
 
+# --p2p-mode pull: NCCL decides read vs write when a P2P channel connects (p2pGetInfo in
+# transport/p2p.cc) from this parameter, which it caches on first use unless NCCL_NO_CACHE names it.
+P2P_READ_ENV = "NCCL_P2P_READ_ENABLE"
+NO_CACHE_ENV = "NCCL_NO_CACHE"
+# The sender's INFO(NCCL_INIT|NCCL_P2P) line for every connection it sets up (p2pSendSetup):
+#   "Channel 03/1 : 0[0] -> 4[0] via P2P/MNNVL/read"
+# connIndex 1 is the send/recv connector; ring/tree/NVLS connect index 0. A NET or SHM transport
+# logs "via NET/..." / "via SHM/...", which a pass on one NVLink domain must not use.
+_P2P_CONNECT_LINE = re.compile(r"Channel \d+/1 : (\d+)\[\d+\] -> (\d+)\[\d+\] (?:\[send\] )?via (\S+)")
+
 SLEEP_CALIBRATION_CYCLES = 10_000_000
 
 
@@ -242,8 +265,11 @@ class CollectiveGroup:
     """One rank set with a dedicated communicator per collective so AG, RS and AR can overlap.
 
     ``ag2_pg`` and ``rs2_pg`` are second communicators for concurrent AG+AG and RS+RS workloads.
-    ``p2p_pg`` is a communicator spanning all ranks in the group used for NCCL P2P send/recv.
-    The extended communicators are ``None`` unless the group was created with ``extended=True``.
+    ``p2p_pgs`` holds one communicator per ``--p2p-modes`` entry for the NCCL send/recv of
+    read/write between the two ranks of ``pair``: each spans the group, or with an outside
+    ``p2p_peer`` only the group's first rank and that peer. A mode needs a communicator of its own
+    because NCCL fixes read vs write when a channel connects, and a connected channel is reused.
+    The extended communicators are ``None`` (empty) unless the group was created with ``extended=True``.
     ``ctas`` is the ``--cta-configs`` entry the communicators were created with (empty: NCCL's choice).
     """
 
@@ -254,17 +280,42 @@ class CollectiveGroup:
     ar_pg: dist.ProcessGroup | None
     ag2_pg: dist.ProcessGroup | None = None
     rs2_pg: dist.ProcessGroup | None = None
-    p2p_pg: dist.ProcessGroup | None = None
+    p2p_pgs: dict[str, dist.ProcessGroup] = dataclasses.field(default_factory=dict)
     ctas: dict[str, int] = dataclasses.field(default_factory=dict)
+    p2p_peer: int | None = None
 
     @property
     def size(self) -> int:
-        """Number of ranks in the group."""
+        """Number of ranks in the group's collectives."""
         return len(self.ranks)
+
+    @property
+    def pair(self) -> tuple[int, int]:
+        """The two ranks of read/write: the group's first two, or its first and the outside peer."""
+        return self.ranks[0], self.ranks[1] if self.p2p_peer is None else self.p2p_peer
+
+    @property
+    def members(self) -> list[int]:
+        """Every rank that takes part in the group's cases, the outside P2P peer included."""
+        return self.ranks if self.p2p_peer is None else [*self.ranks, self.p2p_peer]
+
+    @property
+    def p2p_members(self) -> list[int]:
+        """The ranks of every P2P communicator."""
+        return self.ranks if self.p2p_peer is None else list(self.pair)
 
     def communicators(self) -> tuple[dist.ProcessGroup | None, ...]:
         """Every communicator of the group, in a fixed order (including extended ones)."""
-        return (self.ag_pg, self.rs_pg, self.ar_pg, self.ag2_pg, self.rs2_pg, self.p2p_pg)
+        return (self.ag_pg, self.rs_pg, self.ar_pg, self.ag2_pg, self.rs2_pg, *self.p2p_pgs.values())
+
+    def window_communicators(self) -> tuple[dist.ProcessGroup | None, ...]:
+        """The communicators a symmetric window is registered on.
+
+        An outside peer has no window, and registration is collective over each communicator, so
+        the pair communicators it shares with the group's first rank are left out.
+        """
+        collectives = (self.ag_pg, self.rs_pg, self.ar_pg, self.ag2_pg, self.rs2_pg)
+        return self.communicators() if self.p2p_peer is None else collectives
 
 
 @dataclasses.dataclass
@@ -276,18 +327,23 @@ class Buffers:
 
     ``ag2_out`` and ``rs2_out`` are outputs of the second AG/RS communicator used by the
     concurrent ``ag+ag`` / ``rs+rs`` workloads; they are full-size / shard-size like ``ag_out``
-    / ``rs_out``. ``p2p_buf`` is the receive buffer for P2P workloads (shard-sized, like ``ag_in``).
+    / ``rs_out``. On the two ranks of the read/write pair, ``p2p_src`` is what the rank sends and
+    ``p2p_buf`` where it receives (both shard-sized, like ``ag_in``). An outside P2P peer has only
+    those two; every collective buffer is ``None`` there.
     """
 
-    ag_in: torch.Tensor
-    ag_out: torch.Tensor
-    rs_in: torch.Tensor
-    rs_out: torch.Tensor
-    ar_buf: torch.Tensor
+    ag_in: torch.Tensor | None = None
+    ag_out: torch.Tensor | None = None
+    rs_in: torch.Tensor | None = None
+    rs_out: torch.Tensor | None = None
+    ar_buf: torch.Tensor | None = None
     ag2_out: torch.Tensor | None = None
     rs2_out: torch.Tensor | None = None
+    p2p_src: torch.Tensor | None = None
     p2p_buf: torch.Tensor | None = None
     pool: torch.cuda.MemPool | None = None
+    # The case's --p2p-modes entry: which of the group's P2P communicators read/write go through.
+    p2p_mode: str = "push"
 
 
 @dataclasses.dataclass
@@ -318,7 +374,7 @@ class Topology:
     ) -> None:
         self.rank = rank
         self.groups = groups
-        self.group_by_rank = {member: group for group in groups for member in group.ranks}
+        self.group_by_rank = {member: group for group in groups for member in group.members}
         self.comm_info = comm_info
         self.gate = gate
 
@@ -385,7 +441,31 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         f" AG and RS to their multicast kernels ({SYMM_MC_PIN}, NCCL >= 2.32)",
     )
     parser.add_argument("--output-dir", type=Path, required=True)
-    parser.add_argument("--group-sizes", type=_csv_ints, default=[4, 8, 16, 32], help="Single-group sizes")
+    parser.add_argument(
+        "--group-sizes",
+        type=_csv_ints_or_none,
+        default=[4, 8, 16, 32],
+        help="Single-group sizes; 'none' skips the single scenario (with --outside-p2p-sizes)",
+    )
+    parser.add_argument(
+        "--outside-p2p-sizes",
+        type=_csv_ints_or_none,
+        default=[],
+        help=(
+            "Collective groups [0, n) whose rank 0 also reads from / writes to rank n, outside the group,"
+            " e.g. 4 for GPUs 0-3 collective + GPU 0 <-> GPU 4; default 'none'"
+        ),
+    )
+    parser.add_argument(
+        "--p2p-modes",
+        type=_csv_choices(P2P_MODES),
+        default=["push"],
+        help=(
+            "How read/write move data: push = the data owner stores into the peer (NCCL's P2P write,"
+            " NVLink Requests Data), pull = the receiver loads from the owner (NCCL P2P read, NVLink"
+            " Responses Data). Every read/write workload runs once per mode"
+        ),
+    )
     parser.add_argument(
         "--split-totals",
         type=_csv_ints_or_none,
@@ -454,6 +534,17 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         parser.error("--late-join replaces the single and split scenarios; pass --split-totals none")
     if args.late_join and args.symm_kernel not in ("default", "mc"):
         parser.error("--late-join runs an AG and an RS; --symm-kernel would mask one of them")
+    if args.late_join and args.outside_p2p_sizes:
+        parser.error("--late-join runs only the late-join scenario; drop --outside-p2p-sizes")
+    if not args.group_sizes and not args.outside_p2p_sizes:
+        parser.error("--group-sizes none leaves nothing to run without --outside-p2p-sizes")
+    if args.outside_p2p_sizes and not any(has_p2p(w) for w in args.workloads):
+        parser.error("--outside-p2p-sizes measures read/write next to the collectives; add read or write workloads")
+    # Their communicators are in place (_new_group, connect_p2p), but no scenario runs them yet.
+    if args.outside_p2p_sizes:
+        parser.error("--outside-p2p-sizes is not wired into the scenarios yet; pass none")
+    if args.p2p_modes != ["push"]:
+        parser.error("--p2p-modes pull is not wired into the scenarios yet; run run_p2p_push_pull_benchmark.sh")
     return args
 
 
@@ -647,23 +738,35 @@ def _new_group(
     eager: bool = False,
     extended: bool = False,
     ctas: Mapping[str, int] | None = None,
+    p2p_peer: int | None = None,
+    p2p_modes: tuple[str, ...] = ("push",),
 ) -> CollectiveGroup:
+    """Create the communicators of one group; ``p2p_peer`` is an outside rank for read/write.
+
+    ``extended`` adds the second AG/RS communicators and one P2P communicator per ``p2p_modes``
+    entry. With a ``p2p_peer`` the P2P communicators span only ``ranks[0]`` and the peer, and the
+    peer belongs to no collective communicator.
+    """
     # new_group is collective over the default (Gloo) group: every rank calls it in the same order.
     # With a device_id torch creates the members' NCCL communicator right away instead of at the
     # first collective, so a window can be registered before any collective runs.
     device_id = torch.device("cuda", torch.cuda.current_device()) if eager else None
+    if p2p_peer is not None and (p2p_peer in ranks or not extended):
+        raise ValueError(f"{name}: the P2P peer {p2p_peer} must be outside {ranks} on an extended group")
 
-    def new(op: str) -> dist.ProcessGroup:
+    def new(op: str, members: list[int] = ranks) -> dist.ProcessGroup:
         options = _nccl_options(*comm_ctas(op, ctas or {}))
-        return dist.new_group(ranks=ranks, backend="nccl", device_id=device_id, pg_options=options)
+        return dist.new_group(ranks=members, backend="nccl", device_id=device_id, pg_options=options)
 
     ag_pg = new("ag")
     rs_pg = new("rs")
     ar_pg = new("ar")
     ag2_pg = new("ag2") if extended else None
     rs2_pg = new("rs2") if extended else None
-    p2p_pg = new("read") if extended else None
-    member = dist.get_rank() in ranks
+    p2p_members = ranks if p2p_peer is None else [ranks[0], p2p_peer]
+    p2p_pgs = {mode: new("read", p2p_members) for mode in p2p_modes} if extended else {}
+    rank = dist.get_rank()
+    member = rank in ranks
     return CollectiveGroup(
         name=name,
         ranks=ranks,
@@ -672,8 +775,9 @@ def _new_group(
         ar_pg=ar_pg if member else None,
         ag2_pg=ag2_pg if (extended and member) else None,
         rs2_pg=rs2_pg if (extended and member) else None,
-        p2p_pg=p2p_pg if (extended and member) else None,
+        p2p_pgs=p2p_pgs if rank in p2p_members else {},
         ctas=dict(ctas or {}),
+        p2p_peer=p2p_peer,
     )
 
 
@@ -1003,13 +1107,96 @@ def _connect(groups: list[CollectiveGroup], gate: StartGate, rank: int, *, windo
                     rs2_reduced = torch.empty(1024, device="cuda")
                     dist.reduce_scatter_tensor(rs2_reduced, gathered, group=group.rs2_pg)
                     torch.cuda.synchronize()
-                if group.p2p_pg is not None:
-                    dist.barrier(group=group.p2p_pg)
-                    torch.cuda.synchronize()
+                _init_p2p_communicators(group)
             reduced_inplace = torch.ones(1024, device="cuda")
             dist.all_reduce(reduced_inplace, group=group.ar_pg)
             torch.cuda.synchronize()
         torch.distributed.barrier()
+
+
+def _init_p2p_communicators(group: CollectiveGroup) -> None:
+    """Create the group-wide P2P communicators so a window can be registered on them.
+
+    A barrier is an all-reduce, which initializes the communicator torch keeps for the whole
+    group; read/write themselves may go through a 2-rank one. A pair with an outside peer shares
+    no window, so its communicators are left to :func:`connect_p2p`.
+    """
+    if group.p2p_peer is not None:
+        return
+    for pg in group.p2p_pgs.values():
+        dist.barrier(group=pg)
+        torch.cuda.synchronize()
+
+
+@contextlib.contextmanager
+def _p2p_read_enabled(mode: str) -> Iterator[None]:
+    """Set ``NCCL_P2P_READ_ENABLE`` for the P2P channels NCCL connects inside the block.
+
+    NCCL reads the variable in ``p2pGetInfo`` whenever it connects a P2P channel, and only re-reads
+    it when ``NCCL_NO_CACHE`` names it (the caller must make sure it does). ``push`` sets
+    it to 0, NCCL's own choice on Blackwell but explicit, so the mode never depends on the GPU.
+    """
+    previous = os.environ.get(P2P_READ_ENV)
+    os.environ[P2P_READ_ENV] = "1" if mode == "pull" else "0"
+    try:
+        yield
+    finally:
+        if previous is None:
+            del os.environ[P2P_READ_ENV]
+        else:
+            os.environ[P2P_READ_ENV] = previous
+
+
+def connect_p2p(groups: list[CollectiveGroup], rank: int, mode: str) -> None:
+    """Connect the ``mode`` P2P channels of every group's pair in both directions.
+
+    NCCL connects every channel a send/recv to a peer can use on the first one
+    (``p2pTaskAppend`` in enqueue.cc marks all ``p2pnChannelsPerPeer`` of them), and never
+    reconnects them. One tiny send each way under :func:`_p2p_read_enabled` therefore fixes read
+    vs write for every later read/write of the pair. Both ranks set the variable: sender and
+    receiver each decide in their own ``p2pGetInfo``. The other ranks only join the barriers.
+    """
+    for group in groups:
+        if rank in group.pair and mode in group.p2p_pgs:
+            first, second = group.pair
+            pg = group.p2p_pgs[mode]
+            other = second if rank == first else first
+            out = torch.zeros(1024, device="cuda")
+            into = torch.empty(1024, device="cuda")
+            with _p2p_read_enabled(mode):
+                # The lower rank sends first so the two unbatched sends cannot wait on each other.
+                for sender in (first, second):
+                    if rank == sender:
+                        dist.send(out, dst=other, group=pg)
+                    else:
+                        dist.recv(into, src=other, group=pg)
+                    torch.cuda.synchronize()
+        torch.distributed.barrier()
+
+
+def check_p2p_connections(lines: list[str], *, mode: str) -> tuple[list[str], list[str]]:
+    """Read the P2P channels :func:`connect_p2p` connected on this rank and hold them to ``mode``.
+
+    ``lines`` are this rank's NCCL log lines of that connect. Each connected send channel logs
+    ``Channel <c>/1 : <r>[<d>] -> <p>[<d>] via P2P/<kind>[/read][/CE]``: ``/read`` is a pull. Returns
+    the distinct transports (``P2P/MNNVL/read``) and the violations: a channel over another
+    transport than P2P, or one whose direction is not ``mode``. A rank of the pair that logged
+    nothing is an error too, raised by the caller, which knows who sends.
+    """
+    transports: Counter[str] = Counter()
+    for line in lines:
+        match = _P2P_CONNECT_LINE.search(line)
+        if match:
+            transports[match.group(3)] += 1
+    errors = []
+    for transport, count in sorted(transports.items()):
+        parts = transport.split("/")
+        if parts[0] != "P2P":
+            errors.append(f"{count} send channel(s) via {transport}, not over NVLink P2P")
+        elif ("read" in parts) != (mode == "pull"):
+            want = "P2P read (/read)" if mode == "pull" else "P2P write (no /read)"
+            errors.append(f"--p2p-modes {mode} needs {want}, {count} send channel(s) via {transport}")
+    return sorted(transports), errors
 
 
 def _connect_windows(group: CollectiveGroup, rank: int) -> None:
@@ -1033,9 +1220,7 @@ def _connect_windows(group: CollectiveGroup, rank: int) -> None:
     if group.rs2_pg is not None and buffers.rs2_out is not None:
         dist.reduce_scatter_tensor(buffers.rs2_out, buffers.rs_in, group=group.rs2_pg)
         torch.cuda.synchronize()
-    if group.p2p_pg is not None:
-        dist.barrier(group=group.p2p_pg)
-        torch.cuda.synchronize()
+    _init_p2p_communicators(group)
     _deregister_pool(group, buffers.pool)
 
 
@@ -1194,24 +1379,15 @@ def _launch(
                 dist.reduce_scatter_tensor(buffers.rs2_out, buffers.rs_in, group=group.rs2_pg)
             elif op == "ar":
                 dist.all_reduce(buffers.ar_buf, group=group.ar_pg)
-            elif op == "read" and group.p2p_pg is not None and buffers.p2p_buf is not None:
-                # rank 0 receives from rank 1; rank 1 sends to rank 0.
-                rank_index = group.ranks.index(dist.get_rank()) if dist.get_rank() in group.ranks else -1
-                if rank_index == 0:
-                    req = dist.irecv(buffers.p2p_buf, src=group.ranks[1], group=group.p2p_pg)
-                    req.wait()
-                elif rank_index == 1:
-                    req = dist.isend(buffers.ag_in, dst=group.ranks[0], group=group.p2p_pg)
-                    req.wait()
-            elif op == "write" and group.p2p_pg is not None and buffers.p2p_buf is not None:
-                # rank 0 sends to rank 1; rank 1 receives from rank 0.
-                rank_index = group.ranks.index(dist.get_rank()) if dist.get_rank() in group.ranks else -1
-                if rank_index == 0:
-                    req = dist.isend(buffers.ag_in, dst=group.ranks[1], group=group.p2p_pg)
-                    req.wait()
-                elif rank_index == 1:
-                    req = dist.irecv(buffers.p2p_buf, src=group.ranks[0], group=group.p2p_pg)
-                    req.wait()
+            elif op in P2P_OPS and buffers.p2p_mode in group.p2p_pgs and buffers.p2p_buf is not None:
+                # read: the pair's first rank receives from the second; write: it sends to it.
+                first, second = group.pair
+                sender, receiver = (second, first) if op == "read" else (first, second)
+                pg = group.p2p_pgs[buffers.p2p_mode]
+                if dist.get_rank() == receiver:
+                    dist.irecv(buffers.p2p_buf, src=sender, group=pg).wait()
+                elif dist.get_rank() == sender:
+                    dist.isend(buffers.ag_in, dst=receiver, group=pg).wait()
 
 
 def _calibrate_sleep_cycles_per_ms() -> float:
@@ -1736,9 +1912,8 @@ def _metadata(args: argparse.Namespace, rank: int, world_size: int) -> dict[str,
 
 
 def _needs_extended(workloads: list[str]) -> bool:
-    """Return True if any workload in the list needs ag2_pg, rs2_pg, or p2p_pg."""
-    extended_workloads = frozenset({"ag+ag", "rs+rs", "ag+read", "ag+write", "rs+read", "rs+write"})
-    return any(w in extended_workloads for w in workloads)
+    """Return True if any workload in the list needs ag2_pg, rs2_pg, or the P2P communicators."""
+    return any(w in ("ag+ag", "rs+rs") or has_p2p(w) for w in workloads)
 
 
 def main(argv: list[str] | None = None) -> None:
