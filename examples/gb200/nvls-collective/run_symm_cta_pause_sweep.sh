@@ -49,10 +49,25 @@ Usage:
 
 Options:
   --nnodes N          Nodes in the job (default: 8)
-  --group-sizes LIST  Single-group sizes (default: 32)
+  --group-sizes LIST  Single-group sizes (default: nnodes x --gpus-per-node of the launcher, 4 unless
+                      passed through)
   --max-ctas N        Largest ag / rs CTA count of the sweep (default: 8)
-  --pause-cycles LIST SM cycles per 4 KiB chunk and warp, one run each
-                      (default: 0,500,1000,2000,4000, about 0-2 us at a 2 GHz SM clock)
+  --pause-cycles LIST SM cycles per 4 KiB chunk and warp, one run each (default: per group size, below;
+                      a group size without a default, or several group sizes, need an explicit list)
+
+Default --pause-cycles, for the default AllGather_STMC CTA count of each group size. The AG writes
+n x CTA_AG paths into every GPU (4 GPUs: 4 CTAs, 8: 2, 16: 1, 32 / 64: 1), each path about 64 KiB
+per round and about 1.3 us per round when the ingress is not full (50 GB/s per path), so the AG rate
+is about min(711, paths x 64 KiB / (1.3 us + pause / SM clock)) GB/s. At a 2.06 GHz SM clock:
+  4 / 8 / 16 GPUs (16 paths): 0,64,128,256,512,768,1024,1536,2048,2560,3072,4096
+      711 up to about 340 cycles, then about 580 / 455 / 375 / 320 GB/s at 1024 / 2048 / 3072 / 4096
+  32 GPUs (32 paths):         0,256,1024,2048,3072,4096,5120,6144,7168,8192,10240,12288
+      711 up to about 3400 cycles, then about 635 / 490 / 400 / 290 GB/s at 4096 / 6144 / 8192 / 12288
+  64 GPUs (64 paths):         0,1024,4096,8192,10240,12288,14336,16384,18432,20480,24576
+      711 up to about 9500 cycles, then about 580 / 455 / 375 / 315 GB/s at 12288 / 16384 / 20480 / 24576
+The values below each knee check the plateau (AG still at 711); the rest walk the AG from about 650
+down to about 300 GB/s, past the rate at which a fully overlapped AG+RS (T_pair = T_AG) stops beating
+the default T_pair (about 340-360 GB/s at 1 GiB).
   --venv DIR          Virtualenv to activate, or 'none' to keep the current one
                       (default: <repo>/.venv/python3.12-torch2.13-nccl2.32.3)
   --nccl-lib PATH     libnccl.so.2 to preload
@@ -63,11 +78,11 @@ Anything after the options (or after --) goes to run_nvls_collective_benchmark.s
 last, overrides the defaults above, e.g. --workloads ag or --dry-run.
 
 Examples:
-  # Eight trays, one 32-GPU group (run on every node).
-  bash examples/gb200/nvls-collective/run_symm_cta_pause_sweep.sh
+  # Eight trays, one 32-GPU group, the 32-GPU pauses at NCCL's own CTA counts (run on every node).
+  bash examples/gb200/nvls-collective/run_symm_cta_pause_sweep.sh -- --cta-configs default
 
   # One tray, 4 GPUs, AG / RS up to 4 CTAs, three pauses.
-  bash examples/gb200/nvls-collective/run_symm_cta_pause_sweep.sh --nnodes 1 --group-sizes 4 \
+  bash examples/gb200/nvls-collective/run_symm_cta_pause_sweep.sh --nnodes 1 \
     --max-ctas 4 --pause-cycles 0,1000,4000
 USAGE
 }
@@ -75,9 +90,9 @@ USAGE
 script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 repo_root="$(cd -- "${script_dir}/../../.." && pwd)"
 nnodes=8
-group_sizes=32
+group_sizes=""
 max_ctas=8
-pause_cycles="0,500,1000,2000,4000"
+pause_cycles=""
 venv="${repo_root}/.venv/python3.12-torch2.13-nccl2.32.3"
 nccl_lib="${repo_root}/nccl/nccl-2.32.3-cta-with-pause/build/lib/libnccl.so.2"
 nccl_suffix="-cta-pause"
@@ -106,6 +121,30 @@ done
 
 [[ "$max_ctas" =~ ^[0-9]+$ ]] && (( max_ctas >= 1 && max_ctas <= 64 )) || die "--max-ctas must be in 1..64, got ${max_ctas}"
 [[ "$nnodes" =~ ^[0-9]+$ ]] && (( nnodes >= 1 )) || die "--nnodes must be a positive integer, got ${nnodes}"
+
+# The launcher's --gpus-per-node, for the default group (all GPUs of the job).
+gpus_per_node=4
+args=(${passthrough[@]+"${passthrough[@]}"})
+for (( i = 0; i < ${#args[@]}; i++ )); do
+    [[ "${args[i]}" == --gpus-per-node ]] && gpus_per_node="${args[i + 1]:-}"
+done
+[[ "$gpus_per_node" =~ ^[0-9]+$ ]] && (( gpus_per_node >= 1 )) \
+    || die "--gpus-per-node must be a positive integer, got ${gpus_per_node}"
+[[ -n "$group_sizes" ]] || group_sizes=$(( nnodes * gpus_per_node ))
+
+# The AG rate falls off once the pause outlasts the backpressure wait of a round, which grows with
+# the paths per GPU (n x CTA_AG at NCCL's default CTA count); see the usage text for the model.
+if [[ -z "$pause_cycles" ]]; then
+    [[ "$group_sizes" =~ ^[0-9]+$ ]] \
+        || die "no default --pause-cycles for several group sizes (${group_sizes}); pass one group or a list"
+    case "$group_sizes" in
+        4|8|16) pause_cycles="0,64,128,256,512,768,1024,1536,2048,2560,3072,4096" ;;
+        32) pause_cycles="0,256,1024,2048,3072,4096,5120,6144,7168,8192,10240,12288" ;;
+        64) pause_cycles="0,1024,4096,8192,10240,12288,14336,16384,18432,20480,24576" ;;
+        *) die "no default --pause-cycles for a ${group_sizes}-GPU group; pass --pause-cycles" ;;
+    esac
+    log "pause cycles for the ${group_sizes}-GPU group: ${pause_cycles}"
+fi
 [[ "$pause_cycles" =~ ^[0-9]+(,[0-9]+)*$ ]] \
     || die "--pause-cycles must be a comma-separated list of cycles, got '${pause_cycles}'"
 IFS=, read -r -a pause_list <<<"$pause_cycles"
