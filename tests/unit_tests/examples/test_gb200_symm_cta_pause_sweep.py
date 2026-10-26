@@ -47,7 +47,7 @@ def _sweep(lib: Path, *options: str) -> subprocess.CompletedProcess:
 @pytest.mark.unit
 @needs_bash
 def test_dry_run_gives_every_pause_its_own_tagged_run(tmp_path):
-    result = _sweep(_fake_lib(tmp_path), "--max-ctas", "2", "--pause-cycles", "0,1000", "--dry-run")
+    result = _sweep(_fake_lib(tmp_path), "--pause-cycles", "0,1000", "--dry-run")
     assert result.returncode == 0, result.stderr
     output = result.stdout + result.stderr
     assert "NCCL_SYM_AG_STMC_PAUSE_CYCLES=0: run id sweep-test-pause0cyc" in output
@@ -57,7 +57,10 @@ def test_dry_run_gives_every_pause_its_own_tagged_run(tmp_path):
     for line, pause in zip(torchruns, (0, 1000)):
         assert f"gpu-num-4/sweep-test-pause{pause}cyc/symm" in line
         assert "--workloads ag,rs,ag+rs" in line and "--symm-kernel mc" in line
-        assert "--cta-configs default;ag=1,rs=1;ag=1,rs=2;ag=2,rs=2" in line
+        args = line.split()
+        # Only the pause changes: NCCL's own CTA counts, on the multicast symmetric kernels.
+        assert args[args.index("--cta-configs") + 1] == "default"
+        assert args[args.index("--algo") + 1] == "symm"
 
 
 @pytest.mark.unit
@@ -68,7 +71,9 @@ def test_dry_run_gives_every_pause_its_own_tagged_run(tmp_path):
         (["--pause-cycles", "0,abc"], "comma-separated list"),
         (["--pause-cycles", "500,500"], "twice"),
         (["--pause-cycles", "4294967296"], "uint32"),
-        (["--max-ctas", "0"], "1..64"),
+        (["--", "--cta-configs", "ag=2,rs=2"], "fixed by this sweep"),
+        (["--", "--symm-kernel", "default"], "fixed by this sweep"),
+        (["--", "--algos", "symm-p2p"], "fixed by this sweep"),
     ],
 )
 def test_bad_options_are_rejected(tmp_path, options, match):

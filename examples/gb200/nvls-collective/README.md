@@ -429,8 +429,8 @@ bash examples/gb200/nvls-collective/run_symm_cta_sweep.sh --nnodes 8 --group-siz
 - 读结果：`compare.md` 表 1–5 只用 `default` 的结果，新增的**表 6** 把每个非 default 配置和同一 case 的 default
   配对，每个 op 给出 `CTA 数 / 每次迭代 ms (相对 default)`。
 
-**AllGather_STMC 暂停扫描（`run_symm_cta_pause_sweep.sh`）**：在上面的 CTA 扫描基础上，人为让 AG 的 multimem store
-变慢，看 ag+rs 重叠时 RS 的时间怎么变。先编出带暂停的 NCCL（clone `v2.32.3-1` 到 `nccl/nccl-2.32.3-cta-with-pause`，依次打
+**AllGather_STMC 暂停扫描（`run_symm_cta_pause_sweep.sh`）**：人为让 AG 的 multimem store 变慢，看 ag+rs 重叠时 RS
+的时间怎么变。只扫暂停值，AG / RS 的 CTA 数保持 NCCL 默认（`--cta-configs default`）。先编出带暂停的 NCCL（clone `v2.32.3-1` 到 `nccl/nccl-2.32.3-cta-with-pause`，依次打
 `nccl-2.32.3-cta.patch` 和 `nccl-2.32.3-cta-pause.patch`，横幅为 `NCCL version 2.32.3-cta-pause+cuda...`）：
 
 ```bash
@@ -454,7 +454,11 @@ bash examples/gb200/nvls-collective/run_symm_cta_pause_sweep.sh --nnodes 8 --gro
   `results/gb200/nvls-collective/gpu-num-<N>/<id>-pause<cycles>cyc/`。整次扫描共用一个 `<id>`（导出 `RUN_TIME` 可以指定；
   多节点时由 node 0 生成并下发）。node 0 在每个目录写 `pause.json`，各 algo 的 `metadata.json` 也记录了这个变量；跑完后检查每个
   NCCL 进程的横幅是 `2.32.3-cta-pause`、日志里有 `NCCL_SYM_AG_STMC_PAUSE_CYCLES set by environment to <cycles>.`。
-- 其它选项、torch 要求和 `--` 透传与 `run_symm_cta_sweep.sh` 相同；`--pause-cycles 0` 就是同一个库下的基线。
+- 每个 case 都走 symmetric 的 multicast kernel（`AllGather_STMC` / `ReduceScatter_LDMC`），不走 unicast（P2P）kernel：
+  `--symm-kernel mc` 固定 `NCCL_SYM_KERNEL`、`NCCL_NVLS_ENABLE=1`，`NCCL_SYM_TMA_ENABLE=0` 排除 `AllGather_TmaSTMC`，
+  benchmark 按 TUNING 日志逐次检查，跑了别的 kernel 的 case 直接判失败。`--algos`、`--symm-kernel`、`--cta-configs`
+  不能透传。
+- `--nnodes` 默认 1（单 tray 4 GPU）。torch 要求和 `--` 透传与 `run_symm_cta_sweep.sh` 相同；`--pause-cycles 0` 就是同一个库下的基线。
 
 **看实际用了多少 SM。** CTA 数 ≈ 占用的 SM 数（CTA 数远小于 SM 数时调度器会把它们分散到不同 SM；一个 SM 理论上能放多个
 CTA，所以只是近似）。证据从强到弱：

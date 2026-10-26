@@ -17,13 +17,20 @@ set -euo pipefail
 
 usage() {
     cat <<'USAGE'
-Sweep the symmetric AG / RS CTA counts once per AllGather_STMC pause, with nccl-2.32.3-cta-with-pause preloaded.
+Sweep the AllGather_STMC pause at NCCL's default CTA counts, with nccl-2.32.3-cta-with-pause preloaded.
 
-run_symm_cta_sweep.sh with a paused AllGather: for every value of --pause-cycles it runs
+For every value of --pause-cycles it runs
 run_nvls_collective_benchmark.sh --algos symm --workloads ag,rs,ag+rs --sizes-mib 1024 --nsys
---symm-kernel mc --cta-configs 'default;ag=A,rs=R;...' (1 <= A <= R <= --max-ctas) with
-NCCL_SYM_AG_STMC_PAUSE_CYCLES=<cycles>. The preloaded build (install/install-nccl-2.32.3-cta.sh
---with-pause) is nccl-2.32.3-cta plus that variable: AllGather_STMC makes every warp spin <cycles> SM
+--symm-kernel mc --cta-configs default with NCCL_SYM_AG_STMC_PAUSE_CYCLES=<cycles>. Only the pause
+changes between runs: no per-communicator CTA count is set, and NCCL_MIN_CTAS / NCCL_MIN_NCHANNELS
+from the environment (GB200 images export them) are passed to NCCL unchanged.
+
+Every case runs the symmetric multicast kernels, never the unicast (P2P) ones: --symm-kernel mc pins
+NCCL_SYM_KERNEL=allgather:AllGather_STMC;reducescatter:ReduceScatter_LDMC with NCCL_NVLS_ENABLE=1,
+NCCL_SYM_TMA_ENABLE=0 keeps the AG off AllGather_TmaSTMC, and the benchmark fails any case whose NCCL
+log shows another kernel. --algos, --symm-kernel and --cta-configs cannot be passed through.
+
+The preloaded build (install/install-nccl-2.32.3-cta.sh --with-pause) is nccl-2.32.3-cta plus that variable: AllGather_STMC makes every warp spin <cycles> SM
 cycles (clock64) after each 4 KiB chunk of multimem stores, so the AllGather gets slower at the same CTA
 count and ReduceScatter_LDMC is left alone. 0 runs the kernels unchanged, which makes it the baseline
 of the same library. In ns a pause is <cycles> / SM clock: read the clock from the nsys GPU metrics
@@ -48,10 +55,9 @@ Usage:
   run_symm_cta_pause_sweep.sh [options] [-- run_nvls_collective_benchmark.sh options]
 
 Options:
-  --nnodes N          Nodes in the job (default: 8)
+  --nnodes N          Nodes in the job (default: 1, one 4-GPU tray)
   --group-sizes LIST  Single-group sizes (default: nnodes x --gpus-per-node of the launcher, 4 unless
                       passed through)
-  --max-ctas N        Largest ag / rs CTA count of the sweep (default: 8)
   --pause-cycles LIST SM cycles per 4 KiB chunk and warp, one run each (default: per group size, below;
                       a group size without a default, or several group sizes, need an explicit list)
 
@@ -75,23 +81,22 @@ the default T_pair (about 340-360 GB/s at 1 GiB).
   -h, --help          Show this help
 
 Anything after the options (or after --) goes to run_nvls_collective_benchmark.sh and, coming
-last, overrides the defaults above, e.g. --workloads ag or --dry-run.
+last, overrides the defaults above, e.g. --workloads ag or --dry-run (but not --algos, --symm-kernel
+or --cta-configs).
 
 Examples:
-  # Eight trays, one 32-GPU group, the 32-GPU pauses at NCCL's own CTA counts (run on every node).
-  bash examples/gb200/nvls-collective/run_symm_cta_pause_sweep.sh -- --cta-configs default
+  # Eight trays, one 32-GPU group, the 32-GPU pauses (run on every node).
+  bash examples/gb200/nvls-collective/run_symm_cta_pause_sweep.sh --nnodes 8
 
-  # One tray, 4 GPUs, AG / RS up to 4 CTAs, three pauses.
-  bash examples/gb200/nvls-collective/run_symm_cta_pause_sweep.sh --nnodes 1 \
-    --max-ctas 4 --pause-cycles 0,1000,4000
+  # One tray, 4 GPUs, three pauses.
+  bash examples/gb200/nvls-collective/run_symm_cta_pause_sweep.sh --pause-cycles 0,1000,4000
 USAGE
 }
 
 script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 repo_root="$(cd -- "${script_dir}/../../.." && pwd)"
-nnodes=8
+nnodes=1
 group_sizes=""
-max_ctas=8
 pause_cycles=""
 venv="${repo_root}/.venv/python3.12-torch2.13-nccl2.32.3"
 nccl_lib="${repo_root}/nccl/nccl-2.32.3-cta-with-pause/build/lib/libnccl.so.2"
@@ -109,7 +114,6 @@ while [[ $# -gt 0 ]]; do
     case "$1" in
         --nnodes) nnodes="$2"; shift 2 ;;
         --group-sizes) group_sizes="$2"; shift 2 ;;
-        --max-ctas) max_ctas="$2"; shift 2 ;;
         --pause-cycles) pause_cycles="$2"; shift 2 ;;
         --venv) venv="$2"; shift 2 ;;
         --nccl-lib) nccl_lib="$2"; shift 2 ;;
@@ -119,7 +123,6 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
-[[ "$max_ctas" =~ ^[0-9]+$ ]] && (( max_ctas >= 1 && max_ctas <= 64 )) || die "--max-ctas must be in 1..64, got ${max_ctas}"
 [[ "$nnodes" =~ ^[0-9]+$ ]] && (( nnodes >= 1 )) || die "--nnodes must be a positive integer, got ${nnodes}"
 
 # The launcher's --gpus-per-node, for the default group (all GPUs of the job).
@@ -168,14 +171,9 @@ for (( i = 0; i < ${#args[@]}; i++ )); do
         --node-rank) node_rank="${args[i + 1]:-}" ;;
         --master-addr) master_addr="${args[i + 1]:-}" ;;
         --master-port) master_port="${args[i + 1]:-}" ;;
+        # Only the pause may change between runs, and only on the multicast symmetric kernels.
+        --algos|--symm-kernel|--cta-configs) die "${args[i]} is fixed by this sweep (symm, mc, default)" ;;
     esac
-done
-
-cta_configs="default"
-for (( ag = 1; ag <= max_ctas; ag++ )); do
-    for (( rs = ag; rs <= max_ctas; rs++ )); do
-        cta_configs+=";ag=${ag},rs=${rs}"
-    done
 done
 
 if [[ "$venv" != none ]]; then
@@ -185,8 +183,6 @@ if [[ "$venv" != none ]]; then
 fi
 # Nsight Compute unpacked into the repo, for --ncu passed through.
 [[ -d "${repo_root}/NVIDIA-Nsight-Compute-2026.3" ]] && export PATH="${repo_root}/NVIDIA-Nsight-Compute-2026.3:${PATH}"
-# GB200 images export these; they would override every communicator's minCTAs (the launcher unsets them too).
-unset NCCL_MIN_CTAS NCCL_MIN_NCHANNELS
 if [[ -n "${!pause_env:-}" ]]; then
     log "warning: ${pause_env}=${!pause_env} from the environment is replaced by each --pause-cycles value"
 fi
@@ -276,7 +272,7 @@ for pause in "${pause_list[@]}"; do
         --algos symm \
         --workloads ag,rs,ag+rs \
         --nsys \
-        --cta-configs "$cta_configs" \
+        --cta-configs default \
         --symm-kernel mc \
         ${passthrough[@]+"${passthrough[@]}"} 2>&1 | tee "$log_file"
     run_status="${PIPESTATUS[0]}"
