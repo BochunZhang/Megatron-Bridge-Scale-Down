@@ -385,6 +385,33 @@ bash examples/gb200/nvls-collective/run_symm_cta_sweep.sh --nnodes 8 --group-siz
 - 读结果：`compare.md` 表 1–5 只用 `default` 的结果，新增的**表 6** 把每个非 default 配置和同一 case 的 default
   配对，每个 op 给出 `CTA 数 / 每次迭代 ms (相对 default)`。
 
+**AllGather_STMC 暂停扫描（`run_symm_cta_pause_sweep.sh`）**：在上面的 CTA 扫描基础上，人为让 AG 的 multimem store
+变慢，看 ag+rs 重叠时 RS 的时间怎么变。先编出带暂停的 NCCL（clone `v2.32.3-1` 到 `nccl/nccl-2.32.3-cta-with-pause`，依次打
+`nccl-2.32.3-cta.patch` 和 `nccl-2.32.3-cta-pause.patch`，横幅为 `NCCL version 2.32.3-cta-pause+cuda...`）：
+
+```bash
+./install/install-nccl-2.32.3-cta.sh --with-pause
+bash examples/gb200/nvls-collective/run_symm_cta_pause_sweep.sh --nnodes 8 --group-sizes 32 --pause-cycles 0,500,1000,2000,4000
+```
+
+- 这个 patch 新增 `NCCL_SYM_AG_STMC_PAUSE_CYCLES`（默认 0，即不暂停）：`bcastMultimem` 主循环里每个 warp 每发完一块 4 KiB
+  （8 × 32 lane × 16 B）的 multimem store 后，按 `clock64()` 自旋这么多个 SM 周期，再发下一块；首尾的零头不暂停。
+  只有 `AllGather_STMC` / `AllGather_TmaSTMC` 用到这个参数，`ReduceScatter_LDMC` 和 `AllReduce_RSxLDMC_AGxSTMC` 不变，所以默认
+  workload 是 `ag,rs,ag+rs`，rs 作为对照。
+- 为什么用 `clock64()` 而不用 `%globaltimer`：`clock64()` 每个 SM 周期加 1，暂停长度能精确到几个周期；`%globaltimer`
+  虽然以 ns 为单位，但多久跳一次由 GPU 和驱动决定（挂上 profiler 后还可能变）。跳动间隔为 T 时，p ns 的自旋实际持续
+  `(⌈p/T⌉·T − T, ⌈p/T⌉·T]`，所有小于 T 的 p 都分不出来。代价是换成 ns 要除以 SM 频率：暂停 ns = 周期数 / SM 频率，
+  GB200 降频时同样的周期数会更长。可以扫描前用 `nvidia-smi -lgc <MHz>,<MHz>` 锁频（需要 root），或事后从 nsys GPU metrics
+  的 GPC Clock Frequency 读实际频率。`run_globaltimer_probe.sh` 会测 `%globaltimer` 的跳动间隔、各 SM 的频率和这段自旋的实际周期数。
+- 早先的 `%globaltimer` 版 patch 读的是 `NCCL_SYM_AG_STMC_PAUSE_NS`，横幅同样是 `2.32.3-cta-pause`，扫描脚本会因为库里没有
+  `NCCL_SYM_AG_STMC_PAUSE_CYCLES` 而拒绝它。用旧 patch 打过的 `nccl/nccl-2.32.3-cta-with-pause` 需要先
+  `git -C nccl/nccl-2.32.3-cta-with-pause checkout -- .` 还原，再重新运行 `install-nccl-2.32.3-cta.sh --with-pause`。
+- NCCL 每个进程只读一次这个变量，所以每个暂停值单独启动一次 launcher，结果目录带上暂停标记：
+  `results/gb200/nvls-collective/gpu-num-<N>/<id>-pause<cycles>cyc/`。整次扫描共用一个 `<id>`（导出 `RUN_TIME` 可以指定；
+  多节点时由 node 0 生成并下发）。node 0 在每个目录写 `pause.json`，各 algo 的 `metadata.json` 也记录了这个变量；跑完后检查每个
+  NCCL 进程的横幅是 `2.32.3-cta-pause`、日志里有 `NCCL_SYM_AG_STMC_PAUSE_CYCLES set by environment to <cycles>.`。
+- 其它选项、torch 要求和 `--` 透传与 `run_symm_cta_sweep.sh` 相同；`--pause-cycles 0` 就是同一个库下的基线。
+
 **看实际用了多少 SM。** CTA 数 ≈ 占用的 SM 数（CTA 数远小于 SM 数时调度器会把它们分散到不同 SM；一个 SM 理论上能放多个
 CTA，所以只是近似）。证据从强到弱：
 
@@ -852,7 +879,8 @@ uv run --no-sync python -m pytest \
   --confcutdir=tests/unit_tests/examples \
   tests/unit_tests/examples/test_gb200_nvls_collective.py \
   tests/unit_tests/examples/test_gb200_nvls_analyse_nsys.py \
-  tests/unit_tests/examples/test_gb200_p2p_push_pull.py -q
+  tests/unit_tests/examples/test_gb200_p2p_push_pull.py \
+  tests/unit_tests/examples/test_gb200_symm_cta_pause_sweep.py -q
 bash -n examples/gb200/nvls-collective/run_nvls_collective_benchmark.sh
 bash examples/gb200/nvls-collective/run_nvls_collective_benchmark.sh --dry-run
 bash examples/gb200/nvls-collective/run_p2p_push_pull_benchmark.sh --dry-run

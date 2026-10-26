@@ -1,0 +1,92 @@
+--- a/makefiles/version.mk
++++ b/makefiles/version.mk
+@@ -11,5 +11,6 @@ NCCL_MINOR   := 32
+ NCCL_PATCH   := 3
+ # nccl-2.32.3-cta: "NCCL version 2.32.3-cta+cudaX.Y" in the NCCL_DEBUG=VERSION banner and NCCL_SUFFIX in nccl.h,
+ # so a run shows which libnccl it loaded. NCCL_VERSION_CODE (ncclGetVersion) and the soname are unchanged.
+-NCCL_SUFFIX  := -cta
++# nccl-2.32.3-cta-pause: the same, on top of the AllGather_STMC pause (NCCL_SYM_AG_STMC_PAUSE_CYCLES).
++NCCL_SUFFIX  := -cta-pause
+ PKG_REVISION := 1
+--- a/src/device/symmetric/all_gather.cuh
++++ b/src/device/symmetric/all_gather.cuh
+@@ -301,7 +301,8 @@ __device__ __forceinline__ void ncclSymkRun_AllGather_STMC_impl(ncclSymkDevWorkA
+     int t =
+       flattenIx(threadIdx.x % WARP_SIZE, WARP_SIZE, block, nBlocks, threadIdx.x / WARP_SIZE, blockDim.x / WARP_SIZE);
+     int tn = nBlocks * blockDim.x;
+-    bcastMultimem<char, EnableTma>(handler, tn, t, input, output + rank * nAllElts, nElts, rank);
++    bcastMultimem<char, EnableTma>(handler, tn, t, input, output + rank * nAllElts, nElts, rank,
++                                   args->agStmcPauseCycles);
+   });
+ 
+   if NCCL_IF_CONSTEXPR (EnableProfiler) ncclSymkProfilerPhase(args, NCCL_KERNEL_PHASE_BEFORE_CLOSE);
+--- a/src/device/symmetric/primitives.cuh
++++ b/src/device/symmetric/primitives.cuh
+@@ -335,10 +335,23 @@ static __device__ __forceinline__ void tmaLoadStoreMc(char* dest, char* smem, ch
+ }
+ #endif
+ 
++// nccl-2.32.3-cta-pause: spin the calling warp for pauseCycles of clock64 (the SM's cycle counter). It advances
++// every SM cycle, so the pause is exact to a few cycles; in ns it is pauseCycles / SM clock, which moves with
++// the clock the SM runs at (lock it with nvidia-smi -lgc for a fixed ns). %globaltimer is not used: how often it
++// advances is up to the GPU and the driver, and a coarse tick would make short pauses indistinguishable.
++static __device__ __forceinline__ void ncclSymkPauseCycles(uint32_t pauseCycles) {
++  long long start = clock64();
++  while (clock64() - start < (long long)pauseCycles) {
++  }
++}
++
+ // TODO: move this into data_ops.cuh
++// nccl-2.32.3-cta-pause: with pauseCycles > 0 each warp spins pauseCycles SM cycles after every chunk of its main
++// loop (one UnrollPacks x WARP_SIZE x BytePerPack = 4 KiB tile) before it issues the next one. Only
++// AllGather_STMC / AllGather_TmaSTMC pass it; the prefix / suffix bytes are not paused.
+ template <typename T, bool EnableTma = false>
+ static __device__ void bcastMultimem(ncclSymkArgsHandler& handler, int tn, int t, ncclSymPtr<T> input,
+-                                     ncclSymPtr<T> output, size_t nElts, uint32_t rank = 0) {
++                                     ncclSymPtr<T> output, size_t nElts, uint32_t rank = 0, uint32_t pauseCycles = 0) {
+   size_t nBytes = nElts * sizeof(T);
+   uintptr_t inputUptr = reinterpret_cast<uintptr_t>(input.localPtr());
+   uintptr_t outputUptr = reinterpret_cast<uintptr_t>(output.multimemPtr(handler.comm.lsaMultimem));
+@@ -408,6 +421,7 @@ static __device__ void bcastMultimem(ncclSymkArgsHandler& handler, int tn, int t
+           multimem_st_global(outputUptr + cursor + u * WARP_SIZE * BytePerPack, tmp[u]);
+         }
+       }
++      if (pauseCycles != 0) ncclSymkPauseCycles(pauseCycles);
+       cursor += tn * UnrollPacks * BytePerPack;
+       nIters -= tn / WARP_SIZE;
+     }
+--- a/src/include/sym_kernels.h
++++ b/src/include/sym_kernels.h
+@@ -127,6 +127,9 @@ struct alignas(16) ncclSymkDevWorkArgs {
+   int nMaxChannels;
+   int maxDynamicSmem;
+   uint8_t profilerMode; // ncclDevProfilerMode bits; nonzero means profilerWorkCounters[nMaxChannels] follows
++  // nccl-2.32.3-cta-pause: NCCL_SYM_AG_STMC_PAUSE_CYCLES. AllGather_STMC / AllGather_TmaSTMC make every warp spin
++  // this many SM cycles (clock64) after each chunk of multimem stores; 0 leaves the kernels as in stock NCCL.
++  uint32_t agStmcPauseCycles;
+   // Variable-length trailing data layout:
+   //   if profilerMode: uint64_t profilerWorkCounters[nMaxChannels] (aligned to 16)
+   //   ncclSymkChannelWorkRange[nChannels] (aligned to 16)
+--- a/src/scheduler/symmetric_sched.cc
++++ b/src/scheduler/symmetric_sched.cc
+@@ -21,6 +21,9 @@
+ #endif
+ 
+ extern int64_t ncclParamSingleProcMemRegEnable();
++// nccl-2.32.3-cta-pause: SM cycles (clock64) each AllGather_STMC / AllGather_TmaSTMC warp spins after every
++// 4 KiB chunk of multimem stores (primitives.cuh bcastMultimem); 0 (default) runs the stock kernels' loop.
++NCCL_PARAM(SymAgStmcPauseCycles, "SYM_AG_STMC_PAUSE_CYCLES", 0)
+ 
+ ncclDevRedOp_t symkRedOp(ncclRedOp_t redOp, ncclDevRedOp_t devRedOp) {
+   if (redOp == ncclAvg) {
+@@ -325,6 +328,10 @@ ncclResult_t ncclSymmetricTaskScheduler(struct ncclComm* comm,
+   // KernelCh-only launches leave the phase bit clear, so the profile variant skips the
+   // phase stamps and their fence at runtime.
+   argsBuf->profilerMode = profilerEnabled ? ncclProfilerDeviceMode(headTask->eActivationMask) : ncclDevProfilerModeNone;
++  // nccl-2.32.3-cta-pause: read once per process (NCCL_PARAM caches it), clamped to 0..UINT32_MAX cycles.
++  int64_t agStmcPauseCycles = ncclParamSymAgStmcPauseCycles();
++  argsBuf->agStmcPauseCycles =
++    agStmcPauseCycles <= 0 ? 0 : agStmcPauseCycles >= UINT32_MAX ? UINT32_MAX : (uint32_t)agStmcPauseCycles;
+ 
+   remainCell = cellPerChannel = DIVUP(DIVUP(totalCount, nMaxChannels), cellCount);
+   workRangePtr = argsBuf->getWorkRange();
