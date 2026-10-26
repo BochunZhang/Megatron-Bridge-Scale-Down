@@ -805,15 +805,57 @@ NVLink 拓扑的映射。已有输出目录会报 `FileExistsError`，重复实�
 4. 对照不同 `--trials`、`--iters` 和消息大小重复一次，确认带宽平台稳定；`[HOST-BOUND]` 的 case
    不参与结论。
 
+## P2P push / pull 单独 profile（`run_p2p_push_pull_benchmark.sh`）
+
+只测两张卡之间的单向 NCCL P2P，不跑任何 collective。限定在一个 4-GPU 节点（GB200 一个 tray）上执行
+（`nvidia-smi -L` 不是 4 张卡就直接退出），但每个 workload 只启动 2 个 rank：rank 0 是 sender，rank 1 是
+receiver，对应 `--gpus S,R`（默认 `0,1`）。两个 workload 各起一次 torchrun，因为 read/write 在 P2P
+channel 连接时就由 `NCCL_P2P_READ_ENABLE` 决定，之后不会变：
+
+| workload | `NCCL_P2P_READ_ENABLE` | 搬数据的 SM（NVLink initiator） | 另一侧 |
+| --- | --- | --- | --- |
+| `push` | 0（P2P write） | sender：把数据 store 到 receiver 侧的 staging buffer（sender 的 NVLink TX） | receiver 在本地把 staging buffer 拷进用户 buffer |
+| `pull` | 1（P2P read） | receiver：从 sender 侧的 staging buffer load（receiver 的 NVLink RX） | sender 在本地把用户 buffer 拷进自己的 staging buffer |
+
+连接后 sender 的 NCCL INIT 日志必须是 `via P2P/...`，且 `/read` 只出现在 pull 中，否则作业直接失败。
+
+```bash
+# GPU0 -> GPU1，1 GiB，push 和 pull，默认带 nsys
+bash examples/gb200/nvls-collective/run_p2p_push_pull_benchmark.sh
+
+# 只跑 pull，GPU2 -> GPU3，两个大小
+bash examples/gb200/nvls-collective/run_p2p_push_pull_benchmark.sh --workloads pull --gpus 2,3 --sizes-mib 256,1024
+```
+
+每个 GPU、每个消息大小各生成一个 nsys 报告，只覆盖计时的 trials，并在本 GPU 上采样 GPU metrics
+（NVLink RX/TX、DRAM 等）。跑完后报告会重命名，从文件名就能看出 GPU 的角色：
+
+```
+results/gb200/nvls-collective/p2p-push-pull/<yyyymmdd-hhmmss>/
+  nsys-reports.md                                   # 所有报告：workload / GPU / 角色 / 是否 initiator
+  push/nsys/push.1024MiB.gpu0.sender.initiator.nsys-rep     # push P2P 的 sender
+  push/nsys/push.1024MiB.gpu1.receiver.nsys-rep
+  pull/nsys/pull.1024MiB.gpu0.sender.nsys-rep
+  pull/nsys/pull.1024MiB.gpu1.receiver.initiator.nsys-rep   # pull P2P 的 receiver
+  <workload>/results.jsonl, metadata.json, torchrun.log, nccl-raw/, nsys/index.tsv
+```
+
+报告里最外层的 NVTX range 也是这个名字，并附带这张卡上 SM 在做什么，例如
+`push.1024MiB.gpu0.sender.initiator | NVLink initiator: SMs store into the receiver's staging buffer`；
+每个 trial 是一个 `trial<i>` range。`results.jsonl` 里有两侧各自的 trial 时间，algbw 按 receiver 的时间计算。
+`--no-nsys` 时只计时。
+
 ## 本地检查（无 GPU）
 
 ```bash
 uv run --no-sync python -m pytest \
   --confcutdir=tests/unit_tests/examples \
   tests/unit_tests/examples/test_gb200_nvls_collective.py \
-  tests/unit_tests/examples/test_gb200_nvls_analyse_nsys.py -q
+  tests/unit_tests/examples/test_gb200_nvls_analyse_nsys.py \
+  tests/unit_tests/examples/test_gb200_p2p_push_pull.py -q
 bash -n examples/gb200/nvls-collective/run_nvls_collective_benchmark.sh
 bash examples/gb200/nvls-collective/run_nvls_collective_benchmark.sh --dry-run
+bash examples/gb200/nvls-collective/run_p2p_push_pull_benchmark.sh --dry-run
 uv run --no-sync ruff check examples/gb200/nvls-collective
 ```
 
