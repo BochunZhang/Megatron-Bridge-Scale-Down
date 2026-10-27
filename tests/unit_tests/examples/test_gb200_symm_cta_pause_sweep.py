@@ -66,6 +66,27 @@ def test_dry_run_gives_every_pause_its_own_tagged_run(tmp_path):
 @pytest.mark.unit
 @needs_bash
 @pytest.mark.parametrize(
+    "group_size, pauses",
+    [
+        # 16 paths per GPU (4 GPUs x 4 CTAs): knee at about 340 cycles.
+        ("4", "0,64,128,256,512,768,1024,1536,2048,2560,3072,4096"),
+        # 32 paths per GPU (8 x 4, 16 x 2, 32 x 1 CTAs under NCCL_MIN_CTAS=4): knee at about 3400 cycles.
+        ("8", "0,2048,3072,3584,4096,5120,6144,7168,8192,10240,12288,14336"),
+        ("16", "0,2048,3072,3584,4096,5120,6144,7168,8192,10240,12288,14336"),
+        ("32", "0,2048,3072,3584,4096,5120,6144,7168,8192,10240,12288,14336"),
+        # 64 paths per GPU (64 x 1 CTA): knee at about 9500 cycles.
+        ("64", "0,6144,8192,9728,11264,12288,14336,16384,18432,22528,26624,31744"),
+    ],
+)
+def test_default_pauses_follow_the_paths_per_gpu(tmp_path, group_size, pauses):
+    # The launcher may reject a group larger than the fake job; the default is picked before it runs.
+    result = _sweep(_fake_lib(tmp_path), "--group-sizes", group_size, "--dry-run")
+    assert f"pause cycles for the {group_size}-GPU group: {pauses}\n" in result.stderr
+
+
+@pytest.mark.unit
+@needs_bash
+@pytest.mark.parametrize(
     "options, match",
     [
         (["--pause-cycles", "0,abc"], "comma-separated list"),
