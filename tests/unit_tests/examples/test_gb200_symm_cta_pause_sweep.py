@@ -68,11 +68,11 @@ def test_dry_run_gives_every_pause_its_own_tagged_run(tmp_path):
 @pytest.mark.parametrize(
     "group_size, pauses",
     [
-        # 16 paths per GPU (4 GPUs x 4 CTAs): knee at about 340 cycles.
-        ("4", "0,64,128,256,512,768,1024,1536,2048,2560,3072,4096"),
-        # 32 paths per GPU (8 x 4, 16 x 2, 32 x 1 CTAs under NCCL_MIN_CTAS=4): knee at about 3400 cycles.
-        ("8", "0,2048,3072,3584,4096,5120,6144,7168,8192,10240,12288,14336"),
-        ("16", "0,2048,3072,3584,4096,5120,6144,7168,8192,10240,12288,14336"),
+        # 16 paths per GPU at NCCL's own AG CTA count (4 x 4, 8 x 2, 16 x 1): knee at about 360 cycles.
+        ("4", "0,128,256,512,768,1024,1536,2048,2560,3072,4096,6144"),
+        ("8", "0,128,256,512,768,1024,1536,2048,2560,3072,4096,6144"),
+        ("16", "0,128,256,512,768,1024,1536,2048,2560,3072,4096,6144"),
+        # 32 paths per GPU (32 x 1 CTA): knee at about 3400 cycles.
         ("32", "0,2048,3072,3584,4096,5120,6144,7168,8192,10240,12288,14336"),
         # 64 paths per GPU (64 x 1 CTA): knee at about 9500 cycles.
         ("64", "0,6144,8192,9728,11264,12288,14336,16384,18432,22528,26624,31744"),
@@ -82,6 +82,31 @@ def test_default_pauses_follow_the_paths_per_gpu(tmp_path, group_size, pauses):
     # The launcher may reject a group larger than the fake job; the default is picked before it runs.
     result = _sweep(_fake_lib(tmp_path), "--group-sizes", group_size, "--dry-run")
     assert f"pause cycles for the {group_size}-GPU group: {pauses}\n" in result.stderr
+
+
+@pytest.mark.unit
+@needs_bash
+def test_cta_variables_do_not_reach_the_runs(tmp_path):
+    # A copy of the sweep next to a fake launcher that prints the NCCL variables it inherits.
+    sweep_dir = tmp_path / "repo" / "examples" / "gb200" / "nvls-collective"
+    sweep_dir.mkdir(parents=True)
+    shutil.copy(SCRIPT, sweep_dir / SCRIPT.name)
+    (sweep_dir / "run_nvls_collective_benchmark.sh").write_text('env | grep "^NCCL_" | sort\n')
+    common = tmp_path / "repo" / "scripts" / "scale-down"
+    common.mkdir(parents=True)
+    (common / "common").symlink_to(SCRIPT.parents[3] / "scripts" / "scale-down" / "common")
+    # GB200 images export NCCL_MIN_CTAS=4; with the cta patch it would lift the multicast kernels' CTA counts.
+    cta_env = {"NCCL_MIN_CTAS": "4", "NCCL_MIN_NCHANNELS": "16", "NCCL_SYM_CTAS": "2"}
+    env = {**os.environ, **cta_env, "GLOO_SOCKET_IFNAME": "lo", "RUN_TIME": "sweep-test"}
+    command = ["bash", str(sweep_dir / SCRIPT.name), "--venv", "none", "--nccl-lib", str(_fake_lib(tmp_path))]
+    result = subprocess.run(
+        [*command, "--pause-cycles", "0", "--dry-run"], capture_output=True, text=True, env=env, check=False
+    )
+    assert result.returncode == 0, result.stderr
+    assert "NCCL_SYM_AG_STMC_PAUSE_CYCLES=0" in result.stdout
+    for name, value in cta_env.items():
+        assert f"unsetting {name}={value}" in result.stderr
+        assert f"{name}=" not in result.stdout
 
 
 @pytest.mark.unit

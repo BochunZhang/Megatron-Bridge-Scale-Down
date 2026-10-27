@@ -477,22 +477,26 @@ bash examples/gb200/nvls-collective/run_symm_cta_pause_sweep.sh --nnodes 8 --gro
   benchmark 按 TUNING 日志逐次检查，跑了别的 kernel 的 case 直接判失败。`--algos`、`--symm-kernel`、`--cta-configs`
   不能透传。
 - `--nnodes` 默认 1（单 tray 4 GPU）。torch 要求和 `--` 透传与 `run_symm_cta_sweep.sh` 相同；`--pause-cycles 0` 就是同一个库下的基线。
-- **默认暂停值按组大小选**（不传 `--pause-cycles` 时）。暂停扫描保留镜像的 `NCCL_MIN_CTAS=4`，NCCL 给 `AllGather_STMC` /
-  `ReduceScatter_LDMC` 的 CTA 数是 `min(4, ⌈32/n⌉)`：4 / 8 GPU 为 4，16 GPU 为 2，32 / 64 GPU 为 1（以 TUNING 日志的
-  `Kernel AllGather_STMC nchannels` 为准）。每个 GPU 被写入的路径数是 n × CTA_AG，每条路径每轮 64 KiB（16 warp × 4 KiB），
-  不被反压时一轮约 1.3 µs，所以 AG ≈ min(711, 路径数 × 64 KiB / (1.3 µs + 暂停 / SM 频率)) GB/s，1 GiB 时共 16384 / 路径数 轮。
+- **CTA 数用 NCCL 自己的选择**：扫描脚本 `unset` 掉进程级的 CTA 变量（`NCCL_MIN_CTAS`、`NCCL_MIN_NCHANNELS` 等，以及
+  `NCCL_SYM_CTAS`）再启动 launcher。GB200 镜像导出的 `NCCL_MIN_CTAS=4` 在 cta patch 下会把多播 kernel 的 CTA 数抬过
+  `divUp(32, n)` 的上限（64 GPU 会跑 4 个 CTA 而不是 1 个）。每次运行后，NCCL 日志里出现这些变量的 `set by environment`
+  就判失败，并打印 `Kernel AllGather_STMC / ReduceScatter_LDMC nchannels` 的统计。
+- **默认暂停值按组大小选**（不传 `--pause-cycles` 时）。按 NCCL 的模型（`tuning/sym_model`），1 GiB 时 `AllGather_STMC`
+  在 4 / 8 / 16 / 32 / 64 GPU 上是 4 / 2 / 1 / 1 / 1 个 CTA（`ReduceScatter_LDMC` 是 6 / 4 / 2 / 1 / 1），以打印的
+  nchannels 为准。每个 GPU 被写入的路径数是 n × CTA_AG，每条路径每轮 64 KiB（16 warp × 4 KiB），不被反压时一轮约
+  1.3 µs，所以 AG ≈ min(711, 路径数 × 64 KiB / (1.3 µs + 暂停 / SM 频率)) GB/s，1 GiB 时共 16384 / 路径数 轮。
   拐点之前 AG 不变，暂停看不出效果；按 2.06 GHz：
 
-  | 组大小 | 路径数 | 拐点 | 默认 `--pause-cycles` | 拐点后 T_AG 斜率 |
-  |---|---|---|---|---|
-  | 4 | 16 | ≈340 | `0,64,128,256,512,768,1024,1536,2048,2560,3072,4096` | +0.5 ms / 1000 周期 |
-  | 8 / 16 / 32 | 32 | ≈3400 | `0,2048,3072,3584,4096,5120,6144,7168,8192,10240,12288,14336` | +0.25 ms / 1000 周期 |
-  | 64 | 64 | ≈9500 | `0,6144,8192,9728,11264,12288,14336,16384,18432,22528,26624,31744` | +0.12 ms / 1000 周期 |
+  | 组大小 | CTA_AG | 路径数 | 拐点 | 默认 `--pause-cycles` | 拐点后 T_AG 斜率 |
+  |---|---|---|---|---|---|
+  | 4 / 8 / 16 | 4 / 2 / 1 | 16 | ≈360 | `0,128,256,512,768,1024,1536,2048,2560,3072,4096,6144` | +0.5 ms / 1000 周期 |
+  | 32 | 1 | 32 | ≈3400 | `0,2048,3072,3584,4096,5120,6144,7168,8192,10240,12288,14336` | +0.25 ms / 1000 周期 |
+  | 64 | 1 | 64 | ≈9500 | `0,6144,8192,9728,11264,12288,14336,16384,18432,22528,26624,31744` | +0.12 ms / 1000 周期 |
 
   拐点前的点确认平台、并覆盖一轮 1.0–1.6 µs 时拐点的位置；之后的点把 AG 从约 690 降到约 250 GB/s，越过完全重叠的
   ag+rs 不再快于 default 的速率（1 GiB 时约 340–360 GB/s）。711 GB/s 和 1.3 µs 是估计值：用暂停 0 实测的 AG 速率 R₀ 代入，
   拐点 = (路径数 × 64 KiB / R₀ − 1.3 µs) × SM 频率；拐点后的一点可以反推一轮的实际时间 T_AG / 轮数 − 暂停 / SM 频率。
-  CTA 数和上表不同（比如去掉了 `NCCL_MIN_CTAS`）时按同一公式重算，再用 `--pause-cycles` 传入。
+  打印的 AG CTA 数和上表不同时，按同一公式重算，再用 `--pause-cycles` 传入。
 
 **看实际用了多少 SM。** CTA 数 ≈ 占用的 SM 数（CTA 数远小于 SM 数时调度器会把它们分散到不同 SM；一个 SM 理论上能放多个
 CTA，所以只是近似）。证据从强到弱：

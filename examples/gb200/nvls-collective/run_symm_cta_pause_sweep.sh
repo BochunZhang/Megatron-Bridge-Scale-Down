@@ -22,8 +22,11 @@ Sweep the AllGather_STMC pause at NCCL's default CTA counts, with nccl-2.32.3-ct
 For every value of --pause-cycles it runs
 run_nvls_collective_benchmark.sh --algos symm --workloads ag,rs,ag+rs --sizes-mib 1024 --nsys
 --symm-kernel mc --cta-configs default with NCCL_SYM_AG_STMC_PAUSE_CYCLES=<cycles>. Only the pause
-changes between runs: no per-communicator CTA count is set, and NCCL_MIN_CTAS / NCCL_MIN_NCHANNELS
-from the environment (GB200 images export them) are passed to NCCL unchanged.
+changes between runs: no CTA count is set anywhere, so NCCL picks its own. The process-wide CTA
+variables (NCCL_MIN_CTAS, NCCL_MIN_NCHANNELS, ..., NCCL_SYM_CTAS) are unset for the runs: GB200
+images export NCCL_MIN_CTAS=4, which the nccl-2.32.3-cta patch lets raise the multicast kernels past
+their divUp(32, n) cap (64 GPUs would run 4 CTAs instead of 1). After each run the script fails if
+an NCCL log shows one of them, and prints the CTA counts of the AG / RS launches.
 
 Every case runs the symmetric multicast kernels, never the unicast (P2P) ones: --symm-kernel mc pins
 NCCL_SYM_KERNEL=allgather:AllGather_STMC;reducescatter:ReduceScatter_LDMC with NCCL_NVLS_ENABLE=1,
@@ -63,15 +66,17 @@ Options:
   --pause-cycles LIST SM cycles per 4 KiB chunk and warp, one run each (default: per group size, below;
                       a group size without a default, or several group sizes, need an explicit list)
 
-Default --pause-cycles, for the AllGather_STMC CTA count NCCL picks with the GB200 image's
-NCCL_MIN_CTAS=4: min(4, ceil(32 / n)) CTAs, i.e. 4 GPUs: 4, 8: 4, 16: 2, 32 / 64: 1 (check the
-"Kernel AllGather_STMC nchannels" TUNING lines). The AG writes n x CTA_AG paths into every GPU, each
-path 64 KiB per round (16 warps x 4 KiB) and about 1.3 us per round when the ingress is not full
-(50 GB/s per path), so the AG rate is about min(711, paths x 64 KiB / (1.3 us + pause / SM clock))
-GB/s and T_AG = 16384 / paths rounds at 1 GiB. At a 2.06 GHz SM clock:
-  4 GPUs (16 paths):          0,64,128,256,512,768,1024,1536,2048,2560,3072,4096
-      711 up to about 340 cycles, then about 580 / 455 / 375 / 320 GB/s at 1024 / 2048 / 3072 / 4096
-  8 / 16 / 32 GPUs (32 paths): 0,2048,3072,3584,4096,5120,6144,7168,8192,10240,12288,14336
+Default --pause-cycles, for the CTA counts NCCL's own model (tuning/sym_model) picks at 1 GiB with
+no CTA variable set: AllGather_STMC 4 / 2 / 1 / 1 / 1 CTAs and ReduceScatter_LDMC 6 / 4 / 2 / 1 / 1 at
+4 / 8 / 16 / 32 / 64 GPUs (the printed "Kernel AllGather_STMC nchannels" counts show the real ones).
+The AG writes n x CTA_AG paths into every GPU, each path 64 KiB per round (16 warps x 4 KiB) and about
+1.3 us per round when the ingress is not full (50 GB/s per path), so the AG rate is about
+min(711, paths x 64 KiB / (1.3 us + pause / SM clock)) GB/s and T_AG = 16384 / paths rounds at 1 GiB.
+At a 2.06 GHz SM clock:
+  4 / 8 / 16 GPUs (16 paths): 0,128,256,512,768,1024,1536,2048,2560,3072,4096,6144
+      711 up to about 360 cycles, then about 585 / 455 / 375 / 320 / 245 GB/s at
+      1024 / 2048 / 3072 / 4096 / 6144 (T_AG +0.5 ms per 1000 cycles past the knee)
+  32 GPUs (32 paths):         0,2048,3072,3584,4096,5120,6144,7168,8192,10240,12288,14336
       711 up to about 3400 cycles, then about 640 / 490 / 400 / 335 / 255 GB/s at
       4096 / 6144 / 8192 / 10240 / 14336 (T_AG +0.25 ms per 1000 cycles past the knee)
   64 GPUs (64 paths):         0,6144,8192,9728,11264,12288,14336,16384,18432,22528,26624,31744
@@ -80,7 +85,7 @@ GB/s and T_AG = 16384 / paths rounds at 1 GiB. At a 2.06 GHz SM clock:
 The values below each knee check the plateau (AG still at 711) and bracket the knee for a 1.0-1.6 us
 round; the rest walk the AG from about 690 down to about 250 GB/s, past the rate at which a fully
 overlapped AG+RS (T_pair = T_AG) stops beating the default T_pair (about 340-360 GB/s at 1 GiB).
-Without NCCL_MIN_CTAS, or if the TUNING lines show other CTA counts, recompute the knee as
+If the printed AG CTA counts differ, recompute the knee with paths = n x CTA_AG as
 (paths x 64 KiB / AG rate at pause 0 - 1.3 us) x SM clock and pass --pause-cycles.
   --venv DIR          Virtualenv to activate, or 'none' to keep the current one
                       (default: <repo>/.venv/python3.12-torch2.13-nccl2.32.3)
@@ -144,13 +149,13 @@ done
 [[ -n "$group_sizes" ]] || group_sizes=$(( nnodes * gpus_per_node ))
 
 # The AG rate falls off once the pause outlasts the backpressure wait of a round, which grows with
-# the paths per GPU (n x CTA_AG at NCCL's CTA count under NCCL_MIN_CTAS=4); see the usage text for the model.
+# the paths per GPU (n x CTA_AG at NCCL's own CTA count); see the usage text for the model.
 if [[ -z "$pause_cycles" ]]; then
     [[ "$group_sizes" =~ ^[0-9]+$ ]] \
         || die "no default --pause-cycles for several group sizes (${group_sizes}); pass one group or a list"
     case "$group_sizes" in
-        4) pause_cycles="0,64,128,256,512,768,1024,1536,2048,2560,3072,4096" ;;
-        8|16|32) pause_cycles="0,2048,3072,3584,4096,5120,6144,7168,8192,10240,12288,14336" ;;
+        4|8|16) pause_cycles="0,128,256,512,768,1024,1536,2048,2560,3072,4096,6144" ;;
+        32) pause_cycles="0,2048,3072,3584,4096,5120,6144,7168,8192,10240,12288,14336" ;;
         64) pause_cycles="0,6144,8192,9728,11264,12288,14336,16384,18432,22528,26624,31744" ;;
         *) die "no default --pause-cycles for a ${group_sizes}-GPU group; pass --pause-cycles" ;;
     esac
@@ -191,6 +196,14 @@ if [[ "$venv" != none ]]; then
 fi
 # Nsight Compute unpacked into the repo, for --ncu passed through.
 [[ -d "${repo_root}/NVIDIA-Nsight-Compute-2026.3" ]] && export PATH="${repo_root}/NVIDIA-Nsight-Compute-2026.3:${PATH}"
+# NCCL picks every CTA count itself: the process-wide CTA variables override it (and with the cta patch
+# NCCL_MIN_CTAS lifts the multicast kernels past their divUp(32, n) cap), so none reaches the runs.
+cta_env=(NCCL_MIN_CTAS NCCL_MAX_CTAS NCCL_MIN_NCHANNELS NCCL_MAX_NCHANNELS NCCL_MIN_NRINGS NCCL_MAX_NRINGS
+    NCCL_NVLS_NCHANNELS NCCL_MIN_P2P_NCHANNELS NCCL_MAX_P2P_NCHANNELS NCCL_SYM_CTAS)
+for name in "${cta_env[@]}"; do
+    [[ -n "${!name:-}" ]] && log "warning: unsetting ${name}=${!name}; the sweep runs at NCCL's own CTA counts"
+    unset "$name"
+done
 if [[ -n "${!pause_env:-}" ]]; then
     log "warning: ${pause_env}=${!pause_env} from the environment is replaced by each --pause-cycles value"
 fi
@@ -261,6 +274,18 @@ check_logs() {
         return 1
     fi
     echo "  [ok]   ${files} NCCL processes ran with ${pause_env}=${pause}" >&2
+    # NCCL_DEBUG_SUBSYS includes ENV, so a CTA variable that still reached NCCL is in the logs.
+    local cta_re overrides
+    cta_re="$(IFS='|'; echo "${cta_env[*]}")"
+    overrides="$(cat "${output_dir}"/*/nccl-raw/*.log 2>/dev/null | grep -oE "(${cta_re}) set by environment to [0-9-]+" | sort -u || true)"
+    if [[ -n "$overrides" ]]; then
+        echo "ERROR: NCCL read a CTA variable, so the pause=${pause}cyc run is not at NCCL's own CTA counts:" >&2
+        echo "$overrides" >&2
+        return 1
+    fi
+    echo "=== CTAs per launch (TUNING nchannels) in ${output_dir}/*/nccl-raw" >&2
+    cat "${output_dir}"/*/nccl-raw/*.log 2>/dev/null \
+        | grep -oE "Kernel (AllGather_STMC|ReduceScatter_LDMC) nchannels [0-9]+" | sort | uniq -c >&2 || true
 }
 
 # The launcher files each report as cases/<algo>-<case>/<algo>-<case>.rank_<RR>.nsys-rep (node 0,
