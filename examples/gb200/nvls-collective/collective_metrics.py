@@ -97,7 +97,8 @@ NCCL_ALGO_ENV = {
     "copy-engine": None,
 }
 # Late join (--late-join): one group reduce-scatters a tensor LATE_JOIN_RS_SCALE times the AG size
-# and all-gathers on the same ranks once the RS is LATE_JOIN_FRACTION of its isolated time in.
+# and all-gathers on the same ranks once the RS is --join-fraction (default LATE_JOIN_FRACTION) of its
+# isolated time in; 0 launches both together.
 # Its two references, AG of size S and RS of size LATE_JOIN_RS_SCALE * S, run alone in the same
 # scenario with the same per-iteration timing.
 LATE_JOIN_RS_SCALE = 4
@@ -892,7 +893,8 @@ def late_join_rows(records: Sequence[dict[str, object]]) -> list[list[str]]:
                 str(rs_bytes // BYTES_PER_MIB),
                 _fmt(ag_iso_ms, 3),
                 _fmt(rs_iso_ms, 3),
-                f"{_fmt(float(r['ag_begin_ms']), 3)} ({_fmt(_optional_float(r.get('join_fraction')), 2)})",  # type: ignore[arg-type]
+                # --join-fraction 0 records no ag_begin_ms: the AG is launched with the RS.
+                f"{_fmt(float(r.get('ag_begin_ms', 0.0)), 3)} ({_fmt(_optional_float(r.get('join_fraction')), 2)})",  # type: ignore[arg-type]
                 _fmt(_optional_float(r.get("ag_join_ms")), 3),
                 _fmt(_optional_float(r.get("ag_slowdown")), 2),
                 _fmt(float(r["rs_ms"]), 3),  # type: ignore[arg-type]
@@ -1245,9 +1247,10 @@ def render_report(records: Sequence[dict[str, object]]) -> str:
     if join_table:
         lines += [
             "",
-            f"## 5. late join：RS（{LATE_JOIN_RS_SCALE}×S）跑到约 {LATE_JOIN_FRACTION:g} 时，同一组 rank 加入 AG（S）",
+            f"## 5. late join：RS（{LATE_JOIN_RS_SCALE}×S）跑到 `--join-fraction`（默认 {LATE_JOIN_FRACTION:g}）时，同一组 rank 加入 AG（S）",
             "",
             "每次迭代：RS 先发，AG 的 stream 先 GPU sleep `join_fraction × T_RS iso` 再发 AG，迭代结束两条 stream 汇合；",
+            "`--join-fraction 0` 不 sleep，AG 与 RS 每次迭代同时发射（join 列为 0）；",
             "isolated 是同一 scenario 里用同样的逐迭代计时单独跑的 AG(S)、RS(4S)。时间都从迭代起点（RS 发射）算，",
             "trial 内取组内最慢 rank，再取 trial 中位数。带宽是 algbw = 张量大小 / 时间（GB/s，10^9）。",
             "",

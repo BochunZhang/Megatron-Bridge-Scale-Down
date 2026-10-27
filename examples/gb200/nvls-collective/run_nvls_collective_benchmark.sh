@@ -62,7 +62,7 @@ Options:
   --master-port PORT      First rendezvous port; algorithm i uses PORT+i (default: 29611)
   --gpus-per-node N       GPUs per node (default: 4, one GB200 compute tray)
   --algos LIST            ring,nvls,symm,symm-p2p,symm-tma,copy-engine (default: all six)
-  --group-sizes LIST      Single-group sizes (default: 4,8,16,32 capped at nnodes*gpus-per-node)
+  --group-sizes LIST      Single-group sizes (default: nnodes*gpus-per-node, one group of every rank)
   --split-totals LIST     Ranks cut into two concurrent half-groups; T/2 must be in --group-sizes,
                           e.g. 16 for 8+8 or 32 for 16+16 (default: none, no split scenario)
   --split-layouts LIST    contiguous,interleaved (default: contiguous)
@@ -75,6 +75,8 @@ Options:
                           size runs, and an AG of that size joins on the same ranks once the RS is
                           1/4 of its isolated time in; AG and RS(4x) alone are measured as references.
                           Table 5 of compare.md. Defaults --iters 5 --trials 10 unless given
+  --join-fraction F       With --late-join: release the AG at F of the RS's isolated time (default:
+                          0.25); 0 launches AG and RS together every iteration, without a GPU sleep
   --dtype bf16|fp32       Payload dtype (default: bf16)
   --warmup N              Untimed iterations per case (default: 5)
   --iters N               Back-to-back iterations per trial (default: 20)
@@ -180,6 +182,7 @@ iters=""
 trials=""
 launch_delay_ms="5"
 late_join=false
+join_fraction=""
 symm_kernel="default"
 cta_configs="default"
 nsys_enabled=false
@@ -215,6 +218,7 @@ while [[ $# -gt 0 ]]; do
         --trials) need_value "$@"; trials="$2"; shift 2 ;;
         --launch-delay-ms) need_value "$@"; launch_delay_ms="$2"; shift 2 ;;
         --late-join) late_join=true; shift ;;
+        --join-fraction) need_value "$@"; join_fraction="$2"; shift 2 ;;
         --symm-kernel) need_value "$@"; symm_kernel="$2"; shift 2 ;;
         --cta-configs) need_value "$@"; cta_configs="$2"; shift 2 ;;
         --nsys) nsys_enabled=true; shift ;;
@@ -275,14 +279,9 @@ if $ncu_enabled; then
     split_totals="none"
 fi
 
-# Defaults follow the allocation: every 4/8/16/32 that fits. Split runs only when --split-totals
-# is given; each half's isolated reference is the single group of the same size.
-if [[ -z "$group_sizes" ]]; then
-    for n in 4 8 16 32; do
-        (( n <= world_size )) && group_sizes+="${group_sizes:+,}$n"
-    done
-    [[ -n "$group_sizes" ]] || group_sizes="$world_size"
-fi
+# The default follows the allocation: one group of every rank. Split runs only when --split-totals
+# is given; each half's isolated reference is the single group of the same size, so pass it too.
+[[ -n "$group_sizes" ]] || group_sizes="$world_size"
 [[ -n "$split_totals" ]] || split_totals="none"
 if $late_join; then
     # The join case replaces single and split. AG sizes whose RS (4x) runs 0.4-3.2 ms on symm keep the
@@ -294,6 +293,8 @@ if $late_join; then
     sizes_mib="${sizes_mib:-64,256,512}"
     iters="${iters:-5}"
     trials="${trials:-10}"
+else
+    [[ -z "$join_fraction" ]] || die "--join-fraction needs --late-join"
 fi
 sizes_mib="${sizes_mib:-16,32,64,128,256,512,1024,2048}"
 iters="${iters:-20}"
@@ -411,6 +412,7 @@ bench_args=(
     --cta-configs "$cta_configs"
 )
 $late_join && bench_args+=(--late-join)
+[[ -n "$join_fraction" ]] && bench_args+=(--join-fraction "$join_fraction")
 
 # TUNING carries the per-collective "Algo ... proto ..." and "[Symmetric] ... Kernel ..." lines
 # that the benchmark parses as evidence of the executed kernel; INIT carries nNodes/MNNVL.

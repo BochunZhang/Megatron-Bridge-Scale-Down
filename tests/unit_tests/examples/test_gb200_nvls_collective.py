@@ -171,6 +171,17 @@ def _launcher_dry_run(*options: str) -> subprocess.CompletedProcess:
     )
 
 
+@pytest.mark.unit
+@pytest.mark.skipif(shutil.which("bash") is None, reason="needs bash")
+@pytest.mark.parametrize(("nnodes", "expected"), [("1", "4"), ("2", "8"), ("8", "32"), ("16", "64")])
+def test_launcher_group_sizes_default_to_every_rank(nnodes, expected):
+    result = _launcher_dry_run("--nnodes", nnodes, "--master-addr", "10.0.0.1")
+    assert result.returncode == 0, result.stderr
+    assert f"--group-sizes {expected} " in result.stdout.replace("\\", "")
+    explicit = _launcher_dry_run("--nnodes", nnodes, "--master-addr", "10.0.0.1", "--group-sizes", "4")
+    assert "--group-sizes 4 " in explicit.stdout.replace("\\", "")
+
+
 def _worker_command(stdout: str) -> list[str]:
     (line,) = [line for line in stdout.splitlines() if "torch.distributed.run" in line]
     words = line.replace("\\", "").split()
@@ -1147,6 +1158,37 @@ def test_timed_trial_passes_the_gate_before_its_clock_starts(monkeypatch, member
         assert result is None
 
 
+class _NamedStream(_FakeStream):
+    def __init__(self, name):
+        self.name = name
+
+    def wait_stream(self, other):
+        _FakeEvent.calls.append(("wait", self.name, other.name))
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("lockstep", [True, False])
+def test_run_timed_lockstep_joins_the_op_streams_between_iterations(monkeypatch, lockstep):
+    _FakeEvent.calls = calls = []
+    monkeypatch.setattr(benchmark.torch.cuda, "Event", _FakeEvent, raising=False)
+    monkeypatch.setattr(benchmark, "_launch", lambda *args: calls.append(("launch",)))
+    main = _NamedStream("main")
+    streams = {"ag": _NamedStream("ag"), "rs": _NamedStream("rs")}
+    group = benchmark.CollectiveGroup(name="g", ranks=[0, 1], ag_pg=None, rs_pg=None, ar_pg=None)
+    result = benchmark._run_timed(
+        group, None, ("ag", "rs"), streams, main=main, iters=3, host_start=0.0, lockstep=lockstep
+    )
+    launches_and_waits = [call for call in calls if call[0] in ("launch", "wait")]
+    join = [("wait", "main", "ag"), ("wait", "main", "rs"), ("wait", "ag", "main"), ("wait", "rs", "main")]
+    if lockstep:
+        # Iteration i starts only after both ops of iteration i-1 ended; nothing waits before the first.
+        assert launches_and_waits == [("launch",), *join, ("launch",), *join, ("launch",)]
+    else:
+        assert launches_and_waits == [("launch",)] * 3
+    # Still timed from the one start event to each op's last end.
+    assert set(result) == {"makespan_ms", "enqueue_ms", "ag_ms", "rs_ms"}
+
+
 @pytest.mark.unit
 @pytest.mark.parametrize("name", ["RING", "Ring"])  # 2.29 ncclAlgoToString / older ncclAlgoStr
 def test_check_implementation_accepts_the_algorithm_name_in_any_case(name):
@@ -1637,6 +1679,10 @@ def test_late_join_replaces_split_and_keeps_both_ops():
         benchmark.parse_args([*base, "--late-join", "--split-totals", "16"])
     with pytest.raises(SystemExit):
         benchmark.parse_args([*base, "--late-join", "--symm-kernel", "ag"])
+    assert benchmark.parse_args([*base, "--late-join"]).join_fraction == metrics.LATE_JOIN_FRACTION
+    assert benchmark.parse_args([*base, "--late-join", "--join-fraction", "0"]).join_fraction == 0.0
+    with pytest.raises(SystemExit):
+        benchmark.parse_args([*base, "--late-join", "--join-fraction", "-0.1"])
 
 
 @pytest.mark.unit
@@ -1717,6 +1763,18 @@ def test_late_join_metrics_without_overlap_leave_the_window_empty():
 
 
 @pytest.mark.unit
+def test_late_join_metrics_with_ag_and_rs_launched_together():
+    # --join-fraction 0: the whole AG is in the window, so its in-window algbw is its measured rate.
+    together = _late_join(ag_begin_s=0.0, ag_end_s=2.0, rs_end_s=5.0)
+    assert together["join_fraction"] == 0.0
+    assert together["overlap_ms"] == pytest.approx(2000.0)
+    assert together["ag_algbw_overlap_gb_s"] == pytest.approx(0.5)
+    # The 4 GB RS runs 3 s alone at 1 GB/s after the window, so 1 GB moved in the 2 s window.
+    assert together["rs_algbw_overlap_gb_s"] == pytest.approx(0.5)
+    assert together["overlap_capacity"] == pytest.approx(1.0)
+
+
+@pytest.mark.unit
 def test_report_adds_the_late_join_table_and_per_op_sizes():
     size = 256 * 1024 * 1024
     join = _record(
@@ -1739,6 +1797,10 @@ def test_report_adds_the_late_join_table_and_per_op_sizes():
     assert row[15:18] == ["2.00", "0.50", "yes"]
     report = metrics.render_report([join])
     assert "## 5. late join" in report
+    # --join-fraction 0 records no ag_begin_ms; the join column shows 0.
+    together = {key: value for key, value in join.items() if key != "ag_begin_ms"}
+    (row,) = metrics.late_join_rows([together])
+    assert row[6].startswith("0.000 ")
     # Table 0 counts the RS at its own 4x size: (S + 4S) / 2 ms.
     (completion,) = metrics.completion_rows([join])
     assert completion[12] == f"{5 * size / 2e-3 / 1e9:.1f}"
@@ -1754,6 +1816,11 @@ def test_launcher_late_join_defaults_and_split_default_off():
     plain = _launcher_dry_run()
     assert "--split-totals none" in plain.stdout and "--late-join" not in plain.stdout
     assert _launcher_dry_run("--late-join", "--split-totals", "16").returncode != 0
+    assert "--join-fraction" not in result.stdout
+    together = _launcher_dry_run("--late-join", "--join-fraction", "0")
+    assert together.returncode == 0, together.stderr
+    assert "--join-fraction 0" in together.stdout.replace("\\", "")
+    assert _launcher_dry_run("--join-fraction", "0").returncode != 0
 
 
 # --cta-configs: per-communicator CTA counts (ncclConfig_t minCTAs/maxCTAs).

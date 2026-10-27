@@ -57,7 +57,7 @@ Scenarios (all inside one torchrun job; ranks outside a group wait at a Gloo bar
   all-gathers while group B reduce-scatters. The isolated reference of each half is ``single``
   with ``n = T/2``, so ``T/2`` must be one of ``--group-sizes``.
 * ``late-join`` (``--late-join``, replaces single and split): ranks ``[0, n)`` reduce-scatter
-  ``LATE_JOIN_RS_SCALE * S`` and, once the RS is ``LATE_JOIN_FRACTION`` of its isolated time in,
+  ``LATE_JOIN_RS_SCALE * S`` and, once the RS is ``--join-fraction`` of its isolated time in,
   all-gather ``S`` on a second stream and communicator. Every iteration starts both streams
   together and ends by joining them; the AG stream sleeps on the GPU before its AG. AG(S) and
   RS(4S) alone, timed the same way, are measured first in the same scenario: they are the
@@ -491,7 +491,16 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         action="store_true",
         help=(
             f"Run only the late-join scenario: RS of {LATE_JOIN_RS_SCALE}x each --sizes-mib entry, joined by an AG"
-            f" of that size at {LATE_JOIN_FRACTION:g} of the RS's isolated time; needs --split-totals none"
+            " of that size at --join-fraction of the RS's isolated time; needs --split-totals none"
+        ),
+    )
+    parser.add_argument(
+        "--join-fraction",
+        type=float,
+        default=LATE_JOIN_FRACTION,
+        help=(
+            "Late join: release the AG once the RS is this fraction of its isolated time in (default:"
+            f" {LATE_JOIN_FRACTION:g}); 0 launches AG and RS together every iteration, with no GPU sleep"
         ),
     )
     parser.add_argument("--split-layouts", type=_csv_choices(SPLIT_LAYOUTS), default=["contiguous"])
@@ -550,6 +559,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         parser.error("--late-join runs an AG and an RS; --symm-kernel would mask one of them")
     if args.late_join and args.outside_p2p_sizes:
         parser.error("--late-join runs only the late-join scenario; drop --outside-p2p-sizes")
+    if args.join_fraction < 0:
+        parser.error("--join-fraction must be >= 0")
     if not args.group_sizes and not args.outside_p2p_sizes:
         parser.error("--group-sizes none leaves nothing to run without --outside-p2p-sizes")
     if args.outside_p2p_sizes and not any(has_p2p(w) for w in args.workloads):
@@ -1462,11 +1473,12 @@ def _timed_trial(
     gate: StartGate,
     trial: int,
     join_cycles: int | None = None,
+    lockstep: bool = False,
 ) -> dict[str, float] | None:
     """Pass the start gate, run ``iters`` back-to-back launches and return per-iteration times in ms.
 
     With ``join_cycles`` (late join) every iteration is timed on its own instead, see
-    :func:`_run_joined`.
+    :func:`_run_joined`. ``lockstep`` joins the op streams between iterations, see :func:`_run_timed`.
 
     The GPU sleep keeps the gate and every launch queued before any of them runs, so host
     enqueue time is not measured. Every rank of the scenario passes the gate, including the idle
@@ -1489,7 +1501,9 @@ def _timed_trial(
             return _run_joined(
                 group, buffers, ops, streams, main=main, iters=iters, host_start=host_start, join_cycles=join_cycles
             )
-        return _run_timed(group, buffers, ops, streams, main=main, iters=iters, host_start=host_start)
+        return _run_timed(
+            group, buffers, ops, streams, main=main, iters=iters, host_start=host_start, lockstep=lockstep
+        )
 
 
 def _stream_key(op: str) -> str:
@@ -1506,8 +1520,16 @@ def _run_timed(
     main: torch.cuda.Stream,
     iters: int,
     host_start: float,
+    lockstep: bool = False,
 ) -> dict[str, float] | None:
-    """Time ``iters`` back-to-back launches from the stream state left by the start gate."""
+    """Time ``iters`` back-to-back launches from the stream state left by the start gate.
+
+    ``lockstep`` starts every op of an iteration only once every op of the previous one has ended:
+    ``main`` waits for each op stream, then each op stream waits for ``main``. Without it,
+    ``NCCL_LAUNCH_ORDER_IMPLICIT`` lets an op run at most one iteration ahead of the other (ag[i]
+    waits for rs[i-1] to begin), so the faster op stalls behind the slower one and the slower one
+    runs its last launches alone. The timing is unchanged: from ``start`` to each op's last end.
+    """
     if group is None:
         main.synchronize()
         return None
@@ -1517,7 +1539,12 @@ def _run_timed(
     start.record(main)
     for op in ops:
         streams[_stream_key(op)].wait_event(start)
-    for _ in range(iters):
+    for i in range(iters):
+        if lockstep and i:
+            for op in ops:
+                main.wait_stream(streams[_stream_key(op)])
+            for op in ops:
+                streams[_stream_key(op)].wait_stream(main)
         _launch(group, buffers, ops, streams)
     enqueue_ms = (time.perf_counter() - host_start) * 1e3
     for op in ops:
@@ -1679,6 +1706,7 @@ def run_case(
     rs_size_bytes: int | None = None,
     join_cycles: int | None = None,
     reference: dict[str, float] | None = None,
+    lockstep: bool = False,
 ) -> list[dict[str, object]]:
     """Run ``workloads[i]`` on ``topology.groups[i]``, all at the same time; return records on rank 0.
 
@@ -1694,6 +1722,8 @@ def run_case(
     switches to per-iteration timing (:func:`_run_joined`, 0 for the references), and
     ``reference`` (``ag_iso_ms``, ``rs_iso_ms``) adds :func:`collective_metrics.late_join_metrics`
     to the record.
+
+    ``lockstep`` joins the op streams between iterations (:func:`_run_timed`); single ``ag+rs`` uses it.
     """
     if len(workloads) != len(topology.groups):
         raise ValueError(f"{case}: {len(workloads)} workloads for {len(topology.groups)} groups")
@@ -1750,6 +1780,7 @@ def run_case(
                     gate=gate,
                     trial=trial,
                     join_cycles=join_cycles,
+                    lockstep=lockstep,
                 )
                 if result is not None:
                     trials.append(result)
@@ -1870,6 +1901,7 @@ def run_case(
             "workload": workload,
             "iters": args.iters,
             "trials": args.trials,
+            "lockstep": lockstep,
             "trial_makespan_ms": [trial["makespan_ms"] for trial in per_trial],
             "host_bound": max(trial["enqueue_ms"] for trial in per_trial) > delay_ms,
             "check_passed": True,
@@ -1927,7 +1959,8 @@ def run_case(
                     rs_bytes=op_sizes["rs"],
                     ag_iso_s=reference["ag_iso_ms"] / 1e3,
                     rs_iso_s=reference["rs_iso_ms"] / 1e3,
-                    ag_begin_s=stats["ag_begin_ms"] / 1e3,
+                    # --join-fraction 0 launches the AG with the RS: no sleep, no ag_begin event.
+                    ag_begin_s=stats.get("ag_begin_ms", 0.0) / 1e3,
                     ag_end_s=stats["ag_ms"] / 1e3,
                     rs_end_s=stats["rs_ms"] / 1e3,
                 )
@@ -2119,7 +2152,12 @@ def main(argv: list[str] | None = None) -> None:
                         "rs_iso_ms": rs_alone[0]["makespan_ms"],
                     }
                 dist.broadcast_object_list(reference, src=0)
-                join_cycles = max(1, int(cycles_per_ms * LATE_JOIN_FRACTION * reference[0]["rs_iso_ms"]))
+                # join_cycles=0 (--join-fraction 0): AG and RS start together in every iteration.
+                join_cycles = (
+                    max(1, int(cycles_per_ms * args.join_fraction * reference[0]["rs_iso_ms"]))
+                    if args.join_fraction > 0
+                    else 0
+                )
                 joined = run_case(
                     topology,
                     rs_size_bytes=rs_bytes,
@@ -2138,7 +2176,12 @@ def main(argv: list[str] | None = None) -> None:
             single = {"scenario": "single", "phase": "isolated", "total_ranks": n, "layout": None, "group_index": 0}
             for size_bytes in sizes:
                 for workload in workloads:
-                    records = run_case(topology, **case_kwargs(scenario, None, size_bytes, workload, [workload], ctas))
+                    # ag[i] and rs[i] start together: see _run_timed.
+                    records = run_case(
+                        topology,
+                        lockstep=workload == "ag+rs",
+                        **case_kwargs(scenario, None, size_bytes, workload, [workload], ctas),
+                    )
                     emit(records, **single, **cta_fields)
             destroy(topology, comm_log)
 

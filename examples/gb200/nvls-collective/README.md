@@ -53,7 +53,13 @@ B 组是另一批同样大小、同样拓扑（每 tray 4 卡、同一 NVL domai
 interleaved 布局（偶/奇 rank）与 single 的 rank 集合不同，用它时 isolated 参照是近似值。
 
 `single` 的四种负载都在同一个 job 里测，每组 AG、RS、AR 各有自己的 NCCL communicator 和 CUDA stream；
-`ag+rs` 在两个 communicator 上同时发射，因此它能和单独测的 AG、RS 直接比较：
+`ag+rs` 在两个 communicator 上同时发射，因此它能和单独测的 AG、RS 直接比较。single 的 `ag+rs` 每次迭代之间
+两条 stream 汇合一次（`lockstep`，记录里 `"lockstep": true`）：main 等 AG、RS 两条 stream，两条 stream 再等 main，
+所以 ag[i] 和 rs[i] 同时起步。不汇合时，`NCCL_LAUNCH_ORDER_IMPLICIT=1` 让同一张 GPU 上的 NCCL kernel 按发射顺序
+依次"开始"（下一个要等上一个的 CTA 全部开始执行），ag[i] 要等 rs[i-1] 开始，快的 op 最多领先一次迭代就被卡住，
+最后剩一段慢的 op 单独跑，测到的就不是持续重叠。计时口径不变：仍是一个起点 event 到各 op 最后一次结束，除以
+迭代数，汇合的 µs 级开销计入其中。单独的 AG、RS 和 split 的 `ag+rs` 仍是连续发射：
+
 
 ```text
 speedup          = (T_AG + T_RS) / T_AG+RS     # 1 = 完全串行，理想重叠 = (T_AG+T_RS)/max(T_AG,T_RS)
@@ -311,7 +317,7 @@ bash examples/gb200/nvls-collective/run_nvls_collective_benchmark.sh \
   --nnodes 4 --group-sizes 8 --split-totals 16 --split-layouts contiguous,interleaved
 ```
 
-`--group-sizes` 默认取 4/8/16/32 中不超过 `nnodes × gpus-per-node` 的部分，`--split-totals`
+`--group-sizes` 默认是 `nnodes × gpus-per-node`（一组包含所有 rank），要测更小的组就显式列出，如 `4,8,16`；`--split-totals`
 默认 `none`（不跑 split），要测两组同时就传 16（8+8）或 32（16+16）。`--dry-run` 只打印命令和将要使用的输出目录，不创建目录，
 也不要求 GPU 或 torch。`--launch-delay-ms`（默认 5）是每个 trial 前的 GPU sleep，case 被标 `[HOST-BOUND]` 时调大。
 
@@ -334,7 +340,7 @@ bash examples/gb200/nvls-collective/run_nvls_collective_benchmark.sh \
 | --- | --- | --- |
 | `rs-isolated` | `reduce_scatter-<4S>MiB-...-late-join-n<n>` | 单独 RS(4S)，得到 `T_RS iso` |
 | `ag-isolated` | `all_gather-<S>MiB-...-late-join-n<n>` | 单独 AG(S)，得到 `T_AG iso` |
-| `join` | `reduce_scatter_x4+late_all_gather-<S>MiB-...-late-join-n<n>` | RS(4S) 先发；AG 的 stream 先 GPU sleep `0.25 × T_RS iso`，再发 AG(S) |
+| `join` | `reduce_scatter_x4+late_all_gather-<S>MiB-...-late-join-n<n>` | RS(4S) 先发；AG 的 stream 先 GPU sleep `--join-fraction × T_RS iso`（默认 0.25），再发 AG(S) |
 
 - **计时**：三个 case 都逐迭代计时（`_run_joined`）。每次迭代先在 main stream 上记一个起点，两条 op stream 都等它，
   迭代结束 main 等两条 stream 汇合，所以每次迭代都是"RS 从发射开始、AG 中途加入"，参照和 join 用同样的口径。
@@ -359,6 +365,16 @@ bash examples/gb200/nvls-collective/run_nvls_collective_benchmark.sh \
 | capacity | 窗口内 AG 速率 / AG 单独速率 + RS 速率 / RS 单独速率：**2 = 两者互不影响、都跑满；1 = 分时共用同一瓶颈** |
 | AG share | AG 那一项 / capacity：0.5 是平分，远小于 0.5 说明先跑的 RS 占着资源，后来的 AG 抢不到 |
 | AG in RS | AG 是否在 RS 结束前完成；否则 AG 后半段是单独跑的，窗口只覆盖它的一部分 |
+
+**同时发射（`--join-fraction 0`）**：AG 的 stream 不 sleep，每次迭代 RS(4S) 和 AG(S) 从同一个起点出发，
+迭代结束两条 stream 汇合后才开始下一次（与 single `ag+rs` 的 lockstep 一样，但每次迭代单独计时），overlap 窗口就是
+[0, min(AG 结束, RS 结束)]：AG 整段落在 RS 里时，窗口内 AG algbw 就是它在 overlap 下的实测带宽，不依赖估算；
+RS 的窗口内带宽仍按上面的方法推算。join 列为 0（没有 `ag_begin` 事件）。不同 `--join-fraction` 的 case 名相同，
+放在不同的运行目录里比较。
+
+```bash
+bash examples/gb200/nvls-collective/run_nvls_collective_benchmark.sh --algos symm --late-join --join-fraction 0
+```
 
 capacity 和窗口内带宽都是从完成时间推出来的估算。直接证据是 `--nsys` 的 NVLink TX/RX 采样：在 nsys 时间线上
 对齐 RS、AG 两个 kernel，看 AG 加入前后入方向（RX）和出方向（TX）各自是否上升。
