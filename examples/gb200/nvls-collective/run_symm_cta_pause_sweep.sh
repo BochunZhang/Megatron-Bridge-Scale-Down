@@ -42,7 +42,9 @@ results directory, tagged with the pause:
   results/gb200/nvls-collective/gpu-num-<N>/<id>-pause<cycles>cyc
 <id> is shared by the whole sweep (an exported RUN_TIME pins it; on several nodes node 0 stamps it
 and hands it out like the launcher does). Node 0 writes pause.json there, and metadata.json of
-every algorithm records NCCL_SYM_AG_STMC_PAUSE_CYCLES. After each run the script checks that every
+every algorithm records NCCL_SYM_AG_STMC_PAUSE_CYCLES. Node 0 also tags the pause in the name of
+every filed nsys report: <algo>/cases/<algo>-<case>/<algo>-<case>.pause<cycles>cyc.rank_<RR>.nsys-rep.
+After each run the script checks that every
 NCCL process logged the "NCCL version 2.32.3-cta-pause+cuda..." banner and
 "NCCL_SYM_AG_STMC_PAUSE_CYCLES set by environment to <cycles>".
 
@@ -255,6 +257,27 @@ check_logs() {
     echo "  [ok]   ${files} NCCL processes ran with ${pause_env}=${pause}" >&2
 }
 
+# The launcher files each report as cases/<algo>-<case>/<algo>-<case>.rank_<RR>.nsys-rep (node 0,
+# after each pass). Tag the pause before .rank_ so a report copied out of the run still says which
+# pause it ran with; analyse_nsys.py reads the rank from the .rank_<RR> tail and the case from the
+# directory, so the tagged reports are analysed as before.
+tag_nsys_reports() {
+    local output_dir="$1" pause="$2" report base tagged count=0
+    for report in "${output_dir}"/*/cases/*/*.rank_*.nsys-rep; do
+        [[ -f "$report" ]] || continue
+        base="${report%.rank_*}"
+        [[ "$base" == *".pause${pause}cyc" ]] && continue
+        tagged="${base}.pause${pause}cyc.rank_${report##*.rank_}"
+        [[ -e "$tagged" ]] && { echo "WARNING: ${tagged} exists; left ${report} untagged" >&2; continue; }
+        mv -- "$report" "$tagged"
+        count=$(( count + 1 ))
+    done
+    echo "=== Tagged ${count} nsys reports in ${output_dir}/*/cases with .pause${pause}cyc" >&2
+    if compgen -G "${output_dir}/*/nsys/rank*.nsys-rep" >/dev/null; then
+        echo "WARNING: unfiled reports left in ${output_dir}/*/nsys; analyse_nsys.sh files them without the pause tag" >&2
+    fi
+}
+
 status=0
 runs=()
 for pause in "${pause_list[@]}"; do
@@ -289,6 +312,7 @@ for pause in "${pause_list[@]}"; do
         if (( node_rank == 0 )); then
             printf '{\n  "%s": %d,\n  "sweep_id": "%s",\n  "nccl_lib": "%s",\n  "paused_kernels": ["AllGather_STMC", "AllGather_TmaSTMC"],\n  "pause_unit": "SM cycles (clock64) per warp after each 4 KiB chunk of multimem stores; ns = cycles / SM clock"\n}\n' \
                 "$pause_env" "$pause" "$sweep_id" "nccl-2.32.3${nccl_suffix}" >"${output_dir}/pause.json"
+            tag_nsys_reports "$output_dir" "$pause"
         fi
         check_logs "$output_dir" "$pause" || run_status=1
         runs+=("pause ${pause} cycles -> ${output_dir} (exit ${run_status})")

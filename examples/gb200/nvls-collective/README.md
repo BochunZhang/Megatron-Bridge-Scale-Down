@@ -454,6 +454,8 @@ bash examples/gb200/nvls-collective/run_symm_cta_pause_sweep.sh --nnodes 8 --gro
   `results/gb200/nvls-collective/gpu-num-<N>/<id>-pause<cycles>cyc/`。整次扫描共用一个 `<id>`（导出 `RUN_TIME` 可以指定；
   多节点时由 node 0 生成并下发）。node 0 在每个目录写 `pause.json`，各 algo 的 `metadata.json` 也记录了这个变量；跑完后检查每个
   NCCL 进程的横幅是 `2.32.3-cta-pause`、日志里有 `NCCL_SYM_AG_STMC_PAUSE_CYCLES set by environment to <cycles>.`。
+  node 0 还会把归档好的 nsys 报告改名，带上暂停值：`<algo>-<case>.pause<cycles>cyc.rank_<RR>.nsys-rep`（case 目录名不变），
+  拷出运行目录也能看出是哪个暂停值；`analyse_nsys.sh` 照常分析这些报告。
 - 每个 case 都走 symmetric 的 multicast kernel（`AllGather_STMC` / `ReduceScatter_LDMC`），不走 unicast（P2P）kernel：
   `--symm-kernel mc` 固定 `NCCL_SYM_KERNEL`、`NCCL_NVLS_ENABLE=1`，`NCCL_SYM_TMA_ENABLE=0` 排除 `AllGather_TmaSTMC`，
   benchmark 按 TUNING 日志逐次检查，跑了别的 kernel 的 case 直接判失败。`--algos`、`--symm-kernel`、`--cta-configs`
