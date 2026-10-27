@@ -17,23 +17,25 @@ set -euo pipefail
 
 usage() {
     cat <<'USAGE'
-Sweep the AllGather_STMC pause at NCCL's default CTA counts, with nccl-2.32.3-cta-with-pause preloaded.
+Sweep the AllGather_STMC pause at NCCL's default CTA counts, with nccl-2.32.3-pause preloaded.
 
 For every value of --pause-cycles it runs
 run_nvls_collective_benchmark.sh --algos symm --workloads ag,rs,ag+rs --sizes-mib 1024 --nsys
 --symm-kernel mc --cta-configs default with NCCL_SYM_AG_STMC_PAUSE_CYCLES=<cycles>. Only the pause
-changes between runs: no CTA count is set anywhere, so NCCL picks its own. The process-wide CTA
-variables (NCCL_MIN_CTAS, NCCL_MIN_NCHANNELS, ..., NCCL_SYM_CTAS) are unset for the runs: GB200
-images export NCCL_MIN_CTAS=4, which the nccl-2.32.3-cta patch lets raise the multicast kernels past
-their divUp(32, n) cap (64 GPUs would run 4 CTAs instead of 1). After each run the script fails if
-an NCCL log shows one of them, and prints the CTA counts of the AG / RS launches.
+changes between runs: no CTA count is set anywhere, so NCCL picks its own. Before anything starts,
+the script unsets the process-wide CTA variables (NCCL_MIN_CTAS, NCCL_MIN_NCHANNELS, ...,
+NCCL_SYM_CTAS): GB200 images export NCCL_MIN_CTAS=4, which raises NCCL's choice for the multicast
+kernels to min(4, divUp(32, n)) (8 GPUs: AG 4 CTAs instead of 2; 16 GPUs: 2 instead of 1). After
+each run the script fails if an NCCL log shows one of them, and prints the CTA counts of the AG / RS
+launches.
 
 Every case runs the symmetric multicast kernels, never the unicast (P2P) ones: --symm-kernel mc pins
 NCCL_SYM_KERNEL=allgather:AllGather_STMC;reducescatter:ReduceScatter_LDMC with NCCL_NVLS_ENABLE=1,
 NCCL_SYM_TMA_ENABLE=0 keeps the AG off AllGather_TmaSTMC, and the benchmark fails any case whose NCCL
 log shows another kernel. --algos, --symm-kernel and --cta-configs cannot be passed through.
 
-The preloaded build (install/install-nccl-2.32.3-cta.sh --with-pause) is nccl-2.32.3-cta plus that variable: AllGather_STMC makes every warp spin <cycles> SM
+The preloaded build (install/install-nccl-2.32.3-pause.sh) is stock 2.32.3 plus that variable, without
+the cta patch, so the CTA selection is stock NCCL's: AllGather_STMC makes every warp spin <cycles> SM
 cycles (clock64) after each 4 KiB chunk of multimem stores, so the AllGather gets slower at the same CTA
 count and ReduceScatter_LDMC is left alone. 0 runs the kernels unchanged, which makes it the baseline
 of the same library. In ns a pause is <cycles> / SM clock: read the clock from the nsys GPU metrics
@@ -48,7 +50,7 @@ and hands it out like the launcher does). Node 0 writes pause.json there, and me
 every algorithm records NCCL_SYM_AG_STMC_PAUSE_CYCLES. Node 0 also tags the pause in the name of
 every filed nsys report: <algo>/cases/<algo>-<case>/<algo>-<case>.pause<cycles>cyc.rank_<RR>.nsys-rep.
 After each run the script checks that every
-NCCL process logged the "NCCL version 2.32.3-cta-pause+cuda..." banner and
+NCCL process logged the "NCCL version 2.32.3-pause+cuda..." banner and
 "NCCL_SYM_AG_STMC_PAUSE_CYCLES set by environment to <cycles>".
 
 The torch requirements are those of run_symm_cta_sweep.sh: one libnccl.so.2 loaded through its
@@ -90,7 +92,7 @@ If the printed AG CTA counts differ, recompute the knee with paths = n x CTA_AG 
   --venv DIR          Virtualenv to activate, or 'none' to keep the current one
                       (default: <repo>/.venv/python3.12-torch2.13-nccl2.32.3)
   --nccl-lib PATH     libnccl.so.2 to preload
-                      (default: <repo>/nccl/nccl-2.32.3-cta-with-pause/build/lib/libnccl.so.2)
+                      (default: <repo>/nccl/nccl-2.32.3-pause/build/lib/libnccl.so.2)
   -h, --help          Show this help
 
 Anything after the options (or after --) goes to run_nvls_collective_benchmark.sh and, coming
@@ -112,8 +114,8 @@ nnodes=1
 group_sizes=""
 pause_cycles=""
 venv="${repo_root}/.venv/python3.12-torch2.13-nccl2.32.3"
-nccl_lib="${repo_root}/nccl/nccl-2.32.3-cta-with-pause/build/lib/libnccl.so.2"
-nccl_suffix="-cta-pause"
+nccl_lib="${repo_root}/nccl/nccl-2.32.3-pause/build/lib/libnccl.so.2"
+nccl_suffix="-pause"
 pause_env="NCCL_SYM_AG_STMC_PAUSE_CYCLES"
 passthrough=()
 
@@ -122,6 +124,16 @@ die() {
     exit 1
 }
 log() { printf '%s\n' "$*" >&2; }
+
+# NCCL picks every CTA count itself, so before anything starts no process-wide CTA variable is left to
+# override it (GB200 images export NCCL_MIN_CTAS=4, which raises the multicast kernels to
+# min(4, divUp(32, n)) CTAs). check_logs fails a run whose NCCL logs still show one.
+cta_env=(NCCL_MIN_CTAS NCCL_MAX_CTAS NCCL_MIN_NCHANNELS NCCL_MAX_NCHANNELS NCCL_MIN_NRINGS NCCL_MAX_NRINGS
+    NCCL_NVLS_NCHANNELS NCCL_MIN_P2P_NCHANNELS NCCL_MAX_P2P_NCHANNELS NCCL_SYM_CTAS)
+for name in "${cta_env[@]}"; do
+    [[ -n "${!name:-}" ]] && log "warning: unsetting ${name}=${!name}; the sweep runs at NCCL's own CTA counts"
+    unset "$name"
+done
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -196,19 +208,11 @@ if [[ "$venv" != none ]]; then
 fi
 # Nsight Compute unpacked into the repo, for --ncu passed through.
 [[ -d "${repo_root}/NVIDIA-Nsight-Compute-2026.3" ]] && export PATH="${repo_root}/NVIDIA-Nsight-Compute-2026.3:${PATH}"
-# NCCL picks every CTA count itself: the process-wide CTA variables override it (and with the cta patch
-# NCCL_MIN_CTAS lifts the multicast kernels past their divUp(32, n) cap), so none reaches the runs.
-cta_env=(NCCL_MIN_CTAS NCCL_MAX_CTAS NCCL_MIN_NCHANNELS NCCL_MAX_NCHANNELS NCCL_MIN_NRINGS NCCL_MAX_NRINGS
-    NCCL_NVLS_NCHANNELS NCCL_MIN_P2P_NCHANNELS NCCL_MAX_P2P_NCHANNELS NCCL_SYM_CTAS)
-for name in "${cta_env[@]}"; do
-    [[ -n "${!name:-}" ]] && log "warning: unsetting ${name}=${!name}; the sweep runs at NCCL's own CTA counts"
-    unset "$name"
-done
 if [[ -n "${!pause_env:-}" ]]; then
     log "warning: ${pause_env}=${!pause_env} from the environment is replaced by each --pause-cycles value"
 fi
 
-[[ -f "$nccl_lib" ]] || die "${nccl_lib} not found; build it with install/install-nccl-2.32.3-cta.sh --with-pause or pass --nccl-lib"
+[[ -f "$nccl_lib" ]] || die "${nccl_lib} not found; build it with install/install-nccl-2.32.3-pause.sh or pass --nccl-lib"
 nccl_lib="$(cd -- "$(dirname -- "$nccl_lib")" && pwd -P)/$(basename -- "$nccl_lib")"
 grep -aq "NCCL version 2.32.3${nccl_suffix}+cuda" "$nccl_lib" \
     || die "${nccl_lib} is not the nccl-2.32.3${nccl_suffix} build (no \"NCCL version 2.32.3${nccl_suffix}+cuda\" banner)"

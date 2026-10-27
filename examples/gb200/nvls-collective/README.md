@@ -446,11 +446,12 @@ bash examples/gb200/nvls-collective/run_symm_cta_sweep.sh --nnodes 8 --group-siz
   配对，每个 op 给出 `CTA 数 / 每次迭代 ms (相对 default)`。
 
 **AllGather_STMC 暂停扫描（`run_symm_cta_pause_sweep.sh`）**：人为让 AG 的 multimem store 变慢，看 ag+rs 重叠时 RS
-的时间怎么变。只扫暂停值，AG / RS 的 CTA 数保持 NCCL 默认（`--cta-configs default`）。先编出带暂停的 NCCL（clone `v2.32.3-1` 到 `nccl/nccl-2.32.3-cta-with-pause`，依次打
-`nccl-2.32.3-cta.patch` 和 `nccl-2.32.3-cta-pause.patch`，横幅为 `NCCL version 2.32.3-cta-pause+cuda...`）：
+的时间怎么变。只扫暂停值，AG / RS 的 CTA 数保持 NCCL 默认（`--cta-configs default`）。先编出带暂停的 NCCL（clone `v2.32.3-1` 到
+`nccl/nccl-2.32.3-pause`，只打 `nccl-2.32.3-pause.patch`，**不打 cta patch**，CTA 选择和原版 NCCL 一样；横幅为
+`NCCL version 2.32.3-pause+cuda...`）：
 
 ```bash
-./install/install-nccl-2.32.3-cta.sh --with-pause
+./install/install-nccl-2.32.3-pause.sh
 bash examples/gb200/nvls-collective/run_symm_cta_pause_sweep.sh --nnodes 8 --group-sizes 32
 ```
 
@@ -463,13 +464,13 @@ bash examples/gb200/nvls-collective/run_symm_cta_pause_sweep.sh --nnodes 8 --gro
   `(⌈p/T⌉·T − T, ⌈p/T⌉·T]`，所有小于 T 的 p 都分不出来。代价是换成 ns 要除以 SM 频率：暂停 ns = 周期数 / SM 频率，
   GB200 降频时同样的周期数会更长。可以扫描前用 `nvidia-smi -lgc <MHz>,<MHz>` 锁频（需要 root），或事后从 nsys GPU metrics
   的 GPC Clock Frequency 读实际频率。`run_globaltimer_probe.sh` 会测 `%globaltimer` 的跳动间隔、各 SM 的频率和这段自旋的实际周期数。
-- 早先的 `%globaltimer` 版 patch 读的是 `NCCL_SYM_AG_STMC_PAUSE_NS`，横幅同样是 `2.32.3-cta-pause`，扫描脚本会因为库里没有
-  `NCCL_SYM_AG_STMC_PAUSE_CYCLES` 而拒绝它。用旧 patch 打过的 `nccl/nccl-2.32.3-cta-with-pause` 需要先
-  `git -C nccl/nccl-2.32.3-cta-with-pause checkout -- .` 还原，再重新运行 `install-nccl-2.32.3-cta.sh --with-pause`。
+- 早先的暂停库都叠在 cta patch 上（`install-nccl-2.32.3-cta.sh --with-pause` 编出的 `nccl/nccl-2.32.3-cta-with-pause`，
+  横幅 `2.32.3-cta-pause`；更早的 `%globaltimer` 版读 `NCCL_SYM_AG_STMC_PAUSE_NS`）。扫描脚本只认 `2.32.3-pause` 横幅，会拒绝它们；
+  `--with-pause` 选项已删除，改用 `install-nccl-2.32.3-pause.sh` 重新编译（旧目录可以直接删掉）。
 - NCCL 每个进程只读一次这个变量，所以每个暂停值单独启动一次 launcher，结果目录带上暂停标记：
   `results/gb200/nvls-collective/gpu-num-<N>/<id>-pause<cycles>cyc/`。整次扫描共用一个 `<id>`（导出 `RUN_TIME` 可以指定；
   多节点时由 node 0 生成并下发）。node 0 在每个目录写 `pause.json`，各 algo 的 `metadata.json` 也记录了这个变量；跑完后检查每个
-  NCCL 进程的横幅是 `2.32.3-cta-pause`、日志里有 `NCCL_SYM_AG_STMC_PAUSE_CYCLES set by environment to <cycles>.`。
+  NCCL 进程的横幅是 `2.32.3-pause`、日志里有 `NCCL_SYM_AG_STMC_PAUSE_CYCLES set by environment to <cycles>.`。
   node 0 还会把归档好的 nsys 报告改名，带上暂停值：`<algo>-<case>.pause<cycles>cyc.rank_<RR>.nsys-rep`（case 目录名不变），
   拷出运行目录也能看出是哪个暂停值；`analyse_nsys.sh` 照常分析这些报告。
 - 每个 case 都走 symmetric 的 multicast kernel（`AllGather_STMC` / `ReduceScatter_LDMC`），不走 unicast（P2P）kernel：
@@ -477,10 +478,10 @@ bash examples/gb200/nvls-collective/run_symm_cta_pause_sweep.sh --nnodes 8 --gro
   benchmark 按 TUNING 日志逐次检查，跑了别的 kernel 的 case 直接判失败。`--algos`、`--symm-kernel`、`--cta-configs`
   不能透传。
 - `--nnodes` 默认 1（单 tray 4 GPU）。torch 要求和 `--` 透传与 `run_symm_cta_sweep.sh` 相同；`--pause-cycles 0` 就是同一个库下的基线。
-- **CTA 数用 NCCL 自己的选择**：扫描脚本 `unset` 掉进程级的 CTA 变量（`NCCL_MIN_CTAS`、`NCCL_MIN_NCHANNELS` 等，以及
-  `NCCL_SYM_CTAS`）再启动 launcher。GB200 镜像导出的 `NCCL_MIN_CTAS=4` 在 cta patch 下会把多播 kernel 的 CTA 数抬过
-  `divUp(32, n)` 的上限（64 GPU 会跑 4 个 CTA 而不是 1 个）。每次运行后，NCCL 日志里出现这些变量的 `set by environment`
-  就判失败，并打印 `Kernel AllGather_STMC / ReduceScatter_LDMC nchannels` 的统计。
+- **CTA 数用 NCCL 自己的选择**：扫描脚本启动时第一件事就是 `unset` 掉进程级的 CTA 变量（`NCCL_MIN_CTAS`、
+  `NCCL_MIN_NCHANNELS` 等，以及 `NCCL_SYM_CTAS`）。GB200 镜像导出的 `NCCL_MIN_CTAS=4` 会把多播 kernel 的 CTA 数抬到
+  `min(4, divUp(32, n))`（8 GPU 的 AG 从 2 变 4，16 GPU 从 1 变 2；在 cta patch 下还能越过上限）。每次运行后，NCCL 日志里
+  出现这些变量的 `set by environment` 就判失败，并打印 `Kernel AllGather_STMC / ReduceScatter_LDMC nchannels` 的统计。
 - **默认暂停值按组大小选**（不传 `--pause-cycles` 时）。按 NCCL 的模型（`tuning/sym_model`），1 GiB 时 `AllGather_STMC`
   在 4 / 8 / 16 / 32 / 64 GPU 上是 4 / 2 / 1 / 1 / 1 个 CTA（`ReduceScatter_LDMC` 是 6 / 4 / 2 / 1 / 1），以打印的
   nchannels 为准。每个 GPU 被写入的路径数是 n × CTA_AG，每条路径每轮 64 KiB（16 warp × 4 KiB），不被反压时一轮约

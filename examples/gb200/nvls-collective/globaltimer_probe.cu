@@ -13,7 +13,7 @@
 // limitations under the License.
 
 // Measure %globaltimer and clock64 on one GPU: the timer's tick, the SM clock, and how long the
-// NCCL_SYM_AG_STMC_PAUSE_CYCLES spin (ncclSymkPauseCycles in nccl-2.32.3-cta-pause.patch) really pauses.
+// NCCL_SYM_AG_STMC_PAUSE_CYCLES spin (ncclSymkPauseCycles in nccl-2.32.3-pause.patch) really pauses.
 //
 //   tick   one thread reads %globaltimer back to back and records the first kTicks increments.
 //          PTX only promises a 64-bit ns counter; how often it advances is up to the GPU and the
@@ -58,7 +58,7 @@ __device__ __forceinline__ uint64_t globaltimer() {
   return t;
 }
 
-// The spin of ncclSymkPauseCycles in install/patches/nccl-2.32.3-cta-pause.patch.
+// The spin of ncclSymkPauseCycles in install/patches/nccl-2.32.3-pause.patch.
 __device__ __forceinline__ void pauseCycles(uint32_t cycles) {
   long long start = clock64();
   while (clock64() - start < (long long)cycles) {

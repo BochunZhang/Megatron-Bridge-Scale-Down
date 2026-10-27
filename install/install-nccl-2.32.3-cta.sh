@@ -26,26 +26,21 @@
 # and nccl.h defines NCCL_SUFFIX "-cta"; NCCL_VERSION_CODE (23203), ncclGetVersion() and the soname
 # libnccl.so.2 stay those of 2.32.3.
 #
-# --with-pause builds nccl-2.32.3-cta-with-pause instead: install/patches/nccl-2.32.3-cta-pause.patch on
-# top of the cta patch adds NCCL_SYM_AG_STMC_PAUSE_CYCLES (default 0). AllGather_STMC / AllGather_TmaSTMC then
-# make every warp spin that many SM cycles (clock64) after each 4 KiB chunk of multimem stores, which slows
-# the multicast AllGather without changing its CTA count or its result. In ns a pause is cycles / SM clock
-# (nvidia-smi -lgc pins it). The value is read at run time (once per process), so one build serves every
-# pause; the suffix is -cta-pause.
+# The AllGather_STMC pause build is install-nccl-2.32.3-pause.sh: stock 2.32.3 plus the pause patch, without
+# this one, so the pause sweep runs at NCCL's own CTA counts.
 #
-#   1. Clone tag v2.32.3-1 into <megatron-bridge>/nccl/nccl-2.32.3-cta (with --with-pause:
-#      nccl-2.32.3-cta-with-pause). An existing checkout is reused only if it is at that tag.
-#   2. Apply the patch(es) in order (skipped when they are already applied).
+#   1. Clone tag v2.32.3-1 into <megatron-bridge>/nccl/nccl-2.32.3-cta. An existing checkout is reused only
+#      if it is at that tag.
+#   2. Apply the patch (skipped when it is already applied).
 #   3. Build and check with install-nccl-2.32.3.sh --dest <that tree>: make -j<jobs> src.build for
 #      sm_100 into <tree>/build, then the same kernel / symbol / environment checks.
 #
 # torch built against this NCCL: install-torch-2.13.0-nccl-2.32.3-cta.sh. The sweeps preload it into the
-# torch of install-torch-2.13.0-nccl-2.32.3.sh instead (run_symm_cta_sweep.sh, run_symm_cta_pause_sweep.sh).
+# torch of install-torch-2.13.0-nccl-2.32.3.sh instead (run_symm_cta_sweep.sh).
 #
 # Usage:
-#   ./install/install-nccl-2.32.3-cta.sh [--with-pause] [--dest DIR] [--cuda-home DIR] [--jobs N] [--check-only]
+#   ./install/install-nccl-2.32.3-cta.sh [--dest DIR] [--cuda-home DIR] [--jobs N] [--check-only]
 #
-#   --with-pause    Also apply the AllGather_STMC pause patch (default tree: nccl-2.32.3-cta-with-pause)
 #   --dest DIR      Source tree (default: <megatron-bridge>/nccl/nccl-2.32.3-cta)
 #   --cuda-home DIR CUDA toolkit, >= 12.8 for sm_100 (default: CUDA_HOME or /usr/local/cuda)
 #   --jobs N        make -j (default: every CPU in the affinity mask)
@@ -59,9 +54,8 @@ NCCL_SUFFIX="-cta"  # set by the patch in makefiles/version.mk
 
 script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 repo_root="$(cd -- "${script_dir}/.." && pwd)"
-patches=("${script_dir}/patches/nccl-2.32.3-cta.patch")
-dest=""
-with_pause=false
+patch="${script_dir}/patches/nccl-2.32.3-cta.patch"
+dest="${repo_root}/nccl/nccl-2.32.3-cta"
 cuda_home="${CUDA_HOME:-/usr/local/cuda}"
 # GNU nproc returns OMP_NUM_THREADS when it is set, and training environments usually export
 # OMP_NUM_THREADS=1; drop it (and OMP_THREAD_LIMIT) so only the CPU affinity mask counts.
@@ -75,26 +69,16 @@ die() {
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
-        --with-pause) with_pause=true; shift ;;
         --dest) dest="$2"; shift 2 ;;
         --cuda-home) cuda_home="$2"; shift 2 ;;
         --jobs) jobs="$2"; shift 2 ;;
         --check-only) check_only=true; shift ;;
-        -h|--help) sed -n '16,52p' "$0"; exit 0 ;;
+        -h|--help) sed -n '16,47p' "$0"; exit 0 ;;
         *) die "unknown argument: $1" ;;
     esac
 done
 
-if $with_pause; then
-    # The pause patch's version.mk hunk sits on the cta patch's, so it only applies on top of it.
-    patches+=("${script_dir}/patches/nccl-2.32.3-cta-pause.patch")
-    NCCL_SUFFIX="-cta-pause"
-    [[ -n "$dest" ]] || dest="${repo_root}/nccl/nccl-2.32.3-cta-with-pause"
-fi
-[[ -n "$dest" ]] || dest="${repo_root}/nccl/nccl-2.32.3-cta"
-for patch in "${patches[@]}"; do
-    [[ -f "$patch" ]] || die "${patch} not found"
-done
+[[ -f "$patch" ]] || die "${patch} not found"
 (( jobs >= 1 )) || die "--jobs must be >= 1, got ${jobs}"
 
 ################################################################################
@@ -117,28 +101,15 @@ fi
 ################################################################################
 # 2. Patch
 
-patched() { git -C "$dest" apply --reverse --check "$1" 2>/dev/null; }
-# A later patch reverses only on top of the earlier ones, and once it is applied the earlier ones no
-# longer reverse on their own (the pause patch rewrites the cta patch's NCCL_SUFFIX line). So the last
-# patch tells whether the tree is done; otherwise apply, in order, those that are not in yet.
-last="${patches[${#patches[@]} - 1]}"
-if patched "$last"; then
-    for patch in "${patches[@]}"; do
-        echo "=== ${patch##*/} is applied"
-    done
+if git -C "$dest" apply --reverse --check "$patch" 2>/dev/null; then
+    echo "=== ${patch##*/} is applied"
 elif $check_only; then
-    die "${dest} does not carry ${last##*/}; run without --check-only"
+    die "${dest} does not carry ${patch##*/}; run without --check-only"
 else
-    for patch in "${patches[@]}"; do
-        if [[ "$patch" != "$last" ]] && patched "$patch"; then
-            echo "=== ${patch##*/} is applied"
-            continue
-        fi
-        git -C "$dest" apply --check "$patch" \
-            || die "${patch##*/} does not apply to ${dest}; reset it with git -C ${dest} checkout -- ."
-        git -C "$dest" apply "$patch"
-        echo "=== Applied ${patch##*/}"
-    done
+    git -C "$dest" apply --check "$patch" \
+        || die "${patch##*/} does not apply to ${dest}; reset it with git -C ${dest} checkout -- ."
+    git -C "$dest" apply "$patch"
+    echo "=== Applied ${patch##*/}"
 fi
 git -C "$dest" diff --stat | sed 's/^/  /'
 
@@ -158,14 +129,5 @@ grep -aq "NCCL version 2.32.3${NCCL_SUFFIX}+cuda" "${build_dir}/lib/libnccl.so" 
     || die "${build_dir}/lib/libnccl.so has no \"NCCL version 2.32.3${NCCL_SUFFIX}+cuda\" banner; rebuild without --check-only"
 echo "  [ok]   nccl.h NCCL_SUFFIX \"${NCCL_SUFFIX}\", libnccl.so banner \"NCCL version 2.32.3${NCCL_SUFFIX}+cuda...\""
 
-if $with_pause; then
-    # NCCL_PARAM keeps the variable name as a string literal for ncclGetEnv and the INFO line.
-    grep -aq "NCCL_SYM_AG_STMC_PAUSE_CYCLES" "${build_dir}/lib/libnccl.so" \
-        || die "${build_dir}/lib/libnccl.so does not read NCCL_SYM_AG_STMC_PAUSE_CYCLES; rebuild without --check-only"
-    echo "  [ok]   libnccl.so reads NCCL_SYM_AG_STMC_PAUSE_CYCLES"
-    echo "=== nccl-2.32.3-cta-with-pause: the cta build, plus NCCL_SYM_AG_STMC_PAUSE_CYCLES=<cycles> slowing AllGather_STMC"
-    echo "  sweep: bash examples/gb200/nvls-collective/run_symm_cta_pause_sweep.sh"
-else
-    echo "=== nccl-2.32.3-cta: minCTAs above divUp(32, nRanks) now reaches the multicast symmetric kernels"
-    echo "  torch against it: ./install/install-torch-2.13.0-nccl-2.32.3-cta.sh --python <env>/bin/python"
-fi
+echo "=== nccl-2.32.3-cta: minCTAs above divUp(32, nRanks) now reaches the multicast symmetric kernels"
+echo "  torch against it: ./install/install-torch-2.13.0-nccl-2.32.3-cta.sh --python <env>/bin/python"

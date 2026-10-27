@@ -14,7 +14,7 @@
 
 """CPU-only checks for run_symm_cta_pause_sweep.sh.
 
-The real sweep needs GB200 trays and the nccl-2.32.3-cta-pause build. These tests dry-run it with a
+The real sweep needs GB200 trays and the nccl-2.32.3-pause build. These tests dry-run it with a
 fake libnccl.so.2 that only carries the strings the script greps for: one launcher run per pause,
 each in its own ``<id>-pause<cycles>cyc`` directory, and the option / library checks.
 """
@@ -31,7 +31,7 @@ SCRIPT = Path(__file__).resolve().parents[3] / "examples" / "gb200" / "nvls-coll
 needs_bash = pytest.mark.skipif(shutil.which("bash") is None, reason="needs bash")
 
 
-def _fake_lib(tmp_path: Path, banner: str = "NCCL version 2.32.3-cta-pause+cuda13.0") -> Path:
+def _fake_lib(tmp_path: Path, banner: str = "NCCL version 2.32.3-pause+cuda13.0") -> Path:
     lib = tmp_path / "libnccl.so.2"
     lib.write_bytes(f"\0{banner}\0NCCL_SYM_AG_STMC_PAUSE_CYCLES\0".encode())
     return lib
@@ -133,14 +133,23 @@ def test_bad_options_are_rejected(tmp_path, options, match):
 def test_a_library_without_the_pause_is_refused(tmp_path):
     result = _sweep(_fake_lib(tmp_path, banner="NCCL version 2.32.3-cta+cuda13.0"), "--dry-run")
     assert result.returncode != 0
-    assert "not the nccl-2.32.3-cta-pause build" in result.stderr
+    assert "not the nccl-2.32.3-pause build" in result.stderr
+
+
+@pytest.mark.unit
+@needs_bash
+def test_the_pause_build_on_the_cta_patch_is_refused(tmp_path):
+    # nccl-2.32.3-cta-with-pause lets NCCL_MIN_CTAS lift the multicast kernels past divUp(32, n).
+    result = _sweep(_fake_lib(tmp_path, banner="NCCL version 2.32.3-cta-pause+cuda13.0"), "--dry-run")
+    assert result.returncode != 0
+    assert "not the nccl-2.32.3-pause build" in result.stderr
 
 
 @pytest.mark.unit
 @needs_bash
 def test_a_library_with_the_globaltimer_pause_is_refused(tmp_path):
     lib = tmp_path / "libnccl.so.2"
-    lib.write_bytes(b"\0NCCL version 2.32.3-cta-pause+cuda13.0\0NCCL_SYM_AG_STMC_PAUSE_NS\0")
+    lib.write_bytes(b"\0NCCL version 2.32.3-pause+cuda13.0\0NCCL_SYM_AG_STMC_PAUSE_NS\0")
     result = _sweep(lib, "--dry-run")
     assert result.returncode != 0
     assert "does not read NCCL_SYM_AG_STMC_PAUSE_CYCLES" in result.stderr
