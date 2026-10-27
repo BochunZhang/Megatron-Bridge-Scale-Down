@@ -965,6 +965,76 @@ results/gb200/nvls-collective/p2p-push-pull/<yyyymmdd-hhmmss>/
 每个 trial 是一个 `trial<i>` range。`results.jsonl` 里有两侧各自的 trial 时间，algbw 按 receiver 的时间计算。
 `--no-nsys` 时只计时。
 
+## AllGather_STMC 的 multimem.st 计时（`run_ag_st_debug.sh`）
+
+用 `nccl-2.32.3-pause-with-debug` 扫 AllGather_STMC 的暂停周期：每个暂停值是一个测试，测一次 1 GiB AllGather 里每个 warp 的
+`multimem.st` 花了多少 SM 周期，输出一个文件。这个库
+（`install/install-nccl-2.32.3-pause-with-debug.sh`，在原版 v2.32.3-1 上只打
+`install/patches/nccl-2.32.3-pause-with-debug.patch`，不打 cta patch；横幅 `NCCL version 2.32.3-pause-with-debug+cuda...`）
+包含 `nccl-2.32.3-pause` 的暂停，另外加了计时：
+
+```bash
+./install/install-nccl-2.32.3-pause-with-debug.sh
+bash examples/gb200/nvls-collective/run_ag_st_debug.sh                                  # 4 GPU，默认的 12 个暂停值
+bash examples/gb200/nvls-collective/run_ag_st_debug.sh --pause-cycles 0,1024,4096 --print-interval 128
+```
+
+| 变量 | 默认 | 含义 |
+|---|---|---|
+| `NCCL_SYM_AG_STMC_PAUSE_CYCLES` | 0 | 每个 4 KiB chunk 的 store 之后 warp 空转的 SM 周期（与 pause 版相同） |
+| `NCCL_SYM_AG_STMC_ST_PRINT_INTERVAL` | 0（关） | 每个 warp 每多少个 chunk 打印一行；脚本默认 64 |
+| `NCCL_SYM_AG_STMC_ST_PRINT_SKIP` | 0 | 每个 communicator 前多少次 AllGather_STMC launch 不打印（热身）；脚本设为 `--warmup` |
+| `NCCL_SYM_AG_STMC_ST_PRINT_LAUNCHES` | 1 | 跳过之后打印几次 launch，0 表示之后每次都打印；脚本设为 1 |
+
+- **计时窗口**：`bcastMultimem` 主循环里，每个 chunk 的 8 条 `multimem.st` 之前读一次 `clock64`，之后再读一次。
+  store 是 posted write，所以窗口是这 8 条 store 的发射时间：包含等这个 chunk 的 `ld.global` 数据（第一条 store
+  要用）和 LSU / NVLink 反压，不包含 store 真正落到对端。暂停在窗口之外。只计时 `AllGather_STMC`
+  （`AllGather_TmaSTMC` 通过 TMA 写，不是 `multimem.st`；脚本设置 `NCCL_SYM_TMA_ENABLE=0`）。
+- **每个 chunk 都计时，只是隔一段才打印**：warp 累加 sum / min / max，lane 0 每 `INTERVAL` 个 chunk 打印一行，
+  最后不够一个间隔的部分再打一行。间隔用倒计时（`if (--stCountdown == 0)`）判断，循环里没有除法或取模：
+  `[nccl-ag-stmc-st] launch=2 rank=0 cta=1 warp=3 iter=64 n=64 sum=... min=... max=... last=... pause=0 globaltimer=...`
+- **1 GiB 有多少个 chunk**：每个 rank 写自己的 1/n 分片，共 262144 / n 个 4 KiB chunk，分给 CTA_AG × 16 个 warp。
+  按 NCCL 自己选的 CTA 数：
+
+  | GPU | CTA_AG | warp/rank | chunk/rank | chunk/warp | 行/rank（间隔 64） |
+  |---|---|---|---|---|---|
+  | 4 | 4 | 64 | 65536 | 1024 | 1024 |
+  | 8 | 2 | 32 | 32768 | 1024 | 512 |
+  | 16 | 1 | 16 | 16384 | 1024 | 256 |
+  | 32 | 1 | 16 | 8192 | 512 | 128 |
+  | 64 | 1 | 16 | 4096 | 256 | 64 |
+
+  每个 rank 的行数 = chunk/rank ÷ 间隔（每个 warp 最多再多一行尾巴），和 CTA 数无关。device printf 的 FIFO
+  默认 1 MiB、每行约 100 字节，超出的行会被丢掉，所以脚本拒绝每 rank 超过 4096 行（4 GPU 时间隔至少 16）。
+  间隔 64 时一行覆盖约 83 µs（每个 chunk 约 1.3 µs），printf 的开销（估计在微秒量级，约 1%）落在所有计时窗口之外。
+- **为什么先热身再只打印一次**：第一次 launch 是冷的（kernel 懒加载、multicast 映射第一次访问、SM 时钟还在升频），
+  周期数不代表稳态；每次都打印只会让行数和 FIFO 压力成倍增加。所以先跑 `--warmup`（默认 2）次不打印的 AllGather，
+  再跑一次计时的 AllGather，只有这一次打印。
+- **暂停值**：`--pause-cycles` 接受列表，每个值单独起一次 torchrun（NCCL 每个进程只读一次这个变量），第 i 个用
+  `--master-port + i`。不传时用 `run_symm_cta_pause_sweep.sh` 按组大小选的同一组值，两边结果可以逐个对照。
+- **输出：每个暂停值一个文件**，`results/gb200/nvls-collective/ag-st-debug/gpu-num-<N>/<id>/pause<P>cyc.log`，
+  由 rank 0 通过 Gloo 收齐所有 rank 的数据后写出（多节点不需要共享文件系统；整次扫描共用一个 `<id>`）：
+
+  ```
+  # ag-st-debug status=ok
+  # nccl=2.32.3-pause-with-debug+cuda13.0 kernel=AllGather_STMC ctas=4 warps_per_cta=16 world_size=4 size_mib=1024 warmup=2 chunk_bytes=4096 chunks_per_rank=65536 NCCL_SYM_AG_STMC_PAUSE_CYCLES=1024 ...
+  # rank=0 host=... elapsed_ms=... busbw_gbps=... lines=1024 warps=64 chunks=65536 chunks_per_warp=1024-1024 st_cycles_mean=... st_cycles_min=... st_cycles_max=... span_ns=...
+  # rank=1 ...
+  [nccl-ag-stmc-st] launch=2 rank=0 cta=0 warp=0 iter=64 n=64 sum=... min=... max=... last=... pause=1024 globaltimer=...
+  ...
+  ```
+
+  `# key=value` 行是运行信息和每个 rank 的汇总，后面是所有原始行，按 rank、cta、warp、chunk 排序，格式和库里的
+  printf 一致（`ag_st_debug_benchmark.parse_lines` 可以直接读回）。检查没通过时写 `pause<P>cyc.failed.log`，
+  `status=failed`，并带 `# error:` 行。
+- **校验**：每个 rank 检查 AllGather 输出正确、打印的行覆盖了自己的每一个 chunk（丢行就失败）、自己的 NCCL 日志里
+  横幅是 `2.32.3-pause-with-debug`、四个变量的值都对、没有 CTA 变量；rank 0 还检查每次 AllGather 都是
+  `AllGather_STMC`，打印的 warp 数等于 CTA 数 × 每 CTA 的 warp 数。每个 rank 的 printf 日志、NCCL 日志和 torchrun 日志
+  写在各节点的 `<id>/.work/pause<P>cyc.node<K>/`，通过就删掉，失败就保留。周期换算成 ns 要除以 SM 时钟
+  （用 `nvidia-smi -lgc` 锁定）。
+- 所有变量为 0 时，kernel 仍然带着 printf 调用（寄存器更多），所以只做暂停扫描时继续用 `nccl-2.32.3-pause`；
+  `run_symm_cta_pause_sweep.sh` 只认 `2.32.3-pause` 横幅，会拒绝这个库。
+
 ## 本地检查（无 GPU）
 
 ```bash
@@ -973,7 +1043,8 @@ uv run --no-sync python -m pytest \
   tests/unit_tests/examples/test_gb200_nvls_collective.py \
   tests/unit_tests/examples/test_gb200_nvls_analyse_nsys.py \
   tests/unit_tests/examples/test_gb200_p2p_push_pull.py \
-  tests/unit_tests/examples/test_gb200_symm_cta_pause_sweep.py -q
+  tests/unit_tests/examples/test_gb200_symm_cta_pause_sweep.py \
+  tests/unit_tests/examples/test_gb200_ag_st_debug.py -q
 bash -n examples/gb200/nvls-collective/run_nvls_collective_benchmark.sh
 bash examples/gb200/nvls-collective/run_nvls_collective_benchmark.sh --dry-run
 bash examples/gb200/nvls-collective/run_p2p_push_pull_benchmark.sh --dry-run

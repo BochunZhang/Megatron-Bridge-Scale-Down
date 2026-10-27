@@ -1,0 +1,200 @@
+--- a/makefiles/version.mk
++++ b/makefiles/version.mk
+@@ -9,5 +9,9 @@
+ NCCL_MAJOR   := 2
+ NCCL_MINOR   := 32
+ NCCL_PATCH   := 3
+-NCCL_SUFFIX  :=
++# nccl-2.32.3-pause-with-debug: stock 2.32.3 plus the AllGather_STMC pause (NCCL_SYM_AG_STMC_PAUSE_CYCLES) and the
++# clock64 timing of its multimem.st (NCCL_SYM_AG_STMC_ST_PRINT_*). "NCCL version 2.32.3-pause-with-debug+cudaX.Y" in
++# the NCCL_DEBUG=VERSION banner and NCCL_SUFFIX in nccl.h, so a run shows which libnccl it loaded.
++# NCCL_VERSION_CODE (ncclGetVersion) and the soname are unchanged.
++NCCL_SUFFIX  := -pause-with-debug
+ PKG_REVISION := 1
+--- a/src/device/symmetric/all_gather.cuh
++++ b/src/device/symmetric/all_gather.cuh
+@@ -301,7 +301,7 @@ __device__ __forceinline__ void ncclSymkRun_AllGather_STMC_impl(ncclSymkDevWorkA
+     int t =
+       flattenIx(threadIdx.x % WARP_SIZE, WARP_SIZE, block, nBlocks, threadIdx.x / WARP_SIZE, blockDim.x / WARP_SIZE);
+     int tn = nBlocks * blockDim.x;
+-    bcastMultimem<char, EnableTma>(handler, tn, t, input, output + rank * nAllElts, nElts, rank);
++    bcastMultimem<char, EnableTma>(handler, tn, t, input, output + rank * nAllElts, nElts, rank, args->agStmcDebug);
+   });
+ 
+   if NCCL_IF_CONSTEXPR (EnableProfiler) ncclSymkProfilerPhase(args, NCCL_KERNEL_PHASE_BEFORE_CLOSE);
+--- a/src/device/symmetric/primitives.cuh
++++ b/src/device/symmetric/primitives.cuh
+@@ -335,10 +335,51 @@ static __device__ __forceinline__ void tmaLoadStoreMc(char* dest, char* smem, ch
+ }
+ #endif
+ 
++// nccl-2.32.3-pause-with-debug: the SM's cycle counter. It advances every SM cycle (ns = cycles / SM clock; lock
++// the clock with nvidia-smi -lgc for a fixed ns). The "memory" clobber keeps the compiler from moving the stores
++// across the reads.
++static __device__ __forceinline__ long long ncclSymkClock64() {
++  long long cycles;
++  asm volatile("mov.u64 %0, %%clock64;" : "=l"(cycles)::"memory");
++  return cycles;
++}
++
++// nccl-2.32.3-pause-with-debug: spin the calling warp for pauseCycles of clock64. %globaltimer is not used: how
++// often it advances is up to the GPU and the driver, and a coarse tick would make short pauses indistinguishable.
++static __device__ __forceinline__ void ncclSymkPauseCycles(uint32_t pauseCycles) {
++  long long start = ncclSymkClock64();
++  while (ncclSymkClock64() - start < (long long)pauseCycles) {
++  }
++}
++
++// nccl-2.32.3-pause-with-debug: the multimem.st cycles of the last n chunks of the calling warp, from its lane 0.
++// iter counts the warp's chunks so far in this bcastMultimem; globaltimer (ns) places the line in time across
++// SMs and GPUs (clock64 is per SM). Device printf lands in a FIFO (cudaLimitPrintfFifoSize, 1 MiB by default)
++// that the host prints to stdout at the next synchronization; lines past its end are dropped.
++static __device__ __noinline__ void ncclSymkPrintStCycles(ncclSymkAgStmcDebug dbg, int rank, uint32_t iter, uint32_t n,
++                                                          unsigned long long sum, uint32_t lo, uint32_t hi,
++                                                          uint32_t last) {
++  unsigned long long globaltimer;
++  asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(globaltimer));
++  printf("[nccl-ag-stmc-st] launch=%u rank=%d cta=%u warp=%u iter=%u n=%u sum=%llu min=%u max=%u last=%u "
++         "pause=%u globaltimer=%llu\n",
++         dbg.launch, rank, blockIdx.x, threadIdx.x / WARP_SIZE, iter, n, sum, lo, hi, last, dbg.pauseCycles,
++         globaltimer);
++}
++
+ // TODO: move this into data_ops.cuh
++// nccl-2.32.3-pause-with-debug: dbg (AllGather_STMC / AllGather_TmaSTMC only; the prefix / suffix bytes are left
++// alone) changes the main loop, one UnrollPacks x WARP_SIZE x BytePerPack = 4 KiB chunk per warp and iteration:
++//  - dbg.pauseCycles > 0: the warp spins that many SM cycles after the chunk's stores, before the next chunk.
++//  - dbg.printInterval > 0 (non-TMA path only): clock64 right before the chunk's first multimem.st and right after
++//    its last one. Stores are posted, so the window is the issue of the 8 multimem.st: it waits for the chunk's
++//    ld.global data (the first store needs it) and for the LSU / NVLink backpressure, not for the stores to land.
++//    The warp keeps sum / min / max over its chunks and its lane 0 prints them every printInterval chunks; a
++//    countdown decides when, so the loop has no division. The chunks left over at the end get one more line.
+ template <typename T, bool EnableTma = false>
+ static __device__ void bcastMultimem(ncclSymkArgsHandler& handler, int tn, int t, ncclSymPtr<T> input,
+-                                     ncclSymPtr<T> output, size_t nElts, uint32_t rank = 0) {
++                                     ncclSymPtr<T> output, size_t nElts, uint32_t rank = 0,
++                                     ncclSymkAgStmcDebug dbg = {}) {
+   size_t nBytes = nElts * sizeof(T);
+   uintptr_t inputUptr = reinterpret_cast<uintptr_t>(input.localPtr());
+   uintptr_t outputUptr = reinterpret_cast<uintptr_t>(output.multimemPtr(handler.comm.lsaMultimem));
+@@ -387,6 +428,9 @@ static __device__ void bcastMultimem(ncclSymkArgsHandler& handler, int tn, int t
+     cursor += (t / WARP_SIZE) * UnrollPacks * WARP_SIZE * BytePerPack;
+     cursor += (t % WARP_SIZE) * BytePerPack;
+     int nIters = (int)nChunks - (int)(t / WARP_SIZE);
++    // nccl-2.32.3-pause-with-debug: the chunks timed so far, the countdown to the next line and the open window.
++    uint32_t stIter = 0, stCountdown = dbg.printInterval, stLo = 0xffffffffu, stHi = 0, stLast = 0;
++    unsigned long long stSum = 0;
+     NVCC_PRAGMA_UNROLL_DISABLED
+     while (0 < nIters) {
+       if (cursor >= wrapAt) cursor -= nMainBytes;
+@@ -403,14 +447,35 @@ static __device__ void bcastMultimem(ncclSymkArgsHandler& handler, int tn, int t
+         for (int u = 0; u < UnrollPacks; u++) {
+           tmp[u] = *reinterpret_cast<BytePack<BytePerPack>*>(inputUptr + cursor + u * WARP_SIZE * BytePerPack);
+         }
++        long long stStart = 0;
++        if (dbg.printInterval != 0) stStart = ncclSymkClock64();
+         NVCC_PRAGMA_UNROLL_AUTO
+         for (int u = 0; u < UnrollPacks; u++) {
+           multimem_st_global(outputUptr + cursor + u * WARP_SIZE * BytePerPack, tmp[u]);
+         }
++        if (dbg.printInterval != 0) {
++          stLast = (uint32_t)(ncclSymkClock64() - stStart);
++          stSum += stLast;
++          stLo = min(stLo, stLast);
++          stHi = max(stHi, stLast);
++          stIter++;
++          if (--stCountdown == 0) {
++            if (threadIdx.x % WARP_SIZE == 0)
++              ncclSymkPrintStCycles(dbg, rank, stIter, dbg.printInterval, stSum, stLo, stHi, stLast);
++            stCountdown = dbg.printInterval;
++            stSum = 0;
++            stLo = 0xffffffffu;
++            stHi = 0;
++          }
++        }
+       }
++      if (dbg.pauseCycles != 0) ncclSymkPauseCycles(dbg.pauseCycles);
+       cursor += tn * UnrollPacks * BytePerPack;
+       nIters -= tn / WARP_SIZE;
+     }
++    // The chunks since the last line (stCountdown counts down from printInterval, so they are the difference).
++    if (stCountdown != dbg.printInterval && threadIdx.x % WARP_SIZE == 0)
++      ncclSymkPrintStCycles(dbg, rank, stIter, dbg.printInterval - stCountdown, stSum, stLo, stHi, stLast);
+   } else {
+     nPreBytes = 0;
+     nSufBytes = nBytes;
+--- a/src/include/sym_kernels.h
++++ b/src/include/sym_kernels.h
+@@ -97,6 +97,20 @@ struct ncclSymkState {
+   bool hasLsaMultimem;
+   int maxGinInboxBlocks;
+   struct ncclSymkDevComm kcomm;
++  // nccl-2.32.3-pause-with-debug: AllGather_STMC launches built on this communicator so far, the index
++  // NCCL_SYM_AG_STMC_ST_PRINT_SKIP / _LAUNCHES compare against.
++  uint32_t agStmcLaunches;
++};
++
++// nccl-2.32.3-pause-with-debug: what AllGather_STMC / AllGather_TmaSTMC pass to bcastMultimem.
++struct ncclSymkAgStmcDebug {
++  // NCCL_SYM_AG_STMC_PAUSE_CYCLES: SM cycles (clock64) every warp spins after each 4 KiB chunk of multimem stores.
++  uint32_t pauseCycles;
++  // NCCL_SYM_AG_STMC_ST_PRINT_INTERVAL for a printed launch, 0 otherwise: every warp times the multimem.st of
++  // each chunk with clock64 and prints one line per this many chunks (plus one for the rest at the end).
++  uint32_t printInterval;
++  // Index of this launch among the communicator's AllGather_STMC launches (0 = first), printed with every line.
++  uint32_t launch;
+ };
+ 
+ struct ncclSymkChannelWorkRange {
+@@ -127,6 +141,9 @@ struct alignas(16) ncclSymkDevWorkArgs {
+   int nMaxChannels;
+   int maxDynamicSmem;
+   uint8_t profilerMode; // ncclDevProfilerMode bits; nonzero means profilerWorkCounters[nMaxChannels] follows
++  // nccl-2.32.3-pause-with-debug: the pause and the multimem.st timing of AllGather_STMC / AllGather_TmaSTMC;
++  // all zero leaves the kernels' store loop as in stock NCCL.
++  struct ncclSymkAgStmcDebug agStmcDebug;
+   // Variable-length trailing data layout:
+   //   if profilerMode: uint64_t profilerWorkCounters[nMaxChannels] (aligned to 16)
+   //   ncclSymkChannelWorkRange[nChannels] (aligned to 16)
+--- a/src/scheduler/symmetric_sched.cc
++++ b/src/scheduler/symmetric_sched.cc
+@@ -21,6 +21,20 @@
+ #endif
+ 
+ extern int64_t ncclParamSingleProcMemRegEnable();
++// nccl-2.32.3-pause-with-debug: SM cycles (clock64) each AllGather_STMC / AllGather_TmaSTMC warp spins after every
++// 4 KiB chunk of multimem stores (primitives.cuh bcastMultimem); 0 (default) runs the stock kernels' loop.
++NCCL_PARAM(SymAgStmcPauseCycles, "SYM_AG_STMC_PAUSE_CYCLES", 0)
++// nccl-2.32.3-pause-with-debug: chunks per warp between two printed lines of AllGather_STMC's multimem.st cycles;
++// 0 (default) times nothing. Of each communicator's AllGather_STMC launches, the first PRINT_SKIP (warmup) print
++// nothing, the next PRINT_LAUNCHES print (0: every launch after the skipped ones), the rest print nothing again.
++NCCL_PARAM(SymAgStmcStPrintInterval, "SYM_AG_STMC_ST_PRINT_INTERVAL", 0)
++NCCL_PARAM(SymAgStmcStPrintSkip, "SYM_AG_STMC_ST_PRINT_SKIP", 0)
++NCCL_PARAM(SymAgStmcStPrintLaunches, "SYM_AG_STMC_ST_PRINT_LAUNCHES", 1)
++
++// nccl-2.32.3-pause-with-debug: a parameter clamped to 0..UINT32_MAX.
++static uint32_t symAgStmcParamU32(int64_t value) {
++  return value <= 0 ? 0 : value >= UINT32_MAX ? UINT32_MAX : (uint32_t)value;
++}
+ 
+ ncclDevRedOp_t symkRedOp(ncclRedOp_t redOp, ncclDevRedOp_t devRedOp) {
+   if (redOp == ncclAvg) {
+@@ -325,6 +339,18 @@ ncclResult_t ncclSymmetricTaskScheduler(struct ncclComm* comm,
+   // KernelCh-only launches leave the phase bit clear, so the profile variant skips the
+   // phase stamps and their fence at runtime.
+   argsBuf->profilerMode = profilerEnabled ? ncclProfilerDeviceMode(headTask->eActivationMask) : ncclDevProfilerModeNone;
++  // nccl-2.32.3-pause-with-debug: the parameters are read once per process (NCCL_PARAM caches them). Only
++  // AllGather_STMC is timed (AllGather_TmaSTMC stores through the TMA, not multimem.st) and counts launches; the
++  // count is taken when the launch is built, so a CUDA graph replays the printing of the launch it captured.
++  argsBuf->agStmcDebug.pauseCycles = symAgStmcParamU32(ncclParamSymAgStmcPauseCycles());
++  if (kernelId == ncclSymkKernelId_AllGather_STMC) {
++    uint32_t launch = comm->symkState.agStmcLaunches++;
++    uint32_t skip = symAgStmcParamU32(ncclParamSymAgStmcStPrintSkip());
++    uint32_t nPrinted = symAgStmcParamU32(ncclParamSymAgStmcStPrintLaunches());
++    bool printed = launch >= skip && (nPrinted == 0 || launch - skip < nPrinted);
++    argsBuf->agStmcDebug.printInterval = printed ? symAgStmcParamU32(ncclParamSymAgStmcStPrintInterval()) : 0;
++    argsBuf->agStmcDebug.launch = launch;
++  }
+ 
+   remainCell = cellPerChannel = DIVUP(DIVUP(totalCount, nMaxChannels), cellCount);
+   workRangePtr = argsBuf->getWorkRange();
