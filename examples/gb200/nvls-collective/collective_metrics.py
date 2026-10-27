@@ -585,6 +585,41 @@ def _kernel_cell(op: str, isolated: dict[str, object] | None, pair: dict[str, ob
     return alone or "-"
 
 
+def record_ctas(record: Mapping[str, object]) -> dict[str, str]:
+    """CTAs of each op of a record's workload, in launch order; ops without evidence are left out.
+
+    Collectives: the counts comm rank 0's NCCL TUNING log gave every launch of the case (``"6"``, or
+    ``"3|6"`` when launches differ; ``observed_ctas`` of the benchmark). read/write: the predicted
+    send/recv CTAs as ``"~16"``, since NCCL logs no channel count for them (nsys ``gridX`` measures it).
+    """
+    observed = record.get("observed_ctas") or {}
+    ctas: dict[str, str] = {}
+    for op in workload_ops(str(record["workload"])):
+        if op in ("read", "write"):
+            predicted = record.get("predicted_p2p_ctas")
+            if predicted is not None:
+                ctas[op] = f"~{predicted}"
+        elif observed.get(op):  # type: ignore[union-attr]
+            ctas[op] = str(observed[op])  # type: ignore[index]
+    return ctas
+
+
+def _ctas_summary(record: Mapping[str, object]) -> str:
+    ctas = record_ctas(record)
+    if not ctas:
+        return "-"
+    return "; ".join(f"{OP_LABELS.get(op, op)} {count}" for op, count in ctas.items())
+
+
+def _ctas_cell(op: str, isolated: dict[str, object] | None, pair: dict[str, object] | None = None) -> str:
+    """CTAs of ``op`` in its isolated case; the AG+RS pair is added only if it launched another count."""
+    alone = record_ctas(isolated).get(op) if isolated else None
+    together = record_ctas(pair).get(op) if pair else None
+    if together and together != alone:
+        return f"{alone or '-'}（pair：{together}）"
+    return alone or "-"
+
+
 def load_records(path: Path) -> list[dict[str, object]]:
     """Read one JSON object per non-empty line."""
     with path.open(encoding="utf-8") as handle:
@@ -641,6 +676,9 @@ def single_rows(records: Sequence[dict[str, object]]) -> list[list[str]]:
                 _kernel_cell("ag", ag, both),
                 _kernel_cell("rs", rs, both),
                 _kernel_cell("ar", ar),
+                _ctas_cell("ag", ag, both),
+                _ctas_cell("rs", rs, both),
+                _ctas_cell("ar", ar),
             ]
         )
     return rows
@@ -947,10 +985,7 @@ def cta_rows(records: Sequence[dict[str, object]]) -> list[list[str]]:
             if op not in workload_ops(str(r["workload"])):
                 cells.append("-")
                 continue
-            ctas = (r.get("observed_ctas") or {}).get(op)  # type: ignore[union-attr]
-            if op in ("read", "write"):
-                ctas = r.get("predicted_p2p_ctas")
-                ctas = None if ctas is None else f"~{ctas}"
+            ctas = record_ctas(r).get(op)
             ms = _optional_float(r.get(f"{op}_ms"))
             base_ms = _optional_float(base.get(f"{op}_ms")) if base else None
             ratio = f" ({ms / base_ms:.2f}x)" if ms and base_ms and base is not r else ""
@@ -1027,6 +1062,7 @@ def completion_rows(records: Sequence[dict[str, object]]) -> list[list[str]]:
                 _fmt(busbw),
                 _fmt(_optional_float(r.get("concurrency")), 3),
                 _kernel_summary(r),
+                _ctas_summary(r),
             ]
         )
     return rows
@@ -1075,6 +1111,10 @@ def render_report(records: Sequence[dict[str, object]]) -> str:
         "所以 nvls 的 AG 在 nsys 里也叫 `*_RING_LL`。copy-engine 的 AG 是 cudaMemcpy，没有 kernel。",
         "一个 op 出现多种实现时用 `\\|` 全部列出；`-` 表示没有日志证据。",
         "",
+        "CTAs：每个 op 每次 launch 的 CTA 数（= channel 数）。集合通信取自同一份 TUNING 日志（对称内核的 `nchannels`、",
+        "经典内核的 `channel{Lo..Hi}`），各 launch 不同时用 `\\|` 列出；read/write 是 send/recv，NCCL 不打日志，",
+        "写的是按源码推算的 `~N`，实测值看 nsys 分析报告 `nsys_kernels.md` 的 `CTAs (gridX)`。`-` 表示没有证据。",
+        "",
     ]
     lines += _table(
         [
@@ -1094,6 +1134,7 @@ def render_report(records: Sequence[dict[str, object]]) -> str:
             "busbw",
             "concurrency",
             "kernel",
+            "CTAs",
         ],
         completion_rows(all_records),
     )
@@ -1104,6 +1145,7 @@ def render_report(records: Sequence[dict[str, object]]) -> str:
         "speedup = (T_AG + T_RS) / T_AG+RS；1 表示完全串行，overlap_fraction = 1 表示短的操作被完全隐藏。",
         "AR busbw 已按 all-reduce 口径乘 2，可直接和 AG/RS 的 busbw 比。",
         "AG/RS/AR kernel：单独跑该 op 那个 case 的实际函数（来源同表 0）；AG+RS 同时发起时若换了实现，括号里注明。",
+        "AG/RS/AR CTAs：同一个 case 每次 launch 的 CTA 数（来源同表 0 的 CTAs 列）；AG+RS 同时发起时若 CTA 数不同，括号里注明。",
         "symm-tma、copy-engine 只测 ag 和 ag+rs，所以 RS/AR 列和 speedup、overlap_fraction 为 `-`；"
         "pair 里的 RS 是 `ReduceScatter_LDMC`（见 RS kernel 列的 pair 注明）。",
         "",
@@ -1124,6 +1166,9 @@ def render_report(records: Sequence[dict[str, object]]) -> str:
             "AG kernel",
             "RS kernel",
             "AR kernel",
+            "AG CTAs",
+            "RS CTAs",
+            "AR CTAs",
         ],
         single_rows(records),
     )

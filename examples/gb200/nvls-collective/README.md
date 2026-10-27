@@ -807,8 +807,8 @@ busbw = 357.9 × 7/8 = 313.2 GB/s。表 1–4 用 trial 中位数换算，表 0 
 
 | 表 | 回答 | 每行 | 关键列 |
 | --- | --- | --- | --- |
-| 0 | 每个测试的完成时间 | 实现 × case × 组 | mean / median / min / max ms、由 mean 算的 algbw / busbw、concurrency、**kernel** |
-| 1 | AG / RS / AR / AG+RS | 实现 × 组大小 × 消息 | AG busbw、RS busbw、AR busbw、AG+RS 中各自 busbw、pair aggregate、`speedup`、`overlap_fraction`、**AG / RS / AR kernel** |
+| 0 | 每个测试的完成时间 | 实现 × case × 组 | mean / median / min / max ms、由 mean 算的 algbw / busbw、concurrency、**kernel**、**CTAs** |
+| 1 | AG / RS / AR / AG+RS | 实现 × 组大小 × 消息 | AG busbw、RS busbw、AR busbw、AG+RS 中各自 busbw、pair aggregate、`speedup`、`overlap_fraction`、**AG / RS / AR kernel**、**AG / RS / AR CTAs** |
 | 1b | 各实现的绝对吞吐 | 组大小 × 消息 × 负载 | ring、nvls、symm、symm-p2p、symm-tma、copy-engine 的 aggregate busbw，及最高者 |
 | 2 | 相对 ring | 组大小 × 消息 × 负载 | 每个实现的 aggregate busbw 与 /ring |
 | 2a | TMA / CE 相对 symm | 组大小 × 消息 × 负载（只有 tma/ce 测过的 ag、ag+rs） | symm、symm-tma、copy-engine 的 aggregate busbw 与 /symm |
@@ -820,6 +820,10 @@ busbw = 357.9 × 7/8 = 313.2 GB/s。表 1–4 用 trial 中位数换算，表 0 
 | 6 | CTA 配置（仅 `--cta-configs` 有非 default 条目） | 实现 × case × CTA 配置 | 每个 op 的 CTA 数（P2P 为推算 `~N`）、每次迭代 ms 及相对 default 的比值、makespan / default |
 
 表 1–5 只用 `default` CTA 配置的结果；表 0 列出所有 case（含各 CTA 配置）。
+
+表 0 的 CTAs 列、表 1 的 AG / RS / AR CTAs 列是每个 op 每次 launch 的 CTA 数，取自 `observed_ctas`（comm rank 0 的
+TUNING 日志：对称内核的 `nchannels`、经典内核的 `channel{Lo..Hi}`），所以 `default` 配置下也能看到 NCCL 自己选了几个 CTA；
+各 launch 不同时写成 `3|6`，表 1 里 AG+RS 同时发起时 CTA 数变了会在括号里注明。read/write 没有日志，写推算值 `~N`。
 
 表 3、表 4 的 isolated 参照都是 `single-n<T/2>` 里同大小、同负载的 case（表 4：A 对 `ag`、B 对 `rs`），
 所以 cross case 只在 `--workloads` 同时包含 `ag` 和 `rs` 时运行（默认包含；`--symm-kernel` 固定内核时不跑）。

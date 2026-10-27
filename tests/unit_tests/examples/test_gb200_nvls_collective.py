@@ -1038,6 +1038,7 @@ def test_completion_rows_report_mean_median_and_mean_based_bandwidth():
     assert row[13] == f"{2 * 1.073741824 / 0.002 * 7 / 8:.1f}"
     assert row[14] == "-"
     assert row[15] == "-"  # no nccl_impl evidence, so no kernel is claimed
+    assert row[16] == "-"  # no observed_ctas either
 
 
 @pytest.mark.unit
@@ -1394,7 +1395,21 @@ def test_record_kernels_reads_every_op_and_every_implementation():
 def test_completion_rows_name_the_kernel_of_each_case():
     pair = _record(workload="ag+rs", nccl_impl="AllGather=NVLS/SIMPLE;ReduceScatter=NVLS/SIMPLE")
     (row,) = metrics.completion_rows([pair])
-    assert row[-1] == "AG ncclDevFunc_AllGather_NVLS_SIMPLE; RS ncclDevFunc_ReduceScatter_Sum_bf16_NVLS_SIMPLE"
+    assert row[15] == "AG ncclDevFunc_AllGather_NVLS_SIMPLE; RS ncclDevFunc_ReduceScatter_Sum_bf16_NVLS_SIMPLE"
+
+
+@pytest.mark.unit
+def test_completion_rows_give_the_ctas_of_each_op():
+    pair = _record(algo="symm", workload="ag+rs", observed_ctas={"ag": "2", "rs": "4"})
+    (row,) = metrics.completion_rows([pair])
+    assert row[16] == "AG 2; RS 4"
+    # Launches on different counts are all listed; a send/recv gives the predicted count.
+    write = _record(algo="symm", workload="ag+write", observed_ctas={"ag": "3|6"}, predicted_p2p_ctas=16)
+    (row,) = metrics.completion_rows([write])
+    assert row[16] == "AG 3|6; write ~16"
+    report = metrics.render_report([pair])
+    assert "| kernel | CTAs |" in report
+    assert "| AG CTAs | RS CTAs | AR CTAs |" in report
 
 
 @pytest.mark.unit
@@ -1412,7 +1427,7 @@ def test_single_rows_show_isolated_kernels_and_flag_a_different_one_in_the_pair(
         ),
     ]
     (row,) = metrics.single_rows(records)
-    assert row[-3:] == [
+    assert row[11:14] == [
         "ncclSymkDevKernel_AllGather_STMC（pair：ncclSymkDevKernel_AllGather_ST）",
         "ncclSymkDevKernel_ReduceScatter_LDMC_sum_bf16",
         "ncclSymkDevKernel_AllReduce_RSxLDMC_AGxSTMC_sum_bf16",
@@ -2017,6 +2032,17 @@ def test_cta_configs_pass_the_multicast_cap_but_not_nccl_sym_ctas(monkeypatch):
         benchmark._check_environment("symm", 4, benchmark.parse_args([*base, "--cta-configs", "ag=12"]))
     # NCCL_SYM_CTAS together with a P2P-only config is fine: it leaves the P2P communicator alone.
     benchmark._check_environment("symm", 4, benchmark.parse_args([*base, "--cta-configs", "p2p=32"]))
+
+
+@pytest.mark.unit
+def test_single_rows_show_isolated_ctas_and_flag_a_different_count_in_the_pair():
+    records = [
+        _record(algo="symm", workload="ag", observed_ctas={"ag": "2"}),
+        _record(algo="symm", workload="rs", observed_ctas={"rs": "4"}),
+        _record(algo="symm", workload="ag+rs", observed_ctas={"ag": "2", "rs": "2"}),
+    ]
+    (row,) = metrics.single_rows(records)
+    assert row[14:17] == ["2", "4（pair：2）", "-"]
 
 
 @pytest.mark.unit
