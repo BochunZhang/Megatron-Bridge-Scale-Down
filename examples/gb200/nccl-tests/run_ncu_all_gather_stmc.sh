@@ -24,7 +24,9 @@ nccl-tests all_gather_perf (install/install-nccl-tests-2.32.3.sh, build-mpi) run
 per GPU. The NCCL kernels of the ranks only make progress together, so ncu's multiprocess
 communicator launches and replays each profiled kernel on all ranks in lockstep:
   shmem  one ncu wraps mpirun and sees every rank in its process tree (default)
-  tcp    mpirun starts one ncu per rank; they meet at 127.0.0.1:<port>
+  tcp    mpirun starts one ncu per rank; they meet at 127.0.0.1:<port> (kernel replay only:
+         application replay would have to relaunch one MPI rank without mpirun)
+  none   one ncu wraps mpirun without a communicator; for comparison runs
 
 The kernel is forced with:
   -R 2                                   symmetric window registration of send/recv buffers
@@ -47,7 +49,7 @@ Options:
   --size BYTES           AllGather output size, nccl-tests -b/-e syntax; each rank sends size/n
                          (default: 256M)
   --datatype TYPE        nccl-tests -d (default: bfloat16)
-  --communicator MODE    shmem | tcp (default: shmem)
+  --communicator MODE    shmem | tcp | none (default: shmem)
   --tcp-port N           Port of the tcp communicator (default: ncu's own)
   --set NAME             ncu --set (default: full)
   --replay-mode MODE     ncu --replay-mode: application | kernel (default: application). kernel
@@ -66,7 +68,7 @@ Options:
   -h, --help
 
 Outputs in --output-dir: baseline.log, ncu.log, nccl-logs/<pass>/*.log, the ncu report
-(ag_stmc.ncu-rep for shmem, ag_stmc.rank<R>.ncu-rep for tcp) and summary.csv
+(ag_stmc.ncu-rep for shmem / none, ag_stmc.rank<R>.ncu-rep for tcp) and summary.csv
 (one row per profiled kernel: rank/device, grid, duration).
 USAGE
 }
@@ -121,8 +123,10 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
-[[ "$communicator" == shmem || "$communicator" == tcp ]] || die "--communicator must be shmem or tcp"
+[[ "$communicator" =~ ^(shmem|tcp|none)$ ]] || die "--communicator must be shmem, tcp or none"
 [[ "$replay_mode" == application || "$replay_mode" == kernel ]] || die "--replay-mode must be application or kernel"
+[[ "$communicator" == tcp && "$replay_mode" == application ]] \
+    && die "--communicator tcp needs --replay-mode kernel: application replay cannot relaunch one MPI rank alone"
 IFS=, read -r -a gpu_list <<<"$gpus"
 nranks=${#gpu_list[@]}
 (( nranks >= 2 )) || die "--gpus needs at least two GPUs"
@@ -224,6 +228,9 @@ run_pass() {
     if grep -q "Failed to save memory for replay" "${output_dir}/${pass}.log"; then
         die "${pass}: ncu could not save the kernel's memory for kernel replay; use --replay-mode application (see the /tmp/nsight-compute-*.log named in ${output_dir}/${pass}.log)"
     fi
+    if grep -q "No kernels were profiled" "${output_dir}/${pass}.log"; then
+        die "${pass}: ncu profiled no kernel (communicator=${communicator}, replay=${replay_mode}); see ${output_dir}/${pass}.log"
+    fi
     (( status == 0 )) || die "${pass} exited with ${status}; see ${output_dir}/${pass}.log"
     grep -q "Out of bounds values : 0 OK" "${output_dir}/${pass}.log" \
         || die "${pass}: nccl-tests did not report 'Out of bounds values : 0 OK'"
@@ -256,10 +263,12 @@ ncu_args=(
     "${extra_ncu_args[@]}"
 )
 
-if [[ "$communicator" == shmem ]]; then
+if [[ "$communicator" != tcp ]]; then
     report="${output_dir}/ag_stmc"
+    comm_args=(--communicator none)
+    [[ "$communicator" == shmem ]] && comm_args=(--communicator shmem --communicator-shmem-num-peers "$nranks")
     run_pass ncu $(( 2 * (launch_skip + launch_count) )) \
-        "$ncu_bin" --communicator shmem --communicator-shmem-num-peers "$nranks" "${ncu_args[@]}" \
+        "$ncu_bin" "${comm_args[@]}" "${ncu_args[@]}" \
         --export "$report" \
         "$mpirun_bin" "${mpirun_args[@]}" "$bench" "${bench_args[@]}" "${ncu_iters[@]}"
     reports=("${report}.ncu-rep")

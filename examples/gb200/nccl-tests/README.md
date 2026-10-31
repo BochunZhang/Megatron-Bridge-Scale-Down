@@ -15,7 +15,8 @@ communicator，它让同一个 kernel 在所有 rank 上同时 launch、同时�
 | 模式 | 启动方式 | 适用场景 |
 | --- | --- | --- |
 | `shmem`（默认） | 一个 ncu 包住 `mpirun -np 4`，4 个 rank 都在它的进程树里 | 单节点 |
-| `tcp` | `mpirun -np 4` 给每个 rank 各起一个 ncu，通过 `127.0.0.1` 汇合，并加 `--lockstep-kernel-launch` | shmem 识别不到 rank 时的备选；多节点 |
+| `tcp` | `mpirun -np 4` 给每个 rank 各起一个 ncu，通过 `127.0.0.1` 汇合，并加 `--lockstep-kernel-launch` | 只能配 `--replay-mode kernel`（MPI rank 无法脱离 mpirun 单独重启）；多节点 |
+| `none` | 一个 ncu 包住 `mpirun -np 4`，不启用 communicator | 对照实验 |
 
 shmem 走的是主机 `/dev/shm` 上的 POSIX 共享内存，tcp 走 socket。两者都只传控制消息，不占 HBM、NVLink，
 也不经过 NCCL。
@@ -139,6 +140,20 @@ nccl-tests 对每个消息大小都会先跑 out-of-place，再跑 in-place，�
 - TUNING 日志每一遍都会多出一份，脚本按「每次运行 `2 × (w + n)` 次 STMC」乘以运行次数来检查。
 
 如果想试 kernel replay，可以加 `--replay-mode kernel`。
+
+**实测结果（2026-10-31，shmem + application）：没有 profile 到 kernel。**程序完整跑完，数据校验通过，
+但 ncu 全程没有输出 `Profiling "..."` 或 `Application replay pass N`，最后报 `No kernels were profiled`。
+out-of-place 那次 AllGather 耗时 7.6 s（in-place 只有 1.7 ms），说明 ncu 在这个 kernel 处停了很久后放弃了。
+ncu 二进制里有 `Did not find candidates for profiling across all communicator clients` 这条提示，推测是
+shmem communicator 在 application replay 下没能让 4 个 rank 对齐到同一个候选 kernel，尚未证实。
+
+所以目前两种 replay 都还没跑通，对照实验：
+
+| 命令 | 要验证什么 |
+| --- | --- |
+| `--replay-mode kernel -- --metrics gpu__time_duration.sum` | 只要 1 遍、不需要 replay 时，ncu 是否还会去保存显存 |
+| `--replay-mode kernel --set basic` | 少量 pass 时保存显存是否成功 |
+| `--communicator none --replay-mode application --set basic` | 不用 communicator 时，application replay 能否拦到 kernel（可能卡住，由 `--timeout` 兜底） |
 
 ## 输出
 
