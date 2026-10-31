@@ -28,12 +28,16 @@
 #
 # Usage:
 #   ./install/install-nccl-tests-2.32.3.sh [--nccl-home DIR] [--dest DIR] [--mpi-home DIR]
+#                                          [--mpi-include DIR] [--mpi-lib DIR]
 #                                          [--cuda-home DIR] [--jobs N] [--update] [--rebuild]
 #
 #   --nccl-home DIR NCCL 2.32.3 build (default: <megatron-bridge>/nccl/nccl-2.32.3/build)
 #   --dest DIR      nccl-tests checkout (default: <megatron-bridge>/nccl/nccl-tests)
 #   --mpi-home DIR  MPI prefix with include/mpi.h and lib/libmpi.so (default: ask mpicc in PATH for
-#                   its include / library directories)
+#                   its include / library directories, then try the libopenmpi-dev layout)
+#   --mpi-include DIR  Directory with mpi.h, when it is not under the prefix
+#                   (e.g. /usr/lib/aarch64-linux-gnu/openmpi/include)
+#   --mpi-lib DIR   Directory with libmpi.so (e.g. /usr/lib/aarch64-linux-gnu)
 #   --cuda-home DIR CUDA toolkit, >= 12.8 for sm_100 (default: CUDA_HOME or /usr/local/cuda)
 #   --jobs N        make -j (default: nproc)
 #   --update        Fetch the latest nccl-tests commit into an existing checkout before building
@@ -50,6 +54,8 @@ repo_root="$(cd -- "${script_dir}/.." && pwd)"
 nccl_home="${repo_root}/nccl/nccl-2.32.3/build"
 dest="${repo_root}/nccl/nccl-tests"
 mpi_home="${MPI_HOME:-}"
+mpi_include_arg=""
+mpi_lib_arg=""
 cuda_home="${CUDA_HOME:-/usr/local/cuda}"
 # GNU nproc honours OMP_NUM_THREADS, which training environments usually export as 1.
 jobs="$(env -u OMP_NUM_THREADS -u OMP_THREAD_LIMIT nproc 2>/dev/null || echo 16)"
@@ -68,11 +74,13 @@ while [[ $# -gt 0 ]]; do
         --nccl-home) nccl_home="$2"; shift 2 ;;
         --dest) dest="$2"; shift 2 ;;
         --mpi-home) mpi_home="$2"; shift 2 ;;
+        --mpi-include) mpi_include_arg="$2"; shift 2 ;;
+        --mpi-lib) mpi_lib_arg="$2"; shift 2 ;;
         --cuda-home) cuda_home="$2"; shift 2 ;;
         --jobs) jobs="$2"; shift 2 ;;
         --update) update=true; shift ;;
         --rebuild) rebuild=true; shift ;;
-        -h|--help) sed -n '16,41p' "$0"; exit 0 ;;
+        -h|--help) sed -n '16,45p' "$0"; exit 0 ;;
         *) die "unknown argument: $1" ;;
     esac
 done
@@ -168,18 +176,23 @@ build() {
 
 build "${dest}/build" MPI=0
 
-# The MPI include and library directories. <mpicc>/.. is not always the install prefix: distro
-# packages put mpi.h under e.g. /usr/lib/x86_64-linux-gnu/openmpi/include, so ask the wrapper.
-mpi_incdirs=() mpi_libdirs=() mpi_why=""
+# The MPI include and library directories, first match wins:
+#   --mpi-include / --mpi-lib, then --mpi-home, then what mpicc in PATH reports, then the
+#   Debian/Ubuntu libopenmpi-dev layout (/usr/lib/<arch>-linux-gnu/openmpi/include, libmpi.so in
+#   /usr/lib/<arch>-linux-gnu). <mpicc>/.. is not always the prefix, so the wrapper is asked.
+mpi_incdirs=() mpi_libdirs=() mpi_sources=()
+[[ -n "$mpi_include_arg" ]] && { mpi_incdirs+=("$mpi_include_arg"); mpi_sources+=("--mpi-include"); }
+[[ -n "$mpi_lib_arg" ]] && { mpi_libdirs+=("$mpi_lib_arg"); mpi_sources+=("--mpi-lib"); }
 if [[ -n "$mpi_home" ]]; then
-    mpi_incdirs=("${mpi_home}/include") mpi_libdirs=("${mpi_home}/lib" "${mpi_home}/lib64")
-    mpi_why="--mpi-home / MPI_HOME=${mpi_home}"
-elif command -v mpicc >/dev/null; then
+    mpi_incdirs+=("${mpi_home}/include") mpi_libdirs+=("${mpi_home}/lib" "${mpi_home}/lib64")
+    mpi_sources+=("--mpi-home / MPI_HOME=${mpi_home}")
+fi
+if command -v mpicc >/dev/null; then
     mpicc_bin="$(command -v mpicc)"
     if incs="$(mpicc --showme:incdirs 2>/dev/null)"; then
         # Open MPI / HPC-X
-        read -r -a mpi_incdirs <<<"$incs"
-        read -r -a mpi_libdirs <<<"$(mpicc --showme:libdirs 2>/dev/null)"
+        read -r -a dirs <<<"$incs"; mpi_incdirs+=("${dirs[@]}")
+        read -r -a dirs <<<"$(mpicc --showme:libdirs 2>/dev/null)"; mpi_libdirs+=("${dirs[@]}")
     else
         # MPICH / Intel MPI: "-show" prints the compiler command line with -I / -L flags.
         for flag in $(mpicc -show 2>/dev/null); do
@@ -191,28 +204,39 @@ elif command -v mpicc >/dev/null; then
     fi
     prefix="$(cd -- "$(dirname -- "$(readlink -f "$mpicc_bin")")/.." && pwd)"
     mpi_incdirs+=("${prefix}/include") mpi_libdirs+=("${prefix}/lib" "${prefix}/lib64")
-    mpi_home="$prefix"
-    mpi_why="${mpicc_bin}"
+    mpi_sources+=("$mpicc_bin")
 fi
-mpi_include=""
+multiarch="$(uname -m)-linux-gnu"
+mpi_incdirs+=("/usr/lib/${multiarch}/openmpi/include" /usr/include/openmpi /usr/include/mpich /usr/include)
+mpi_libdirs+=("/usr/lib/${multiarch}" "/usr/lib/${multiarch}/openmpi/lib")
+mpi_include="" mpi_lib=""
 for dir in "${mpi_incdirs[@]}"; do
-    [[ -f "${dir}/mpi.h" ]] && { mpi_include="$dir"; break; }
+    [[ -n "$dir" && -f "${dir}/mpi.h" ]] && { mpi_include="$dir"; break; }
 done
-if [[ -z "$mpi_why" ]]; then
-    note "no MPI found (mpicc not in PATH, no --mpi-home); skipped build-mpi"
+for dir in "${mpi_libdirs[@]}"; do
+    [[ -n "$dir" && -e "${dir}/libmpi.so" ]] && { mpi_lib="$dir"; break; }
+done
+if [[ -z "$mpi_include" && -z "$mpi_lib" && ${#mpi_sources[@]} -eq 0 ]]; then
+    note "no MPI found (no mpicc in PATH, no --mpi-home / --mpi-include, no libopenmpi-dev); skipped build-mpi"
     note "run_ncu_all_gather_stmc.sh needs it: one process per GPU is only possible through MPI"
 elif [[ -z "$mpi_include" ]]; then
-    die "MPI from ${mpi_why}, but no mpi.h in: ${mpi_incdirs[*]}; pass --mpi-home <prefix with include/mpi.h>"
+    die "no mpi.h in: ${mpi_incdirs[*]}; pass --mpi-include <dir with mpi.h>"
+elif [[ -z "$mpi_lib" ]]; then
+    die "no libmpi.so in: ${mpi_libdirs[*]}; pass --mpi-lib <dir with libmpi.so>"
 else
-    # nccl-tests links -L$(MPI_HOME)/lib{,64} -lmpi; the wrapper's library directories reach the
-    # linker through LIBRARY_PATH, since overriding NVLDFLAGS would drop the Makefile's own flags.
-    mpi_libpath="$(IFS=:; echo "${mpi_libdirs[*]}")"
-    echo "MPI: ${mpi_why} (mpi.h in ${mpi_include}, libraries in ${mpi_libpath})"
-    LIBRARY_PATH="${mpi_libpath}${LIBRARY_PATH:+:${LIBRARY_PATH}}" \
-        build "${dest}/build-mpi" MPI=1 MPI_HOME="$mpi_home" MPI_INCLUDE="$mpi_include"
+    # nccl-tests compiles with -I$(MPI_INCLUDE) and links -L$(MPI_HOME)/lib{,64} -lmpi. MPI_HOME is
+    # set to the parent of the library directory, and the directory itself also reaches the linker
+    # through LIBRARY_PATH: overriding NVLDFLAGS would drop the Makefile's own flags.
+    echo "MPI: mpi.h in ${mpi_include}, libmpi.so in ${mpi_lib}"
+    LIBRARY_PATH="${mpi_lib}${LIBRARY_PATH:+:${LIBRARY_PATH}}" \
+        build "${dest}/build-mpi" MPI=1 MPI_HOME="$(dirname -- "$mpi_lib")" MPI_INCLUDE="$mpi_include"
     LD_LIBRARY_PATH="${nccl_home}/lib" ldd "${dest}/build-mpi/all_gather_perf" | grep -q "libmpi.*=> /" \
-        && ok "${dest}/build-mpi/all_gather_perf links libmpi" \
-        || note "libmpi does not resolve at run time; add one of ${mpi_libpath} to LD_LIBRARY_PATH"
+        && ok "${dest}/build-mpi/all_gather_perf links $(LD_LIBRARY_PATH="${nccl_home}/lib" ldd "${dest}/build-mpi/all_gather_perf" | awk '/libmpi\./ {print $3; exit}')" \
+        || note "libmpi does not resolve at run time; add ${mpi_lib} to LD_LIBRARY_PATH"
+    # all_gather_perf must be started by the mpirun of the MPI it links.
+    if command -v mpirun >/dev/null; then
+        echo "  mpirun in PATH: $(command -v mpirun) ($(mpirun --version 2>&1 | head -1))"
+    fi
 fi
 
 echo "=== nccl-tests ready: ${dest}"
