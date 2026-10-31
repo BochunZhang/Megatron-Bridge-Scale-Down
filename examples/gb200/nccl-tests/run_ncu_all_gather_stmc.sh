@@ -50,6 +50,10 @@ Options:
   --communicator MODE    shmem | tcp (default: shmem)
   --tcp-port N           Port of the tcp communicator (default: ncu's own)
   --set NAME             ncu --set (default: full)
+  --replay-mode MODE     ncu --replay-mode: application | kernel (default: application). kernel
+                         replay saves and restores the memory the kernel can reach before every
+                         pass, which fails for the symmetric windows ("Failed to save memory for
+                         replay"); application relaunches all ranks once per pass instead
   --launch-skip N        STMC launches per rank to skip before profiling (default: 1, the warmup)
   --launch-count N       STMC launches to profile (default: 1)
   --timeout SEC          Kill a pass after SEC seconds and report a hang (default: 1800)
@@ -76,6 +80,7 @@ datatype="bfloat16"
 communicator="shmem"
 tcp_port=""
 ncu_set="full"
+replay_mode="application"
 launch_skip=1
 launch_count=1
 timeout_sec=1800
@@ -100,6 +105,7 @@ while [[ $# -gt 0 ]]; do
         --communicator) communicator="$2"; shift 2 ;;
         --tcp-port) tcp_port="$2"; shift 2 ;;
         --set) ncu_set="$2"; shift 2 ;;
+        --replay-mode) replay_mode="$2"; shift 2 ;;
         --launch-skip) launch_skip="$2"; shift 2 ;;
         --launch-count) launch_count="$2"; shift 2 ;;
         --timeout) timeout_sec="$2"; shift 2 ;;
@@ -116,6 +122,7 @@ while [[ $# -gt 0 ]]; do
 done
 
 [[ "$communicator" == shmem || "$communicator" == tcp ]] || die "--communicator must be shmem or tcp"
+[[ "$replay_mode" == application || "$replay_mode" == kernel ]] || die "--replay-mode must be application or kernel"
 IFS=, read -r -a gpu_list <<<"$gpus"
 nranks=${#gpu_list[@]}
 (( nranks >= 2 )) || die "--gpus needs at least two GPUs"
@@ -174,28 +181,32 @@ bench_args=(-b "$size" -e "$size" -d "$datatype" -g 1 -R 2)
     echo "nccl_home=${nccl_home}"
     echo "nccl_tests=${nccl_tests} ($(git -C "$nccl_tests" log -1 --format='%h %cd' --date=short 2>/dev/null || echo ?))"
     echo "ncu=$(command -v "$ncu_bin") ${ncu_version}"
-    echo "gpus=${gpus} size=${size} datatype=${datatype} communicator=${communicator} set=${ncu_set}"
+    echo "gpus=${gpus} size=${size} datatype=${datatype} communicator=${communicator} set=${ncu_set} replay=${replay_mode}"
     echo "launch_skip=${launch_skip} launch_count=${launch_count} extra_ncu_args=${extra_ncu_args[*]:-}"
     env | grep -E '^(NCCL_|CUDA_VISIBLE_DEVICES=)' | sort
 } >"${output_dir}/config.txt"
 cat "${output_dir}/config.txt"
 
 # Every AllGather in the TUNING log of the pass must be AllGather_STMC, and there must be
-# <expected> of them. NCCL prints the line on comm rank 0 only.
+# <expected> of them per application run. NCCL prints the line on comm rank 0 only, into one log
+# per process; application replay starts the ranks again for every ncu pass, so <runs> is the
+# number of rank-0 logs.
 check_tuning() {
-    local pass="$1" expected="$2" logs ag stmc
+    local pass="$1" expected="$2" logs ag stmc total runs
     logs=("${output_dir}/nccl-logs/${pass}"/*.log)
     ag="$(cat "${logs[@]}" | grep -E 'NCCL INFO AllGather( \[[^]]*\])?: [0-9]+ Bytes -> ' || true)"
     stmc="$(grep -c 'AllGather \[Symmetric\]: [0-9]* Bytes -> Kernel AllGather_STMC' <<<"$ag" || true)"
-    if [[ "$(grep -c . <<<"$ag" || true)" != "$expected" || "$stmc" != "$expected" ]]; then
-        echo "${pass}: expected ${expected} AllGather_STMC launches in the TUNING log, got:" >&2
+    total="$(grep -c . <<<"$ag" || true)"
+    runs="$(grep -lE 'NCCL INFO AllGather( \[[^]]*\])?: [0-9]+ Bytes -> ' "${logs[@]}" | wc -l | tr -d ' ')"
+    if (( runs == 0 || total != stmc || total != runs * expected )); then
+        echo "${pass}: expected ${expected} AllGather_STMC launches per run in the TUNING log (${runs} run(s)), got:" >&2
         sort <<<"$ag" | sed 's/.*NCCL INFO //; s/ Bytes -> \(\S* \S*\).*/ Bytes -> \1/' | uniq -c >&2
         die "${pass}: NCCL did not run AllGather_STMC for every launch; logs in ${output_dir}/nccl-logs/${pass}"
     fi
-    echo "${pass}: ${stmc}/${expected} AllGather launches are AllGather_STMC"
+    echo "${pass}: ${stmc}/${total} AllGather launches are AllGather_STMC (${runs} run(s) x ${expected})"
 }
 
-# run_pass <name> <expected AllGather count> <cmd...>
+# run_pass <name> <expected AllGather count per run> <cmd...>
 run_pass() {
     local pass="$1" expected="$2"; shift 2
     mkdir -p "${output_dir}/nccl-logs/${pass}"
@@ -209,6 +220,9 @@ run_pass() {
     fi
     if grep -q "ERR_NVGPUCTRPERM" "${output_dir}/${pass}.log"; then
         die "${pass}: no permission for GPU performance counters; run as root or load nvidia with NVreg_RestrictProfilingToAdminUsers=0"
+    fi
+    if grep -q "Failed to save memory for replay" "${output_dir}/${pass}.log"; then
+        die "${pass}: ncu could not save the kernel's memory for kernel replay; use --replay-mode application (see the /tmp/nsight-compute-*.log named in ${output_dir}/${pass}.log)"
     fi
     (( status == 0 )) || die "${pass} exited with ${status}; see ${output_dir}/${pass}.log"
     grep -q "Out of bounds values : 0 OK" "${output_dir}/${pass}.log" \
@@ -233,6 +247,7 @@ fi
 ncu_iters=(-w "$launch_skip" -n "$launch_count" -c 0)
 ncu_args=(
     --set "$ncu_set"
+    --replay-mode "$replay_mode"
     --kernel-name "regex:^ncclSymkDevKernel_AllGather_STMC"
     --launch-skip "$launch_skip"
     --launch-count "$launch_count"

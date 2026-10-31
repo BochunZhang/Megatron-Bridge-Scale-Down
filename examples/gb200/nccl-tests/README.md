@@ -74,7 +74,8 @@ bash examples/gb200/nccl-tests/run_ncu_all_gather_stmc.sh
 脚本依次跑两遍：
 
 1. **baseline**：不挂 ncu，打开数据校验。确认 `AllGather_STMC` 能被选中、结果正确。
-2. **ncu**：只 profile `^ncclSymkDevKernel_AllGather_STMC`。默认跳过 1 次 warmup，采集 1 次，使用 `--set full`。
+2. **ncu**：只 profile `^ncclSymkDevKernel_AllGather_STMC`。默认跳过 1 次 warmup，采集 1 次，使用 `--set full`
+   和 `--replay-mode application`（见下文「为什么用 application replay」）。
 
 每一遍都会检查 NCCL 的 TUNING 日志：每次 AllGather launch 都必须是
 `AllGather [Symmetric]: <n> Bytes -> Kernel AllGather_STMC`，launch 次数也要对上，否则直接报错退出。
@@ -89,7 +90,7 @@ bash examples/gb200/nccl-tests/run_ncu_all_gather_stmc.sh --communicator tcp
 # 换消息大小或数据类型；--size 是 AllGather 的总输出大小，每个 rank 发送 size/4
 bash examples/gb200/nccl-tests/run_ncu_all_gather_stmc.sh --size 1G --datatype float
 
-# 只采几个 section，速度更快
+# 只采几个 section，需要的 pass 少，application replay 重启的次数也少
 bash examples/gb200/nccl-tests/run_ncu_all_gather_stmc.sh --set basic
 
 # 用 -- 透传额外的 ncu 参数，例如不锁频
@@ -113,6 +114,31 @@ bash examples/gb200/nccl-tests/run_ncu_all_gather_stmc.sh --gpus 4,5,6,7 --ncu /
 
 nccl-tests 对每个消息大小都会先跑 out-of-place，再跑 in-place，每一遍各有 `-w + -n + -c` 次 launch，
 所以期望的 STMC launch 数是 `2 × (w + n + c)`。被 profile 的那次 launch 在 out-of-place 那一遍里。
+
+## 为什么用 application replay
+
+`--set full` 需要很多遍（pass）才能采完全部计数器。ncu 默认的 kernel replay 在每一遍之前都要保存、
+之后恢复这个 kernel 能访问到的全部显存。在 4 卡上实测（shmem 模式），4 个 rank 都在 STMC kernel 处
+齐步停下，`==PROF== Waiting for 4 clients` 之后报错：
+
+```text
+==WARNING== Backing up device memory in system memory. Kernel replay might be slow. ...
+==ERROR== Failed to save memory for replay. If the issue persists, consider using --replay-mode application ...
+==ERROR== Failed to wait for profiling
+```
+
+这说明 communicator 本身没有问题，失败的是保存显存这一步。STMC kernel 能访问的不只是本卡的 buffer，
+还有 symmetric window 映射进来的其他 3 张卡的显存，以及 multicast 对象。ncu 的报错没有说明是哪一块
+保存失败，细节在报错里给出的 `/tmp/nsight-compute-*.log` 中。
+
+`--replay-mode application` 不保存显存，而是每一遍都把 `mpirun` 连同 4 个 rank 整体重新启动，
+所以每次都是新的 NCCL 初始化，也就没有需要恢复的状态。代价是：
+
+- 慢：`--set full` 有几十遍，每一遍都要重新启动并初始化 NCCL；用 `--set basic` 可以少很多遍。
+- 要求每次运行的 kernel 序列相同。nccl-tests 每次都按同样的顺序 launch，满足这个要求。
+- TUNING 日志每一遍都会多出一份，脚本按「每次运行 `2 × (w + n)` 次 STMC」乘以运行次数来检查。
+
+如果想试 kernel replay，可以加 `--replay-mode kernel`。
 
 ## 输出
 
