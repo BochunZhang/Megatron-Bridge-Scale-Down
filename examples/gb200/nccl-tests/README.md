@@ -85,8 +85,8 @@ bash examples/gb200/nccl-tests/run_ncu_all_gather_stmc.sh
 常用变体：
 
 ```bash
-# shmem 识别不到 rank 或卡住时，改用 tcp
-bash examples/gb200/nccl-tests/run_ncu_all_gather_stmc.sh --communicator tcp
+# shmem 识别不到 rank 或卡住时，改用 tcp（每个 rank 一个 ncu，只能用 kernel replay）
+bash examples/gb200/nccl-tests/run_ncu_all_gather_stmc.sh --communicator tcp --replay-mode kernel
 
 # 换消息大小或数据类型；--size 是 AllGather 的总输出大小，每个 rank 发送 size/4
 bash examples/gb200/nccl-tests/run_ncu_all_gather_stmc.sh --size 1G --datatype float
