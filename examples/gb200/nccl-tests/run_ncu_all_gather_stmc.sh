@@ -137,7 +137,6 @@ ncu_minor="${ncu_version#*.}"
 if [[ -z "$ncu_version" ]] || (( ncu_year < 2026 || (ncu_year == 2026 && ncu_minor < 1) )); then
     die "Nsight Compute ${ncu_version:-?} has no multiprocess communicator; need >= 2026.1"
 fi
-"$ncu_bin" --help | grep -q -- "--communicator" || die "${ncu_bin} --help does not list --communicator"
 
 if command -v nvidia-smi >/dev/null; then
     ngpu="$(nvidia-smi -L | wc -l | tr -d ' ')"
