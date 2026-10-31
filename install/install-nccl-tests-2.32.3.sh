@@ -19,7 +19,8 @@
 #      install-nccl-2.32.3.sh makes in <megatron-bridge>/nccl/nccl-2.32.3, not the -cta / -pause trees).
 #   2. Clone the default branch of nccl-tests into <megatron-bridge>/nccl/nccl-tests (reused if it
 #      exists; --update fetches the latest commit again).
-#   3. Build it for sm_100 twice:
+#   3. Build it for sm_100 twice (each is skipped when an earlier build used the same nccl-tests
+#      commit, NCCL, CUDA and make vars, recorded in <build dir>/.build-stamp):
 #        <nccl-tests>/build      MPI=0: one process drives all GPUs (-g / -t)
 #        <nccl-tests>/build-mpi  MPI=1: one process per GPU (mpirun -np N ... -g 1); needed by
 #                                 run_ncu_all_gather_stmc.sh. Skipped with a warning without MPI.
@@ -27,14 +28,16 @@
 #
 # Usage:
 #   ./install/install-nccl-tests-2.32.3.sh [--nccl-home DIR] [--dest DIR] [--mpi-home DIR]
-#                                          [--cuda-home DIR] [--jobs N] [--update]
+#                                          [--cuda-home DIR] [--jobs N] [--update] [--rebuild]
 #
 #   --nccl-home DIR NCCL 2.32.3 build (default: <megatron-bridge>/nccl/nccl-2.32.3/build)
 #   --dest DIR      nccl-tests checkout (default: <megatron-bridge>/nccl/nccl-tests)
-#   --mpi-home DIR  MPI install with include/mpi.h and lib/libmpi.so (default: from mpicc in PATH)
+#   --mpi-home DIR  MPI prefix with include/mpi.h and lib/libmpi.so (default: ask mpicc in PATH for
+#                   its include / library directories)
 #   --cuda-home DIR CUDA toolkit, >= 12.8 for sm_100 (default: CUDA_HOME or /usr/local/cuda)
 #   --jobs N        make -j (default: nproc)
 #   --update        Fetch the latest nccl-tests commit into an existing checkout before building
+#   --rebuild       Rebuild even if a build matches its stamp (commit, NCCL, CUDA, make vars)
 
 set -euo pipefail
 
@@ -51,6 +54,7 @@ cuda_home="${CUDA_HOME:-/usr/local/cuda}"
 # GNU nproc honours OMP_NUM_THREADS, which training environments usually export as 1.
 jobs="$(env -u OMP_NUM_THREADS -u OMP_THREAD_LIMIT nproc 2>/dev/null || echo 16)"
 update=false
+rebuild=false
 
 die() {
     echo "ERROR: $*" >&2
@@ -67,7 +71,8 @@ while [[ $# -gt 0 ]]; do
         --cuda-home) cuda_home="$2"; shift 2 ;;
         --jobs) jobs="$2"; shift 2 ;;
         --update) update=true; shift ;;
-        -h|--help) sed -n '16,38p' "$0"; exit 0 ;;
+        --rebuild) rebuild=true; shift ;;
+        -h|--help) sed -n '16,41p' "$0"; exit 0 ;;
         *) die "unknown argument: $1" ;;
     esac
 done
@@ -118,11 +123,36 @@ echo "nccl-tests: $(git -C "$dest" log -1 --format='%h %cd' --date=short)"
 ################################################################################
 # 3. Build
 
+check_nccl_link() {
+    local bin="$1" resolved
+    resolved="$(LD_LIBRARY_PATH="${nccl_home}/lib" ldd "$bin" | awk '/libnccl/ {print $3}')"
+    [[ -n "$resolved" && "$(readlink -f "$resolved")" == "$(readlink -f "${nccl_home}/lib/libnccl.so")" ]]
+}
+
+# build <dir> <make vars...>: a build is reused when its stamp (nccl-tests commit, NCCL, CUDA,
+# gencode, make vars) matches and all_gather_perf still loads this NCCL; --rebuild forces it.
 build() {
     local build_dir="$1"; shift
+    local stamp="${build_dir}/.build-stamp" want
+    want="$(printf '%s\n' "nccl-tests $(git -C "$dest" rev-parse HEAD)" \
+        "nccl ${nccl_home} $(stat -c %Y "${nccl_home}/lib/libnccl.so" 2>/dev/null || echo ?)" \
+        "cuda ${cuda_home}" "gencode ${GENCODE}" "make $*")"
+    if ! $rebuild && [[ -x "${build_dir}/all_gather_perf" && -f "$stamp" && "$(cat "$stamp")" == "$want" ]] \
+        && check_nccl_link "${build_dir}/all_gather_perf"; then
+        ok "reusing ${build_dir} (same nccl-tests commit, NCCL and make vars; --rebuild to force)"
+        return
+    fi
+    # Builds from before the stamp existed: adopt one that loads this NCCL, unless --update may
+    # have moved the checkout past the commit it was built from.
+    if ! $rebuild && ! $update && [[ -x "${build_dir}/all_gather_perf" && ! -f "$stamp" ]] \
+        && check_nccl_link "${build_dir}/all_gather_perf"; then
+        echo "$want" >"$stamp"
+        ok "reusing ${build_dir} (built before stamps; it loads ${nccl_home}/lib; --rebuild to force)"
+        return
+    fi
     echo "=== Building ${build_dir} ($*, make -j${jobs})"
-    # The build directory is derived from its sources only, so rebuild from scratch: a reused
-    # checkout may have been built against another NCCL.
+    # Rebuild from scratch: make only tracks the nccl-tests sources, not which NCCL or MPI they
+    # were built against.
     rm -rf "$build_dir"
     if ! make -C "$dest" -j"$jobs" BUILDDIR="$build_dir" CUDA_HOME="$cuda_home" NCCL_HOME="$nccl_home" \
         NVCC_GENCODE="$GENCODE" "$@" >"${build_dir}.log" 2>&1; then
@@ -130,24 +160,59 @@ build() {
         die "build failed; full log in ${build_dir}.log"
     fi
     [[ -x "${build_dir}/all_gather_perf" ]] || die "${build_dir}/all_gather_perf was not built"
-    local resolved
-    resolved="$(LD_LIBRARY_PATH="${nccl_home}/lib" ldd "${build_dir}/all_gather_perf" | awk '/libnccl/ {print $3}')"
-    [[ "$(readlink -f "$resolved")" == "$(readlink -f "${nccl_home}/lib/libnccl.so")" ]] \
-        || die "${build_dir}/all_gather_perf loads ${resolved:-no libnccl}, not ${nccl_home}/lib"
+    check_nccl_link "${build_dir}/all_gather_perf" \
+        || die "${build_dir}/all_gather_perf does not load ${nccl_home}/lib/libnccl.so"
     ok "${build_dir}/all_gather_perf loads ${nccl_home}/lib/libnccl.so"
+    echo "$want" >"$stamp"
 }
 
 build "${dest}/build" MPI=0
 
-if [[ -z "$mpi_home" ]] && command -v mpicc >/dev/null; then
-    mpi_home="$(cd -- "$(dirname -- "$(readlink -f "$(command -v mpicc)")")/.." && pwd)"
+# The MPI include and library directories. <mpicc>/.. is not always the install prefix: distro
+# packages put mpi.h under e.g. /usr/lib/x86_64-linux-gnu/openmpi/include, so ask the wrapper.
+mpi_incdirs=() mpi_libdirs=() mpi_why=""
+if [[ -n "$mpi_home" ]]; then
+    mpi_incdirs=("${mpi_home}/include") mpi_libdirs=("${mpi_home}/lib" "${mpi_home}/lib64")
+    mpi_why="--mpi-home / MPI_HOME=${mpi_home}"
+elif command -v mpicc >/dev/null; then
+    mpicc_bin="$(command -v mpicc)"
+    if incs="$(mpicc --showme:incdirs 2>/dev/null)"; then
+        # Open MPI / HPC-X
+        read -r -a mpi_incdirs <<<"$incs"
+        read -r -a mpi_libdirs <<<"$(mpicc --showme:libdirs 2>/dev/null)"
+    else
+        # MPICH / Intel MPI: "-show" prints the compiler command line with -I / -L flags.
+        for flag in $(mpicc -show 2>/dev/null); do
+            case "$flag" in
+                -I*) mpi_incdirs+=("${flag#-I}") ;;
+                -L*) mpi_libdirs+=("${flag#-L}") ;;
+            esac
+        done
+    fi
+    prefix="$(cd -- "$(dirname -- "$(readlink -f "$mpicc_bin")")/.." && pwd)"
+    mpi_incdirs+=("${prefix}/include") mpi_libdirs+=("${prefix}/lib" "${prefix}/lib64")
+    mpi_home="$prefix"
+    mpi_why="${mpicc_bin}"
 fi
-if [[ -n "$mpi_home" && -f "${mpi_home}/include/mpi.h" ]]; then
-    echo "MPI: ${mpi_home}"
-    build "${dest}/build-mpi" MPI=1 MPI_HOME="$mpi_home"
-else
+mpi_include=""
+for dir in "${mpi_incdirs[@]}"; do
+    [[ -f "${dir}/mpi.h" ]] && { mpi_include="$dir"; break; }
+done
+if [[ -z "$mpi_why" ]]; then
     note "no MPI found (mpicc not in PATH, no --mpi-home); skipped build-mpi"
     note "run_ncu_all_gather_stmc.sh needs it: one process per GPU is only possible through MPI"
+elif [[ -z "$mpi_include" ]]; then
+    die "MPI from ${mpi_why}, but no mpi.h in: ${mpi_incdirs[*]}; pass --mpi-home <prefix with include/mpi.h>"
+else
+    # nccl-tests links -L$(MPI_HOME)/lib{,64} -lmpi; the wrapper's library directories reach the
+    # linker through LIBRARY_PATH, since overriding NVLDFLAGS would drop the Makefile's own flags.
+    mpi_libpath="$(IFS=:; echo "${mpi_libdirs[*]}")"
+    echo "MPI: ${mpi_why} (mpi.h in ${mpi_include}, libraries in ${mpi_libpath})"
+    LIBRARY_PATH="${mpi_libpath}${LIBRARY_PATH:+:${LIBRARY_PATH}}" \
+        build "${dest}/build-mpi" MPI=1 MPI_HOME="$mpi_home" MPI_INCLUDE="$mpi_include"
+    LD_LIBRARY_PATH="${nccl_home}/lib" ldd "${dest}/build-mpi/all_gather_perf" | grep -q "libmpi.*=> /" \
+        && ok "${dest}/build-mpi/all_gather_perf links libmpi" \
+        || note "libmpi does not resolve at run time; add one of ${mpi_libpath} to LD_LIBRARY_PATH"
 fi
 
 echo "=== nccl-tests ready: ${dest}"
