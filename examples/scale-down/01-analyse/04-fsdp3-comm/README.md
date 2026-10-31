@@ -90,6 +90,13 @@ bash examples/scale-down/01-analyse/04-fsdp3-comm/benchmark_397b_fsdp1_vs_fsdp3.
 
 两个对比脚本都固定 CP=1，不比较 CP。
 
+两个对比脚本默认 BF16；加 `--mxfp8`（等价于 `--dtype mxfp8`）改为 MXFP8 训练，覆盖与 `run_pretrain_fsdp3.sh --dtype mxfp8` 相同（`fp8_param_gather=false`，MoE 另开 `moe_router_padding_for_fp8`）。MXFP8 的结果目录与 nsys 报告名在 `fsdp_<1|3>` 后加 `-mxfp8`，例如 `model_27b-fsdp_3-mxfp8-layers_8-...` 与 `qwen35_27b-fsdp_3-mxfp8-experts_0-...-rank_0.nsys-rep`；BF16 的命名保持不变。
+
+```bash
+bash examples/scale-down/01-analyse/04-fsdp3-comm/benchmark_27b_fsdp1_vs_fsdp3.sh --mxfp8
+bash examples/scale-down/01-analyse/04-fsdp3-comm/benchmark_397b_fsdp1_vs_fsdp3.sh --mxfp8
+```
+
 ## CUDA graph
 
 | `--cuda-graph` | dense（27b） | MoE（397b / 2p4t） |

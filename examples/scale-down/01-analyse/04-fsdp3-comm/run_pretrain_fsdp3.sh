@@ -209,16 +209,19 @@ esac
 LAYERS_TAG="${NUM_LAYERS:-full}"
 MTP_TAG="${MTP_NUM_LAYERS:-0}"
 if [[ "${MODEL}" == 27b ]]; then EXPERTS_TAG=0; else EXPERTS_TAG="${NUM_EXPERTS:-full}"; fi
-CASE_NAME="model_${MODEL}-fsdp_${FSDP_LEVEL}-layers_${LAYERS_TAG}-mtp_${MTP_TAG}-experts_${EXPERTS_TAG}-cg_${CUDA_GRAPH}-mbs_${MICRO_BATCH_SIZE}-seq_${SEQ_LENGTH}-cp_${CONTEXT_PARALLEL}-ep_${EXPERT_PARALLEL}-disp_${DISPATCHER}-gbs_${GLOBAL_BATCH_SIZE}-gpus_${GPU_COUNT}-profile_${PROFILE}-date_${RUN_DATE}"
+# BF16 names carry no dtype tag so earlier results stay resumable; MXFP8 adds "-mxfp8".
+DTYPE_TAG=""
+[[ "${DTYPE}" == mxfp8 ]] && DTYPE_TAG="-mxfp8"
+CASE_NAME="model_${MODEL}-fsdp_${FSDP_LEVEL}${DTYPE_TAG}-layers_${LAYERS_TAG}-mtp_${MTP_TAG}-experts_${EXPERTS_TAG}-cg_${CUDA_GRAPH}-mbs_${MICRO_BATCH_SIZE}-seq_${SEQ_LENGTH}-cp_${CONTEXT_PARALLEL}-ep_${EXPERT_PARALLEL}-disp_${DISPATCHER}-gbs_${GLOBAL_BATCH_SIZE}-gpus_${GPU_COUNT}-profile_${PROFILE}-date_${RUN_DATE}"
 RESULT_DIR="${RESULTS_ROOT}/${CASE_NAME}/node${NODE_RANK}"
 if [[ "${PRINT_RESULT_DIR}" == true ]]; then
     printf '%s\n' "${RESULT_DIR}"
     exit 0
 fi
-# nsys report name, e.g. qwen35_27b-fsdp_3-experts_0-cg_off-cp_4-ep_1-mbs_1-gbs_4-seq_16k-rank_0;
+# nsys report name, e.g. qwen35_27b-fsdp_3-mxfp8-experts_0-cg_off-cp_4-ep_1-mbs_1-gbs_4-seq_16k-rank_0;
 # %q{RANK} expands to the torchrun global rank in each worker.
 if (( SEQ_LENGTH % 1024 == 0 )); then SEQ_TAG="$((SEQ_LENGTH / 1024))k"; else SEQ_TAG="${SEQ_LENGTH}"; fi
-NSYS_NAME="${MODEL_TAG}-fsdp_${FSDP_LEVEL}-experts_${EXPERTS_TAG}-cg_${CUDA_GRAPH}-cp_${CONTEXT_PARALLEL}-ep_${EXPERT_PARALLEL}-mbs_${MICRO_BATCH_SIZE}-gbs_${GLOBAL_BATCH_SIZE}-seq_${SEQ_TAG}-rank_%q{RANK}"
+NSYS_NAME="${MODEL_TAG}-fsdp_${FSDP_LEVEL}${DTYPE_TAG}-experts_${EXPERTS_TAG}-cg_${CUDA_GRAPH}-cp_${CONTEXT_PARALLEL}-ep_${EXPERT_PARALLEL}-mbs_${MICRO_BATCH_SIZE}-gbs_${GLOBAL_BATCH_SIZE}-seq_${SEQ_TAG}-rank_%q{RANK}"
 NUM_MICROBATCHES=$((GLOBAL_BATCH_SIZE / (MICRO_BATCH_SIZE * (GPU_COUNT / CONTEXT_PARALLEL))))
 
 # torchrun creates LOCAL_RANK before this worker wrapper is invoked. Prefer a

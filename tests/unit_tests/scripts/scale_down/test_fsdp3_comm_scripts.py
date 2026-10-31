@@ -165,3 +165,20 @@ def test_397b_fsdp1_vs_fsdp3_sweep_crops_experts_without_cp(tmp_path: Path):
                 command = next(c for c in commands if prefix in c)
                 assert f"model.num_moe_experts={experts}" in command
                 assert f"ddp.data_parallel_sharding_strategy={strategy} " in command
+
+
+def test_fsdp1_vs_fsdp3_sweeps_tag_mxfp8_in_result_dirs_and_nsys_reports(tmp_path: Path):
+    for script, model_tag, report_tag in (
+        ("benchmark_27b_fsdp1_vs_fsdp3.sh", "model_27b", "qwen35_27b"),
+        ("benchmark_397b_fsdp1_vs_fsdp3.sh", "model_397b", "qwen35_397b"),
+    ):
+        bf16 = _commands(_run(EXAMPLE / script, "--dry-run", "--run-date", RUN_DATE, "--output-dir", str(tmp_path)).stderr)
+        assert bf16 and all("mxfp8" not in c and "mixed_precision.fp8=" not in c for c in bf16)
+        result = _run(EXAMPLE / script, "--dry-run", "--mxfp8", "--run-date", RUN_DATE, "--output-dir", str(tmp_path))
+        assert result.returncode == 0, result.stderr
+        mxfp8 = _commands(result.stderr)
+        assert len(mxfp8) == len(bf16)
+        for fsdp in (1, 3):
+            command = next(c for c in mxfp8 if f"{model_tag}-fsdp_{fsdp}-mxfp8-layers_" in c)
+            assert f"{report_tag}-fsdp_{fsdp}-mxfp8-experts_" in command
+            assert "mixed_precision.fp8_recipe=mxfp8" in command

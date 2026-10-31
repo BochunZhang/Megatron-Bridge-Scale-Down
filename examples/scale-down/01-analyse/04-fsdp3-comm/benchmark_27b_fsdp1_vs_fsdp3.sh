@@ -21,6 +21,7 @@ MTP_NUM_LAYERS="${MTP_NUM_LAYERS:-1}"
 NUM_MICROBATCHES="${NUM_MICROBATCHES:-4}"
 GPUS="${GPUS:-4}"
 TRAIN_ITERS="${TRAIN_ITERS:-10}"
+DTYPE="${DTYPE:-bf16}"
 PROFILE="${PROFILE:-nsys}"
 PROFILE_START="${PROFILE_START:-7}"
 PROFILE_END="${PROFILE_END:-8}"
@@ -32,7 +33,7 @@ usage() {
     cat <<'USAGE'
 Usage: benchmark_27b_fsdp1_vs_fsdp3.sh [options]
 
-Qwen3.5-27B dense, 4 GPUs on one node, DP=4 (TP=PP=CP=1), BF16, CUDA graph off,
+Qwen3.5-27B dense, 4 GPUs on one node, DP=4 (TP=PP=CP=1), BF16 (or MXFP8), CUDA graph off,
 8 layers (6 GatedDeltaNet + 2 gated attention) + 1 MTP layer, MBS=1,
 4 microbatches per iteration (GBS=16), Nsight Systems on step 7.
 Default matrix: seq 256,1024,4096 x FSDP 3,1 = 6 runs.
@@ -44,6 +45,8 @@ Options:
   --mtp-num-layers N       MTP layers (default: 1)
   --num-microbatches N     Microbatches per iteration (default: 4)
   --train-iters N          Training iterations (default: 10)
+  --mxfp8                  Train in MXFP8 (same as --dtype mxfp8); names get "-mxfp8"
+  --dtype bf16|mxfp8       Compute mode (default: bf16)
   --profile none|nsys      Profiling mode (default: nsys)
   --profile-start N        First profiled iteration (default: 7)
   --profile-end N          Stop iteration, exclusive (default: 8)
@@ -65,6 +68,8 @@ while [[ $# -gt 0 ]]; do
         --mtp-num-layers) need_value "$@"; MTP_NUM_LAYERS="$2"; shift 2;;
         --num-microbatches) need_value "$@"; NUM_MICROBATCHES="$2"; shift 2;;
         --train-iters) need_value "$@"; TRAIN_ITERS="$2"; shift 2;;
+        --dtype|--precision) need_value "$@"; DTYPE="$2"; [[ "${DTYPE}" == fp8mx ]] && DTYPE=mxfp8; shift 2;;
+        --mxfp8) DTYPE=mxfp8; shift;;
         --profile) need_value "$@"; PROFILE="$2"; shift 2;;
         --profile-start) need_value "$@"; PROFILE_START="$2"; shift 2;;
         --profile-end) need_value "$@"; PROFILE_END="$2"; shift 2;;
@@ -79,6 +84,7 @@ while [[ $# -gt 0 ]]; do
 done
 
 [[ "${RUN_DATE}" =~ ^[0-9]{6}-[0-9]{6}$ ]] || { echo "--run-date must use yymmdd-hhmmss" >&2; exit 2; }
+case "${DTYPE}" in bf16|mxfp8) ;; *) echo "--dtype must be bf16 or mxfp8" >&2; exit 2;; esac
 case "${PROFILE}" in none|nsys) ;; *) echo "--profile must be none or nsys" >&2; exit 2;; esac
 for name in NUM_LAYERS NUM_MICROBATCHES TRAIN_ITERS; do
     [[ "${!name}" =~ ^[1-9][0-9]*$ ]] || { echo "${name} must be a positive integer" >&2; exit 2; }
@@ -103,17 +109,17 @@ for seq in "${SEQUENCES[@]}"; do
             --model 27b --recipe "${RECIPE}" --fsdp "${fsdp}" --seq-length "${seq}" --cp 1
             --micro-batch-size 1 --global-batch-size "${GBS}" --train-iters "${TRAIN_ITERS}"
             --num-layers "${NUM_LAYERS}" --linear-attention-freq 4 --mtp-num-layers "${MTP_NUM_LAYERS}"
-            --cuda-graph off --dtype bf16 --gpu "${GPUS}" --nproc-per-node "${GPUS}" --nnodes 1
+            --cuda-graph off --dtype "${DTYPE}" --gpu "${GPUS}" --nproc-per-node "${GPUS}" --nnodes 1
             --master-port "${MASTER_PORT}" --profile "${PROFILE}"
             --profile-start "${PROFILE_START}" --profile-end "${PROFILE_END}"
             --run-date "${RUN_DATE}" --results-root "${OUTPUT_DIR}"
         )
         [[ "${RESUME}" == true ]] && ARGS+=(--resume)
         [[ "${DRY_RUN}" == true ]] && ARGS+=(--dry-run)
-        printf 'launch model=27b fsdp=%s seq=%s gbs=%s\n' "${fsdp}" "${seq}" "${GBS}" >&2
+        printf 'launch model=27b dtype=%s fsdp=%s seq=%s gbs=%s\n' "${DTYPE}" "${fsdp}" "${seq}" "${GBS}" >&2
         if ! "${RUN_ONE}" "${ARGS[@]}"; then
-            echo "case failed: fsdp=${fsdp} seq=${seq}" >&2
-            FAILED+=("fsdp=${fsdp} seq=${seq}")
+            echo "case failed: dtype=${DTYPE} fsdp=${fsdp} seq=${seq}" >&2
+            FAILED+=("dtype=${DTYPE} fsdp=${fsdp} seq=${seq}")
         fi
     done
 done
