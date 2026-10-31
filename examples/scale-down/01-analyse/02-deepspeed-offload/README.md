@@ -103,7 +103,47 @@ bash examples/scale-down/01-analyse/02-deepspeed-offload/pretrain_experiment.sh 
 
 启动前会检查 `nvme_path` 可写、挂载自 `nvme_device`、`async_io` op 可加载,任一失败即退出。
 
-### 3.5 `--test` 非有限值诊断
+### 3.5 通信 overlap 观察(nsys)
+
+观察 4 卡 ZeRO-3 + SuperOffload 下,backward 期间参数 all-gather(prefetch)与梯度 reduce-scatter 能否被计算掩盖,以及参数卸载到 CPU 后的变化:
+
+```bash
+# Dense
+bash examples/scale-down/01-analyse/02-deepspeed-offload/pretrain_experiment.sh \
+  --models Qwen/Qwen3.5-9B-Base \
+  --optimizer_strategies super_offload_1.0 \
+  --param_positions "param_gpu param_cpu" \
+  --recompute_combos recompute_none \
+  --micro_batch_sizes 1 \
+  --per_gpu_batch_size 4 \
+  --profile nsys
+
+# MoE(AutoEP=4,64 专家)
+bash examples/scale-down/01-analyse/02-deepspeed-offload/pretrain_experiment.sh \
+  --models Qwen/Qwen3.5-35B-A3B-Base \
+  --optimizer_strategies super_offload_1.0 \
+  --param_positions "param_gpu param_cpu" \
+  --recompute_combos recompute_none \
+  --micro_batch_sizes 1 \
+  --per_gpu_batch_size 4 \
+  --profile nsys
+```
+
+- `recompute_none`:recompute 会把一次 forward 放进 backward,不便比较通信与 backward 计算;
+- `--per_gpu_batch_size 4`:每 step 4 个 micro-batch,step 7–8 共 8 个,控制 trace 大小;
+- 只有 rank 0 被抓取,trace 为 `<run_dir>/nsys_trace.nsys-rep`。
+
+在 nsys 中看 `backward_step[i]` NVTX 范围内的计算 stream 是否出现空隙,以及空隙期间在跑什么:
+
+| 空隙期间 | 含义 |
+| --- | --- |
+| AllGather kernel | 等待参数 prefetch |
+| ReduceScatter kernel | AG 与 RS 共用同一个 NCCL communicator,在 GPU 上串行,AG 排在 RS 之后 |
+| HtoD memcpy(`param_cpu`) | 参数分片从 CPU 拷回 GPU,未完成前无法 all-gather |
+
+ZeRO-3 的 AG 粒度为单个 submodule 的参数加上 `stage3_prefetch_bucket_size`(默认 5e7 元素)的预取,RS 每攒满 `reduce_bucket_size`(本测试 4e8 元素)发起一次,因此单次 RS 通常比 AG 大一个量级。MoE 在 AutoEP 下 EDP=1,expert 参数不被 ZeRO 切分,AG/RS 只覆盖非 expert 参数,expert 流量体现为 AutoEP 的 all-to-all。nsys 会增加 host 开销,比较 iteration 绝对时间时以不加 `--profile` 的 `metrics.csv` 为准。
+
+### 3.6 `--test` 非有限值诊断
 
 追加 `--test` 后,在 `metrics.csv` 同目录写出 NaN/Inf 报告:
 
