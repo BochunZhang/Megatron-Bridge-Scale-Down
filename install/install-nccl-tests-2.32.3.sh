@@ -144,7 +144,8 @@ build() {
     local stamp="${build_dir}/.build-stamp" want
     want="$(printf '%s\n' "nccl-tests $(git -C "$dest" rev-parse HEAD)" \
         "nccl ${nccl_home} $(stat -c %Y "${nccl_home}/lib/libnccl.so" 2>/dev/null || echo ?)" \
-        "cuda ${cuda_home}" "gencode ${GENCODE}" "make $*")"
+        "cuda ${cuda_home}" "gencode ${GENCODE}" "make $*" \
+        "env CXXFLAGS=${CXXFLAGS:-} NVCUFLAGS=${NVCUFLAGS:-}")"
     if ! $rebuild && [[ -x "${build_dir}/all_gather_perf" && -f "$stamp" && "$(cat "$stamp")" == "$want" ]] \
         && check_nccl_link "${build_dir}/all_gather_perf"; then
         ok "reusing ${build_dir} (same nccl-tests commit, NCCL and make vars; --rebuild to force)"
@@ -228,7 +229,15 @@ else
     # set to the parent of the library directory, and the directory itself also reaches the linker
     # through LIBRARY_PATH: overriding NVLDFLAGS would drop the Makefile's own flags.
     echo "MPI: mpi.h in ${mpi_include}, libmpi.so in ${mpi_lib}"
+    # The GIN device-API tests compile src/device_api/gin/utils/*.cc with plain $(CXX) and
+    # -I$(MPI_HOME)/include, and the Makefile links only -lmpi. With Open MPI 4.x (Debian/Ubuntu),
+    # mpi.h then pulls in the C++ bindings, whose symbols (MPI::Comm::Comm(),
+    # ompi_mpi_cxx_op_intercept) live in libmpi_cxx: undefined references at link time. nccl-tests
+    # uses no MPI:: API, so skip the bindings. Pass this through the environment: common.mk folds an
+    # inherited CXXFLAGS / NVCUFLAGS into its own, while a command-line value would replace them.
+    mpi_cflags="-DOMPI_SKIP_MPICXX=1 -DMPICH_SKIP_MPICXX=1 -I${mpi_include}"
     LIBRARY_PATH="${mpi_lib}${LIBRARY_PATH:+:${LIBRARY_PATH}}" \
+        CXXFLAGS="${mpi_cflags}${CXXFLAGS:+ ${CXXFLAGS}}" NVCUFLAGS="${mpi_cflags}${NVCUFLAGS:+ ${NVCUFLAGS}}" \
         build "${dest}/build-mpi" MPI=1 MPI_HOME="$(dirname -- "$mpi_lib")" MPI_INCLUDE="$mpi_include"
     LD_LIBRARY_PATH="${nccl_home}/lib" ldd "${dest}/build-mpi/all_gather_perf" | grep -q "libmpi.*=> /" \
         && ok "${dest}/build-mpi/all_gather_perf links $(LD_LIBRARY_PATH="${nccl_home}/lib" ldd "${dest}/build-mpi/all_gather_perf" | awk '/libmpi\./ {print $3; exit}')" \
