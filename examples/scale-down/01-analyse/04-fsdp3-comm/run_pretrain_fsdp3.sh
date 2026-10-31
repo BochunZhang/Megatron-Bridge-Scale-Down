@@ -2,7 +2,7 @@
 # Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
 # Licensed under the Apache License, Version 2.0.
 
-# Run one cropped Qwen3.5 case through scripts/training/run_recipe.py.
+# Run one cropped Qwen3.5 / Qwen3.8 case through scripts/training/run_recipe.py.
 # The selected GB200 recipe is FSDP1 by default; the overrides below select
 # Megatron FSDP3 for this communication experiment.
 set -euo pipefail
@@ -18,9 +18,9 @@ DTYPE="${DTYPE:-bf16}"
 PROFILE="${PROFILE:-none}"
 CONTEXT_PARALLEL="1"
 MICRO_BATCH_SIZE="1"
-GLOBAL_BATCH_SIZE="32"
+GLOBAL_BATCH_SIZE="16"
 TRAIN_ITERS="10"
-PROFILE_START="5"
+PROFILE_START="7"
 PROFILE_END="8"
 NUM_LAYERS=""
 NUM_EXPERTS=""
@@ -28,6 +28,9 @@ EXPERT_PARALLEL=""
 MOE_LAYER_FREQ=""
 LINEAR_ATTENTION_FREQ=""
 MTP_NUM_LAYERS=""
+DISPATCHER="${DISPATCHER:-hybridep}"
+CUDA_GRAPH="${CUDA_GRAPH:-off}"
+HYBRIDEP_NUM_SMS="${HYBRIDEP_NUM_SMS:-32}"
 GPU_COUNT="${GPU_COUNT:-4}"
 GPUS_PER_NODE="${GPUS_PER_NODE:-4}"
 NNODES="${NNODES:-}"
@@ -37,17 +40,21 @@ MASTER_PORT="${MASTER_PORT:-29501}"
 RUN_DATE="${RUN_DATE:-$(date +%y%m%d-%H%M%S)}"
 RUN_NAME=""
 DRY_RUN=false
+PRINT_RESULT_DIR=false
 RESUME=false
 EXTRA_OVERRIDES=()
 
 usage() {
     cat <<'USAGE'
-Usage: run_pretrain_fsdp3.sh --model 397b|122b|27b --recipe NAME --seq-length N [options]
+Usage: run_pretrain_fsdp3.sh --model 397b|122b|27b|2p4t --recipe NAME --seq-length N [options]
+
+Models: 397b/122b/27b are Qwen3.5-397B-A17B / 122B-A10B / 27B; 2p4t (alias 2.4t)
+is Qwen3.8-2.4T-A95B.
 
 Options:
   --cp N                         Context parallel size (default: 1)
   --micro-batch-size N           Micro batch size (default: 1)
-  --global-batch-size N          Global batch size (default: 32)
+  --global-batch-size N          Global batch size (default: 16)
   --train-iters N                Training iterations (default: 10)
   --num-layers N                 Crop transformer layers for this case
   --num-experts N                Crop routed experts for a MoE case
@@ -56,6 +63,12 @@ Options:
   --moe-layer-freq VALUE         Override model.moe_layer_freq
   --linear-attention-freq VALUE  Override model.linear_attention_freq
   --mtp-num-layers N             Override model.mtp_num_layers
+  --dispatcher hybridep|alltoall MoE token dispatcher (default: hybridep)
+  --hybridep-num-sms N           SMs for HybridEP dispatch (default: 32)
+  --cuda-graph off|on            off: no CUDA graph. on: Transformer Engine
+                                 per-layer graphs, attn+mlp for dense models and
+                                 the partial attn+moe_router+moe_preprocess scope
+                                 for MoE models (default: off)
   --dtype|--precision bf16|mxfp8 Compute mode (default: bf16)
   --gpu|--gpus N                 Global GPU count (default: 4)
   --nproc-per-node N              GPUs per node (default: 4)
@@ -65,8 +78,8 @@ Options:
   --master-port N                Multi-node rendezvous port (default: 29501)
   --profile none|nsys            Profiling mode (default: none)
   --nsys                         Alias for --profile nsys
-  --profile-start N              First profiler iteration (default: 5)
-  --profile-end N                Last profiler iteration (default: 8)
+  --profile-start N              First profiled iteration (default: 7)
+  --profile-end N                Stop iteration, exclusive (default: 8, i.e. one step)
   --run-date YYMMDD-HHMMSS       Shared matrix timestamp
   --run-name NAME                Optional human-readable case name
   --results-root PATH            Result root
@@ -74,13 +87,14 @@ Options:
   --resume                       Skip a completed case; archive a failed or
                                  incomplete result and rerun it
   --dry-run                      Print the resolved command and exit
+  --print-result-dir             Print this node's result directory and exit
 USAGE
 }
 
 need_value() { [[ $# -ge 2 ]] || { echo "Missing value for $1" >&2; usage >&2; exit 2; }; }
 while [[ $# -gt 0 ]]; do
     case "$1" in
-        --model) need_value "$@"; MODEL="$2"; shift 2;;
+        --model) need_value "$@"; MODEL="$2"; [[ "${MODEL}" == 2.4t ]] && MODEL=2p4t; shift 2;;
         --recipe) need_value "$@"; RECIPE="$2"; shift 2;;
         --seq-length) need_value "$@"; SEQ_LENGTH="$2"; shift 2;;
         --dtype|--precision) need_value "$@"; DTYPE="$2"; [[ "${DTYPE}" == fp8mx ]] && DTYPE=mxfp8; shift 2;;
@@ -94,6 +108,9 @@ while [[ $# -gt 0 ]]; do
         --moe-layer-freq) need_value "$@"; MOE_LAYER_FREQ="$2"; shift 2;;
         --linear-attention-freq) need_value "$@"; LINEAR_ATTENTION_FREQ="$2"; shift 2;;
         --mtp-num-layers) need_value "$@"; MTP_NUM_LAYERS="$2"; shift 2;;
+        --dispatcher) need_value "$@"; DISPATCHER="$2"; shift 2;;
+        --hybridep-num-sms) need_value "$@"; HYBRIDEP_NUM_SMS="$2"; shift 2;;
+        --cuda-graph) need_value "$@"; CUDA_GRAPH="$2"; shift 2;;
         --gpu|--gpus) need_value "$@"; GPU_COUNT="$2"; shift 2;;
         --nproc-per-node) need_value "$@"; GPUS_PER_NODE="$2"; shift 2;;
         --nnodes) need_value "$@"; NNODES="$2"; shift 2;;
@@ -110,6 +127,7 @@ while [[ $# -gt 0 ]]; do
         --override) need_value "$@"; EXTRA_OVERRIDES+=("$2"); shift 2;;
         --resume) RESUME=true; shift;;
         --dry-run) DRY_RUN=true; shift;;
+        --print-result-dir) PRINT_RESULT_DIR=true; shift;;
         -h|--help) usage; exit 0;;
         *) echo "Unknown option: $1" >&2; usage >&2; exit 2;;
     esac
@@ -117,10 +135,12 @@ done
 
 [[ -n "${MODEL}" && -n "${RECIPE}" && -n "${SEQ_LENGTH}" ]] || { echo "--model, --recipe, and --seq-length are required" >&2; exit 2; }
 [[ "${DTYPE}" == fp8mx ]] && DTYPE=mxfp8
-case "${MODEL}" in 397b|122b|27b) ;; *) echo "Unsupported model: ${MODEL}" >&2; exit 2;; esac
+case "${MODEL}" in 397b|122b|27b|2p4t) ;; *) echo "Unsupported model: ${MODEL}" >&2; exit 2;; esac
 case "${DTYPE}" in bf16|mxfp8) ;; *) echo "--dtype must be bf16 or mxfp8" >&2; exit 2;; esac
 case "${PROFILE}" in none|nsys) ;; *) echo "--profile must be none or nsys" >&2; exit 2;; esac
-for name in SEQ_LENGTH CONTEXT_PARALLEL MICRO_BATCH_SIZE GLOBAL_BATCH_SIZE TRAIN_ITERS GPU_COUNT GPUS_PER_NODE MASTER_PORT; do
+case "${DISPATCHER}" in hybridep|alltoall) ;; *) echo "--dispatcher must be hybridep or alltoall" >&2; exit 2;; esac
+case "${CUDA_GRAPH}" in off|on) ;; *) echo "--cuda-graph must be off or on" >&2; exit 2;; esac
+for name in SEQ_LENGTH CONTEXT_PARALLEL MICRO_BATCH_SIZE GLOBAL_BATCH_SIZE TRAIN_ITERS GPU_COUNT GPUS_PER_NODE MASTER_PORT HYBRIDEP_NUM_SMS; do
     [[ "${!name}" =~ ^[1-9][0-9]*$ ]] || { echo "${name} must be a positive integer" >&2; exit 2; }
 done
 for name in NODE_RANK PROFILE_START PROFILE_END; do
@@ -145,27 +165,46 @@ else
 fi
 if [[ -n "${NUM_LAYERS}" ]] && ! [[ "${NUM_LAYERS}" =~ ^[1-9][0-9]*$ ]]; then echo "num-layers must be positive" >&2; exit 2; fi
 if [[ -n "${NUM_EXPERTS}" ]] && ! [[ "${NUM_EXPERTS}" =~ ^[1-9][0-9]*$ ]]; then echo "num-experts must be positive" >&2; exit 2; fi
+if [[ -n "${MTP_NUM_LAYERS}" ]] && ! [[ "${MTP_NUM_LAYERS}" =~ ^[0-9]+$ ]]; then echo "mtp-num-layers must be a non-negative integer" >&2; exit 2; fi
 # MoE cases always use expert parallelism; the EP group folds onto the same
 # GPUs as the DP x CP mesh, so EP only needs to divide the world size.
 if [[ "${MODEL}" == 27b ]]; then
     EXPERT_PARALLEL="${EXPERT_PARALLEL:-1}"
     [[ "${EXPERT_PARALLEL}" == 1 ]] || { echo "dense model 27b only supports --ep 1" >&2; exit 2; }
+    DISPATCHER=none
 else
     EXPERT_PARALLEL="${EXPERT_PARALLEL:-4}"
     [[ "${EXPERT_PARALLEL}" =~ ^[1-9][0-9]*$ ]] || { echo "ep must be a positive integer" >&2; exit 2; }
     (( GPU_COUNT % EXPERT_PARALLEL == 0 )) || { echo "world size must be divisible by ep" >&2; exit 2; }
+    if [[ "${DISPATCHER}" == hybridep ]]; then
+        (( EXPERT_PARALLEL <= 72 )) || { echo "HybridEP ep must fit in the 72-rank NVLink domain" >&2; exit 2; }
+    fi
     if [[ -n "${NUM_EXPERTS}" ]]; then
         (( NUM_EXPERTS % EXPERT_PARALLEL == 0 )) || { echo "num-experts must be divisible by ep" >&2; exit 2; }
     fi
 fi
 
 case "${MODEL}" in
-    397b) MODEL_ID=Qwen/Qwen3.5-397B-A17B;;
-    122b) MODEL_ID=Qwen/Qwen3.5-122B-A10B;;
-    27b) MODEL_ID=Qwen/Qwen3.5-27B;;
+    397b) MODEL_ID=Qwen/Qwen3.5-397B-A17B; MODEL_TAG=qwen35_397b;;
+    122b) MODEL_ID=Qwen/Qwen3.5-122B-A10B; MODEL_TAG=qwen35_122b;;
+    27b) MODEL_ID=Qwen/Qwen3.5-27B; MODEL_TAG=qwen35_27b;;
+    2p4t) MODEL_ID=Qwen/Qwen3.8-2.4T-A95B; MODEL_TAG=qwen38_2p4t;;
 esac
-CASE_NAME="model_${MODEL}-fsdp_3-mbs_${MICRO_BATCH_SIZE}-seq_${SEQ_LENGTH}-cp_${CONTEXT_PARALLEL}-ep_${EXPERT_PARALLEL}-gbs_${GLOBAL_BATCH_SIZE}-gpus_${GPU_COUNT}-profile_${PROFILE}-date_${RUN_DATE}"
+# Shape tags in the result path: an unset crop keeps the recipe value ("full");
+# the launcher disables MTP unless --mtp-num-layers is given.
+LAYERS_TAG="${NUM_LAYERS:-full}"
+MTP_TAG="${MTP_NUM_LAYERS:-0}"
+if [[ "${MODEL}" == 27b ]]; then EXPERTS_TAG=0; else EXPERTS_TAG="${NUM_EXPERTS:-full}"; fi
+CASE_NAME="model_${MODEL}-fsdp_3-layers_${LAYERS_TAG}-mtp_${MTP_TAG}-experts_${EXPERTS_TAG}-cg_${CUDA_GRAPH}-mbs_${MICRO_BATCH_SIZE}-seq_${SEQ_LENGTH}-cp_${CONTEXT_PARALLEL}-ep_${EXPERT_PARALLEL}-disp_${DISPATCHER}-gbs_${GLOBAL_BATCH_SIZE}-gpus_${GPU_COUNT}-profile_${PROFILE}-date_${RUN_DATE}"
 RESULT_DIR="${RESULTS_ROOT}/${CASE_NAME}/node${NODE_RANK}"
+if [[ "${PRINT_RESULT_DIR}" == true ]]; then
+    printf '%s\n' "${RESULT_DIR}"
+    exit 0
+fi
+# nsys report name, e.g. qwen35_27b-experts_0-cg_off-cp_4-ep_1-mbs_1-gbs_4-seq_16k-rank_0;
+# %q{RANK} expands to the torchrun global rank in each worker.
+if (( SEQ_LENGTH % 1024 == 0 )); then SEQ_TAG="$((SEQ_LENGTH / 1024))k"; else SEQ_TAG="${SEQ_LENGTH}"; fi
+NSYS_NAME="${MODEL_TAG}-experts_${EXPERTS_TAG}-cg_${CUDA_GRAPH}-cp_${CONTEXT_PARALLEL}-ep_${EXPERT_PARALLEL}-mbs_${MICRO_BATCH_SIZE}-gbs_${GLOBAL_BATCH_SIZE}-seq_${SEQ_TAG}-rank_%q{RANK}"
 NUM_MICROBATCHES=$((GLOBAL_BATCH_SIZE / (MICRO_BATCH_SIZE * (GPU_COUNT / CONTEXT_PARALLEL))))
 
 # torchrun creates LOCAL_RANK before this worker wrapper is invoked. Prefer a
@@ -184,6 +223,10 @@ fi
 # Single-node four-GPU Gloo uses the GB200 host interface. DLC multi-node
 # launchers own their network environment and do not receive this override.
 if (( NNODES == 1 && GPU_COUNT == 4 )); then export GLOO_SOCKET_IFNAME=eth0; else unset GLOO_SOCKET_IFNAME || true; fi
+# HybridEP topology on GB200 NVL72: the whole EP group sits in one MNNVL domain.
+if [[ "${DISPATCHER}" == hybridep ]]; then
+    export NUM_OF_HYBRID_EP_RANKS_PER_NVLINK_DOMAIN="${EXPERT_PARALLEL}" NVLINK_DOMAIN_SIZE=72 USE_MNNVL=1
+fi
 
 PROFILE_RANKS=0
 for (( rank = 1; rank < GPU_COUNT; rank++ )); do PROFILE_RANKS+=",${rank}"; done
@@ -197,7 +240,6 @@ OVERRIDES=(
     "model.cp_comm_type=p2p" "model.mtp_num_layers=0" "model.linear_attention_freq=4"
     "model.recompute_granularity=null" "model.recompute_method=null" "model.recompute_num_layers=null"
     "model.recompute_modules=[]" "model.fine_grained_activation_offloading=false" "model.offload_modules=[]"
-    "model.cuda_graph_impl=none" "model.cuda_graph_scope=null" "model.cuda_graph_modules=[]"
     "dist.use_megatron_fsdp=true" "ddp.use_megatron_fsdp=true" "ddp.use_distributed_optimizer=true"
     "ddp.data_parallel_sharding_strategy=optim_grads_params" "ddp.average_in_collective=false"
     "ddp.overlap_grad_reduce=true" "ddp.overlap_param_gather=true" "ddp.grad_reduce_in_fp32=true"
@@ -210,16 +252,37 @@ OVERRIDES=(
     "profiling.use_nsys_profiler=$([[ "${PROFILE}" == nsys ]] && echo true || echo false)"
     "profiling.use_pytorch_profiler=false" "profiling.profile_step_start=${PROFILE_START}" "profiling.profile_step_end=${PROFILE_END}"
     "profiling.profile_ranks=[${PROFILE_RANKS}]"
+    # nvtx_ranges also turns on Megatron-FSDP's per-layer all-gather / reduce-scatter
+    # ranges ("FSDP AG fwd prefetch L2 ...", "FSDP RS L1 ...").
     "profiling.nvtx_ranges=$([[ "${PROFILE}" == nsys ]] && echo true || echo false)"
+    # emit_nvtx(record_shapes=True): every op range, including c10d
+    # record_param_comms for FSDP all-gather / reduce-scatter, carries tensor shapes.
+    "profiling.record_shapes=$([[ "${PROFILE}" == nsys ]] && echo true || echo false)"
 )
+if [[ "${CUDA_GRAPH}" == on ]]; then
+    # TE per-layer graphs around the module compute only; FSDP hooks, all-gather
+    # and reduce-scatter stay eager. Dense layers graph attention and MLP; MoE
+    # layers graph attention and the router/preprocess part, leaving dispatch,
+    # experts and combine eager. megatron_fsdp_cuda_graph_mode keeps gradient
+    # references alive for replay (Megatron-LM sets it automatically, Bridge
+    # does not); the recipe's max-pool double buffer keeps bucket addresses fixed.
+    if [[ "${MODEL}" == 27b ]]; then GRAPH_MODULES="[attn,mlp]"; else GRAPH_MODULES="[attn,moe_router,moe_preprocess]"; fi
+    OVERRIDES+=(
+        "model.cuda_graph_impl=transformer_engine" "model.cuda_graph_scope=null" "model.cuda_graph_modules=${GRAPH_MODULES}"
+        "model.cuda_graph_warmup_steps=3" "ddp.megatron_fsdp_cuda_graph_mode=true"
+    )
+else
+    OVERRIDES+=("model.cuda_graph_impl=none" "model.cuda_graph_scope=null" "model.cuda_graph_modules=[]")
+fi
 [[ -n "${NUM_LAYERS}" ]] && OVERRIDES+=("model.num_layers=${NUM_LAYERS}")
 [[ -n "${NUM_EXPERTS}" ]] && OVERRIDES+=("model.num_moe_experts=${NUM_EXPERTS}")
 [[ -n "${MOE_LAYER_FREQ}" ]] && OVERRIDES+=("model.moe_layer_freq=${MOE_LAYER_FREQ}")
 [[ -n "${LINEAR_ATTENTION_FREQ}" ]] && OVERRIDES+=("model.linear_attention_freq=${LINEAR_ATTENTION_FREQ}")
 [[ -n "${MTP_NUM_LAYERS}" ]] && OVERRIDES+=("model.mtp_num_layers=${MTP_NUM_LAYERS}")
-if [[ "${MODEL}" != 27b ]]; then
-    OVERRIDES+=("model.moe_token_dispatcher_type=alltoall" "model.moe_flex_dispatcher_backend=null")
-fi
+case "${DISPATCHER}" in
+    alltoall) OVERRIDES+=("model.moe_token_dispatcher_type=alltoall" "model.moe_flex_dispatcher_backend=null" "model.moe_flex_dispatcher_num_sms=null");;
+    hybridep) OVERRIDES+=("model.moe_token_dispatcher_type=flex" "model.moe_flex_dispatcher_backend=hybridep" "model.moe_flex_dispatcher_num_sms=${HYBRIDEP_NUM_SMS}");;
+esac
 if [[ "${DTYPE}" == mxfp8 ]]; then
     OVERRIDES+=("mixed_precision.fp8=e4m3" "mixed_precision.fp8_recipe=mxfp8" "mixed_precision.fp8_param_gather=false" "mixed_precision.reuse_grad_buf_for_mxfp8_param_ag=false")
     [[ "${MODEL}" != 27b ]] && OVERRIDES+=("model.moe_router_padding_for_fp8=true")
@@ -236,7 +299,10 @@ else
 fi
 WORKER=(uv run --no-sync python)
 if [[ "${PROFILE}" == nsys ]]; then
-    WORKER=(nsys profile --trace=cuda,nvtx --sample=none --cpuctxsw=none --capture-range=cudaProfilerApi --capture-range-end=stop --force-overwrite=true --output="${RESULT_DIR}/nsys-rank%q{LOCAL_RANK}" uv run --no-sync python)
+    # NCCL's own NVTX ranges (domain NCCL) carry message bytes and comm hash per
+    # collective; nsys NCCL recipes need them to report sizes and bandwidth.
+    export NCCL_NVTX_DISABLE=0
+    WORKER=(nsys profile --trace=cuda,nvtx --sample=none --cpuctxsw=none --capture-range=cudaProfilerApi --capture-range-end=stop --force-overwrite=true --output="${RESULT_DIR}/${NSYS_NAME}" uv run --no-sync python)
 fi
 COMMAND=(uv run --no-sync python -m torch.distributed.run "${DIST_ARGS[@]}" --no-python)
 if (( ${#NUMA_WRAPPER[@]} > 0 )); then
@@ -245,7 +311,7 @@ fi
 COMMAND+=("${WORKER[@]}" "${TRAIN_ARGS[@]}")
 
 if [[ "${DRY_RUN}" == true ]]; then
-    printf 'model=%s recipe=%s dtype=%s seq=%s cp=%s ep=%s mbs=%s gbs=%s gpus=%s num_microbatches=%s numa=%s\n' "${MODEL}" "${RECIPE}" "${DTYPE}" "${SEQ_LENGTH}" "${CONTEXT_PARALLEL}" "${EXPERT_PARALLEL}" "${MICRO_BATCH_SIZE}" "${GLOBAL_BATCH_SIZE}" "${GPU_COUNT}" "${NUM_MICROBATCHES}" "${NUMA_MODE}" >&2
+    printf 'model=%s recipe=%s dtype=%s layers=%s mtp=%s experts=%s cuda_graph=%s seq=%s cp=%s ep=%s dispatcher=%s mbs=%s gbs=%s gpus=%s num_microbatches=%s numa=%s\n' "${MODEL}" "${RECIPE}" "${DTYPE}" "${LAYERS_TAG}" "${MTP_TAG}" "${EXPERTS_TAG}" "${CUDA_GRAPH}" "${SEQ_LENGTH}" "${CONTEXT_PARALLEL}" "${EXPERT_PARALLEL}" "${DISPATCHER}" "${MICRO_BATCH_SIZE}" "${GLOBAL_BATCH_SIZE}" "${GPU_COUNT}" "${NUM_MICROBATCHES}" "${NUMA_MODE}" >&2
     printf 'GLOO_SOCKET_IFNAME=%s\ncommand:' "${GLOO_SOCKET_IFNAME:-<unset>}" >&2
     printf ' %q' "${COMMAND[@]}" >&2; printf '\n' >&2
     exit 0
@@ -265,9 +331,9 @@ printf 'command:' >"${RESULT_DIR}/command.txt"
 printf ' %q' "${COMMAND[@]}" >>"${RESULT_DIR}/command.txt"
 printf '\n' >>"${RESULT_DIR}/command.txt"
 cat >"${RESULT_DIR}/launch.json" <<JSON
-{"model":"${MODEL_ID}","recipe":"${RECIPE}","run_name":"${RUN_NAME}","dtype":"${DTYPE}","fsdp":3,"seq_length":${SEQ_LENGTH},"context_parallel_size":${CONTEXT_PARALLEL},"expert_model_parallel_size":${EXPERT_PARALLEL},"micro_batch_size":${MICRO_BATCH_SIZE},"global_batch_size":${GLOBAL_BATCH_SIZE},"num_microbatches":${NUM_MICROBATCHES},"gpu_count":${GPU_COUNT},"nnodes":${NNODES},"node_rank":${NODE_RANK},"numa_mode":"${NUMA_MODE}","run_date":"${RUN_DATE}"}
+{"model":"${MODEL_ID}","recipe":"${RECIPE}","run_name":"${RUN_NAME}","dtype":"${DTYPE}","fsdp":3,"num_layers":"${LAYERS_TAG}","mtp_num_layers":${MTP_TAG},"num_moe_experts":"${EXPERTS_TAG}","cuda_graph":"${CUDA_GRAPH}","seq_length":${SEQ_LENGTH},"context_parallel_size":${CONTEXT_PARALLEL},"expert_model_parallel_size":${EXPERT_PARALLEL},"dispatcher":"${DISPATCHER}","micro_batch_size":${MICRO_BATCH_SIZE},"global_batch_size":${GLOBAL_BATCH_SIZE},"num_microbatches":${NUM_MICROBATCHES},"gpu_count":${GPU_COUNT},"nnodes":${NNODES},"node_rank":${NODE_RANK},"numa_mode":"${NUMA_MODE}","run_date":"${RUN_DATE}"}
 JSON
-printf 'model=%s dtype=%s seq=%s cp=%s ep=%s mbs=%s gbs=%s gpus=%s num_microbatches=%s numa=%s\n' "${MODEL}" "${DTYPE}" "${SEQ_LENGTH}" "${CONTEXT_PARALLEL}" "${EXPERT_PARALLEL}" "${MICRO_BATCH_SIZE}" "${GLOBAL_BATCH_SIZE}" "${GPU_COUNT}" "${NUM_MICROBATCHES}" "${NUMA_MODE}" | tee "${RESULT_DIR}/run_info.txt"
+printf 'model=%s dtype=%s layers=%s mtp=%s experts=%s cuda_graph=%s seq=%s cp=%s ep=%s dispatcher=%s mbs=%s gbs=%s gpus=%s num_microbatches=%s numa=%s\n' "${MODEL}" "${DTYPE}" "${LAYERS_TAG}" "${MTP_TAG}" "${EXPERTS_TAG}" "${CUDA_GRAPH}" "${SEQ_LENGTH}" "${CONTEXT_PARALLEL}" "${EXPERT_PARALLEL}" "${DISPATCHER}" "${MICRO_BATCH_SIZE}" "${GLOBAL_BATCH_SIZE}" "${GPU_COUNT}" "${NUM_MICROBATCHES}" "${NUMA_MODE}" | tee "${RESULT_DIR}/run_info.txt"
 set +e
 "${COMMAND[@]}" 2>&1 | tee "${RESULT_DIR}/train.log"
 STATUS=${PIPESTATUS[0]}

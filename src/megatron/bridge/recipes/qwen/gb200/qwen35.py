@@ -31,6 +31,7 @@ _QWEN35_35B_A3B_BASE = "Qwen/Qwen3.5-35B-A3B-Base"
 _QWEN35_27B_BASE = "Qwen/Qwen3.5-27B"
 _QWEN35_122B_A10B_BASE = "Qwen/Qwen3.5-122B-A10B"
 _QWEN35_397B_A17B_BASE = "Qwen/Qwen3.5-397B-A17B"
+_QWEN38_2P4T_A95B_BASE = "Qwen/Qwen3.8-2.4T-A95B"
 
 
 def _qwen35_text_4gpu_gb200_fsdp1_config(
@@ -55,7 +56,10 @@ def _qwen35_text_4gpu_gb200_fsdp1_config(
     """
     cfg = _pretrain_common()
 
-    text_config = AutoConfig.from_pretrained(hf_path).text_config
+    # Qwen3.5 checkpoints nest the text model under ``text_config``; text-only
+    # checkpoints such as Qwen3.8-2.4T-A95B are already a text config.
+    hf_config = AutoConfig.from_pretrained(hf_path)
+    text_config = getattr(hf_config, "text_config", hf_config)
     text_config.architectures = [architecture]
     cfg.model = AutoBridge.from_hf_config(text_config).to_megatron_provider(load_weights=False)
     cfg.tokenizer.tokenizer_model = hf_path
@@ -318,7 +322,7 @@ def qwen35_text_35b_a3b_pretrain_4gpu_gb200_bf16_fsdp1_config() -> ConfigContain
     The provider is initialized from the Qwen3.5 35B-A3B architecture because
     that is the model definition used by the corresponding Qwen3.5 recipe.
     The recipe intentionally does not load a checkpoint and uses mock data.
-    
+
     fork from
     - base config: qwen35_text_35b_a3b_pretrain_8gpu_gb200_bf16_config
     - fsdp config: qwen35_vl_35b_a3b_sft_2gpu_h100_bf16_fsdp_config
@@ -490,6 +494,21 @@ def qwen35_text_397b_a17b_pretrain_4gpu_gb200_bf16_fsdp1_config() -> ConfigConta
     )
 
 
+def qwen38_text_2p4t_a95b_pretrain_4gpu_gb200_bf16_fsdp1_config() -> ConfigContainer:
+    """Return a 4-GPU GB200 Qwen3.8-2.4T-A95B MoE FSDP1 config.
+
+    The checkpoint uses the Qwen3.5 MoE text architecture.  Its
+    ``output_gate_type="swish"`` is not modelled: Megatron's attention output
+    gate is sigmoid, with identical parameter shapes.  The complete layer and
+    expert counts are retained, so a 4-GPU run must crop both at launch time.
+    """
+    return _qwen35_text_4gpu_gb200_fsdp1_config(
+        _QWEN38_2P4T_A95B_BASE,
+        "Qwen3_5MoeForCausalLM",
+        is_moe=True,
+    )
+
+
 def qwen35_text_9b_pretrain_4gpu_gb200_bf16_fsdp1_config() -> ConfigContainer:
     """Return a 4-GPU GB200 Qwen3.5 9B dense model FSDP1 config."""
     cfg = _pretrain_common()
@@ -571,7 +590,7 @@ def qwen35_text_9b_pretrain_4gpu_gb200_bf16_fsdp1_config() -> ConfigContainer:
 
     cfg.mixed_precision = bf16_mixed()
     cfg.mixed_precision.grad_reduce_in_fp32 = True
-    
+
     cfg.comm_overlap = CommOverlapConfig(
         tp_comm_overlap=False,
         overlap_grad_reduce=False,
