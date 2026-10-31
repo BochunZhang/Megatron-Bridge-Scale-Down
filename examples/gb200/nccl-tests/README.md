@@ -155,6 +155,24 @@ shmem communicator 在 application replay 下没能让 4 个 rank 对齐到同�
 | `--replay-mode kernel --set basic` | 少量 pass 时保存显存是否成功 |
 | `--communicator none --replay-mode application --set basic` | 不用 communicator 时，application replay 能否拦到 kernel（可能卡住，由 `--timeout` 兜底） |
 
+**实测结果（2026-10-31，tcp + kernel）：communicator 正常，保存显存仍然失败。**4 个 ncu 在 127.0.0.1 上组成
+communicator（`Initialized Communicator [rank N | size 4]`），4 个 rank 同时进入 STMC kernel
+（`Profiling "ncclSymkDevKernel_AllGather_STMC"` ×4），随后每个 rank 都报 `Failed to save memory for
+replay`，然后退出，退出码 9。可见保存显存失败与 communicator 用 shmem 还是 tcp 无关，是 kernel replay
+遇到 STMC kernel 能访问的这些内存时的问题。
+
+**下一个候选：`--replay-mode app-range`。**它和 application replay 一样每一遍都重启所有 rank，不保存显存，
+但采集对象是 NVTX range，而不是逐个 kernel。NCCL 2.32.3 会给每次 API 调用打一个 NVTX range，domain 是
+`NCCL`，名字是 `ncclAllGather`（`src/include/nvtx.h` 的 `NVTX3_FUNC_WITH_PARAMS`）。`-g 1` 时 nccl-tests
+不用 group 包住调用，STMC kernel 就是在这个 range 里 launch 的，range 里没有别的 GPU 工作，所以 range
+的指标基本就是这个 kernel 的指标。脚本用 `--nvtx --nvtx-include "NCCL@ncclAllGather/"` 选中它，
+`--launch-skip` / `--launch-count` 计的是 range 数。
+
+```bash
+bash examples/gb200/nccl-tests/run_ncu_all_gather_stmc.sh --skip-baseline --replay-mode app-range --set basic
+bash examples/gb200/nccl-tests/run_ncu_all_gather_stmc.sh --skip-baseline --replay-mode app-range --set basic --communicator none
+```
+
 ## 输出
 
 默认目录是 `results/gb200/nccl-tests/ncu-all-gather-stmc/<时间>/`，也可以用 `--output-dir` 指定：

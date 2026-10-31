@@ -52,10 +52,14 @@ Options:
   --communicator MODE    shmem | tcp | none (default: shmem)
   --tcp-port N           Port of the tcp communicator (default: ncu's own)
   --set NAME             ncu --set (default: full)
-  --replay-mode MODE     ncu --replay-mode: application | kernel (default: application). kernel
-                         replay saves and restores the memory the kernel can reach before every
-                         pass, which fails for the symmetric windows ("Failed to save memory for
-                         replay"); application relaunches all ranks once per pass instead
+  --replay-mode MODE     ncu --replay-mode: application | kernel | app-range (default: application).
+                           kernel       saves and restores the memory the kernel can reach before
+                                        every pass; fails for the symmetric windows ("Failed to
+                                        save memory for replay")
+                           application  relaunches all ranks once per pass, profiles the kernel
+                           app-range    relaunches all ranks once per pass, profiles NCCL's own
+                                        NVTX range NCCL@ncclAllGather (the STMC launch is its only
+                                        GPU work with -g 1), so metrics are per range, not kernel
   --launch-skip N        STMC launches per rank to skip before profiling (default: 1, the warmup)
   --launch-count N       STMC launches to profile (default: 1)
   --timeout SEC          Kill a pass after SEC seconds and report a hang (default: 1800)
@@ -124,9 +128,9 @@ while [[ $# -gt 0 ]]; do
 done
 
 [[ "$communicator" =~ ^(shmem|tcp|none)$ ]] || die "--communicator must be shmem, tcp or none"
-[[ "$replay_mode" == application || "$replay_mode" == kernel ]] || die "--replay-mode must be application or kernel"
-[[ "$communicator" == tcp && "$replay_mode" == application ]] \
-    && die "--communicator tcp needs --replay-mode kernel: application replay cannot relaunch one MPI rank alone"
+[[ "$replay_mode" =~ ^(application|kernel|app-range)$ ]] || die "--replay-mode must be application, kernel or app-range"
+[[ "$communicator" == tcp && "$replay_mode" != kernel ]] \
+    && die "--communicator tcp needs --replay-mode kernel: ${replay_mode} replay cannot relaunch one MPI rank alone"
 IFS=, read -r -a gpu_list <<<"$gpus"
 nranks=${#gpu_list[@]}
 (( nranks >= 2 )) || die "--gpus needs at least two GPUs"
@@ -168,7 +172,7 @@ mkdir -p "$output_dir"
 
 # Every rank inherits mpirun's environment on a single node. Drop the per-process selectors that
 # would compete with NCCL_SYM_KERNEL.
-unset NCCL_ALGO NCCL_PROTO NCCL_CTA_POLICY NCCL_CE_COLL_AG_MULTICAST_THRESHOLD
+unset NCCL_ALGO NCCL_PROTO NCCL_CTA_POLICY NCCL_CE_COLL_AG_MULTICAST_THRESHOLD NCCL_NVTX_DISABLE
 export CUDA_VISIBLE_DEVICES="$gpus"
 export LD_LIBRARY_PATH="${nccl_home}/lib${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
 export NCCL_NVLS_ENABLE=1
@@ -252,10 +256,17 @@ fi
 # launch, no data check (it would add launches the counters do not need). The profiled launches
 # are in the out-of-place pass; the in-place pass that follows repeats the same count unprofiled.
 ncu_iters=(-w "$launch_skip" -n "$launch_count" -c 0)
+if [[ "$replay_mode" == app-range ]]; then
+    # NCCL pushes one NVTX range per API call in domain "NCCL", named after the function
+    # (NVTX3_FUNC_WITH_PARAMS, src/include/nvtx.h). --launch-skip / --launch-count count ranges.
+    target_args=(--nvtx --nvtx-include "NCCL@ncclAllGather/")
+else
+    target_args=(--kernel-name "regex:^ncclSymkDevKernel_AllGather_STMC")
+fi
 ncu_args=(
     --set "$ncu_set"
     --replay-mode "$replay_mode"
-    --kernel-name "regex:^ncclSymkDevKernel_AllGather_STMC"
+    "${target_args[@]}"
     --launch-skip "$launch_skip"
     --launch-count "$launch_count"
     --target-processes all
