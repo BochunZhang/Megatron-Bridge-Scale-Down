@@ -4,7 +4,7 @@
 
 # Run one cropped Qwen3.5 / Qwen3.8 case through scripts/training/run_recipe.py.
 # The selected GB200 recipe is FSDP1 by default; the overrides below select
-# Megatron FSDP3 for this communication experiment.
+# Megatron FSDP3 (default) or keep FSDP1 with --fsdp 1.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -30,6 +30,7 @@ LINEAR_ATTENTION_FREQ=""
 MTP_NUM_LAYERS=""
 DISPATCHER="${DISPATCHER:-hybridep}"
 CUDA_GRAPH="${CUDA_GRAPH:-off}"
+FSDP_LEVEL="${FSDP_LEVEL:-3}"
 HYBRIDEP_NUM_SMS="${HYBRIDEP_NUM_SMS:-32}"
 GPU_COUNT="${GPU_COUNT:-4}"
 GPUS_PER_NODE="${GPUS_PER_NODE:-4}"
@@ -69,6 +70,11 @@ Options:
                                  per-layer graphs, attn+mlp for dense models and
                                  the partial attn+moe_router+moe_preprocess scope
                                  for MoE models (default: off)
+  --fsdp 3|1                     3: Megatron FSDP optim_grads_params with prefetch and
+                                 overlapped reduce-scatter. 1: the recipe's optim
+                                 strategy (only optimizer state sharded; gradient
+                                 reduce-scatter and parameter all-gather once per
+                                 iteration, not overlapped) (default: 3)
   --dtype|--precision bf16|mxfp8 Compute mode (default: bf16)
   --gpu|--gpus N                 Global GPU count (default: 4)
   --nproc-per-node N              GPUs per node (default: 4)
@@ -111,6 +117,7 @@ while [[ $# -gt 0 ]]; do
         --dispatcher) need_value "$@"; DISPATCHER="$2"; shift 2;;
         --hybridep-num-sms) need_value "$@"; HYBRIDEP_NUM_SMS="$2"; shift 2;;
         --cuda-graph) need_value "$@"; CUDA_GRAPH="$2"; shift 2;;
+        --fsdp) need_value "$@"; FSDP_LEVEL="$2"; shift 2;;
         --gpu|--gpus) need_value "$@"; GPU_COUNT="$2"; shift 2;;
         --nproc-per-node) need_value "$@"; GPUS_PER_NODE="$2"; shift 2;;
         --nnodes) need_value "$@"; NNODES="$2"; shift 2;;
@@ -140,6 +147,13 @@ case "${DTYPE}" in bf16|mxfp8) ;; *) echo "--dtype must be bf16 or mxfp8" >&2; e
 case "${PROFILE}" in none|nsys) ;; *) echo "--profile must be none or nsys" >&2; exit 2;; esac
 case "${DISPATCHER}" in hybridep|alltoall) ;; *) echo "--dispatcher must be hybridep or alltoall" >&2; exit 2;; esac
 case "${CUDA_GRAPH}" in off|on) ;; *) echo "--cuda-graph must be off or on" >&2; exit 2;; esac
+# FSDP1 keeps the recipe's settings: with the optim strategy Megatron-FSDP delays the
+# gradient reduction to the end of the iteration, so there is nothing to overlap.
+case "${FSDP_LEVEL}" in
+    3) SHARDING_STRATEGY=optim_grads_params; FSDP_OVERLAP=true;;
+    1) SHARDING_STRATEGY=optim; FSDP_OVERLAP=false;;
+    *) echo "--fsdp must be 1 or 3" >&2; exit 2;;
+esac
 for name in SEQ_LENGTH CONTEXT_PARALLEL MICRO_BATCH_SIZE GLOBAL_BATCH_SIZE TRAIN_ITERS GPU_COUNT GPUS_PER_NODE MASTER_PORT HYBRIDEP_NUM_SMS; do
     [[ "${!name}" =~ ^[1-9][0-9]*$ ]] || { echo "${name} must be a positive integer" >&2; exit 2; }
 done
@@ -195,16 +209,16 @@ esac
 LAYERS_TAG="${NUM_LAYERS:-full}"
 MTP_TAG="${MTP_NUM_LAYERS:-0}"
 if [[ "${MODEL}" == 27b ]]; then EXPERTS_TAG=0; else EXPERTS_TAG="${NUM_EXPERTS:-full}"; fi
-CASE_NAME="model_${MODEL}-fsdp_3-layers_${LAYERS_TAG}-mtp_${MTP_TAG}-experts_${EXPERTS_TAG}-cg_${CUDA_GRAPH}-mbs_${MICRO_BATCH_SIZE}-seq_${SEQ_LENGTH}-cp_${CONTEXT_PARALLEL}-ep_${EXPERT_PARALLEL}-disp_${DISPATCHER}-gbs_${GLOBAL_BATCH_SIZE}-gpus_${GPU_COUNT}-profile_${PROFILE}-date_${RUN_DATE}"
+CASE_NAME="model_${MODEL}-fsdp_${FSDP_LEVEL}-layers_${LAYERS_TAG}-mtp_${MTP_TAG}-experts_${EXPERTS_TAG}-cg_${CUDA_GRAPH}-mbs_${MICRO_BATCH_SIZE}-seq_${SEQ_LENGTH}-cp_${CONTEXT_PARALLEL}-ep_${EXPERT_PARALLEL}-disp_${DISPATCHER}-gbs_${GLOBAL_BATCH_SIZE}-gpus_${GPU_COUNT}-profile_${PROFILE}-date_${RUN_DATE}"
 RESULT_DIR="${RESULTS_ROOT}/${CASE_NAME}/node${NODE_RANK}"
 if [[ "${PRINT_RESULT_DIR}" == true ]]; then
     printf '%s\n' "${RESULT_DIR}"
     exit 0
 fi
-# nsys report name, e.g. qwen35_27b-experts_0-cg_off-cp_4-ep_1-mbs_1-gbs_4-seq_16k-rank_0;
+# nsys report name, e.g. qwen35_27b-fsdp_3-experts_0-cg_off-cp_4-ep_1-mbs_1-gbs_4-seq_16k-rank_0;
 # %q{RANK} expands to the torchrun global rank in each worker.
 if (( SEQ_LENGTH % 1024 == 0 )); then SEQ_TAG="$((SEQ_LENGTH / 1024))k"; else SEQ_TAG="${SEQ_LENGTH}"; fi
-NSYS_NAME="${MODEL_TAG}-experts_${EXPERTS_TAG}-cg_${CUDA_GRAPH}-cp_${CONTEXT_PARALLEL}-ep_${EXPERT_PARALLEL}-mbs_${MICRO_BATCH_SIZE}-gbs_${GLOBAL_BATCH_SIZE}-seq_${SEQ_TAG}-rank_%q{RANK}"
+NSYS_NAME="${MODEL_TAG}-fsdp_${FSDP_LEVEL}-experts_${EXPERTS_TAG}-cg_${CUDA_GRAPH}-cp_${CONTEXT_PARALLEL}-ep_${EXPERT_PARALLEL}-mbs_${MICRO_BATCH_SIZE}-gbs_${GLOBAL_BATCH_SIZE}-seq_${SEQ_TAG}-rank_%q{RANK}"
 NUM_MICROBATCHES=$((GLOBAL_BATCH_SIZE / (MICRO_BATCH_SIZE * (GPU_COUNT / CONTEXT_PARALLEL))))
 
 # torchrun creates LOCAL_RANK before this worker wrapper is invoked. Prefer a
@@ -227,6 +241,10 @@ if (( NNODES == 1 && GPU_COUNT == 4 )); then export GLOO_SOCKET_IFNAME=eth0; els
 if [[ "${DISPATCHER}" == hybridep ]]; then
     export NUM_OF_HYBRID_EP_RANKS_PER_NVLINK_DOMAIN="${EXPERT_PARALLEL}" NVLINK_DOMAIN_SIZE=72 USE_MNNVL=1
 fi
+# Keep NCCL to warnings even when the shell exports NCCL_DEBUG=INFO; INFO floods train.log
+# with per-communicator channel/topology lines.
+export NCCL_DEBUG=WARN
+unset NCCL_DEBUG_SUBSYS NCCL_DEBUG_FILE || true
 
 PROFILE_RANKS=0
 for (( rank = 1; rank < GPU_COUNT; rank++ )); do PROFILE_RANKS+=",${rank}"; done
@@ -241,12 +259,12 @@ OVERRIDES=(
     "model.recompute_granularity=null" "model.recompute_method=null" "model.recompute_num_layers=null"
     "model.recompute_modules=[]" "model.fine_grained_activation_offloading=false" "model.offload_modules=[]"
     "dist.use_megatron_fsdp=true" "ddp.use_megatron_fsdp=true" "ddp.use_distributed_optimizer=true"
-    "ddp.data_parallel_sharding_strategy=optim_grads_params" "ddp.average_in_collective=false"
-    "ddp.overlap_grad_reduce=true" "ddp.overlap_param_gather=true" "ddp.grad_reduce_in_fp32=true"
+    "ddp.data_parallel_sharding_strategy=${SHARDING_STRATEGY}" "ddp.average_in_collective=false"
+    "ddp.overlap_grad_reduce=${FSDP_OVERLAP}" "ddp.overlap_param_gather=${FSDP_OVERLAP}" "ddp.grad_reduce_in_fp32=true"
     # The recipe pins comm_overlap.overlap_*=false, and CommOverlapConfig.setup()
     # copies those values back into ddp at runtime. Override both layers so
     # FSDP3 keeps parameter prefetch and asynchronous reduce-scatter enabled.
-    "comm_overlap.overlap_grad_reduce=true" "comm_overlap.overlap_param_gather=true"
+    "comm_overlap.overlap_grad_reduce=${FSDP_OVERLAP}" "comm_overlap.overlap_param_gather=${FSDP_OVERLAP}"
     "checkpoint.ckpt_format=fsdp_dtensor" "checkpoint.save=null" "checkpoint.load=null"
     "logger.log_interval=1" "logger.tensorboard_dir=null" "logger.save_config_filepath=${RESULT_DIR}/config.yaml"
     "profiling.use_nsys_profiler=$([[ "${PROFILE}" == nsys ]] && echo true || echo false)"
@@ -311,7 +329,7 @@ fi
 COMMAND+=("${WORKER[@]}" "${TRAIN_ARGS[@]}")
 
 if [[ "${DRY_RUN}" == true ]]; then
-    printf 'model=%s recipe=%s dtype=%s layers=%s mtp=%s experts=%s cuda_graph=%s seq=%s cp=%s ep=%s dispatcher=%s mbs=%s gbs=%s gpus=%s num_microbatches=%s numa=%s\n' "${MODEL}" "${RECIPE}" "${DTYPE}" "${LAYERS_TAG}" "${MTP_TAG}" "${EXPERTS_TAG}" "${CUDA_GRAPH}" "${SEQ_LENGTH}" "${CONTEXT_PARALLEL}" "${EXPERT_PARALLEL}" "${DISPATCHER}" "${MICRO_BATCH_SIZE}" "${GLOBAL_BATCH_SIZE}" "${GPU_COUNT}" "${NUM_MICROBATCHES}" "${NUMA_MODE}" >&2
+    printf 'model=%s recipe=%s fsdp=%s dtype=%s layers=%s mtp=%s experts=%s cuda_graph=%s seq=%s cp=%s ep=%s dispatcher=%s mbs=%s gbs=%s gpus=%s num_microbatches=%s numa=%s\n' "${MODEL}" "${RECIPE}" "${FSDP_LEVEL}" "${DTYPE}" "${LAYERS_TAG}" "${MTP_TAG}" "${EXPERTS_TAG}" "${CUDA_GRAPH}" "${SEQ_LENGTH}" "${CONTEXT_PARALLEL}" "${EXPERT_PARALLEL}" "${DISPATCHER}" "${MICRO_BATCH_SIZE}" "${GLOBAL_BATCH_SIZE}" "${GPU_COUNT}" "${NUM_MICROBATCHES}" "${NUMA_MODE}" >&2
     printf 'GLOO_SOCKET_IFNAME=%s\ncommand:' "${GLOO_SOCKET_IFNAME:-<unset>}" >&2
     printf ' %q' "${COMMAND[@]}" >&2; printf '\n' >&2
     exit 0
@@ -331,9 +349,9 @@ printf 'command:' >"${RESULT_DIR}/command.txt"
 printf ' %q' "${COMMAND[@]}" >>"${RESULT_DIR}/command.txt"
 printf '\n' >>"${RESULT_DIR}/command.txt"
 cat >"${RESULT_DIR}/launch.json" <<JSON
-{"model":"${MODEL_ID}","recipe":"${RECIPE}","run_name":"${RUN_NAME}","dtype":"${DTYPE}","fsdp":3,"num_layers":"${LAYERS_TAG}","mtp_num_layers":${MTP_TAG},"num_moe_experts":"${EXPERTS_TAG}","cuda_graph":"${CUDA_GRAPH}","seq_length":${SEQ_LENGTH},"context_parallel_size":${CONTEXT_PARALLEL},"expert_model_parallel_size":${EXPERT_PARALLEL},"dispatcher":"${DISPATCHER}","micro_batch_size":${MICRO_BATCH_SIZE},"global_batch_size":${GLOBAL_BATCH_SIZE},"num_microbatches":${NUM_MICROBATCHES},"gpu_count":${GPU_COUNT},"nnodes":${NNODES},"node_rank":${NODE_RANK},"numa_mode":"${NUMA_MODE}","run_date":"${RUN_DATE}"}
+{"model":"${MODEL_ID}","recipe":"${RECIPE}","run_name":"${RUN_NAME}","dtype":"${DTYPE}","fsdp":${FSDP_LEVEL},"num_layers":"${LAYERS_TAG}","mtp_num_layers":${MTP_TAG},"num_moe_experts":"${EXPERTS_TAG}","cuda_graph":"${CUDA_GRAPH}","seq_length":${SEQ_LENGTH},"context_parallel_size":${CONTEXT_PARALLEL},"expert_model_parallel_size":${EXPERT_PARALLEL},"dispatcher":"${DISPATCHER}","micro_batch_size":${MICRO_BATCH_SIZE},"global_batch_size":${GLOBAL_BATCH_SIZE},"num_microbatches":${NUM_MICROBATCHES},"gpu_count":${GPU_COUNT},"nnodes":${NNODES},"node_rank":${NODE_RANK},"numa_mode":"${NUMA_MODE}","run_date":"${RUN_DATE}"}
 JSON
-printf 'model=%s dtype=%s layers=%s mtp=%s experts=%s cuda_graph=%s seq=%s cp=%s ep=%s dispatcher=%s mbs=%s gbs=%s gpus=%s num_microbatches=%s numa=%s\n' "${MODEL}" "${DTYPE}" "${LAYERS_TAG}" "${MTP_TAG}" "${EXPERTS_TAG}" "${CUDA_GRAPH}" "${SEQ_LENGTH}" "${CONTEXT_PARALLEL}" "${EXPERT_PARALLEL}" "${DISPATCHER}" "${MICRO_BATCH_SIZE}" "${GLOBAL_BATCH_SIZE}" "${GPU_COUNT}" "${NUM_MICROBATCHES}" "${NUMA_MODE}" | tee "${RESULT_DIR}/run_info.txt"
+printf 'model=%s fsdp=%s dtype=%s layers=%s mtp=%s experts=%s cuda_graph=%s seq=%s cp=%s ep=%s dispatcher=%s mbs=%s gbs=%s gpus=%s num_microbatches=%s numa=%s\n' "${MODEL}" "${FSDP_LEVEL}" "${DTYPE}" "${LAYERS_TAG}" "${MTP_TAG}" "${EXPERTS_TAG}" "${CUDA_GRAPH}" "${SEQ_LENGTH}" "${CONTEXT_PARALLEL}" "${EXPERT_PARALLEL}" "${DISPATCHER}" "${MICRO_BATCH_SIZE}" "${GLOBAL_BATCH_SIZE}" "${GPU_COUNT}" "${NUM_MICROBATCHES}" "${NUMA_MODE}" | tee "${RESULT_DIR}/run_info.txt"
 set +e
 "${COMMAND[@]}" 2>&1 | tee "${RESULT_DIR}/train.log"
 STATUS=${PIPESTATUS[0]}

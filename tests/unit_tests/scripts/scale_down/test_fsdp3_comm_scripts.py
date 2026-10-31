@@ -110,3 +110,58 @@ def test_run_one_print_result_dir_encodes_shape_and_cuda_graph(tmp_path: Path):
     assert Path(result.stdout.strip()).parent.name.startswith(
         "model_2p4t-fsdp_3-layers_4-mtp_1-experts_64-cg_on-mbs_1-seq_4096-cp_1-ep_4-"
     )
+
+
+def test_27b_fsdp1_vs_fsdp3_sweep_selects_sharding_and_overlap(tmp_path: Path):
+    result = _run(
+        EXAMPLE / "benchmark_27b_fsdp1_vs_fsdp3.sh",
+        *("--dry-run", "--run-date", RUN_DATE, "--output-dir", str(tmp_path)),
+    )
+    assert result.returncode == 0, result.stderr
+    commands = _commands(result.stderr)
+    assert len(commands) == 6
+    for command in commands:
+        assert "model.num_layers=8" in command
+        assert "model.mtp_num_layers=1" in command
+        assert "model.cuda_graph_impl=none" in command
+        assert "train.global_batch_size=16" in command
+        assert "nsys profile" in command
+    for seq in (256, 1024, 4096):
+        fsdp3 = next(c for c in commands if f"model_27b-fsdp_3-layers_8-mtp_1-experts_0-cg_off-mbs_1-seq_{seq}-" in c)
+        assert "ddp.data_parallel_sharding_strategy=optim_grads_params" in fsdp3
+        assert "comm_overlap.overlap_param_gather=true" in fsdp3
+        fsdp1 = next(c for c in commands if f"model_27b-fsdp_1-layers_8-mtp_1-experts_0-cg_off-mbs_1-seq_{seq}-" in c)
+        assert "ddp.data_parallel_sharding_strategy=optim " in fsdp1
+        assert "ddp.overlap_grad_reduce=false" in fsdp1
+        assert "comm_overlap.overlap_param_gather=false" in fsdp1
+
+
+def test_run_one_rejects_unknown_fsdp_level():
+    result = _run(RUN_ONE, "--model", "27b", "--recipe", "r", "--seq-length", "256", "--fsdp", "2", "--dry-run")
+    assert result.returncode == 2
+    assert "--fsdp must be 1 or 3" in result.stderr
+
+
+def test_397b_fsdp1_vs_fsdp3_sweep_crops_experts_without_cp(tmp_path: Path):
+    result = _run(
+        EXAMPLE / "benchmark_397b_fsdp1_vs_fsdp3.sh",
+        *("--dry-run", "--run-date", RUN_DATE, "--output-dir", str(tmp_path)),
+    )
+    assert result.returncode == 0, result.stderr
+    commands = _commands(result.stderr)
+    assert len(commands) == 12
+    for command in commands:
+        assert "model.num_layers=4" in command
+        assert "model.mtp_num_layers=1" in command
+        assert "model.context_parallel_size=1" in command
+        assert "model.expert_model_parallel_size=4" in command
+        assert r"model.moe_layer_freq=\[1\,1\,1\,1\]" in command
+        assert "model.cuda_graph_impl=none" in command
+        assert "nsys profile" in command
+    for experts in (64, 32):
+        for seq in (256, 1024, 4096):
+            for fsdp, strategy in ((3, "optim_grads_params"), (1, "optim")):
+                prefix = f"model_397b-fsdp_{fsdp}-layers_4-mtp_1-experts_{experts}-cg_off-mbs_1-seq_{seq}-cp_1-ep_4-"
+                command = next(c for c in commands if prefix in c)
+                assert f"model.num_moe_experts={experts}" in command
+                assert f"ddp.data_parallel_sharding_strategy={strategy} " in command

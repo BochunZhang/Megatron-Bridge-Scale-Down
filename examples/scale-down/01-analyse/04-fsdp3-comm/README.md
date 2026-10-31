@@ -44,6 +44,52 @@ FSDP3 每个 micro-batch 都要 all-gather 参数并 reduce-scatter 梯度，单
 
 传入 `--model`、`--seq`、`--cp`、`--mbs` 任一参数时改为笛卡尔积矩阵：未指定的维度取完整默认值（模型 `397b,27b,2p4t`、CP `1,4`、seq `4096,16384,32768`、MBS `1,2,4`），`--model all` 加入 122b。`--cuda-graph off,on` 选择 CUDA graph 模式，`--num-layers`、`--mtp-num-layers` 修改裁剪，`--num-microbatches` 修改 micro-batch 数，`--global-batch-size N` 改为固定 GBS（此时忽略 `--num-microbatches`）。
 
+### 短序列：FSDP3 与 FSDP1 对比（27b）
+
+seq=4096 时每层计算足以盖住 FSDP3 的 all-gather / reduce-scatter，nsys 上看不到暴露的通信。`benchmark_27b_fsdp1_vs_fsdp3.sh` 把每 micro-batch 的计算压到很小，专门让通信暴露出来：
+
+| 项 | 取值 |
+| --- | --- |
+| 模型 | 27b dense，8 层（6 GatedDeltaNet + 2 gated attention）+ 1 层 MTP |
+| 并行 | 4 卡单节点，DP=4，TP=PP=CP=1 |
+| 其他 | BF16，CUDA graph 关，MBS=1，每 iter 4 个 micro-batch（GBS=16），nsys 采集 step 7 |
+| 矩阵 | seq `256,1024,4096` × FSDP `3,1`，共 6 次 |
+
+FSDP 级别由单 case 启动器的 `--fsdp 3|1` 选择：
+
+- `--fsdp 3`（默认）：`optim_grads_params`，开启参数预取与 reduce-scatter 重叠，与上面的矩阵相同；每个 micro-batch 都做 fwd AG、bwd AG 和 RS。
+- `--fsdp 1`：保持 recipe 自身的 `optim` 策略，只切 optimizer state。Megatron-FSDP 对 `optim` 延迟梯度规约，整个 iteration 只在最后做一次梯度 reduce-scatter、optimizer step 后做一次参数 all-gather，因此 recipe 关闭 overlap，启动器也保持关闭。
+
+结果目录名带 `fsdp_<1|3>`，nsys 报告名以 `qwen35_27b-fsdp_<1|3>-` 开头：
+
+```bash
+bash examples/scale-down/01-analyse/04-fsdp3-comm/benchmark_27b_fsdp1_vs_fsdp3.sh --dry-run
+bash examples/scale-down/01-analyse/04-fsdp3-comm/benchmark_27b_fsdp1_vs_fsdp3.sh
+# 只跑一部分，例如
+bash examples/scale-down/01-analyse/04-fsdp3-comm/benchmark_27b_fsdp1_vs_fsdp3.sh --seq 256 --fsdp 3
+```
+
+### 短序列：FSDP3 与 FSDP1 对比（397b，裁剪 experts）
+
+`benchmark_397b_fsdp1_vs_fsdp3.sh` 在 MoE 上做同样的对比，并加入 routed expert 数一维：
+
+| 项 | 取值 |
+| --- | --- |
+| 模型 | 397b MoE，4 层（3 GatedDeltaNet + 1 gated attention，每层 MoE）+ 1 层 MTP |
+| 并行 | 4 卡单节点，DP=4，EP=4，TP=PP=CP=1，HybridEP dispatcher |
+| 其他 | BF16，CUDA graph 关，MBS=1，每 iter 4 个 micro-batch（GBS=16），nsys 采集 step 7 |
+| 矩阵 | experts `64,32` × seq `256,1024,4096` × FSDP `3,1`，共 12 次 |
+
+4 卡 EP=4 时 expert 的数据并行组大小为 1，routed expert 参数在两种 FSDP 级别下都不切分，也没有 FSDP 通信；FSDP3 与 FSDP1 的差别只来自 dense 参数（attention / GDN、shared expert、router、embedding、LM head）。expert 数只改变每卡 routed expert 参数量（64 时每卡 16 个，32 时每卡 8 个），不改变 EP dispatch / combine 的通信量。
+
+```bash
+bash examples/scale-down/01-analyse/04-fsdp3-comm/benchmark_397b_fsdp1_vs_fsdp3.sh --dry-run
+bash examples/scale-down/01-analyse/04-fsdp3-comm/benchmark_397b_fsdp1_vs_fsdp3.sh
+bash examples/scale-down/01-analyse/04-fsdp3-comm/benchmark_397b_fsdp1_vs_fsdp3.sh --experts 64 --seq 256
+```
+
+两个对比脚本都固定 CP=1，不比较 CP。
+
 ## CUDA graph
 
 | `--cuda-graph` | dense（27b） | MoE（397b / 2p4t） |
