@@ -16,7 +16,7 @@ RECIPE=qwen35_text_27b_pretrain_4gpu_gb200_bf16_fsdp1_config
 SEQUENCES=(256 1024 4096)
 FSDP_LEVELS=(3 1)
 NUM_LAYERS="${NUM_LAYERS:-8}"
-MTP_NUM_LAYERS="${MTP_NUM_LAYERS:-1}"
+MTP_NUM_LAYERS="${MTP_NUM_LAYERS:-0}"
 # Microbatches per iteration; GBS = nmb * MBS * DP with MBS=1, DP=GPUS (CP=1).
 NUM_MICROBATCHES="${NUM_MICROBATCHES:-4}"
 GPUS="${GPUS:-4}"
@@ -34,7 +34,7 @@ usage() {
 Usage: benchmark_27b_fsdp1_vs_fsdp3.sh [options]
 
 Qwen3.5-27B dense, 4 GPUs on one node, DP=4 (TP=PP=CP=1), BF16 (or MXFP8), CUDA graph off,
-8 layers (6 GatedDeltaNet + 2 gated attention) + 1 MTP layer, MBS=1,
+8 layers (6 GatedDeltaNet + 2 gated attention), no MTP, MBS=1,
 4 microbatches per iteration (GBS=16), Nsight Systems on step 7.
 Default matrix: seq 256,1024,4096 x FSDP 3,1 = 6 runs.
 
@@ -42,7 +42,7 @@ Options:
   --seq N[,N...]           Sequence lengths (default: 256,1024,4096)
   --fsdp 3|1[,...]         FSDP levels (default: 3,1)
   --num-layers N           Decoder layers (default: 8)
-  --mtp-num-layers N       MTP layers (default: 1)
+  --mtp-num-layers N       MTP layers (default: 0)
   --num-microbatches N     Microbatches per iteration (default: 4)
   --train-iters N          Training iterations (default: 10)
   --mxfp8                  Train in MXFP8 (same as --dtype mxfp8); names get "-mxfp8"

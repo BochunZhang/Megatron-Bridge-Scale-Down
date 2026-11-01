@@ -47,9 +47,9 @@ EXTRA_OVERRIDES=()
 
 usage() {
     cat <<'USAGE'
-Usage: run_pretrain_fsdp3.sh --model 397b|122b|27b|2p4t --recipe NAME --seq-length N [options]
+Usage: run_pretrain_fsdp3.sh --model 397b|122b|27b|2.4t --recipe NAME --seq-length N [options]
 
-Models: 397b/122b/27b are Qwen3.5-397B-A17B / 122B-A10B / 27B; 2p4t (alias 2.4t)
+Models: 397b/122b/27b are Qwen3.5-397B-A17B / 122B-A10B / 27B; 2.4t (alias 2p4t)
 is Qwen3.8-2.4T-A95B.
 
 Options:
@@ -100,7 +100,7 @@ USAGE
 need_value() { [[ $# -ge 2 ]] || { echo "Missing value for $1" >&2; usage >&2; exit 2; }; }
 while [[ $# -gt 0 ]]; do
     case "$1" in
-        --model) need_value "$@"; MODEL="$2"; [[ "${MODEL}" == 2.4t ]] && MODEL=2p4t; shift 2;;
+        --model) need_value "$@"; MODEL="$2"; [[ "${MODEL}" == 2p4t ]] && MODEL=2.4t; shift 2;;
         --recipe) need_value "$@"; RECIPE="$2"; shift 2;;
         --seq-length) need_value "$@"; SEQ_LENGTH="$2"; shift 2;;
         --dtype|--precision) need_value "$@"; DTYPE="$2"; [[ "${DTYPE}" == fp8mx ]] && DTYPE=mxfp8; shift 2;;
@@ -142,7 +142,7 @@ done
 
 [[ -n "${MODEL}" && -n "${RECIPE}" && -n "${SEQ_LENGTH}" ]] || { echo "--model, --recipe, and --seq-length are required" >&2; exit 2; }
 [[ "${DTYPE}" == fp8mx ]] && DTYPE=mxfp8
-case "${MODEL}" in 397b|122b|27b|2p4t) ;; *) echo "Unsupported model: ${MODEL}" >&2; exit 2;; esac
+case "${MODEL}" in 397b|122b|27b|2.4t) ;; *) echo "Unsupported model: ${MODEL}" >&2; exit 2;; esac
 case "${DTYPE}" in bf16|mxfp8) ;; *) echo "--dtype must be bf16 or mxfp8" >&2; exit 2;; esac
 case "${PROFILE}" in none|nsys) ;; *) echo "--profile must be none or nsys" >&2; exit 2;; esac
 case "${DISPATCHER}" in hybridep|alltoall) ;; *) echo "--dispatcher must be hybridep or alltoall" >&2; exit 2;; esac
@@ -202,7 +202,7 @@ case "${MODEL}" in
     397b) MODEL_ID=Qwen/Qwen3.5-397B-A17B; MODEL_TAG=qwen35_397b;;
     122b) MODEL_ID=Qwen/Qwen3.5-122B-A10B; MODEL_TAG=qwen35_122b;;
     27b) MODEL_ID=Qwen/Qwen3.5-27B; MODEL_TAG=qwen35_27b;;
-    2p4t) MODEL_ID=Qwen/Qwen3.8-2.4T-A95B; MODEL_TAG=qwen38_2p4t;;
+    2.4t) MODEL_ID=Qwen/Qwen3.8-2.4T-A95B; MODEL_TAG=qwen38_2.4t;;
 esac
 # Shape tags in the result path: an unset crop keeps the recipe value ("full");
 # the launcher disables MTP unless --mtp-num-layers is given.
@@ -218,10 +218,10 @@ if [[ "${PRINT_RESULT_DIR}" == true ]]; then
     printf '%s\n' "${RESULT_DIR}"
     exit 0
 fi
-# nsys report name, e.g. qwen35_27b-fsdp_3-mxfp8-experts_0-cg_off-cp_4-ep_1-mbs_1-gbs_4-seq_16k-rank_0;
-# %q{RANK} expands to the torchrun global rank in each worker.
+# nsys report name, e.g. qwen35_27b-fsdp_3-mxfp8-experts_0-cg_off-cp_4-ep_1-mbs_1-gbs_4-seq_16k-node_0;
+# nsys wraps torchrun, so one report per node holds every local rank.
 if (( SEQ_LENGTH % 1024 == 0 )); then SEQ_TAG="$((SEQ_LENGTH / 1024))k"; else SEQ_TAG="${SEQ_LENGTH}"; fi
-NSYS_NAME="${MODEL_TAG}-fsdp_${FSDP_LEVEL}${DTYPE_TAG}-experts_${EXPERTS_TAG}-cg_${CUDA_GRAPH}-cp_${CONTEXT_PARALLEL}-ep_${EXPERT_PARALLEL}-mbs_${MICRO_BATCH_SIZE}-gbs_${GLOBAL_BATCH_SIZE}-seq_${SEQ_TAG}-rank_%q{RANK}"
+NSYS_NAME="${MODEL_TAG}-fsdp_${FSDP_LEVEL}${DTYPE_TAG}-experts_${EXPERTS_TAG}-cg_${CUDA_GRAPH}-cp_${CONTEXT_PARALLEL}-ep_${EXPERT_PARALLEL}-mbs_${MICRO_BATCH_SIZE}-gbs_${GLOBAL_BATCH_SIZE}-seq_${SEQ_TAG}-node_${NODE_RANK}"
 NUM_MICROBATCHES=$((GLOBAL_BATCH_SIZE / (MICRO_BATCH_SIZE * (GPU_COUNT / CONTEXT_PARALLEL))))
 
 # torchrun creates LOCAL_RANK before this worker wrapper is invoked. Prefer a
@@ -318,18 +318,21 @@ if (( NNODES == 1 )); then
 else
     DIST_ARGS=(--nproc_per_node="${GPUS_PER_NODE}" --nnodes="${NNODES}" --node_rank="${NODE_RANK}" --master_addr="${MASTER_ADDR}" --master_port="${MASTER_PORT}")
 fi
-WORKER=(uv run --no-sync python)
+COMMAND=()
 if [[ "${PROFILE}" == nsys ]]; then
     # NCCL's own NVTX ranges (domain NCCL) carry message bytes and comm hash per
     # collective; nsys NCCL recipes need them to report sizes and bandwidth.
     export NCCL_NVTX_DISABLE=0
-    WORKER=(nsys profile --trace=cuda,nvtx --sample=none --cpuctxsw=none --capture-range=cudaProfilerApi --capture-range-end=stop --force-overwrite=true --output="${RESULT_DIR}/${NSYS_NAME}" uv run --no-sync python)
+    # nsys outside torchrun follows every worker process into one report, so all
+    # ranks of the node share one timeline. Every rank calls cudaProfilerStart /
+    # Stop (profile_ranks lists them all), bounding the capture to the profiled steps.
+    COMMAND=(nsys profile --trace=cuda,nvtx --sample=none --cpuctxsw=none --capture-range=cudaProfilerApi --capture-range-end=stop --force-overwrite=true --output="${RESULT_DIR}/${NSYS_NAME}")
 fi
-COMMAND=(uv run --no-sync python -m torch.distributed.run "${DIST_ARGS[@]}" --no-python)
+COMMAND+=(uv run --no-sync python -m torch.distributed.run "${DIST_ARGS[@]}" --no-python)
 if (( ${#NUMA_WRAPPER[@]} > 0 )); then
     COMMAND+=("${NUMA_WRAPPER[@]}")
 fi
-COMMAND+=("${WORKER[@]}" "${TRAIN_ARGS[@]}")
+COMMAND+=(uv run --no-sync python "${TRAIN_ARGS[@]}")
 
 if [[ "${DRY_RUN}" == true ]]; then
     printf 'model=%s recipe=%s fsdp=%s dtype=%s layers=%s mtp=%s experts=%s cuda_graph=%s seq=%s cp=%s ep=%s dispatcher=%s mbs=%s gbs=%s gpus=%s num_microbatches=%s numa=%s\n' "${MODEL}" "${RECIPE}" "${FSDP_LEVEL}" "${DTYPE}" "${LAYERS_TAG}" "${MTP_TAG}" "${EXPERTS_TAG}" "${CUDA_GRAPH}" "${SEQ_LENGTH}" "${CONTEXT_PARALLEL}" "${EXPERT_PARALLEL}" "${DISPATCHER}" "${MICRO_BATCH_SIZE}" "${GLOBAL_BATCH_SIZE}" "${GPU_COUNT}" "${NUM_MICROBATCHES}" "${NUMA_MODE}" >&2

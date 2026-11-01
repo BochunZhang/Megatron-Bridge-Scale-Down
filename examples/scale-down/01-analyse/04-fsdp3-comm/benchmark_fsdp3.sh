@@ -17,9 +17,9 @@ RUN_DATE="${RUN_DATE:-$(date +%y%m%d-%H%M%S)}"
 REPRESENTATIVE_CASES=(
     "27b 1 4096 1" "27b 1 32768 1" "27b 4 16384 1"
     "397b 1 4096 1" "397b 1 32768 1" "397b 4 16384 1"
-    "2p4t 1 4096 1" "2p4t 1 32768 1" "2p4t 4 16384 1"
+    "2.4t 1 4096 1" "2.4t 1 32768 1" "2.4t 4 16384 1"
 )
-MODELS=(397b 27b 2p4t)
+MODELS=(397b 27b 2.4t)
 SEQUENCES=(4096 16384 32768)
 MICRO_BATCH_SIZES=(1 2 4)
 CONTEXT_PARALLEL_SIZES=(1 4)
@@ -29,7 +29,7 @@ DTYPE="${DTYPE:-bf16}"
 PROFILE="${PROFILE:-nsys}"
 TRAIN_ITERS="${TRAIN_ITERS:-10}"
 NUM_LAYERS="${NUM_LAYERS:-4}"
-MTP_NUM_LAYERS="${MTP_NUM_LAYERS:-1}"
+MTP_NUM_LAYERS="${MTP_NUM_LAYERS:-0}"
 # Qwen3.8 2.4T routed experts: empty = halve from MAX_EXPERTS_2P4T on OOM.
 EXPERTS_2P4T="${EXPERTS_2P4T:-}"
 MAX_EXPERTS_2P4T="${MAX_EXPERTS_2P4T:-512}"
@@ -56,30 +56,31 @@ usage() {
 Usage: benchmark_fsdp3.sh [options]
 
 By default nine representative cases run with CUDA graph off and on (18 runs,
-plus the expert-halving retries of 2p4t), 4 microbatches per iteration, MBS=1,
+plus the expert-halving retries of 2.4t), 4 microbatches per iteration, MBS=1,
 BF16 (GBS = microbatches * MBS * DP, i.e. 16 at DP=4):
   27b  (Qwen3.5-27B, dense)              seq=4096 CP=1 | seq=32768 CP=1 | seq=16384 CP=4
   397b (Qwen3.5-397B-A17B, MoE, EP=4)    same three
-  2p4t (Qwen3.8-2.4T-A95B, MoE, EP=4)    same three
-Every model is cropped to 4 layers (3 GatedDeltaNet + 1 gated attention) plus one
-MTP layer. 397b keeps all 512 routed experts. 2p4t starts at 512 routed experts
+  2.4t (Qwen3.8-2.4T-A95B, MoE, EP=4)    same three
+Every model is cropped to 4 layers (3 GatedDeltaNet + 1 gated attention) without
+MTP. 397b keeps all 512 routed experts. 2.4t starts at 512 routed experts
 and halves the count after an out-of-memory failure until the case trains; both
 CUDA graph modes of a case use the same expert count.
 Passing any of --model/--seq/--cp/--mbs switches to the Cartesian matrix of
-models=397b,27b,2p4t; CP=1,4; seq=4096,16384,32768; MBS=1,2,4, restricted by the
+models=397b,27b,2.4t; CP=1,4; seq=4096,16384,32768; MBS=1,2,4, restricted by the
 given options. All cases are validated before the first launch; a failed case
 does not stop the sweep.
 
 Options:
-  --model NAME[,NAME...]        Select models: 397b,122b,27b,2p4t or all (or --models)
+  --model NAME[,NAME...]        Select models: 397b,122b,27b,2.4t or all (or --models);
+                                2p4t is accepted for 2.4t
   --seq N[,N...]                Select sequence lengths (or --seq-lengths)
   --cp N[,N...]                 Select context parallel sizes
   --mbs N[,N...]                Select micro batch sizes
   --cuda-graph off|on[,...]     CUDA graph modes per case (default: off,on)
   --num-layers N                Decoder layers (default: 4)
-  --mtp-num-layers N            MTP layers (default: 1)
-  --experts-2p4t N              Fix the Qwen3.8 2.4T routed-expert count (no search)
-  --max-experts-2p4t N          First count of the halving search (default: 512)
+  --mtp-num-layers N            MTP layers (default: 0)
+  --experts-2.4t N              Fix the Qwen3.8 2.4T routed-expert count (no search)
+  --max-experts-2.4t N          First count of the halving search (default: 512)
   --dtype|--precision bf16|mxfp8
   --dispatcher hybridep|alltoall MoE token dispatcher (default: hybridep)
   --profile none|nsys            Profiling mode (default: nsys)
@@ -115,8 +116,8 @@ while [[ $# -gt 0 ]]; do
         --cuda-graph|--cuda-graphs) need_value "$@"; parse_csv "$2" CUDA_GRAPHS; shift 2;;
         --num-layers) need_value "$@"; NUM_LAYERS="$2"; shift 2;;
         --mtp-num-layers) need_value "$@"; MTP_NUM_LAYERS="$2"; shift 2;;
-        --experts-2p4t) need_value "$@"; EXPERTS_2P4T="$2"; shift 2;;
-        --max-experts-2p4t) need_value "$@"; MAX_EXPERTS_2P4T="$2"; shift 2;;
+        --experts-2.4t|--experts-2p4t) need_value "$@"; EXPERTS_2P4T="$2"; shift 2;;
+        --max-experts-2.4t|--max-experts-2p4t) need_value "$@"; MAX_EXPERTS_2P4T="$2"; shift 2;;
         --dtype|--precision) need_value "$@"; DTYPE="$2"; [[ "${DTYPE}" == fp8mx ]] && DTYPE=mxfp8; shift 2;;
         --profile) need_value "$@"; PROFILE="$2"; shift 2;;
         --dispatcher) need_value "$@"; DISPATCHER="$2"; shift 2;;
@@ -155,7 +156,7 @@ done
 for experts in "${EXPERTS_2P4T}" "${MAX_EXPERTS_2P4T}"; do
     [[ -z "${experts}" ]] && continue
     [[ "${experts}" =~ ^[1-9][0-9]*$ ]] && (( experts % MOE_EP == 0 && experts >= MOE_TOPK_2P4T )) || {
-        echo "2p4t expert counts must be multiples of EP=${MOE_EP} and at least top-k=${MOE_TOPK_2P4T}" >&2; exit 2
+        echo "2.4t expert counts must be multiples of EP=${MOE_EP} and at least top-k=${MOE_TOPK_2P4T}" >&2; exit 2
     }
 done
 if [[ -n "${GLOBAL_BATCH_SIZE}" ]]; then
@@ -167,9 +168,9 @@ else
 fi
 
 if (( ${#MODELS[@]} == 1 )) && [[ "${MODELS[0]}" == all ]]; then
-    MODELS=(397b 122b 27b 2p4t)
+    MODELS=(397b 122b 27b 2.4t)
 fi
-for i in "${!MODELS[@]}"; do [[ "${MODELS[i]}" == 2.4t ]] && MODELS[i]=2p4t; done
+for i in "${!MODELS[@]}"; do [[ "${MODELS[i]}" == 2p4t ]] && MODELS[i]=2.4t; done
 (( GPUS % NPROC_PER_NODE == 0 )) || { echo "gpus must be divisible by nproc-per-node" >&2; exit 2; }
 NNODES="${NNODES:-$((GPUS / NPROC_PER_NODE))}"
 [[ "${NNODES}" =~ ^[1-9][0-9]*$ ]] || { echo "nnodes must be positive" >&2; exit 2; }
@@ -181,7 +182,7 @@ recipe_for_model() {
         397b) echo qwen35_text_397b_a17b_pretrain_4gpu_gb200_bf16_fsdp1_config;;
         122b) echo qwen35_text_122b_a10b_pretrain_4gpu_gb200_bf16_fsdp1_config;;
         27b) echo qwen35_text_27b_pretrain_4gpu_gb200_bf16_fsdp1_config;;
-        2p4t) echo qwen38_text_2p4t_a95b_pretrain_4gpu_gb200_bf16_fsdp1_config;;
+        2.4t) echo qwen38_text_2p4t_a95b_pretrain_4gpu_gb200_bf16_fsdp1_config;;
         *) echo "Unsupported model: $1" >&2; return 2;;
     esac
 }
@@ -215,8 +216,8 @@ for case_spec in "${CANDIDATES[@]}"; do
     fi
     # Each node decides the next expert count from its own train.log, so an
     # automatic search is only consistent on a single node.
-    if [[ "${model}" == 2p4t && -z "${EXPERTS_2P4T}" ]] && (( NNODES > 1 )); then
-        echo "multi-node 2p4t runs require --experts-2p4t (the OOM halving search is single-node only)" >&2; exit 2
+    if [[ "${model}" == 2.4t && -z "${EXPERTS_2P4T}" ]] && (( NNODES > 1 )); then
+        echo "multi-node 2.4t runs require --experts-2.4t (the OOM halving search is single-node only)" >&2; exit 2
     fi
     if [[ -n "${GLOBAL_BATCH_SIZE}" ]]; then
         (( GLOBAL_BATCH_SIZE % (mbs * (GPUS / cp)) == 0 )) || {
@@ -279,7 +280,7 @@ trap 'echo "benchmark interrupted" >&2; exit 130' INT TERM
 FAILED=()
 for case_spec in "${CASES[@]}"; do
     read -r model cp seq mbs gbs <<<"${case_spec}"
-    if [[ "${model}" != 2p4t ]]; then
+    if [[ "${model}" != 2.4t ]]; then
         for cg in "${CUDA_GRAPHS[@]}"; do
             case_args "${model}" "${cp}" "${seq}" "${mbs}" "${gbs}" "${cg}"
             printf 'launch model=%s cp=%s seq=%s mbs=%s gbs=%s cuda_graph=%s\n' "${model}" "${cp}" "${seq}" "${mbs}" "${gbs}" "${cg}" >&2

@@ -9,40 +9,40 @@
 | `397b` | `Qwen/Qwen3.5-397B-A17B` | `qwen35_text_397b_a17b_pretrain_4gpu_gb200_bf16_fsdp1_config` |
 | `122b` | `Qwen/Qwen3.5-122B-A10B` | `qwen35_text_122b_a10b_pretrain_4gpu_gb200_bf16_fsdp1_config` |
 | `27b` | `Qwen/Qwen3.5-27B` | `qwen35_text_27b_pretrain_4gpu_gb200_bf16_fsdp1_config` |
-| `2p4t`（别名 `2.4t`） | `Qwen/Qwen3.8-2.4T-A95B` | `qwen38_text_2p4t_a95b_pretrain_4gpu_gb200_bf16_fsdp1_config` |
+| `2.4t`（别名 `2p4t`） | `Qwen/Qwen3.8-2.4T-A95B` | `qwen38_text_2p4t_a95b_pretrain_4gpu_gb200_bf16_fsdp1_config` |
 
 Qwen3.8-2.4T-A95B 的 HF 配置是纯文本的 `Qwen3_5MoeForCausalLM`（没有 `text_config`），与 Qwen3.5 MoE 同构。它的 `output_gate_type="swish"` 在 Megatron 中没有对应实现：Megatron 的 attention output gate 是 sigmoid，参数形状相同，只差一个逐元素乘法，对通信与显存分析没有影响。
 
 ## 实验矩阵
 
-默认运行 9 个代表性 case，每个 case 分别以 CUDA graph 关闭和开启各跑一次（共 18 次，另加 2p4t 减半 experts 的重试）。每 iter 固定 4 个 micro-batch（MBS=1、4 卡），GBS 按 `micro-batch 数 × MBS × DP` 逐 case 推算，DP=4 时 GBS=16：
+默认运行 9 个代表性 case，每个 case 分别以 CUDA graph 关闭和开启各跑一次（共 18 次，另加 2.4t 减半 experts 的重试）。每 iter 固定 4 个 micro-batch（MBS=1、4 卡），GBS 按 `micro-batch 数 × MBS × DP` 逐 case 推算，DP=4 时 GBS=16：
 
 | case | 模型 | seq | CP | DP | EP | GBS | 每 micro-batch 每 rank token | 观察点 |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- |
 | D1 / D2 / D3 | 27b dense | 4096 / 32768 / 16384 | 1 / 1 / 4 | 4 / 4 / 1 | 1 | 16 / 16 / 4 | 4096 / 32768 / 4096 | 计算最少时 FSDP 通信占比上限；长序列是否隐藏 FSDP 通信；CP 通信 |
 | M1 / M2 / M3 | 397b MoE | 同上 | 同上 | 同上 | 4 | 同上 | 同上 | 同上，增加 HybridEP dispatch / combine |
-| T1 / T2 / T3 | 2p4t MoE（裁剪 experts） | 同上 | 同上 | 同上 | 4 | 同上 | 同上 | hidden=8192 的大层：单层 dense 参数是 397b 的约 3.7 倍 |
+| T1 / T2 / T3 | 2.4t MoE（裁剪 experts） | 同上 | 同上 | 同上 | 4 | 同上 | 同上 | hidden=8192 的大层：单层 dense 参数是 397b 的约 3.7 倍 |
 
 模型裁剪规则：
 
-- 所有模型裁剪到 **4 层**（`linear_attention_freq=4`，即 3 层 GatedDeltaNet + 1 层 gated attention），并开启 **1 层 MTP**（`mtp_num_layers=1`，MTP 层是 gated attention + MoE / dense MLP，与 embedding、output layer 共享权重）。
+- 所有模型裁剪到 **4 层**（`linear_attention_freq=4`，即 3 层 GatedDeltaNet + 1 层 gated attention），默认**关闭 MTP**（`mtp_num_layers=0`）；`--mtp-num-layers 1` 可加回 1 层 MTP（gated attention + MoE / dense MLP，与 embedding、output layer 共享权重）。
 - `397b` **不裁剪 experts**（512 个 routed experts，EP=4，每 rank 128 个）。
-- `2p4t` 从 512 个 experts 开始；某个 expert 数下任一 CUDA graph 模式在 `train.log` 中出现 OOM（`out of memory` / `OutOfMemoryError`），就把 experts 减半并重跑该 case 的所有 CUDA graph 模式，直到能训练（下限为 top-k=10 以上且能被 EP=4 整除，即 16）。同一 case 的 graph 关 / 开因此总是使用同一个 expert 数；每个 expert 数先跑显存更高的 graph 开。搜索结果追加到 `results/01-analyse/04-fsdp3-comm/expert_search-date_<RUN_DATE>-node<N>.tsv`（`experts=` 为最终值，`tried=` 记录 `512:oom,256:oom,...`）。`--experts-2p4t N` 固定 expert 数、不搜索，`--max-experts-2p4t N` 修改搜索起点。多节点时各节点只能看到自己的日志，减半决策可能不一致，因此多节点 2p4t 必须用 `--experts-2p4t`。
+- `2.4t` 从 512 个 experts 开始；某个 expert 数下任一 CUDA graph 模式在 `train.log` 中出现 OOM（`out of memory` / `OutOfMemoryError`），就把 experts 减半并重跑该 case 的所有 CUDA graph 模式，直到能训练（下限为 top-k=10 以上且能被 EP=4 整除，即 16）。同一 case 的 graph 关 / 开因此总是使用同一个 expert 数；每个 expert 数先跑显存更高的 graph 开。搜索结果追加到 `results/01-analyse/04-fsdp3-comm/expert_search-date_<RUN_DATE>-node<N>.tsv`（`experts=` 为最终值，`tried=` 记录 `512:oom,256:oom,...`）。`--experts-2.4t N` 固定 expert 数、不搜索，`--max-experts-2.4t N` 修改搜索起点。多节点时各节点只能看到自己的日志，减半决策可能不一致，因此多节点 2.4t 必须用 `--experts-2.4t`。
 
 按 BF16 混合精度 + Adam、FSDP3 每参数 18 B（bf16 参数 2 + fp32 main grad 4 + fp32 master/m/v 12，`grad_reduce_in_fp32=true`）、EP=4 时 expert 也是 4 路切分估算，每卡模型状态：
 
-| 模型（4 层 + MTP） | dense 参数 | routed expert 参数 | 每卡模型状态 |
+| 模型（4 层 + 1 层 MTP） | dense 参数 | routed expert 参数 | 每卡模型状态 |
 | --- | --- | --- | --- |
 | 27b | 约 4.5B | — | 约 19 GiB |
 | 397b（512 experts） | 约 2.7B | 约 32.2B | 约 147 GiB |
-| 2p4t，128 experts | 约 6.6B | 约 32.2B | 约 163 GiB |
-| 2p4t，64 experts | 约 6.6B | 约 16.1B | 约 95 GiB |
+| 2.4t，128 experts | 约 6.6B | 约 32.2B | 约 163 GiB |
+| 2.4t，64 experts | 约 6.6B | 约 16.1B | 约 95 GiB |
 
-GB200 每卡约 185 GiB。另外还有 FSDP double buffer（两个 FSDP unit 的 bf16 参数与 fp32 梯度桶）、激活、248K 词表的 fp32 logits（seq 4096 时每份约 3.8 GiB，MTP 再加一份）以及 CUDA graph 内存池。因此 397b 在 4096 上可以放下但余量不大，32768 很可能 OOM（按要求 397b 不裁剪 experts，OOM 只记为失败 case）；2p4t 预计停在 64 experts。
+GB200 每卡约 185 GiB。另外还有 FSDP double buffer（两个 FSDP unit 的 bf16 参数与 fp32 梯度桶）、激活、248K 词表的 fp32 logits（seq 4096 时每份约 3.8 GiB，MTP 再加一份）以及 CUDA graph 内存池。因此 397b 在 4096 上可以放下但余量不大，32768 很可能 OOM（按要求 397b 不裁剪 experts，OOM 只记为失败 case）；2.4t 预计停在 64 experts。
 
 FSDP3 每个 micro-batch 都要 all-gather 参数并 reduce-scatter 梯度，单次通信量与 seq、MBS 无关，因此计算强度主要由“每 micro-batch 每 rank token 数 = MBS × seq / CP”决定，默认固定 MBS=1。4 个 micro-batch 保证一个 iter 内既有每个 micro-batch 重复的 FSDP 通信，也有每 iter 只发生一次的开销（optimizer step、首层 all-gather / 末层 reduce-scatter 等无法被重叠的部分）。122b 与 397b 结构相同、只是更小，默认不跑。
 
-传入 `--model`、`--seq`、`--cp`、`--mbs` 任一参数时改为笛卡尔积矩阵：未指定的维度取完整默认值（模型 `397b,27b,2p4t`、CP `1,4`、seq `4096,16384,32768`、MBS `1,2,4`），`--model all` 加入 122b。`--cuda-graph off,on` 选择 CUDA graph 模式，`--num-layers`、`--mtp-num-layers` 修改裁剪，`--num-microbatches` 修改 micro-batch 数，`--global-batch-size N` 改为固定 GBS（此时忽略 `--num-microbatches`）。
+传入 `--model`、`--seq`、`--cp`、`--mbs` 任一参数时改为笛卡尔积矩阵：未指定的维度取完整默认值（模型 `397b,27b,2.4t`、CP `1,4`、seq `4096,16384,32768`、MBS `1,2,4`），`--model all` 加入 122b。`--cuda-graph off,on` 选择 CUDA graph 模式，`--num-layers`、`--mtp-num-layers` 修改裁剪，`--num-microbatches` 修改 micro-batch 数，`--global-batch-size N` 改为固定 GBS（此时忽略 `--num-microbatches`）。
 
 ### 短序列：FSDP3 与 FSDP1 对比（27b）
 
@@ -50,7 +50,7 @@ seq=4096 时每层计算足以盖住 FSDP3 的 all-gather / reduce-scatter，nsy
 
 | 项 | 取值 |
 | --- | --- |
-| 模型 | 27b dense，8 层（6 GatedDeltaNet + 2 gated attention）+ 1 层 MTP |
+| 模型 | 27b dense，8 层（6 GatedDeltaNet + 2 gated attention），无 MTP |
 | 并行 | 4 卡单节点，DP=4，TP=PP=CP=1 |
 | 其他 | BF16，CUDA graph 关，MBS=1，每 iter 4 个 micro-batch（GBS=16），nsys 采集 step 7 |
 | 矩阵 | seq `256,1024,4096` × FSDP `3,1`，共 6 次 |
@@ -75,7 +75,7 @@ bash examples/scale-down/01-analyse/04-fsdp3-comm/benchmark_27b_fsdp1_vs_fsdp3.s
 
 | 项 | 取值 |
 | --- | --- |
-| 模型 | 397b MoE，4 层（3 GatedDeltaNet + 1 gated attention，每层 MoE）+ 1 层 MTP |
+| 模型 | 397b MoE，4 层（3 GatedDeltaNet + 1 gated attention，每层 MoE），无 MTP |
 | 并行 | 4 卡单节点，DP=4，EP=4，TP=PP=CP=1，HybridEP dispatcher |
 | 其他 | BF16，CUDA graph 关，MBS=1，每 iter 4 个 micro-batch（GBS=16），nsys 采集 step 7 |
 | 矩阵 | experts `64,32` × seq `256,1024,4096` × FSDP `3,1`，共 12 次 |
@@ -88,18 +88,38 @@ bash examples/scale-down/01-analyse/04-fsdp3-comm/benchmark_397b_fsdp1_vs_fsdp3.
 bash examples/scale-down/01-analyse/04-fsdp3-comm/benchmark_397b_fsdp1_vs_fsdp3.sh --experts 64 --seq 256
 ```
 
-两个对比脚本都固定 CP=1，不比较 CP。
+### 短序列：FSDP3 与 FSDP1 对比（2.4t，裁剪 experts）
 
-两个对比脚本默认 BF16；加 `--mxfp8`（等价于 `--dtype mxfp8`）改为 MXFP8 训练，覆盖与 `run_pretrain_fsdp3.sh --dtype mxfp8` 相同（`fp8_param_gather=false`，MoE 另开 `moe_router_padding_for_fp8`）。MXFP8 的结果目录与 nsys 报告名在 `fsdp_<1|3>` 后加 `-mxfp8`，例如 `model_27b-fsdp_3-mxfp8-layers_8-...` 与 `qwen35_27b-fsdp_3-mxfp8-experts_0-...-rank_0.nsys-rep`；BF16 的命名保持不变。
+`benchmark_2.4t_fsdp1_vs_fsdp3.sh` 在 Qwen3.8-2.4T-A95B 上做与 397b 相同的对比：
+
+| 项 | 取值 |
+| --- | --- |
+| 模型 | 2.4t MoE，4 层（3 GatedDeltaNet + 1 gated attention，每层 MoE），无 MTP |
+| 并行 | 4 卡单节点，DP=4，EP=4，TP=PP=CP=1，HybridEP dispatcher |
+| 其他 | BF16，CUDA graph 关（`--cuda-graph off,on` 可加入开启模式），MBS=1，每 iter 4 个 micro-batch（GBS=16），nsys 采集 step 7 |
+| 矩阵 | experts `64,32` × seq `256,1024,4096` × FSDP `3,1`，共 12 次 |
+
+2.4t 的 hidden=8192，单层 dense 参数约为 397b 的 3.7 倍，FSDP3 每层 all-gather / reduce-scatter 的数据量也相应更大，因此在短序列下通信更难被计算盖住。EP=4 时 routed expert 同样不经过 FSDP 通信，差别只来自 dense 参数。FSDP1 不切参数与梯度，dense 部分每卡约多 30 GiB，64 experts 时按上表估算每卡模型状态约 130 GiB，仍在 GB200 范围内。结果目录名以 `model_2.4t-fsdp_<1|3>-` 开头，nsys 报告名以 `qwen38_2.4t-fsdp_<1|3>-` 开头。
+
+```bash
+bash examples/scale-down/01-analyse/04-fsdp3-comm/benchmark_2.4t_fsdp1_vs_fsdp3.sh --dry-run
+bash examples/scale-down/01-analyse/04-fsdp3-comm/benchmark_2.4t_fsdp1_vs_fsdp3.sh
+bash examples/scale-down/01-analyse/04-fsdp3-comm/benchmark_2.4t_fsdp1_vs_fsdp3.sh --experts 64 --seq 256
+```
+
+三个对比脚本都固定 CP=1，不比较 CP。
+
+三个对比脚本默认 BF16；加 `--mxfp8`（等价于 `--dtype mxfp8`）改为 MXFP8 训练，覆盖与 `run_pretrain_fsdp3.sh --dtype mxfp8` 相同（`fp8_param_gather=false`，MoE 另开 `moe_router_padding_for_fp8`）。MXFP8 的结果目录与 nsys 报告名在 `fsdp_<1|3>` 后加 `-mxfp8`，例如 `model_27b-fsdp_3-mxfp8-layers_8-...` 与 `qwen35_27b-fsdp_3-mxfp8-experts_0-...-node_0.nsys-rep`；BF16 的命名保持不变。
 
 ```bash
 bash examples/scale-down/01-analyse/04-fsdp3-comm/benchmark_27b_fsdp1_vs_fsdp3.sh --mxfp8
 bash examples/scale-down/01-analyse/04-fsdp3-comm/benchmark_397b_fsdp1_vs_fsdp3.sh --mxfp8
+bash examples/scale-down/01-analyse/04-fsdp3-comm/benchmark_2.4t_fsdp1_vs_fsdp3.sh --mxfp8
 ```
 
 ## CUDA graph
 
-| `--cuda-graph` | dense（27b） | MoE（397b / 2p4t） |
+| `--cuda-graph` | dense（27b） | MoE（397b / 2.4t） |
 | --- | --- | --- |
 | `off` | `cuda_graph_impl=none` | `cuda_graph_impl=none` |
 | `on` | TE per-layer graph，`cuda_graph_modules=[attn,mlp]`：attention 与 MLP 计算全部进 graph | TE per-layer graph，`cuda_graph_modules=[attn,moe_router,moe_preprocess]`（部分 graph）：attention、router、shared expert、preprocess 进 graph；HybridEP dispatch / combine 与 routed experts 保持 eager |
@@ -107,6 +127,15 @@ bash examples/scale-down/01-analyse/04-fsdp3-comm/benchmark_397b_fsdp1_vs_fsdp3.
 开启时同时设置 `cuda_graph_warmup_steps=3` 与 `ddp.megatron_fsdp_cuda_graph_mode=true`。后者让 Megatron-FSDP 在 optimizer step 后不解除梯度引用，保证 graph replay 使用的地址有效；Megatron-LM 在 FSDP + CUDA graph 时会自动打开它，Bridge 不会，所以启动器显式覆盖。recipe 本身已启用 `fsdp_double_buffer` 与 `megatron_fsdp_max_pool_double_buffer`，后者让每个 FSDP unit 的参数桶落在固定地址，是 graph replay 读取 all-gather 结果的前提。TE graph 也覆盖 MTP 层。
 
 per-layer graph 只包住模块内部计算：FSDP 的 pre-forward / post-backward hook、all-gather、reduce-scatter 都在 graph 之外 eager 执行，因此 FSDP 通信在两种模式下相同，对比的是 graph 消除的 CPU launch 开销是否改变计算与通信的重叠。graph 在第 3 个 iteration 后捕获，nsys 默认采集 step 7，已处于 replay 阶段。首次运行开启模式时，建议对比同一 case 关 / 开的 `train.log` loss 是否一致。Bridge 只支持 `transformer_engine` 按模块 graph 与 `full_iteration` graph，`full_iteration` 会把 FSDP 通信一起捕获，不在本实验范围内。
+
+测试 FSDP3 下 CUDA graph 的收益，用同一 case 的 graph 关 / 开对比 step 时间与 nsys 上暴露的通信，例如 2.4t 短序列（每 micro-batch 计算最少、最可能受 CPU launch 限制）：
+
+```bash
+bash examples/scale-down/01-analyse/04-fsdp3-comm/benchmark_2.4t_fsdp1_vs_fsdp3.sh \
+  --fsdp 3 --experts 64 --seq 256,1024,4096 --cuda-graph off,on
+```
+
+比较 iteration 时间时加 `--profile none`，以排除 nsys 与 `record_shapes` 的 host 开销。FSDP1 加 CUDA graph（`--fsdp 1 --cuda-graph on`）也能启动，但尚未验证。
 
 ## FSDP all-gather / reduce-scatter 的层标注
 
@@ -121,7 +150,7 @@ per-layer graph 只包住模块内部计算：FSDP 的 pre-forward / post-backwa
 本项目使用的 Megatron-LM（`core_v0.19.0_scale_down` 分支）在 Megatron-FSDP 中直接加入了带层号的 NVTX range：
 
 - `megatron_fsdp/utils.py`：`configure_nvtx_profiling()` 开关与 `nvtx_range()`（未开启时不构造 label，无额外开销）；`megatron.core.utils.configure_nvtx_profiling()` 会同步转发到这个开关，因此 Bridge 的 `profiling.nvtx_ranges=true`（启动器在 nsys 模式下设置）或 Megatron-LM 的 `--nvtx-ranges` 即可开启；
-- `param_and_grad_buffer.py`：`ParamAndGradBuffer.bucket_nvtx_label()` 由 `param_to_name` 生成 bucket label；`AllGatherPipeline.all_gather_params` 与 `GradReducePipeline._bucket_group_gradient_reduce` 把 `_coalescing_manager` 与 `nvtx_range` 放在同一个 `with` 中，range 正好包住 coalesced NCCL kernel 的发起（发生在 manager 退出时）；
+- `param_and_grad_buffer.py`：`ParamAndGradBuffer` 在构建 parameter group（bucket）时用 `param_to_name` 一次性算出每个 bucket 的层、类型和参数量，存入 `ParameterGroup.nvtx_label`；运行时 `AllGatherPipeline.all_gather_nvtx_label()` / `GradReducePipeline.grad_reduce_nvtx_label()` 只按 bucket 组合查表，组合的拼接串在首次出现时生成并缓存；`AllGatherPipeline.all_gather_params` 与 `GradReducePipeline._bucket_group_gradient_reduce` 把 `_coalescing_manager` 与 `nvtx_range` 放在同一个 `with` 中，range 正好包住 coalesced NCCL kernel 的发起（发生在 manager 退出时）；
 - `megatron_fsdp.py`：非 overlap 路径 `start_param_sync` 中逐 bucket 的 all-gather 也带同样的 label。
 
 label 例如：
@@ -139,6 +168,20 @@ FSDP RS L3 dense 119.6M
 - 同一次 coalesced 发起的多个 bucket 以 `+` 连接，请求与预取以 `|` 分隔。nsys 会把 range 投影到对应 NCCL kernel（`nsys stats --report nvtx_gpu_proj_trace`，或在 GUI 中看 NVTX 行下的 GPU 投影）。
 
 `--profile none` 时不开启 NVTX，也就没有这些 range。
+
+## Layer 的 forward / backward 标注
+
+`TransformerLayer` 的 NVTX range 与上面的 FSDP label 使用同一套 0-based 层号（即参数名 `decoder.layers.<i>` / `mtp.layers.<i>` 中的 `<i>`），名称在构造 layer 时算好：
+
+```text
+L0 fwd / L0 bwd ... L3 fwd / L3 bwd      decoder 层
+mtp0 fwd / mtp0 bwd                       MTP 层（开启 MTP 时）
+```
+
+- `L<i> fwd`：`TransformerLayer.forward` 的 push / pop；
+- `L<i> bwd`：按 Megatron-FSDP backward hook 的方式注入。layer 输出上挂一个 tensor hook，输出梯度到达（该层 backward 开始）时 push；layer 输入经过一个恒等 autograd Function，输入梯度算完（该层 backward 结束）时 pop。range 在 autograd 线程上，包住该层全部 backward kernel 的发起；full recompute 时重算的 `L<i> fwd` 嵌套在 `L<i> bwd` 内。
+- 只在 NVTX 开启、梯度开启且输入 `requires_grad` 时注入，`--profile none` 与推理没有额外开销。
+- PP>1 时层号是全局层号，而 FSDP label 来自本 stage 的参数名（本地层号），两者只在 PP=1（本实验）时一致。
 
 ## 执行步骤
 
@@ -160,7 +203,7 @@ bash examples/scale-down/01-analyse/04-fsdp3-comm/benchmark_fsdp3.sh
 
 所有 case 在启动第一个之前整体校验（CP 整除、`seq % (2*CP)`，固定 GBS 时还检查 GBS 整除 MBS×DP）。单个 case 失败（例如长序列 OOM）会记录下来并继续下一个 case，结束时打印失败列表并以非 0 退出；`Ctrl-C` 会中止整个矩阵。
 
-中断后可用同一个 `RUN_DATE` 加 `--resume` 续跑：已成功（`run_info.txt` 含 `status=0`）的 case 跳过；2p4t 已 OOM 的 expert 数直接沿用结论、继续减半，不再重跑；其他失败或未完成的旧结果被重命名为 `nodeN.attempt-<时间>` 后重跑：
+中断后可用同一个 `RUN_DATE` 加 `--resume` 续跑：已成功（`run_info.txt` 含 `status=0`）的 case 跳过；2.4t 已 OOM 的 expert 数直接沿用结论、继续减半，不再重跑；其他失败或未完成的旧结果被重命名为 `nodeN.attempt-<时间>` 后重跑：
 
 ```bash
 RUN_DATE=261031-120000 bash examples/scale-down/01-analyse/04-fsdp3-comm/benchmark_fsdp3.sh --resume
@@ -174,14 +217,14 @@ RUN_DATE=261031-120000 bash examples/scale-down/01-analyse/04-fsdp3-comm/benchma
 bash examples/scale-down/01-analyse/04-fsdp3-comm/benchmark_fsdp3.sh \
   --model 27b --cp 1 --seq 4096 --mbs 1 --cuda-graph off --profile none
 bash examples/scale-down/01-analyse/04-fsdp3-comm/benchmark_fsdp3.sh \
-  --model 2p4t --cp 1 --seq 4096 --mbs 1 --max-experts-2p4t 128
+  --model 2.4t --cp 1 --seq 4096 --mbs 1 --max-experts-2.4t 128
 ```
 
 `--dtype mxfp8`、`--train-iters`、`--global-batch-size`、`--gpus`、`--nproc-per-node`、`--nnodes`、`--node-rank`、`--master-addr` 和 `--master-port` 可以覆盖默认值。多节点 DLC 各节点使用相同的矩阵和 `RUN_DATE`，并设置 `MASTER_ADDR`、`NODE_RANK` 等分布式参数，例如 4 节点、每节点 4 卡：
 
 ```bash
 RUN_DATE=261031-130000 bash examples/scale-down/01-analyse/04-fsdp3-comm/benchmark_fsdp3.sh \
-  --model 2p4t --cp 1 --seq 4096 --mbs 1 --experts-2p4t 256 --profile none \
+  --model 2.4t --cp 1 --seq 4096 --mbs 1 --experts-2.4t 256 --profile none \
   --gpus 16 --nproc-per-node 4 --nnodes 4 \
   --node-rank 0 --master-addr <rank0-host> --master-port 29501
 ```
@@ -194,10 +237,10 @@ TP、PP 固定为 1，MoE 的 EP 固定为 4，FSDP3 在全部 DP×CP rank 上�
 
 ```bash
 bash examples/scale-down/01-analyse/04-fsdp3-comm/run_pretrain_fsdp3.sh \
-  --model 2p4t \
+  --model 2.4t \
   --recipe qwen38_text_2p4t_a95b_pretrain_4gpu_gb200_bf16_fsdp1_config \
   --seq-length 4096 --cp 1 --micro-batch-size 1 \
-  --num-layers 4 --mtp-num-layers 1 --num-experts 64 --moe-layer-freq '[1,1,1,1]' \
+  --num-layers 4 --num-experts 64 --moe-layer-freq '[1,1,1,1]' \
   --cuda-graph on --profile nsys
 ```
 
@@ -206,17 +249,17 @@ bash examples/scale-down/01-analyse/04-fsdp3-comm/run_pretrain_fsdp3.sh \
 结果目录保持为 `results/01-analyse/04-fsdp3-comm/`，case 名包含层数、MTP 层数、routed expert 数（dense 为 0，未裁剪为 `full`）和 CUDA graph 模式，并按节点保存：
 
 ```text
-results/01-analyse/04-fsdp3-comm/model_2p4t-fsdp_3-layers_4-mtp_1-experts_64-cg_on-mbs_1-seq_4096-cp_1-ep_4-disp_hybridep-gbs_16-gpus_4-profile_nsys-date_261031-120000/node0/
+results/01-analyse/04-fsdp3-comm/model_2.4t-fsdp_3-layers_4-mtp_0-experts_64-cg_on-mbs_1-seq_4096-cp_1-ep_4-disp_hybridep-gbs_16-gpus_4-profile_nsys-date_261031-120000/node0/
 ```
 
-目录中包含 `launch.json`、`command.txt`、`run_info.txt` 和 `train.log`；启用 `--nsys` 时还会生成该节点每个 rank 的 nsys 报告。`config.yaml` 只由全局 rank 0 写出，因此多节点时只出现在 `node0/`。
+目录中包含 `launch.json`、`command.txt`、`run_info.txt` 和 `train.log`；启用 `--nsys` 时还会生成该节点的 nsys 报告（包含该节点全部 rank）。`config.yaml` 只由全局 rank 0 写出，因此多节点时只出现在 `node0/`。
 
 ## Nsys
 
-`benchmark_fsdp3.sh` 默认 `--profile nsys`（单 case 脚本 `run_pretrain_fsdp3.sh` 默认 `none`）。每个 torchrun worker 由 `nsys profile --capture-range=cudaProfilerApi` 包裹，Bridge 在 `profile_step_start`（默认 7）调用 `cudaProfilerStart`，在 step 计数到 `profile_step_end`（默认 8）时停止，因此每份报告只覆盖 step 7（0-based，对应日志里的 iteration 8）这一个完整 iteration（含 4 个 micro-batch）。每个 rank 生成一份报告，文件名为 `<qwen35_397b|qwen35_27b|qwen38_2p4t>-experts_<E>-cg_<off|on>-cp_<CP>-ep_<EP>-mbs_<MBS>-gbs_<GBS>-seq_<N>k-rank_<RANK>.nsys-rep`，其中 `%q{RANK}` 由 nsys 按各 worker 的 `RANK` 环境变量展开成全局 rank。
+`benchmark_fsdp3.sh` 默认 `--profile nsys`（单 case 脚本 `run_pretrain_fsdp3.sh` 默认 `none`）。`nsys profile --capture-range=cudaProfilerApi` 包在 torchrun 外面，跟踪 torchrun 拉起的全部 worker 进程；所有 rank 都在 `profiling.profile_ranks` 中，Bridge 在 `profile_step_start`（默认 7）调用 `cudaProfilerStart`，在 step 计数到 `profile_step_end`（默认 8）时停止，因此每份报告只覆盖 step 7（0-based，对应日志里的 iteration 8）这一个完整 iteration（含 4 个 micro-batch）。每个节点生成一份报告，同一时间线上按进程列出该节点全部 rank，文件名为 `<qwen35_397b|qwen35_27b|qwen38_2.4t>-fsdp_<1|3>-experts_<E>-cg_<off|on>-cp_<CP>-ep_<EP>-mbs_<MBS>-gbs_<GBS>-seq_<N>k-node_<NODE_RANK>.nsys-rep`。
 
 - trace 范围为 `cuda,nvtx`：NCCL（FSDP all-gather / reduce-scatter、CP p2p）与 HybridEP dispatch / combine kernel 以 CUDA kernel 形式出现在 GPU 时间线上，可以直接与计算 kernel 对比。CUDA graph 开启时，graph 内的 kernel 以 graph launch 形式出现。
 - 启用 nsys 时启动器设置 `profiling.record_shapes=true`，Bridge 进入 `torch.autograd.profiler.emit_nvtx(record_shapes=True)`，每个 op 的 NVTX range 带输入形状；会增加 host 开销，比较 iteration 绝对时间时，用 `--profile none` 的 `train.log` 作为基准。
 - FSDP all-gather / reduce-scatter 的层归属看上一节的 `FSDP AG ...` / `FSDP RS ...` range。
 - NCCL 自身在 `NCCL` NVTX domain 为每次 `ncclAllGather` / `ncclReduceScatter` 打 range，payload 含消息字节数和 comm hash；启动器在 nsys 模式下设置 `NCCL_NVTX_DISABLE=0`。nsys 不会在 kernel 上直接显示带宽，需要用 recipe 关联 NVTX 和 kernel，例如 `nsys recipe nccl_sum --input <report>.nsys-rep`。
-- FSDP3 下各 rank 对称，通常打开 `rank_0` 的报告即可；EP / CP case 如需看负载不均衡再对比其他 rank。
+- 4 个 rank 在同一份报告中，可直接对比各 rank 的 FSDP AG / RS 与 EP / CP 通信是否对齐、负载是否均衡。

@@ -18,7 +18,7 @@ SEQUENCES=(256 1024 4096)
 FSDP_LEVELS=(3 1)
 EXPERT_PARALLEL=4
 NUM_LAYERS="${NUM_LAYERS:-4}"
-MTP_NUM_LAYERS="${MTP_NUM_LAYERS:-1}"
+MTP_NUM_LAYERS="${MTP_NUM_LAYERS:-0}"
 # Microbatches per iteration; GBS = nmb * MBS * DP with MBS=1, DP=GPUS (CP=1).
 NUM_MICROBATCHES="${NUM_MICROBATCHES:-4}"
 GPUS="${GPUS:-4}"
@@ -37,8 +37,8 @@ usage() {
 Usage: benchmark_397b_fsdp1_vs_fsdp3.sh [options]
 
 Qwen3.5-397B-A17B MoE, 4 GPUs on one node, DP=4 and EP=4 (TP=PP=CP=1), BF16 (or MXFP8),
-CUDA graph off, 4 layers (3 GatedDeltaNet + 1 gated attention, every layer MoE)
-+ 1 MTP layer, MBS=1, 4 microbatches per iteration (GBS=16), Nsight Systems on
+CUDA graph off, 4 layers (3 GatedDeltaNet + 1 gated attention, every layer MoE),
+no MTP, MBS=1, 4 microbatches per iteration (GBS=16), Nsight Systems on
 step 7. Default matrix: experts 64,32 x seq 256,1024,4096 x FSDP 3,1 = 12 runs.
 
 Options:
@@ -46,7 +46,7 @@ Options:
   --seq N[,N...]               Sequence lengths (default: 256,1024,4096)
   --fsdp 3|1[,...]             FSDP levels (default: 3,1)
   --num-layers N               Decoder layers (default: 4)
-  --mtp-num-layers N           MTP layers (default: 1)
+  --mtp-num-layers N           MTP layers (default: 0)
   --num-microbatches N         Microbatches per iteration (default: 4)
   --dispatcher hybridep|alltoall  MoE token dispatcher (default: hybridep)
   --train-iters N              Training iterations (default: 10)
