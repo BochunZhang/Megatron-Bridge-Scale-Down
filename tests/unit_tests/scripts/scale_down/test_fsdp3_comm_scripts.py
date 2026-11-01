@@ -42,11 +42,22 @@ def test_default_sweep_runs_three_models_without_mtp_and_both_cuda_graph_modes(t
         assert "profiling.nvtx_ranges=true" in command
         assert "fsdp_comm_nvtx" not in command
 
+    # Megatron-FSDP's module hooks rule out per-layer graphs; both models use one
+    # full-iteration graph, and MoE adds the static token budget it needs.
+    for on in (c for c in commands if "-cg_on-" in c):
+        assert "model.cuda_graph_impl=full_iteration" in on
+        assert r"model.cuda_graph_modules=\[\]" in on
+        assert "ddp.megatron_fsdp_cuda_graph_mode=true" in on
+        assert "ddp.fsdp_all_gather_in_start_param_sync=false" in on
+        assert "rerun_state_machine.check_for_nan_in_loss=false" in on
+        assert "ddp.check_for_nan_in_grad=false" in on
     dense_on = next(c for c in commands if "model_27b-" in c and "-cg_on-" in c)
-    assert r"model.cuda_graph_modules=\[attn\,mlp\]" in dense_on
-    assert "ddp.megatron_fsdp_cuda_graph_mode=true" in dense_on
+    assert "moe_expert_rank_capacity_factor" not in dense_on
+    assert "moe_paged_stash" not in dense_on
     moe_on = next(c for c in commands if "model_397b-" in c and "-cg_on-" in c)
-    assert r"model.cuda_graph_modules=\[attn\,moe_router\,moe_preprocess\]" in moe_on
+    assert "model.moe_expert_rank_capacity_factor=1.5" in moe_on
+    assert "model.moe_paged_stash=true" in moe_on
+    assert "model.use_transformer_engine_op_fuser=true" in moe_on
     assert "num_moe_experts" not in moe_on  # 397b keeps every routed expert
     moe_off = next(c for c in commands if "model_397b-" in c and "-cg_off-" in c)
     assert "model.cuda_graph_impl=none" in moe_off
@@ -113,7 +124,7 @@ def test_run_one_print_result_dir_encodes_shape_and_cuda_graph(tmp_path: Path):
 
 
 def test_run_one_cuda_graph_disables_nccl_graph_register_with_expandable_segments(tmp_path: Path):
-    # TECudaGraphHelper asserts on expandable_segments:True unless NCCL_GRAPH_REGISTER=0.
+    # The graph holds NCCL collectives; registering expandable segments can fault.
     result = _run(
         RUN_ONE,
         *("--model", "2.4t", "--recipe", "r", "--seq-length", "1024", "--num-experts", "64", "--cuda-graph", "on"),
@@ -124,6 +135,21 @@ def test_run_one_cuda_graph_disables_nccl_graph_register_with_expandable_segment
     assert result.returncode == 0, result.stderr
     assert "PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True" in result.stderr.splitlines()
     assert "NCCL_GRAPH_REGISTER=0" in result.stderr.splitlines()
+
+
+def test_cuda_graph_on_rejects_alltoall_for_moe(tmp_path: Path):
+    common = ("--run-date", RUN_DATE, "--dry-run", "--dispatcher", "alltoall", "--cuda-graph", "on")
+    for script, args in (
+        (RUN_ONE, ("--model", "2.4t", "--recipe", "r", "--seq-length", "1024", "--num-experts", "64")),
+        (BENCHMARK, ("--model", "397b", "--output-dir", str(tmp_path))),
+        (EXAMPLE / "benchmark_2.4t_fsdp1_vs_fsdp3.sh", ("--output-dir", str(tmp_path))),
+    ):
+        result = _run(script, *args, *common)
+        assert result.returncode == 2, result.stderr
+        assert "requires --dispatcher hybridep" in result.stderr
+    # Dense 27b has no dispatcher, so the sweep still accepts it.
+    result = _run(BENCHMARK, "--model", "27b", "--output-dir", str(tmp_path), *common)
+    assert result.returncode == 0, result.stderr
 
 
 def test_27b_fsdp1_vs_fsdp3_sweep_selects_sharding_and_overlap(tmp_path: Path):
@@ -236,8 +262,9 @@ def test_2_4t_fsdp1_vs_fsdp3_sweep_runs_cuda_graph_modes(tmp_path: Path):
     graphed = [c for c in commands if "-cg_on-" in c]
     assert len(graphed) == 2
     for command in graphed:
-        assert "model.cuda_graph_impl=transformer_engine" in command
-        assert r"model.cuda_graph_modules=\[attn\,moe_router\,moe_preprocess\]" in command
+        assert "model.cuda_graph_impl=full_iteration" in command
+        assert "model.moe_expert_rank_capacity_factor=1.5" in command
+        assert "model.moe_paged_stash=true" in command
         assert "ddp.megatron_fsdp_cuda_graph_mode=true" in command
 
 

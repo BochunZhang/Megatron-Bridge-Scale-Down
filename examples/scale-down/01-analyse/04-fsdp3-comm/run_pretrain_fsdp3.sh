@@ -67,10 +67,11 @@ Options:
   --mtp-num-layers N             Override model.mtp_num_layers
   --dispatcher hybridep|alltoall MoE token dispatcher (default: hybridep)
   --hybridep-num-sms N           SMs for HybridEP dispatch (default: 32)
-  --cuda-graph off|on            off: no CUDA graph. on: Transformer Engine
-                                 per-layer graphs, attn+mlp for dense models and
-                                 the partial attn+moe_router+moe_preprocess scope
-                                 for MoE models (default: off)
+  --cuda-graph off|on            off: no CUDA graph. on: full-iteration graph of
+                                 forward+backward, FSDP all-gather / reduce-scatter
+                                 included; MoE models add a per-rank token budget
+                                 (capacity factor 1.5) and paged stash, hybridep
+                                 only (default: off)
   --force-balance                MoE only: replace router logits with random values
                                  (moe_router_force_load_balancing), so tokens spread
                                  uniformly over experts; benchmark only, the loss is
@@ -200,6 +201,11 @@ else
     if [[ "${DISPATCHER}" == hybridep ]]; then
         (( EXPERT_PARALLEL <= 72 )) || { echo "HybridEP ep must fit in the 72-rank NVLink domain" >&2; exit 2; }
     fi
+    # The full-iteration graph needs static MoE shapes, which only the HybridEP
+    # per-rank token budget (moe_expert_rank_capacity_factor) provides.
+    if [[ "${CUDA_GRAPH}" == on && "${DISPATCHER}" != hybridep ]]; then
+        echo "--cuda-graph on for MoE models requires --dispatcher hybridep" >&2; exit 2
+    fi
     if [[ -n "${NUM_EXPERTS}" ]]; then
         (( NUM_EXPERTS % EXPERT_PARALLEL == 0 )) || { echo "num-experts must be divisible by ep" >&2; exit 2; }
     fi
@@ -290,21 +296,34 @@ OVERRIDES=(
     "profiling.record_shapes=$([[ "${PROFILE}" == nsys ]] && echo true || echo false)"
 )
 if [[ "${CUDA_GRAPH}" == on ]]; then
-    # TE per-layer graphs around the module compute only; FSDP hooks, all-gather
-    # and reduce-scatter stay eager. Dense layers graph attention and MLP; MoE
-    # layers graph attention and the router/preprocess part, leaving dispatch,
-    # experts and combine eager. megatron_fsdp_cuda_graph_mode keeps gradient
-    # references alive for replay (Megatron-LM sets it automatically, Bridge
-    # does not); the recipe's max-pool double buffer keeps bucket addresses fixed.
-    if [[ "${MODEL}" == 27b ]]; then GRAPH_MODULES="[attn,mlp]"; else GRAPH_MODULES="[attn,moe_router,moe_preprocess]"; fi
+    # One full-iteration graph of forward+backward (optimizer step stays eager), with
+    # the FSDP all-gather / reduce-scatter captured inside. Per-layer graphs (TE or
+    # local) are not an option: both refuse modules carrying Megatron-FSDP's
+    # forward / backward hooks. megatron_fsdp_cuda_graph_mode keeps gradient references
+    # alive for replay, and fsdp_all_gather_in_start_param_sync=false keeps the
+    # optimizer step from issuing an all-gather the graph would wait on (Megatron-LM
+    # sets both automatically, Bridge does not); the recipe's max-pool double buffer
+    # keeps bucket addresses fixed. The graph cannot check NaN loss or gradients.
     OVERRIDES+=(
-        "model.cuda_graph_impl=transformer_engine" "model.cuda_graph_scope=null" "model.cuda_graph_modules=${GRAPH_MODULES}"
+        "model.cuda_graph_impl=full_iteration" "model.cuda_graph_scope=null" "model.cuda_graph_modules=[]"
         "model.cuda_graph_warmup_steps=3" "ddp.megatron_fsdp_cuda_graph_mode=true"
+        "ddp.fsdp_all_gather_in_start_param_sync=false"
+        "rerun_state_machine.check_for_nan_in_loss=false" "ddp.check_for_nan_in_grad=false"
     )
-    # TECudaGraphHelper asserts NCCL_GRAPH_REGISTER=0 whenever the inherited
-    # PYTORCH_CUDA_ALLOC_CONF has expandable_segments:True (NCCL graph registration of
-    # expandable segments can hit illegal memory access). The graphed scopes hold no
-    # NCCL collectives and nccl_ub stays off, so turning registration off costs nothing.
+    # Dropless MoE copies token counts to the host and changes shapes every step,
+    # which a graph cannot capture. A per-rank token budget of 1.5x the balanced
+    # load fixes the HybridEP buffers (it needs the TE op-fuser grouped MLP), and
+    # paged stash keeps the routed-expert activations in fixed pages. An overflowing
+    # step is re-run eagerly by PagedStashRunner.
+    if [[ "${MODEL}" != 27b ]]; then
+        OVERRIDES+=(
+            "model.moe_expert_rank_capacity_factor=1.5" "model.moe_paged_stash=true"
+            "model.use_transformer_engine_op_fuser=true"
+        )
+    fi
+    # Keep NCCL graph registration off: the graph now holds NCCL collectives, and
+    # registering expandable segments (often inherited through PYTORCH_CUDA_ALLOC_CONF)
+    # can hit illegal memory access. nccl_ub stays off either way.
     export NCCL_GRAPH_REGISTER=0
 else
     OVERRIDES+=("model.cuda_graph_impl=none" "model.cuda_graph_scope=null" "model.cuda_graph_modules=[]")

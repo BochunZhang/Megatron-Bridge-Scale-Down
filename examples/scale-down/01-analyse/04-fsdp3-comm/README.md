@@ -125,22 +125,38 @@ bash examples/scale-down/01-analyse/04-fsdp3-comm/benchmark_2.4t_fsdp1_vs_fsdp3.
 - 只作用于 MoE case，`benchmark_fsdp3.sh` 中的 27b 不受影响，单 case 启动器对 27b 报错；
 - 结果目录与 nsys 报告名在 dtype 标记后加 `-fb`，例如 `model_2.4t-fsdp_3-fb-layers_4-...` 与 `qwen38_2.4t-fsdp_3-fb-experts_64-...-node_0.nsys-rep`；不加该选项时命名不变；
 - 默认路由是 `global_aux_loss`，系数取 HF config 的 `router_aux_loss_coef`（缺省时为 0）。10 个 iter 的 mock 数据下，路由主要由随机初始化的 router 决定，EP rank 之间可能不均；`--force-balance` 用来排除这部分干扰；
-- 与 `--cuda-graph on`（`moe_router` 在 graph 内）同时使用时，replay 是否每次重新采样随机 logits 尚未验证。
+- 与 `--cuda-graph on`（router 在 full-iteration graph 内）同时使用时，replay 是否每次重新采样随机 logits 尚未验证。
 
 ```bash
 bash examples/scale-down/01-analyse/04-fsdp3-comm/benchmark_2.4t_fsdp1_vs_fsdp3.sh --force-balance
 ```
 
-## CUDA graph
-
-| `--cuda-graph` | dense（27b） | MoE（397b / 2.4t） |
+## CUD| `--cuda-graph` | dense（27b） | MoE（397b / 2.4t） |
 | --- | --- | --- |
 | `off` | `cuda_graph_impl=none` | `cuda_graph_impl=none` |
-| `on` | TE per-layer graph，`cuda_graph_modules=[attn,mlp]`：attention 与 MLP 计算全部进 graph | TE per-layer graph，`cuda_graph_modules=[attn,moe_router,moe_preprocess]`（部分 graph）：attention、router、shared expert、preprocess 进 graph；HybridEP dispatch / combine 与 routed experts 保持 eager |
+| `on` | `cuda_graph_impl=full_iteration`：整个 forward + backward（含 FSDP all-gather / reduce-scatter）一个 graph，optimizer step 保持 eager | 同左，另加 `moe_expert_rank_capacity_factor=1.5`、`moe_paged_stash=true`、`use_transformer_engine_op_fuser=true`；只支持 `--dispatcher hybridep` |
 
-开启时同时设置 `cuda_graph_warmup_steps=3` 与 `ddp.megatron_fsdp_cuda_graph_mode=true`。后者让 Megatron-FSDP 在 optimizer step 后不解除梯度引用，保证 graph replay 使用的地址有效；Megatron-LM 在 FSDP + CUDA graph 时会自动打开它，Bridge 不会，所以启动器显式覆盖。recipe 本身已启用 `fsdp_double_buffer` 与 `megatron_fsdp_max_pool_double_buffer`，后者让每个 FSDP unit 的参数桶落在固定地址，是 graph replay 读取 all-gather 结果的前提。TE graph 也覆盖 MTP 层。
+开启时同时设置：
 
-per-layer graph 只包住模块内部计算：FSDP 的 pre-forward / post-backward hook、all-gather、reduce-scatter 都在 graph 之外 eager 执行，因此 FSDP 通信在两种模式下相同，对比的是 graph 消除的 CPU launch 开销是否改变计算与通信的重叠。graph 在第 3 个 iteration 后捕获，nsys 默认采集 step 7，已处于 replay 阶段。首次运行开启模式时，建议对比同一 case 关 / 开的 `train.log` loss 是否一致。Bridge 只支持 `transformer_engine` 按模块 graph 与 `full_iteration` graph，`full_iteration` 会把 FSDP 通信一起捕获，不在本实验范围内。
+- `cuda_graph_warmup_steps=3`；
+- `ddp.megatron_fsdp_cuda_graph_mode=true`：Megatron-FSDP 在 optimizer step 后不解除梯度引用，保证 replay 使用的地址有效；
+- `ddp.fsdp_all_gather_in_start_param_sync=false`：optimizer step 里的 `start_param_sync()` 不再发起 all-gather，否则 graph 会 wait 一个在 capture 之外 stream 上的 kernel；
+- `rerun_state_machine.check_for_nan_in_loss=false`、`ddp.check_for_nan_in_grad=false`：整轮 graph 内无法检查 NaN；
+- `NCCL_GRAPH_REGISTER=0`：graph 内含 NCCL 集合通信，`PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` 时 NCCL 注册 graph 内存可能非法访存。
+
+Megatron-LM 在 FSDP + full-iteration graph 时会自动设置前两项 ddp 选项，Bridge 不会，所以启动器显式覆盖。recipe 本身已启用 `fsdp_double_buffer` 与 `megatron_fsdp_max_pool_double_buffer`，后者让每个 FSDP unit 的参数桶落在固定地址，是 replay 的前提。
+
+不用按层 graph 的原因：Megatron-FSDP 在每个 `TransformerLayer` 上注册 unshard / reshard / post-backward 的 module hook。TE `make_graphed_callables` 要求被 graph 的 module 上没有任何 hook（报 `Modules must not have hooks registered`），MCore 的 `local` 按层 graph 在 replay 时只放行 MCore DDP 的 pre-forward hook；Bridge 也只允许 `local` 用于 inference。因此 FSDP 下只有 full-iteration graph 可用。
+
+MoE 的额外设置：dropless MoE 每步把各 expert 的 token 数拷回 host、shape 随路由变化，无法进 graph。`moe_expert_rank_capacity_factor=1.5` 给每个 EP rank 固定 1.5 倍均衡负载的 token 预算，让 HybridEP 的 buffer 与 expert 输入 shape 固定（需要 TE op fuser 的 grouped MLP）；`moe_paged_stash` 把 routed expert 反向所需的激活放进固定的分页 buffer。某一步超出预算时，`PagedStashRunner` 检测到 overflow 并以 eager 重跑该步。因此：
+
+- 开启模式的 MoE expert 计算走 op fuser 路径（对齐到 256 token），与关闭模式的 expert kernel 不同，关 / 开对比的不只是 graph 本身；
+- 不加 `--force-balance` 时，随机初始化的 router 可能让某些 rank 超出预算而触发 eager 重跑，`train.log` 中需要检查；
+- graph 让中间 buffer 常驻，显存高于关闭模式；2.4t 的 expert 减半搜索会把这部分算进去。
+
+graph 在第 3 个 iteration 后捕获，nsys 默认采集 step 7，已处于 replay 阶段；FSDP 通信与计算 kernel 都以 graph launch 形式出现。首次运行开启模式时，建议对比同一 case 关 / 开的 `train.log` loss 是否接近。
+
+本实验范围内。
 
 测试 FSDP3 下 CUDA graph 的收益，用同一 case 的 graph 关 / 开对比 step 时间与 nsys 上暴露的通信，例如 2.4t 短序列（每 micro-batch 计算最少、最可能受 CPU launch 限制）：
 
@@ -272,7 +288,7 @@ results/01-analyse/04-fsdp3-comm/model_2.4t-fsdp_3-layers_4-mtp_0-experts_64-cg_
 
 `benchmark_fsdp3.sh` 默认 `--profile nsys`（单 case 脚本 `run_pretrain_fsdp3.sh` 默认 `none`）。`nsys profile --capture-range=cudaProfilerApi` 包在 torchrun 外面，跟踪 torchrun 拉起的全部 worker 进程；所有 rank 都在 `profiling.profile_ranks` 中，Bridge 在 `profile_step_start`（默认 7）调用 `cudaProfilerStart`，在 step 计数到 `profile_step_end`（默认 8）时停止，因此每份报告只覆盖 step 7（0-based，对应日志里的 iteration 8）这一个完整 iteration（含 4 个 micro-batch）。每个节点生成一份报告，同一时间线上按进程列出该节点全部 rank，文件名为 `<qwen35_397b|qwen35_27b|qwen38_2.4t>-fsdp_<1|3>-experts_<E>-cg_<off|on>-cp_<CP>-ep_<EP>-mbs_<MBS>-gbs_<GBS>-seq_<N>k-node_<NODE_RANK>.nsys-rep`。
 
-- trace 范围为 `cuda,nvtx`：NCCL（FSDP all-gather / reduce-scatter、CP p2p）与 HybridEP dispatch / combine kernel 以 CUDA kernel 形式出现在 GPU 时间线上，可以直接与计算 kernel 对比。CUDA graph 开启时，graph 内的 kernel 以 graph launch 形式出现。
+- trace 范围为 `cuda,nvtx`：NCCL（FSDP all-gather / reduce-scatter、CP p2p）与 HybridEP dispatch / combine kernel 以 CUDA kernel 形式出现在 GPU 时间线上，可以直接与计算 kernel 对比。CUDA graph 开启时，整轮 forward + backward（含 FSDP 通信）以 graph launch 形式出现。
 - 启用 nsys 时启动器设置 `profiling.record_shapes=true`，Bridge 进入 `torch.autograd.profiler.emit_nvtx(record_shapes=True)`，每个 op 的 NVTX range 带输入形状；会增加 host 开销，比较 iteration 绝对时间时，用 `--profile none` 的 `train.log` 作为基准。
 - FSDP all-gather / reduce-scatter 的层归属看上一节的 `FSDP AG ...` / `FSDP RS ...` range。
 - NCCL 自身在 `NCCL` NVTX domain 为每次 `ncclAllGather` / `ncclReduceScatter` 打 range，payload 含消息字节数和 comm hash；启动器在 nsys 模式下设置 `NCCL_NVTX_DISABLE=0`。nsys 不会在 kernel 上直接显示带宽，需要用 recipe 关联 NVTX 和 kernel，例如 `nsys recipe nccl_sum --input <report>.nsys-rep`。

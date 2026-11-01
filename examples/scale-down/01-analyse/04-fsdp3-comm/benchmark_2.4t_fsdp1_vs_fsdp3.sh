@@ -47,8 +47,8 @@ Options:
   --experts N[,N...]           Routed experts, multiples of EP=4 and >= top-k (default: 64,32)
   --seq N[,N...]               Sequence lengths (default: 256,1024,4096)
   --fsdp 3|1[,...]             FSDP levels (default: 3,1)
-  --cuda-graph off|on[,...]    CUDA graph modes per case (default: off); on = TE per-layer
-                               graphs of attn + moe_router + moe_preprocess
+  --cuda-graph off|on[,...]    CUDA graph modes per case (default: off); on = full-iteration
+                               graph with capacity factor 1.5 + paged stash (hybridep only)
   --num-layers N               Decoder layers (default: 4)
   --mtp-num-layers N           MTP layers (default: 0)
   --num-microbatches N         Microbatches per iteration (default: 4)
@@ -120,6 +120,10 @@ done
 for cg in "${CUDA_GRAPHS[@]}"; do
     case "${cg}" in off|on) ;; *) echo "--cuda-graph values must be off or on" >&2; exit 2;; esac
 done
+# The full-iteration graph relies on the HybridEP per-rank token budget.
+if [[ " ${CUDA_GRAPHS[*]} " == *" on "* && "${DISPATCHER}" != hybridep ]]; then
+    echo "--cuda-graph on requires --dispatcher hybridep" >&2; exit 2
+fi
 GBS=$((NUM_MICROBATCHES * GPUS))
 MOE_LAYER_FREQ="[1"
 for (( i = 1; i < NUM_LAYERS; i++ )); do MOE_LAYER_FREQ+=",1"; done

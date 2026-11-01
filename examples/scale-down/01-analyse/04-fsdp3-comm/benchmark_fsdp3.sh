@@ -175,6 +175,10 @@ if (( ${#MODELS[@]} == 1 )) && [[ "${MODELS[0]}" == all ]]; then
     MODELS=(397b 122b 27b 2.4t)
 fi
 for i in "${!MODELS[@]}"; do [[ "${MODELS[i]}" == 2p4t ]] && MODELS[i]=2.4t; done
+# MoE full-iteration graphs rely on the HybridEP per-rank token budget.
+if [[ " ${CUDA_GRAPHS[*]} " == *" on "* && "${DISPATCHER}" != hybridep && " ${MODELS[*]} " != " 27b " ]]; then
+    echo "--cuda-graph on for MoE models requires --dispatcher hybridep" >&2; exit 2
+fi
 (( GPUS % NPROC_PER_NODE == 0 )) || { echo "gpus must be divisible by nproc-per-node" >&2; exit 2; }
 NNODES="${NNODES:-$((GPUS / NPROC_PER_NODE))}"
 [[ "${NNODES}" =~ ^[1-9][0-9]*$ ]] || { echo "nnodes must be positive" >&2; exit 2; }
