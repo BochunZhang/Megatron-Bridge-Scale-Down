@@ -13,12 +13,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# NCCL 2.32.3 with a pause in the multicast AllGather (nccl-2.32.3-pause).
+# NCCL 2.32.3 with a pause in the multicast and unicast AllGathers (nccl-2.32.3-pause).
 #
 # install/patches/nccl-2.32.3-pause.patch on stock v2.32.3-1 (not on the cta patch: the CTA selection
 # stays NCCL's own) adds NCCL_SYM_AG_STMC_PAUSE_CYCLES (default 0). AllGather_STMC / AllGather_TmaSTMC
 # then make every warp spin that many SM cycles (clock64) after each 4 KiB chunk of multimem stores,
-# which slows the multicast AllGather without changing its CTA count or its result. In ns a pause is
+# which slows the multicast AllGather without changing its CTA count or its result. NCCL_SYM_AG_ST_PAUSE_CYCLES
+# (default 0) does the same for the unicast AllGather_ST / AllGather_TmaST: every warp spins after each tile it
+# has stored to every peer (bcastDeep, 2 KiB per peer on the 16 B path). In ns a pause is
 # cycles / SM clock (nvidia-smi -lgc pins it). The value is read at run time (once per process), so one
 # build serves every pause. The patch also sets NCCL_SUFFIX := -pause in makefiles/version.mk, so
 # NCCL_DEBUG=VERSION prints "NCCL version 2.32.3-pause+cudaX.Y" and nccl.h defines NCCL_SUFFIX "-pause";
@@ -31,7 +33,11 @@
 #      sm_100 into <tree>/build, then the same kernel / symbol / environment checks.
 #
 # The sweep preloads it into the torch of install-torch-2.13.0-nccl-2.32.3.sh
-# (examples/gb200/nvls-collective/run_symm_cta_pause_sweep.sh).
+# (examples/gb200/nvls-collective/run_symm_cta_pause_sweep.sh, multicast) and the GEMM / AllGather HBM
+# contention sweep (examples/gb200/hbm-conflict/run_hbm_conflict_benchmark.sh, unicast).
+#
+# A tree patched with an older version of the patch (multicast pause only) does not take this one;
+# reset it with git -C <tree> checkout -- . and rerun.
 #
 # Usage:
 #   ./install/install-nccl-2.32.3-pause.sh [--dest DIR] [--cuda-home DIR] [--jobs N] [--check-only]
@@ -47,6 +53,7 @@ NCCL_TAG="v2.32.3-1"
 NCCL_REPO="https://github.com/NVIDIA/nccl.git"
 NCCL_SUFFIX="-pause"  # set by the patch in makefiles/version.mk
 PAUSE_ENV="NCCL_SYM_AG_STMC_PAUSE_CYCLES"
+ST_PAUSE_ENV="NCCL_SYM_AG_ST_PAUSE_CYCLES"
 
 script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 repo_root="$(cd -- "${script_dir}/.." && pwd)"
@@ -69,7 +76,7 @@ while [[ $# -gt 0 ]]; do
         --cuda-home) cuda_home="$2"; shift 2 ;;
         --jobs) jobs="$2"; shift 2 ;;
         --check-only) check_only=true; shift ;;
-        -h|--help) sed -n '16,42p' "$0"; exit 0 ;;
+        -h|--help) sed -n '16,48p' "$0"; exit 0 ;;
         *) die "unknown argument: $1" ;;
     esac
 done
@@ -133,6 +140,11 @@ echo "  [ok]   nccl.h NCCL_SUFFIX \"${NCCL_SUFFIX}\", libnccl.so banner \"NCCL v
 grep -aq "$PAUSE_ENV" "${build_dir}/lib/libnccl.so" \
     || die "${build_dir}/lib/libnccl.so does not read ${PAUSE_ENV}; rebuild without --check-only"
 echo "  [ok]   libnccl.so reads ${PAUSE_ENV}"
+grep -aq "$ST_PAUSE_ENV" "${build_dir}/lib/libnccl.so" \
+    || die "${build_dir}/lib/libnccl.so does not read ${ST_PAUSE_ENV} (built from an older patch?); rebuild without --check-only"
+echo "  [ok]   libnccl.so reads ${ST_PAUSE_ENV}"
 
 echo "=== nccl-2.32.3-pause: stock 2.32.3, plus ${PAUSE_ENV}=<cycles> slowing AllGather_STMC"
-echo "  sweep: bash examples/gb200/nvls-collective/run_symm_cta_pause_sweep.sh"
+echo "    and ${ST_PAUSE_ENV}=<cycles> slowing AllGather_ST"
+echo "  sweeps: bash examples/gb200/nvls-collective/run_symm_cta_pause_sweep.sh"
+echo "          bash examples/gb200/hbm-conflict/run_hbm_conflict_benchmark.sh"

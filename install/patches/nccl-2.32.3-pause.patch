@@ -1,18 +1,83 @@
 --- a/makefiles/version.mk
 +++ b/makefiles/version.mk
-@@ -9,5 +9,8 @@
+@@ -9,5 +9,9 @@
  NCCL_MAJOR   := 2
  NCCL_MINOR   := 32
  NCCL_PATCH   := 3
 -NCCL_SUFFIX  :=
-+# nccl-2.32.3-pause: stock 2.32.3 plus the AllGather_STMC pause (NCCL_SYM_AG_STMC_PAUSE_CYCLES). "NCCL version
++# nccl-2.32.3-pause: stock 2.32.3 plus the AllGather pauses (NCCL_SYM_AG_STMC_PAUSE_CYCLES for the multicast
++# kernels, NCCL_SYM_AG_ST_PAUSE_CYCLES for the unicast ones). "NCCL version
 +# 2.32.3-pause+cudaX.Y" in the NCCL_DEBUG=VERSION banner and NCCL_SUFFIX in nccl.h, so a run shows which libnccl it
 +# loaded. NCCL_VERSION_CODE (ncclGetVersion) and the soname are unchanged.
 +NCCL_SUFFIX  := -pause
  PKG_REVISION := 1
 --- a/src/device/symmetric/all_gather.cuh
 +++ b/src/device/symmetric/all_gather.cuh
-@@ -301,7 +301,8 @@ __device__ __forceinline__ void ncclSymkRun_AllGather_STMC_impl(ncclSymkDevWorkA
+@@ -12,7 +12,7 @@
+ template <int BytePerPack, int UnrollPacks, int UnrollPeers, bool EnableTma>
+ static __device__ void bcastDeep(ncclSymkArgsHandler const& handler, int tn, int t, bool waitNeeded,
+                                  ncclLsaBarrierSession<ncclCoopCta>& bar, ncclSymPtr<char> input,
+-                                 ncclSymPtr<char> output, bool inPlace, int nIters) {
++                                 ncclSymPtr<char> output, bool inPlace, int nIters, uint32_t pauseCycles) {
+   using Pack = BytePack<BytePerPack>;
+   int wn = tn / WARP_SIZE;
+   int w = t / WARP_SIZE;
+@@ -115,6 +115,8 @@ static __device__ void bcastDeep(ncclSymkArgsHandler const& handler, int tn, int
+ #endif
+         }
+       }
++      // nccl-2.32.3-pause: the tile is stored to every peer; spin before loading the next one.
++      if (pauseCycles != 0) ncclSymkPauseCycles(pauseCycles);
+       inpPacks += intptr_t(wn) * UnrollPacks * WARP_SIZE;
+       outPacks += intptr_t(wn) * UnrollPacks * WARP_SIZE;
+       nIters -= wn;
+@@ -173,7 +175,7 @@ static __device__ void bcastEnds(ncclSymkArgsHandler const& handler, int tn, int
+ template <typename T, bool EnableTma>
+ static __device__ void bcast(ncclSymkArgsHandler const& handler, int tn, int t, int nBlocks, bool waitNeeded,
+                              ncclLsaBarrierSession<ncclCoopCta>& bar, ncclSymPtr<T> input, ncclSymPtr<T> output,
+-                             size_t nElts) {
++                             size_t nElts, uint32_t pauseCycles) {
+   bool inPlace = (input == output);
+   size_t nBytes = nElts * sizeof(T);
+   uint32_t nBlocks_rcp32 = nccl::utility::idivRcp32_upto64(nBlocks);
+@@ -200,7 +202,7 @@ static __device__ void bcast(ncclSymkArgsHandler const& handler, int tn, int t,
+         bcastDeep<BytePerPack, UnrollPacks, UnrollPeers, EnableTma>(handler, tn, t, waitNeeded, bar,
+                                                                     (ncclSymPtr<char>)input + cursor,
+                                                                     (ncclSymPtr<char>)output + cursor, inPlace,
+-                                                                    chunks * ncclSymkMinWarpsPerBlock);
++                                                                    chunks * ncclSymkMinWarpsPerBlock, pauseCycles);
+         cursor = cursorAfter;
+         waitNeeded = false;
+       }
+@@ -218,7 +220,7 @@ static __device__ void bcast(ncclSymkArgsHandler const& handler, int tn, int t,
+       bcastDeep<BytePerPack, UnrollPacks, UnrollPeers, EnableTma>(handler, tn, t, waitNeeded, bar,
+                                                                   (ncclSymPtr<char>)input + cursor,
+                                                                   (ncclSymPtr<char>)output + cursor, inPlace,
+-                                                                  chunks * ncclSymkMinWarpsPerBlock);
++                                                                  chunks * ncclSymkMinWarpsPerBlock, pauseCycles);
+       cursor = cursorAfter;
+       waitNeeded = false;
+     }
+@@ -233,7 +235,7 @@ static __device__ void bcast(ncclSymkArgsHandler const& handler, int tn, int t,
+       uintptr_t cursorAfter = cursor + uintptr_t(chunks) * BytePerChunk;
+       bcastDeep<(sizeof(T) <= BytePerPack ? BytePerPack : 0), UnrollPacks, UnrollPeers, false>(
+         handler, tn, t, waitNeeded, bar, (ncclSymPtr<char>)input + cursor, (ncclSymPtr<char>)output + cursor, inPlace,
+-        chunks * ncclSymkMinWarpsPerBlock);
++        chunks * ncclSymkMinWarpsPerBlock, pauseCycles);
+       cursor = cursorAfter;
+       waitNeeded = false;
+     }
+@@ -268,7 +270,8 @@ __device__ __forceinline__ void ncclSymkRun_AllGather_ST_impl(ncclSymkDevWorkArg
+     int bt =
+       flattenIx(threadIdx.x % WARP_SIZE, WARP_SIZE, block, nBlocks, threadIdx.x / WARP_SIZE, blockDim.x / WARP_SIZE);
+     int btn = nBlocks * blockDim.x;
+-    bcast<char, EnableTma>(handler, btn, bt, nBlocks, waitNeeded, bar, input, output + rank * nAllElts, nElts);
++    bcast<char, EnableTma>(handler, btn, bt, nBlocks, waitNeeded, bar, input, output + rank * nAllElts, nElts,
++                           args->agStPauseCycles);
+     waitNeeded = false;
+   });
+ 
+@@ -301,7 +304,8 @@ __device__ __forceinline__ void ncclSymkRun_AllGather_STMC_impl(ncclSymkDevWorkA
      int t =
        flattenIx(threadIdx.x % WARP_SIZE, WARP_SIZE, block, nBlocks, threadIdx.x / WARP_SIZE, blockDim.x / WARP_SIZE);
      int tn = nBlocks * blockDim.x;
@@ -59,29 +124,35 @@
      }
 --- a/src/include/sym_kernels.h
 +++ b/src/include/sym_kernels.h
-@@ -127,6 +127,9 @@ struct alignas(16) ncclSymkDevWorkArgs {
+@@ -127,6 +127,12 @@ struct alignas(16) ncclSymkDevWorkArgs {
    int nMaxChannels;
    int maxDynamicSmem;
    uint8_t profilerMode; // ncclDevProfilerMode bits; nonzero means profilerWorkCounters[nMaxChannels] follows
 +  // nccl-2.32.3-pause: NCCL_SYM_AG_STMC_PAUSE_CYCLES. AllGather_STMC / AllGather_TmaSTMC make every warp spin
 +  // this many SM cycles (clock64) after each chunk of multimem stores; 0 leaves the kernels as in stock NCCL.
 +  uint32_t agStmcPauseCycles;
++  // nccl-2.32.3-pause: NCCL_SYM_AG_ST_PAUSE_CYCLES. AllGather_ST / AllGather_TmaST make every warp spin this
++  // many SM cycles (clock64) after each tile it stores to every peer; 0 leaves the kernels as in stock NCCL.
++  uint32_t agStPauseCycles;
    // Variable-length trailing data layout:
    //   if profilerMode: uint64_t profilerWorkCounters[nMaxChannels] (aligned to 16)
    //   ncclSymkChannelWorkRange[nChannels] (aligned to 16)
 --- a/src/scheduler/symmetric_sched.cc
 +++ b/src/scheduler/symmetric_sched.cc
-@@ -21,6 +21,9 @@
+@@ -21,6 +21,12 @@
  #endif
  
  extern int64_t ncclParamSingleProcMemRegEnable();
 +// nccl-2.32.3-pause: SM cycles (clock64) each AllGather_STMC / AllGather_TmaSTMC warp spins after every
 +// 4 KiB chunk of multimem stores (primitives.cuh bcastMultimem); 0 (default) runs the stock kernels' loop.
 +NCCL_PARAM(SymAgStmcPauseCycles, "SYM_AG_STMC_PAUSE_CYCLES", 0)
++// nccl-2.32.3-pause: SM cycles (clock64) each AllGather_ST / AllGather_TmaST warp spins after every tile it
++// stores to all peers (all_gather.cuh bcastDeep: 2 KiB per peer on the 16 B path); 0 (default) is stock.
++NCCL_PARAM(SymAgStPauseCycles, "SYM_AG_ST_PAUSE_CYCLES", 0)
  
  ncclDevRedOp_t symkRedOp(ncclRedOp_t redOp, ncclDevRedOp_t devRedOp) {
    if (redOp == ncclAvg) {
-@@ -325,6 +328,10 @@ ncclResult_t ncclSymmetricTaskScheduler(struct ncclComm* comm,
+@@ -325,6 +331,13 @@ ncclResult_t ncclSymmetricTaskScheduler(struct ncclComm* comm,
    // KernelCh-only launches leave the phase bit clear, so the profile variant skips the
    // phase stamps and their fence at runtime.
    argsBuf->profilerMode = profilerEnabled ? ncclProfilerDeviceMode(headTask->eActivationMask) : ncclDevProfilerModeNone;
@@ -89,6 +160,9 @@
 +  int64_t agStmcPauseCycles = ncclParamSymAgStmcPauseCycles();
 +  argsBuf->agStmcPauseCycles =
 +    agStmcPauseCycles <= 0 ? 0 : agStmcPauseCycles >= UINT32_MAX ? UINT32_MAX : (uint32_t)agStmcPauseCycles;
++  int64_t agStPauseCycles = ncclParamSymAgStPauseCycles();
++  argsBuf->agStPauseCycles =
++    agStPauseCycles <= 0 ? 0 : agStPauseCycles >= UINT32_MAX ? UINT32_MAX : (uint32_t)agStPauseCycles;
  
    remainCell = cellPerChannel = DIVUP(DIVUP(totalCount, nMaxChannels), cellCount);
    workRangePtr = argsBuf->getWorkRange();
