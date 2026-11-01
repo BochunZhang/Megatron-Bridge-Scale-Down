@@ -198,7 +198,7 @@ def test_run_one_nsys_wraps_torchrun_with_one_report_per_node(tmp_path: Path):
 def test_run_one_rejects_unknown_fsdp_level():
     result = _run(RUN_ONE, "--model", "27b", "--recipe", "r", "--seq-length", "256", "--fsdp", "2", "--dry-run")
     assert result.returncode == 2
-    assert "--fsdp must be 1 or 3" in result.stderr
+    assert "--fsdp must be 1, 3, or ddp" in result.stderr
 
 
 def test_397b_fsdp1_vs_fsdp3_sweep_crops_experts_without_cp(tmp_path: Path):
@@ -323,6 +323,80 @@ def test_run_one_rejects_force_balance_for_dense_model():
     result = _run(RUN_ONE, "--model", "27b", "--recipe", "r", "--seq-length", "256", "--force-balance", "--dry-run")
     assert result.returncode == 2
     assert "--force-balance only applies to MoE models" in result.stderr
+
+
+def test_ddp_sweeps_replace_megatron_fsdp_and_use_te_per_layer_graphs(tmp_path: Path):
+    for script, model_tag, report_tag, extra, modules in (
+        ("benchmark_27b_fsdp1_vs_fsdp3.sh", "model_27b", "qwen35_27b", (), r"\[attn\,mlp\]"),
+        (
+            "benchmark_397b_fsdp1_vs_fsdp3.sh",
+            "model_397b",
+            "qwen35_397b",
+            ("--experts", "64"),
+            r"\[attn\,moe_router\,moe_preprocess\]",
+        ),
+        (
+            "benchmark_2.4t_fsdp1_vs_fsdp3.sh",
+            "model_2.4t",
+            "qwen38_2.4t",
+            ("--experts", "64"),
+            r"\[attn\,moe_router\,moe_preprocess\]",
+        ),
+    ):
+        result = _run(
+            EXAMPLE / script,
+            *("--dry-run", "--fsdp", "ddp", "--cuda-graph", "off,on", "--seq", "256", *extra),
+            *("--run-date", RUN_DATE, "--output-dir", str(tmp_path)),
+        )
+        assert result.returncode == 0, result.stderr
+        commands = _commands(result.stderr)
+        assert len(commands) == 2
+        for command in commands:
+            assert f"{model_tag}-ddp-layers_" in command and f"/{report_tag}-ddp-experts_" in command
+            assert "dist.use_megatron_fsdp=false" in command and "ddp.use_megatron_fsdp=false" in command
+            assert "ddp.use_distributed_optimizer=true" in command
+            assert "ddp.data_parallel_sharding_strategy=no_shard " in command
+            assert "ddp.overlap_grad_reduce=true" in command and "comm_overlap.overlap_param_gather=true" in command
+            assert "checkpoint.ckpt_format=torch_dist" in command
+            # Layer backward ranges need NVTX in the nsys runs.
+            assert "profiling.nvtx_ranges=true" in command
+        off = next(c for c in commands if "-cg_off-" in c)
+        assert "model.cuda_graph_impl=none" in off
+        on = next(c for c in commands if "-cg_on-" in c)
+        assert "model.cuda_graph_impl=transformer_engine" in on
+        assert f"model.cuda_graph_modules={modules}" in on
+        assert "model.use_te_rng_tracker=true" in on and "rng.te_rng_tracker=true" in on
+        # Dropless MoE stays eager, so none of the FSDP full-iteration graph setup applies.
+        for fsdp_only in (
+            "moe_expert_rank_capacity_factor",
+            "moe_paged_stash",
+            "use_transformer_engine_op_fuser",
+            "megatron_fsdp_cuda_graph_mode",
+            "check_for_nan_in_loss=false",
+        ):
+            assert fsdp_only not in on
+
+
+def test_ddp_cuda_graph_accepts_alltoall_and_skips_preprocess_with_fp8_padding(tmp_path: Path):
+    common = ("--recipe", "r", "--seq-length", "256", "--num-experts", "64", "--fsdp", "ddp", "--cuda-graph", "on")
+    common += ("--dispatcher", "alltoall", "--run-date", RUN_DATE, "--results-root", str(tmp_path), "--dry-run")
+    bf16 = _run(RUN_ONE, "--model", "397b", *common, NCCL_GRAPH_REGISTER="1")
+    assert bf16.returncode == 0, bf16.stderr
+    assert r"model.cuda_graph_modules=\[attn\,moe_router\,moe_preprocess\]" in bf16.stderr
+    # TECudaGraphHelper asserts NCCL graph registration is off under expandable segments.
+    assert "NCCL_GRAPH_REGISTER=0" in bf16.stderr.splitlines()
+    # moe_router_padding_for_fp8 makes the alltoall preprocess sync with the host.
+    mxfp8 = _run(RUN_ONE, "--model", "2.4t", "--dtype", "mxfp8", *common)
+    assert mxfp8.returncode == 0, mxfp8.stderr
+    assert r"model.cuda_graph_modules=\[attn\,moe_router\] " in mxfp8.stderr
+    # The sweeps only insist on HybridEP when an FSDP level is in the matrix.
+    sweep = ("--dry-run", "--dispatcher", "alltoall", "--cuda-graph", "on", "--experts", "64", "--seq", "256")
+    sweep += ("--run-date", RUN_DATE, "--output-dir", str(tmp_path))
+    for script in ("benchmark_397b_fsdp1_vs_fsdp3.sh", "benchmark_2.4t_fsdp1_vs_fsdp3.sh"):
+        assert _run(EXAMPLE / script, *sweep, "--fsdp", "ddp").returncode == 0
+        mixed = _run(EXAMPLE / script, *sweep, "--fsdp", "3,ddp")
+        assert mixed.returncode == 2
+        assert "requires --dispatcher hybridep" in mixed.stderr
 
 
 def test_fsdp1_vs_fsdp3_sweeps_tag_mxfp8_in_result_dirs_and_nsys_reports(tmp_path: Path):

@@ -4,7 +4,8 @@
 
 # Run one cropped Qwen3.5 / Qwen3.8 case through scripts/training/run_recipe.py.
 # The selected GB200 recipe is FSDP1 by default; the overrides below select
-# Megatron FSDP3 (default) or keep FSDP1 with --fsdp 1.
+# Megatron FSDP3 (default), keep FSDP1 with --fsdp 1, or switch to Megatron DDP
+# with --fsdp ddp.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -67,20 +68,25 @@ Options:
   --mtp-num-layers N             Override model.mtp_num_layers
   --dispatcher hybridep|alltoall MoE token dispatcher (default: hybridep)
   --hybridep-num-sms N           SMs for HybridEP dispatch (default: 32)
-  --cuda-graph off|on            off: no CUDA graph. on: full-iteration graph of
-                                 forward+backward, FSDP all-gather / reduce-scatter
+  --cuda-graph off|on            off: no CUDA graph. on with FSDP: full-iteration graph
+                                 of forward+backward, FSDP all-gather / reduce-scatter
                                  included; MoE models add a per-rank token budget
                                  (capacity factor 1.5) and paged stash, hybridep
-                                 only (default: off)
+                                 only. on with DDP: TE per-layer graphs, dense
+                                 attn+mlp, MoE attn+moe_router+moe_preprocess with
+                                 dispatch / experts / combine eager (default: off)
   --force-balance                MoE only: replace router logits with random values
                                  (moe_router_force_load_balancing), so tokens spread
                                  uniformly over experts; benchmark only, the loss is
                                  not meaningful. Names get "-fb"
-  --fsdp 3|1                     3: Megatron FSDP optim_grads_params with prefetch and
+  --fsdp 3|1|ddp                 3: Megatron FSDP optim_grads_params with prefetch and
                                  overlapped reduce-scatter. 1: the recipe's optim
                                  strategy (only optimizer state sharded; gradient
                                  reduce-scatter and parameter all-gather once per
-                                 iteration, not overlapped) (default: 3)
+                                 iteration, not overlapped). ddp: Megatron DDP with
+                                 the distributed optimizer; bucketed gradient
+                                 reduce-scatter overlapped with backward, parameter
+                                 all-gather with the next forward (default: 3)
   --dtype|--precision bf16|mxfp8 Compute mode (default: bf16)
   --gpu|--gpus N                 Global GPU count (default: 4)
   --nproc-per-node N              GPUs per node (default: 4)
@@ -156,10 +162,13 @@ case "${DISPATCHER}" in hybridep|alltoall) ;; *) echo "--dispatcher must be hybr
 case "${CUDA_GRAPH}" in off|on) ;; *) echo "--cuda-graph must be off or on" >&2; exit 2;; esac
 # FSDP1 keeps the recipe's settings: with the optim strategy Megatron-FSDP delays the
 # gradient reduction to the end of the iteration, so there is nothing to overlap.
+# DDP replaces Megatron-FSDP with MCore DistributedDataParallel; the sharding
+# strategy is FSDP-only, so it goes back to the no_shard default.
 case "${FSDP_LEVEL}" in
-    3) SHARDING_STRATEGY=optim_grads_params; FSDP_OVERLAP=true;;
-    1) SHARDING_STRATEGY=optim; FSDP_OVERLAP=false;;
-    *) echo "--fsdp must be 1 or 3" >&2; exit 2;;
+    3) SHARDING_STRATEGY=optim_grads_params; FSDP_OVERLAP=true; DP_TAG=fsdp_3; FSDP_JSON=3;;
+    1) SHARDING_STRATEGY=optim; FSDP_OVERLAP=false; DP_TAG=fsdp_1; FSDP_JSON=1;;
+    ddp) SHARDING_STRATEGY=no_shard; FSDP_OVERLAP=true; DP_TAG=ddp; FSDP_JSON=null;;
+    *) echo "--fsdp must be 1, 3, or ddp" >&2; exit 2;;
 esac
 for name in SEQ_LENGTH CONTEXT_PARALLEL MICRO_BATCH_SIZE GLOBAL_BATCH_SIZE TRAIN_ITERS GPU_COUNT GPUS_PER_NODE MASTER_PORT HYBRIDEP_NUM_SMS; do
     [[ "${!name}" =~ ^[1-9][0-9]*$ ]] || { echo "${name} must be a positive integer" >&2; exit 2; }
@@ -201,10 +210,11 @@ else
     if [[ "${DISPATCHER}" == hybridep ]]; then
         (( EXPERT_PARALLEL <= 72 )) || { echo "HybridEP ep must fit in the 72-rank NVLink domain" >&2; exit 2; }
     fi
-    # The full-iteration graph needs static MoE shapes, which only the HybridEP
-    # per-rank token budget (moe_expert_rank_capacity_factor) provides.
-    if [[ "${CUDA_GRAPH}" == on && "${DISPATCHER}" != hybridep ]]; then
-        echo "--cuda-graph on for MoE models requires --dispatcher hybridep" >&2; exit 2
+    # The FSDP full-iteration graph needs static MoE shapes, which only the HybridEP
+    # per-rank token budget (moe_expert_rank_capacity_factor) provides. DDP per-layer
+    # graphs stop before the dispatch and keep dropless MoE eager.
+    if [[ "${CUDA_GRAPH}" == on && "${FSDP_LEVEL}" != ddp && "${DISPATCHER}" != hybridep ]]; then
+        echo "--cuda-graph on for MoE models with FSDP requires --dispatcher hybridep" >&2; exit 2
     fi
     if [[ -n "${NUM_EXPERTS}" ]]; then
         (( NUM_EXPERTS % EXPERT_PARALLEL == 0 )) || { echo "num-experts must be divisible by ep" >&2; exit 2; }
@@ -227,7 +237,7 @@ DTYPE_TAG=""
 [[ "${DTYPE}" == mxfp8 ]] && DTYPE_TAG="-mxfp8"
 # Forced balanced routing adds "-fb" the same way, so default names are unchanged.
 [[ "${FORCE_BALANCE}" == true ]] && DTYPE_TAG+="-fb"
-CASE_NAME="model_${MODEL}-fsdp_${FSDP_LEVEL}${DTYPE_TAG}-layers_${LAYERS_TAG}-mtp_${MTP_TAG}-experts_${EXPERTS_TAG}-cg_${CUDA_GRAPH}-mbs_${MICRO_BATCH_SIZE}-seq_${SEQ_LENGTH}-cp_${CONTEXT_PARALLEL}-ep_${EXPERT_PARALLEL}-disp_${DISPATCHER}-gbs_${GLOBAL_BATCH_SIZE}-gpus_${GPU_COUNT}-profile_${PROFILE}-date_${RUN_DATE}"
+CASE_NAME="model_${MODEL}-${DP_TAG}${DTYPE_TAG}-layers_${LAYERS_TAG}-mtp_${MTP_TAG}-experts_${EXPERTS_TAG}-cg_${CUDA_GRAPH}-mbs_${MICRO_BATCH_SIZE}-seq_${SEQ_LENGTH}-cp_${CONTEXT_PARALLEL}-ep_${EXPERT_PARALLEL}-disp_${DISPATCHER}-gbs_${GLOBAL_BATCH_SIZE}-gpus_${GPU_COUNT}-profile_${PROFILE}-date_${RUN_DATE}"
 RESULT_DIR="${RESULTS_ROOT}/${CASE_NAME}/node${NODE_RANK}"
 if [[ "${PRINT_RESULT_DIR}" == true ]]; then
     printf '%s\n' "${RESULT_DIR}"
@@ -236,7 +246,7 @@ fi
 # nsys report name, e.g. qwen35_27b-fsdp_3-mxfp8-experts_0-cg_off-cp_4-ep_1-mbs_1-gbs_4-seq_16k-node_0;
 # nsys wraps torchrun, so one report per node holds every local rank.
 if (( SEQ_LENGTH % 1024 == 0 )); then SEQ_TAG="$((SEQ_LENGTH / 1024))k"; else SEQ_TAG="${SEQ_LENGTH}"; fi
-NSYS_NAME="${MODEL_TAG}-fsdp_${FSDP_LEVEL}${DTYPE_TAG}-experts_${EXPERTS_TAG}-cg_${CUDA_GRAPH}-cp_${CONTEXT_PARALLEL}-ep_${EXPERT_PARALLEL}-mbs_${MICRO_BATCH_SIZE}-gbs_${GLOBAL_BATCH_SIZE}-seq_${SEQ_TAG}-node_${NODE_RANK}"
+NSYS_NAME="${MODEL_TAG}-${DP_TAG}${DTYPE_TAG}-experts_${EXPERTS_TAG}-cg_${CUDA_GRAPH}-cp_${CONTEXT_PARALLEL}-ep_${EXPERT_PARALLEL}-mbs_${MICRO_BATCH_SIZE}-gbs_${GLOBAL_BATCH_SIZE}-seq_${SEQ_TAG}-node_${NODE_RANK}"
 NUM_MICROBATCHES=$((GLOBAL_BATCH_SIZE / (MICRO_BATCH_SIZE * (GPU_COUNT / CONTEXT_PARALLEL))))
 
 # torchrun creates LOCAL_RANK before this worker wrapper is invoked. Prefer a
@@ -266,6 +276,13 @@ unset NCCL_DEBUG_SUBSYS NCCL_DEBUG_FILE || true
 
 PROFILE_RANKS=0
 for (( rank = 1; rank < GPU_COUNT; rank++ )); do PROFILE_RANKS+=",${rank}"; done
+# DDP replicates parameters and gradients (the distributed optimizer still shards
+# optimizer state); fsdp_dtensor checkpoints only exist for Megatron-FSDP.
+if [[ "${FSDP_LEVEL}" == ddp ]]; then
+    DP_OVERRIDES=("dist.use_megatron_fsdp=false" "ddp.use_megatron_fsdp=false" "checkpoint.ckpt_format=torch_dist")
+else
+    DP_OVERRIDES=("dist.use_megatron_fsdp=true" "ddp.use_megatron_fsdp=true" "checkpoint.ckpt_format=fsdp_dtensor")
+fi
 OVERRIDES=(
     "model.seq_length=${SEQ_LENGTH}" "dataset.seq_length=${SEQ_LENGTH}" "dataset.blend=null"
     "train.train_iters=${TRAIN_ITERS}" "train.global_batch_size=${GLOBAL_BATCH_SIZE}" "train.micro_batch_size=${MICRO_BATCH_SIZE}"
@@ -276,14 +293,14 @@ OVERRIDES=(
     "model.cp_comm_type=p2p" "model.mtp_num_layers=0" "model.linear_attention_freq=4"
     "model.recompute_granularity=null" "model.recompute_method=null" "model.recompute_num_layers=null"
     "model.recompute_modules=[]" "model.fine_grained_activation_offloading=false" "model.offload_modules=[]"
-    "dist.use_megatron_fsdp=true" "ddp.use_megatron_fsdp=true" "ddp.use_distributed_optimizer=true"
+    "${DP_OVERRIDES[@]}" "ddp.use_distributed_optimizer=true"
     "ddp.data_parallel_sharding_strategy=${SHARDING_STRATEGY}" "ddp.average_in_collective=false"
     "ddp.overlap_grad_reduce=${FSDP_OVERLAP}" "ddp.overlap_param_gather=${FSDP_OVERLAP}" "ddp.grad_reduce_in_fp32=true"
     # The recipe pins comm_overlap.overlap_*=false, and CommOverlapConfig.setup()
     # copies those values back into ddp at runtime. Override both layers so
-    # FSDP3 keeps parameter prefetch and asynchronous reduce-scatter enabled.
+    # FSDP3 and DDP keep parameter prefetch and asynchronous gradient reduction.
     "comm_overlap.overlap_grad_reduce=${FSDP_OVERLAP}" "comm_overlap.overlap_param_gather=${FSDP_OVERLAP}"
-    "checkpoint.ckpt_format=fsdp_dtensor" "checkpoint.save=null" "checkpoint.load=null"
+    "checkpoint.save=null" "checkpoint.load=null"
     "logger.log_interval=1" "logger.tensorboard_dir=null" "logger.save_config_filepath=${RESULT_DIR}/config.yaml"
     "profiling.use_nsys_profiler=$([[ "${PROFILE}" == nsys ]] && echo true || echo false)"
     "profiling.use_pytorch_profiler=false" "profiling.profile_step_start=${PROFILE_START}" "profiling.profile_step_end=${PROFILE_END}"
@@ -295,7 +312,30 @@ OVERRIDES=(
     # record_param_comms for FSDP all-gather / reduce-scatter, carries tensor shapes.
     "profiling.record_shapes=$([[ "${PROFILE}" == nsys ]] && echo true || echo false)"
 )
-if [[ "${CUDA_GRAPH}" == on ]]; then
+GRAPH_IMPL=none
+GRAPH_MODULES="[]"
+if [[ "${CUDA_GRAPH}" == on && "${FSDP_LEVEL}" == ddp ]]; then
+    # TE per-layer graphs: one make_graphed_callables() graph per layer and micro-batch
+    # for forward and one for backward. Bridge removes DDP's forward pre-hook
+    # (parameter all-gather) for the capture and re-installs it as the layers'
+    # manual hooks. Dense layers are captured whole. MoE layers stop after the router
+    # and preprocess, so the dropless HybridEP / alltoall dispatch, routed experts and
+    # combine stay eager and keep the unfused TEGroupedMLP of the off mode.
+    GRAPH_IMPL=transformer_engine
+    if [[ "${MODEL}" == 27b ]]; then
+        GRAPH_MODULES="[attn,mlp]"
+    elif [[ "${DTYPE}" == mxfp8 && "${DISPATCHER}" == alltoall ]]; then
+        # moe_router_padding_for_fp8 makes the alltoall preprocess copy token counts
+        # to the host, which MCore refuses to graph.
+        GRAPH_MODULES="[attn,moe_router]"
+    else
+        GRAPH_MODULES="[attn,moe_router,moe_preprocess]"
+    fi
+    OVERRIDES+=(
+        "model.cuda_graph_impl=${GRAPH_IMPL}" "model.cuda_graph_scope=null" "model.cuda_graph_modules=${GRAPH_MODULES}"
+        "model.cuda_graph_warmup_steps=3" "model.use_te_rng_tracker=true" "rng.te_rng_tracker=true"
+    )
+elif [[ "${CUDA_GRAPH}" == on ]]; then
     # One full-iteration graph of forward+backward (optimizer step stays eager), with
     # the FSDP all-gather / reduce-scatter captured inside. Per-layer graphs (TE or
     # local) are not an option: both refuse modules carrying Megatron-FSDP's
@@ -304,8 +344,9 @@ if [[ "${CUDA_GRAPH}" == on ]]; then
     # optimizer step from issuing an all-gather the graph would wait on (Megatron-LM
     # sets both automatically, Bridge does not); the recipe's max-pool double buffer
     # keeps bucket addresses fixed. The graph cannot check NaN loss or gradients.
+    GRAPH_IMPL=full_iteration
     OVERRIDES+=(
-        "model.cuda_graph_impl=full_iteration" "model.cuda_graph_scope=null" "model.cuda_graph_modules=[]"
+        "model.cuda_graph_impl=${GRAPH_IMPL}" "model.cuda_graph_scope=null" "model.cuda_graph_modules=${GRAPH_MODULES}"
         "model.cuda_graph_warmup_steps=3" "ddp.megatron_fsdp_cuda_graph_mode=true"
         "ddp.fsdp_all_gather_in_start_param_sync=false"
         "rerun_state_machine.check_for_nan_in_loss=false" "ddp.check_for_nan_in_grad=false"
@@ -325,9 +366,12 @@ if [[ "${CUDA_GRAPH}" == on ]]; then
         # supported for this configuration".
         export NVTE_CUTEDSL_FUSED_GROUPED_MLP=1
     fi
-    # Keep NCCL graph registration off: the graph now holds NCCL collectives, and
-    # registering expandable segments (often inherited through PYTORCH_CUDA_ALLOC_CONF)
-    # can hit illegal memory access. nccl_ub stays off either way.
+fi
+if [[ "${CUDA_GRAPH}" == on ]]; then
+    # Keep NCCL graph registration off. The full-iteration graph holds NCCL
+    # collectives, where registering expandable segments (often inherited through
+    # PYTORCH_CUDA_ALLOC_CONF) can hit illegal memory access, and TECudaGraphHelper
+    # asserts it under expandable segments. nccl_ub stays off either way.
     export NCCL_GRAPH_REGISTER=0
 else
     OVERRIDES+=("model.cuda_graph_impl=none" "model.cuda_graph_scope=null" "model.cuda_graph_modules=[]")
@@ -395,7 +439,7 @@ printf 'command:' >"${RESULT_DIR}/command.txt"
 printf ' %q' "${COMMAND[@]}" >>"${RESULT_DIR}/command.txt"
 printf '\n' >>"${RESULT_DIR}/command.txt"
 cat >"${RESULT_DIR}/launch.json" <<JSON
-{"model":"${MODEL_ID}","recipe":"${RECIPE}","run_name":"${RUN_NAME}","dtype":"${DTYPE}","fsdp":${FSDP_LEVEL},"num_layers":"${LAYERS_TAG}","mtp_num_layers":${MTP_TAG},"num_moe_experts":"${EXPERTS_TAG}","force_balance":${FORCE_BALANCE},"cuda_graph":"${CUDA_GRAPH}","seq_length":${SEQ_LENGTH},"context_parallel_size":${CONTEXT_PARALLEL},"expert_model_parallel_size":${EXPERT_PARALLEL},"dispatcher":"${DISPATCHER}","micro_batch_size":${MICRO_BATCH_SIZE},"global_batch_size":${GLOBAL_BATCH_SIZE},"num_microbatches":${NUM_MICROBATCHES},"gpu_count":${GPU_COUNT},"nnodes":${NNODES},"node_rank":${NODE_RANK},"numa_mode":"${NUMA_MODE}","pytorch_cuda_alloc_conf":"${PYTORCH_CUDA_ALLOC_CONF:-}","nccl_graph_register":"${NCCL_GRAPH_REGISTER:-}","nvte_cutedsl_fused_grouped_mlp":"${NVTE_CUTEDSL_FUSED_GROUPED_MLP:-}","run_date":"${RUN_DATE}"}
+{"model":"${MODEL_ID}","recipe":"${RECIPE}","run_name":"${RUN_NAME}","dtype":"${DTYPE}","fsdp":${FSDP_JSON},"data_parallel":"${DP_TAG}","num_layers":"${LAYERS_TAG}","mtp_num_layers":${MTP_TAG},"num_moe_experts":"${EXPERTS_TAG}","force_balance":${FORCE_BALANCE},"cuda_graph":"${CUDA_GRAPH}","cuda_graph_impl":"${GRAPH_IMPL}","cuda_graph_modules":"${GRAPH_MODULES}","seq_length":${SEQ_LENGTH},"context_parallel_size":${CONTEXT_PARALLEL},"expert_model_parallel_size":${EXPERT_PARALLEL},"dispatcher":"${DISPATCHER}","micro_batch_size":${MICRO_BATCH_SIZE},"global_batch_size":${GLOBAL_BATCH_SIZE},"num_microbatches":${NUM_MICROBATCHES},"gpu_count":${GPU_COUNT},"nnodes":${NNODES},"node_rank":${NODE_RANK},"numa_mode":"${NUMA_MODE}","pytorch_cuda_alloc_conf":"${PYTORCH_CUDA_ALLOC_CONF:-}","nccl_graph_register":"${NCCL_GRAPH_REGISTER:-}","nvte_cutedsl_fused_grouped_mlp":"${NVTE_CUTEDSL_FUSED_GROUPED_MLP:-}","run_date":"${RUN_DATE}"}
 JSON
 printf 'model=%s fsdp=%s dtype=%s layers=%s mtp=%s experts=%s force_balance=%s cuda_graph=%s seq=%s cp=%s ep=%s dispatcher=%s mbs=%s gbs=%s gpus=%s num_microbatches=%s numa=%s\n' "${MODEL}" "${FSDP_LEVEL}" "${DTYPE}" "${LAYERS_TAG}" "${MTP_TAG}" "${EXPERTS_TAG}" "${FORCE_BALANCE}" "${CUDA_GRAPH}" "${SEQ_LENGTH}" "${CONTEXT_PARALLEL}" "${EXPERT_PARALLEL}" "${DISPATCHER}" "${MICRO_BATCH_SIZE}" "${GLOBAL_BATCH_SIZE}" "${GPU_COUNT}" "${NUM_MICROBATCHES}" "${NUMA_MODE}" | tee "${RESULT_DIR}/run_info.txt"
 set +e

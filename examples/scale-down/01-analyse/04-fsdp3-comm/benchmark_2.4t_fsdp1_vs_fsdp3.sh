@@ -2,8 +2,9 @@
 # Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
 # Licensed under the Apache License, Version 2.0.
 
-# Compare Megatron FSDP3 with FSDP1 on Qwen3.8-2.4T-A95B cropped to a few routed
-# experts, at short sequences where FSDP and EP communication is not hidden.
+# Compare Megatron FSDP3 with FSDP1 (and Megatron DDP with --fsdp ddp) on
+# Qwen3.8-2.4T-A95B cropped to a few routed experts, at short sequences where data
+# parallel and EP communication is not hidden.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -46,9 +47,11 @@ step 7. Default matrix: experts 64,32 x seq 256,1024,4096 x FSDP 3,1 = 12 runs.
 Options:
   --experts N[,N...]           Routed experts, multiples of EP=4 and >= top-k (default: 64,32)
   --seq N[,N...]               Sequence lengths (default: 256,1024,4096)
-  --fsdp 3|1[,...]             FSDP levels (default: 3,1)
+  --fsdp 3|1|ddp[,...]         FSDP levels, ddp = Megatron DDP (default: 3,1)
   --cuda-graph off|on[,...]    CUDA graph modes per case (default: off); on = full-iteration
-                               graph with capacity factor 1.5 + paged stash (hybridep only)
+                               graph with capacity factor 1.5 + paged stash for FSDP
+                               (hybridep only), TE per-layer attn+moe_router+moe_preprocess
+                               graphs for DDP
   --num-layers N               Decoder layers (default: 4)
   --mtp-num-layers N           MTP layers (default: 0)
   --num-microbatches N         Microbatches per iteration (default: 4)
@@ -115,14 +118,17 @@ for seq in "${SEQUENCES[@]}"; do
     [[ "${seq}" =~ ^[1-9][0-9]*$ ]] && (( seq % 2 == 0 )) || { echo "seq must be a positive even integer: ${seq}" >&2; exit 2; }
 done
 for fsdp in "${FSDP_LEVELS[@]}"; do
-    case "${fsdp}" in 1|3) ;; *) echo "--fsdp values must be 1 or 3" >&2; exit 2;; esac
+    case "${fsdp}" in 1|3|ddp) ;; *) echo "--fsdp values must be 1, 3, or ddp" >&2; exit 2;; esac
 done
 for cg in "${CUDA_GRAPHS[@]}"; do
     case "${cg}" in off|on) ;; *) echo "--cuda-graph values must be off or on" >&2; exit 2;; esac
 done
-# The full-iteration graph relies on the HybridEP per-rank token budget.
-if [[ " ${CUDA_GRAPHS[*]} " == *" on "* && "${DISPATCHER}" != hybridep ]]; then
-    echo "--cuda-graph on requires --dispatcher hybridep" >&2; exit 2
+# The FSDP full-iteration graph relies on the HybridEP per-rank token budget; the
+# DDP per-layer graphs leave the dispatch eager.
+USES_FSDP=false
+for fsdp in "${FSDP_LEVELS[@]}"; do [[ "${fsdp}" == ddp ]] || USES_FSDP=true; done
+if [[ " ${CUDA_GRAPHS[*]} " == *" on "* && "${USES_FSDP}" == true && "${DISPATCHER}" != hybridep ]]; then
+    echo "--cuda-graph on with FSDP requires --dispatcher hybridep" >&2; exit 2
 fi
 GBS=$((NUM_MICROBATCHES * GPUS))
 MOE_LAYER_FREQ="[1"

@@ -55,7 +55,7 @@ seq=4096 时每层计算足以盖住 FSDP3 的 all-gather / reduce-scatter，nsy
 | 其他 | BF16，CUDA graph 关，MBS=1，每 iter 4 个 micro-batch（GBS=16），nsys 采集 step 7 |
 | 矩阵 | seq `256,1024,4096` × FSDP `3,1`，共 6 次 |
 
-FSDP 级别由单 case 启动器的 `--fsdp 3|1` 选择：
+FSDP 级别由单 case 启动器的 `--fsdp 3|1|ddp` 选择（`ddp` 见下文「DDP：逐层 backward 时间」）：
 
 - `--fsdp 3`（默认）：`optim_grads_params`，开启参数预取与 reduce-scatter 重叠，与上面的矩阵相同；每个 micro-batch 都做 fwd AG、bwd AG 和 RS。
 - `--fsdp 1`：保持 recipe 自身的 `optim` 策略，只切 optimizer state。Megatron-FSDP 对 `optim` 延迟梯度规约，整个 iteration 只在最后做一次梯度 reduce-scatter、optimizer step 后做一次参数 all-gather，因此 recipe 关闭 overlap，启动器也保持关闭。
@@ -117,6 +117,46 @@ bash examples/scale-down/01-analyse/04-fsdp3-comm/benchmark_397b_fsdp1_vs_fsdp3.
 bash examples/scale-down/01-analyse/04-fsdp3-comm/benchmark_2.4t_fsdp1_vs_fsdp3.sh --mxfp8
 ```
 
+### DDP：逐层 backward 时间（27b / 397b / 2.4t）
+
+三个对比脚本与单 case 启动器都接受 `--fsdp ddp`，把 Megatron-FSDP 换成 MCore `DistributedDataParallel`，用来在 CUDA graph 关 / 开下观察每个 layer 的 backward 时间。FSDP 下只能用 full-iteration graph（见下文「CUDA graph」），整轮 forward + backward 是一个 graph，看不到层边界；DDP 可以用 TE 的按层 graph。
+
+| 项 | `--fsdp ddp` 的覆盖 |
+| --- | --- |
+| 数据并行 | `dist.use_megatron_fsdp=false`、`ddp.use_megatron_fsdp=false`、`ddp.data_parallel_sharding_strategy=no_shard`（该字段只有 FSDP 使用） |
+| 优化器 | `ddp.use_distributed_optimizer=true`：参数与梯度在每卡完整保留，只切 optimizer state |
+| 通信重叠 | `ddp.overlap_grad_reduce=true`、`ddp.overlap_param_gather=true`（`comm_overlap.*` 同步覆盖）：梯度按 bucket 在 backward 中 reduce-scatter，参数 all-gather 与下一轮 forward 重叠 |
+| checkpoint | `checkpoint.ckpt_format=torch_dist`（`fsdp_dtensor` 只支持 Megatron-FSDP；本实验不保存） |
+| 命名 | 结果目录 `model_<m>-ddp-...`，nsys 报告 `<qwen35_27b\|qwen35_397b\|qwen38_2.4t>-ddp-...`；`launch.json` 中 `fsdp` 为 `null`、`data_parallel` 为 `ddp` |
+
+`--cuda-graph on` 时设置 `cuda_graph_impl=transformer_engine`、`cuda_graph_warmup_steps=3`、`use_te_rng_tracker=true`、`rng.te_rng_tracker=true` 与 `NCCL_GRAPH_REGISTER=0`（`TECudaGraphHelper` 在 expandable segments 下要求关闭）。每层每个 micro-batch 分别有一个 forward graph 和一个 backward graph：
+
+- dense（27b）：`cuda_graph_modules=[attn,mlp]`，整层进 graph；
+- MoE（397b / 2.4t）：`cuda_graph_modules=[attn,moe_router,moe_preprocess]`，attention、router、shared expert 与 preprocess 进 graph，dispatch、routed experts、combine 保持 eager。MoE 仍是 dropless，不需要容量因子、paged stash 或 TE op fuser，expert 走与关闭模式相同的非融合 `TEGroupedMLP`，因此不受上文 cuBLAS 13.3 的限制，hybridep 与 alltoall 都可以用；
+- MXFP8 + alltoall 时 `moe_router_padding_for_fp8` 让 alltoall 的 preprocess 把 token 数拷回 host，MCore 不允许 graph 它，启动器改用 `[attn,moe_router]`；
+- 不需要关闭 NaN 检查，recipe 的 `check_for_nan_in_loss` / `check_for_nan_in_grad` 保持开启；
+- DDP 的参数 all-gather 是 forward pre-hook：Bridge 在 capture 时摘掉它，capture 后改为每层的 manual hook（`train.py` 的 `cuda_graph_set_manual_hooks`）。
+
+显存：DDP 每卡保留完整的 bf16 参数与 fp32 梯度，dense 部分约 9 B/参数（2 + 4 + 12/4），EP=4 时 routed expert 的数据并行组为 1，与 FSDP 相同。2.4t 64 experts 每卡模型状态约 120 GiB，与 FSDP1 相当；397b 与 27b 余量更大。
+
+逐层 backward 时间的读法：
+
+- **graph 关**：nsys 模式下每层有 `L<i> bwd` NVTX range（见下文「Layer 的 forward / backward 标注」），直接投影到 GPU 即可得到每层 backward 时间；DDP 的梯度 reduce-scatter 在独立 stream 上，与后续层的 backward 重叠。
+- **graph 开**：MCore 的 TE graph 路径在 capture 与 replay 时都绕过 `TransformerLayer.forward()`，直接调用 `_forward_attention` / `_forward_mlp`（`megatron/core/transformer/transformer_layer.py` 的 `_te_cuda_graph_capture` / `_te_cuda_graph_replay`），而 `L<i> fwd` / `L<i> bwd` 是在 `forward()` 里注入的，因此 capture 之后（nsys 采集的 step 7）**没有这两类 range**。此时按 graph 读：nsys 默认 `--cuda-graph-trace=graph`，每次 graph launch 在 GPU 时间线上是一个整体。27b 每层的 backward 就是该层的 backward graph；MoE 层的 backward 是 graph 部分（attention / router / shared expert）加上前后 eager 的 combine、routed experts、dispatch 的 backward kernel。
+- 比较 graph 关 / 开的 iteration 时间时加 `--profile none`，以排除 nsys 与 `record_shapes` 的 host 开销。
+
+```bash
+bash examples/scale-down/01-analyse/04-fsdp3-comm/benchmark_27b_fsdp1_vs_fsdp3.sh --fsdp ddp --cuda-graph off,on
+bash examples/scale-down/01-analyse/04-fsdp3-comm/benchmark_397b_fsdp1_vs_fsdp3.sh --fsdp ddp --cuda-graph off,on
+bash examples/scale-down/01-analyse/04-fsdp3-comm/benchmark_2.4t_fsdp1_vs_fsdp3.sh --fsdp ddp --cuda-graph off,on
+# 与 FSDP 放在同一矩阵里（FSDP 的 graph 开需要 cuBLAS >= 13.3 编译的 TE）
+bash examples/scale-down/01-analyse/04-fsdp3-comm/benchmark_2.4t_fsdp1_vs_fsdp3.sh --fsdp 3,1,ddp --experts 64 --seq 1024
+```
+
+前三条命令的矩阵：27b 为 seq `256,1024,4096` × graph `off,on` 共 6 次；397b / 2.4t 为 experts `64,32` × seq `256,1024,4096` × graph `off,on` 共 12 次。不传 `--fsdp` / `--cuda-graph` 时三个脚本的默认仍是 FSDP `3,1`、graph `off`。
+
+尚未在 GPU 上验证的点：GatedDeltaNet 层在 TE graph 中的 capture；`--force-balance` 的随机 logits 在 router graph replay 时是否重新采样（与 FSDP full-iteration graph 的同一问题）。
+
 ### 强制均衡路由（`--force-balance`）
 
 `benchmark_fsdp3.sh`、`benchmark_397b_fsdp1_vs_fsdp3.sh`、`benchmark_2.4t_fsdp1_vs_fsdp3.sh` 与单 case 启动器都支持 `--force-balance`，它设置 MCore 的 `model.moe_router_force_load_balancing=true`：`TopKRouter.forward` 在 router GEMM 之后把 logits 换成每 rank 独立的 N(0,1) 随机数（`apply_random_logits`，反向为直通），再照常 top-k。每个 token 因此均匀随机地选 k 个 expert，各 expert 与各 EP rank 的 token 数在统计上相等；router GEMM、dispatch / combine 与 expert 计算量不变。
@@ -131,12 +171,19 @@ bash examples/scale-down/01-analyse/04-fsdp3-comm/benchmark_2.4t_fsdp1_vs_fsdp3.
 bash examples/scale-down/01-analyse/04-fsdp3-comm/benchmark_2.4t_fsdp1_vs_fsdp3.sh --force-balance
 ```
 
-## CUD| `--cuda-graph` | dense（27b） | MoE（397b / 2.4t） |
-| --- | --- | --- |
-| `off` | `cuda_graph_impl=none` | `cuda_graph_impl=none` |
-| `on` | `cuda_graph_impl=full_iteration`：整个 forward + backward（含 FSDP all-gather / reduce-scatter）一个 graph，optimizer step 保持 eager | 同左，另加 `moe_expert_rank_capacity_factor=1.5`、`moe_paged_stash=true`、`use_transformer_engine_op_fuser=true`；只支持 `--dispatcher hybridep` |
+## CUDA graph
 
-开启时同时设置：
+`--cuda-graph on` 的含义取决于数据并行方式（`--fsdp`）：
+
+| `--cuda-graph` | `--fsdp` | dense（27b） | MoE（397b / 2.4t） |
+| --- | --- | --- | --- |
+| `off` | 任意 | `cuda_graph_impl=none` | `cuda_graph_impl=none` |
+| `on` | `3` / `1` | `cuda_graph_impl=full_iteration`：整个 forward + backward（含 FSDP all-gather / reduce-scatter）一个 graph，optimizer step 保持 eager | 同左，另加 `moe_expert_rank_capacity_factor=1.5`、`moe_paged_stash=true`、`use_transformer_engine_op_fuser=true`；只支持 `--dispatcher hybridep` |
+| `on` | `ddp` | `cuda_graph_impl=transformer_engine`，`cuda_graph_modules=[attn,mlp]`：每层整层一个 graph | `cuda_graph_impl=transformer_engine`，`cuda_graph_modules=[attn,moe_router,moe_preprocess]`：dispatch / routed experts / combine 保持 eager；hybridep 与 alltoall 都可用 |
+
+DDP 的 TE 按层 graph 见下文「DDP：逐层 backward 时间」。下面先说明 FSDP 的 full-iteration graph。
+
+FSDP 开启时同时设置：
 
 - `cuda_graph_warmup_steps=3`；
 - `ddp.megatron_fsdp_cuda_graph_mode=true`：Megatron-FSDP 在 optimizer step 后不解除梯度引用，保证 replay 使用的地址有效；
@@ -152,11 +199,10 @@ MoE 的额外设置：dropless MoE 每步把各 expert 的 token 数拷回 host�
 
 - 开启模式的 MoE expert 计算走 op fuser 路径（对齐到 256 token），与关闭模式的 expert kernel 不同，关 / 开对比的不只是 graph 本身；
 - 不加 `--force-balance` 时，随机初始化的 router 可能让某些 rank 超出预算而触发 eager 重跑，`train.log` 中需要检查；
-- graph 让中间 buffer 常驻，显存高于关闭模式；2.4t 的 expert 减半搜索会把这部分算进去。
+- graph 让中间 buffer 常驻，显存高于关闭模式；2.4t 的 expert 减半搜索会把这部分算进去；
+- op fuser 的 `te.ops.GroupedLinear` 在 Blackwell + BF16/MXFP8 上固定走 cuBLASLt grouped GEMM（GPU 端读取每组 shape），TE 必须用 **cuBLAS ≥ 13.3（CUDA ≥ 13.2）** 编译。用 CUDA 13.0 编译的 TE 会在第一个 warmup iteration 报 `nvte_get_grouped_gemm_setup_workspace_size requires cuBLAS 13.3+, but compile-time cuBLAS version is 130000`，日志最上面看到的 `Attempted to pop NVTX range ...` 只是这个异常引起的连锁错误。
 
 graph 在第 3 个 iteration 后捕获，nsys 默认采集 step 7，已处于 replay 阶段；FSDP 通信与计算 kernel 都以 graph launch 形式出现。首次运行开启模式时，建议对比同一 case 关 / 开的 `train.log` loss 是否接近。
-
-本实验范围内。
 
 测试 FSDP3 下 CUDA graph 的收益，用同一 case 的 graph 关 / 开对比 step 时间与 nsys 上暴露的通信，例如 2.4t 短序列（每 micro-batch 计算最少、最可能受 CPU launch 限制）：
 
@@ -212,6 +258,7 @@ mtp0 fwd / mtp0 bwd                       MTP 层（开启 MTP 时）
 - `L<i> bwd`：按 Megatron-FSDP backward hook 的方式注入。layer 输出上挂一个 tensor hook，输出梯度到达（该层 backward 开始）时 push；layer 输入经过一个恒等 autograd Function，输入梯度算完（该层 backward 结束）时 pop。range 在 autograd 线程上，包住该层全部 backward kernel 的发起；full recompute 时重算的 `L<i> fwd` 嵌套在 `L<i> bwd` 内。
 - 只在 NVTX 开启、梯度开启且输入 `requires_grad` 时注入，`--profile none` 与推理没有额外开销。
 - PP>1 时层号是全局层号，而 FSDP label 来自本 stage 的参数名（本地层号），两者只在 PP=1（本实验）时一致。
+- `cuda_graph_impl=transformer_engine`（`--fsdp ddp --cuda-graph on`）capture 之后不再调用 `forward()`，这两类 range 都不会出现；`full_iteration` graph replay 时也不会执行 Python 代码，同样没有。
 
 ## 执行步骤
 

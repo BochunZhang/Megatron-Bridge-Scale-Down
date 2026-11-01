@@ -2,8 +2,9 @@
 # Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
 # Licensed under the Apache License, Version 2.0.
 
-# Compare Megatron FSDP3 with FSDP1 on Qwen3.5-397B-A17B cropped to a few routed
-# experts, at short sequences where FSDP and EP communication is not hidden.
+# Compare Megatron FSDP3 with FSDP1 (and Megatron DDP with --fsdp ddp) on
+# Qwen3.5-397B-A17B cropped to a few routed experts, at short sequences where data
+# parallel and EP communication is not hidden.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -16,6 +17,7 @@ RECIPE=qwen35_text_397b_a17b_pretrain_4gpu_gb200_bf16_fsdp1_config
 EXPERTS_LIST=(64 32)
 SEQUENCES=(256 1024 4096)
 FSDP_LEVELS=(3 1)
+CUDA_GRAPHS=(off)
 EXPERT_PARALLEL=4
 NUM_LAYERS="${NUM_LAYERS:-4}"
 MTP_NUM_LAYERS="${MTP_NUM_LAYERS:-0}"
@@ -38,14 +40,19 @@ usage() {
 Usage: benchmark_397b_fsdp1_vs_fsdp3.sh [options]
 
 Qwen3.5-397B-A17B MoE, 4 GPUs on one node, DP=4 and EP=4 (TP=PP=CP=1), BF16 (or MXFP8),
-CUDA graph off, 4 layers (3 GatedDeltaNet + 1 gated attention, every layer MoE),
+CUDA graph off (--cuda-graph off,on adds the graphed mode), 4 layers (3 GatedDeltaNet +
+1 gated attention, every layer MoE),
 no MTP, MBS=1, 4 microbatches per iteration (GBS=16), Nsight Systems on
 step 7. Default matrix: experts 64,32 x seq 256,1024,4096 x FSDP 3,1 = 12 runs.
 
 Options:
   --experts N[,N...]           Routed experts, multiples of EP=4 and >= top-k (default: 64,32)
   --seq N[,N...]               Sequence lengths (default: 256,1024,4096)
-  --fsdp 3|1[,...]             FSDP levels (default: 3,1)
+  --fsdp 3|1|ddp[,...]         FSDP levels, ddp = Megatron DDP (default: 3,1)
+  --cuda-graph off|on[,...]    CUDA graph modes per case (default: off); on = full-iteration
+                               graph with capacity factor 1.5 + paged stash for FSDP
+                               (hybridep only), TE per-layer attn+moe_router+moe_preprocess
+                               graphs for DDP
   --num-layers N               Decoder layers (default: 4)
   --mtp-num-layers N           MTP layers (default: 0)
   --num-microbatches N         Microbatches per iteration (default: 4)
@@ -72,6 +79,7 @@ while [[ $# -gt 0 ]]; do
         --experts|--num-experts) need_value "$@"; parse_csv "$2" EXPERTS_LIST; shift 2;;
         --seq|--seq-length|--seq-lengths) need_value "$@"; parse_csv "$2" SEQUENCES; shift 2;;
         --fsdp) need_value "$@"; parse_csv "$2" FSDP_LEVELS; shift 2;;
+        --cuda-graph|--cuda-graphs) need_value "$@"; parse_csv "$2" CUDA_GRAPHS; shift 2;;
         --num-layers) need_value "$@"; NUM_LAYERS="$2"; shift 2;;
         --mtp-num-layers) need_value "$@"; MTP_NUM_LAYERS="$2"; shift 2;;
         --num-microbatches) need_value "$@"; NUM_MICROBATCHES="$2"; shift 2;;
@@ -111,8 +119,18 @@ for seq in "${SEQUENCES[@]}"; do
     [[ "${seq}" =~ ^[1-9][0-9]*$ ]] && (( seq % 2 == 0 )) || { echo "seq must be a positive even integer: ${seq}" >&2; exit 2; }
 done
 for fsdp in "${FSDP_LEVELS[@]}"; do
-    case "${fsdp}" in 1|3) ;; *) echo "--fsdp values must be 1 or 3" >&2; exit 2;; esac
+    case "${fsdp}" in 1|3|ddp) ;; *) echo "--fsdp values must be 1, 3, or ddp" >&2; exit 2;; esac
 done
+for cg in "${CUDA_GRAPHS[@]}"; do
+    case "${cg}" in off|on) ;; *) echo "--cuda-graph values must be off or on" >&2; exit 2;; esac
+done
+# The FSDP full-iteration graph relies on the HybridEP per-rank token budget; the
+# DDP per-layer graphs leave the dispatch eager.
+USES_FSDP=false
+for fsdp in "${FSDP_LEVELS[@]}"; do [[ "${fsdp}" == ddp ]] || USES_FSDP=true; done
+if [[ " ${CUDA_GRAPHS[*]} " == *" on "* && "${USES_FSDP}" == true && "${DISPATCHER}" != hybridep ]]; then
+    echo "--cuda-graph on with FSDP requires --dispatcher hybridep" >&2; exit 2
+fi
 GBS=$((NUM_MICROBATCHES * GPUS))
 MOE_LAYER_FREQ="[1"
 for (( i = 1; i < NUM_LAYERS; i++ )); do MOE_LAYER_FREQ+=",1"; done
@@ -124,27 +142,29 @@ FAILED=()
 total=0
 for experts in "${EXPERTS_LIST[@]}"; do
     for seq in "${SEQUENCES[@]}"; do
-        for fsdp in "${FSDP_LEVELS[@]}"; do
-            total=$((total + 1))
-            ARGS=(
-                --model 397b --recipe "${RECIPE}" --fsdp "${fsdp}" --seq-length "${seq}" --cp 1
-                --micro-batch-size 1 --global-batch-size "${GBS}" --train-iters "${TRAIN_ITERS}"
-                --num-layers "${NUM_LAYERS}" --linear-attention-freq 4 --mtp-num-layers "${MTP_NUM_LAYERS}"
-                --num-experts "${experts}" --ep "${EXPERT_PARALLEL}" --dispatcher "${DISPATCHER}"
-                --moe-layer-freq "${MOE_LAYER_FREQ}"
-                --cuda-graph off --dtype "${DTYPE}" --gpu "${GPUS}" --nproc-per-node "${GPUS}" --nnodes 1
-                --master-port "${MASTER_PORT}" --profile "${PROFILE}"
-                --profile-start "${PROFILE_START}" --profile-end "${PROFILE_END}"
-                --run-date "${RUN_DATE}" --results-root "${OUTPUT_DIR}"
-            )
-            [[ "${FORCE_BALANCE}" == true ]] && ARGS+=(--force-balance)
-            [[ "${RESUME}" == true ]] && ARGS+=(--resume)
-            [[ "${DRY_RUN}" == true ]] && ARGS+=(--dry-run)
-            printf 'launch model=397b dtype=%s force_balance=%s experts=%s fsdp=%s seq=%s gbs=%s\n' "${DTYPE}" "${FORCE_BALANCE}" "${experts}" "${fsdp}" "${seq}" "${GBS}" >&2
-            if ! "${RUN_ONE}" "${ARGS[@]}"; then
-                echo "case failed: dtype=${DTYPE} experts=${experts} fsdp=${fsdp} seq=${seq}" >&2
-                FAILED+=("dtype=${DTYPE} experts=${experts} fsdp=${fsdp} seq=${seq}")
-            fi
+        for cg in "${CUDA_GRAPHS[@]}"; do
+            for fsdp in "${FSDP_LEVELS[@]}"; do
+                total=$((total + 1))
+                ARGS=(
+                    --model 397b --recipe "${RECIPE}" --fsdp "${fsdp}" --seq-length "${seq}" --cp 1
+                    --micro-batch-size 1 --global-batch-size "${GBS}" --train-iters "${TRAIN_ITERS}"
+                    --num-layers "${NUM_LAYERS}" --linear-attention-freq 4 --mtp-num-layers "${MTP_NUM_LAYERS}"
+                    --num-experts "${experts}" --ep "${EXPERT_PARALLEL}" --dispatcher "${DISPATCHER}"
+                    --moe-layer-freq "${MOE_LAYER_FREQ}"
+                    --cuda-graph "${cg}" --dtype "${DTYPE}" --gpu "${GPUS}" --nproc-per-node "${GPUS}" --nnodes 1
+                    --master-port "${MASTER_PORT}" --profile "${PROFILE}"
+                    --profile-start "${PROFILE_START}" --profile-end "${PROFILE_END}"
+                    --run-date "${RUN_DATE}" --results-root "${OUTPUT_DIR}"
+                )
+                [[ "${FORCE_BALANCE}" == true ]] && ARGS+=(--force-balance)
+                [[ "${RESUME}" == true ]] && ARGS+=(--resume)
+                [[ "${DRY_RUN}" == true ]] && ARGS+=(--dry-run)
+                printf 'launch model=397b dtype=%s force_balance=%s experts=%s fsdp=%s cuda_graph=%s seq=%s gbs=%s\n' "${DTYPE}" "${FORCE_BALANCE}" "${experts}" "${fsdp}" "${cg}" "${seq}" "${GBS}" >&2
+                if ! "${RUN_ONE}" "${ARGS[@]}"; then
+                    echo "case failed: dtype=${DTYPE} experts=${experts} fsdp=${fsdp} cuda_graph=${cg} seq=${seq}" >&2
+                    FAILED+=("dtype=${DTYPE} experts=${experts} fsdp=${fsdp} cuda_graph=${cg} seq=${seq}")
+                fi
+            done
         done
     done
 done
