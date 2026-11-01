@@ -48,6 +48,7 @@ MASTER_PORT="${MASTER_PORT:-29501}"
 DISPATCHER="${DISPATCHER:-hybridep}"
 PROFILE_START="${PROFILE_START:-7}"
 PROFILE_END="${PROFILE_END:-8}"
+FORCE_BALANCE=false
 DRY_RUN=false
 RESUME=false
 
@@ -83,6 +84,8 @@ Options:
   --max-experts-2.4t N          First count of the halving search (default: 512)
   --dtype|--precision bf16|mxfp8
   --dispatcher hybridep|alltoall MoE token dispatcher (default: hybridep)
+  --force-balance               Uniform random routing for MoE cases (benchmark
+                                only; 27b is unaffected); names get "-fb"
   --profile none|nsys            Profiling mode (default: nsys)
   --nsys                         Alias for --profile nsys
   --train-iters N               Training iterations
@@ -121,6 +124,7 @@ while [[ $# -gt 0 ]]; do
         --dtype|--precision) need_value "$@"; DTYPE="$2"; [[ "${DTYPE}" == fp8mx ]] && DTYPE=mxfp8; shift 2;;
         --profile) need_value "$@"; PROFILE="$2"; shift 2;;
         --dispatcher) need_value "$@"; DISPATCHER="$2"; shift 2;;
+        --force-balance) FORCE_BALANCE=true; shift;;
         --nsys) PROFILE=nsys; shift;;
         --train-iters) need_value "$@"; TRAIN_ITERS="$2"; shift 2;;
         --num-microbatches) need_value "$@"; parse_csv "$2" NUM_MICROBATCHES_LIST; shift 2;;
@@ -252,6 +256,7 @@ case_args() {
     if [[ "${model}" != 27b ]]; then
         ARGS+=(--ep "${MOE_EP}" --dispatcher "${DISPATCHER}" --moe-layer-freq "${MOE_LAYER_FREQ}")
         [[ -n "${experts}" ]] && ARGS+=(--num-experts "${experts}")
+        [[ "${FORCE_BALANCE}" == true ]] && ARGS+=(--force-balance)
     fi
     [[ "${RESUME}" == true ]] && ARGS+=(--resume)
     [[ "${DRY_RUN}" == true ]] && ARGS+=(--dry-run)

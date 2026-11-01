@@ -30,6 +30,7 @@ LINEAR_ATTENTION_FREQ=""
 MTP_NUM_LAYERS=""
 DISPATCHER="${DISPATCHER:-hybridep}"
 CUDA_GRAPH="${CUDA_GRAPH:-off}"
+FORCE_BALANCE=false
 FSDP_LEVEL="${FSDP_LEVEL:-3}"
 HYBRIDEP_NUM_SMS="${HYBRIDEP_NUM_SMS:-32}"
 GPU_COUNT="${GPU_COUNT:-4}"
@@ -70,6 +71,10 @@ Options:
                                  per-layer graphs, attn+mlp for dense models and
                                  the partial attn+moe_router+moe_preprocess scope
                                  for MoE models (default: off)
+  --force-balance                MoE only: replace router logits with random values
+                                 (moe_router_force_load_balancing), so tokens spread
+                                 uniformly over experts; benchmark only, the loss is
+                                 not meaningful. Names get "-fb"
   --fsdp 3|1                     3: Megatron FSDP optim_grads_params with prefetch and
                                  overlapped reduce-scatter. 1: the recipe's optim
                                  strategy (only optimizer state sharded; gradient
@@ -117,6 +122,7 @@ while [[ $# -gt 0 ]]; do
         --dispatcher) need_value "$@"; DISPATCHER="$2"; shift 2;;
         --hybridep-num-sms) need_value "$@"; HYBRIDEP_NUM_SMS="$2"; shift 2;;
         --cuda-graph) need_value "$@"; CUDA_GRAPH="$2"; shift 2;;
+        --force-balance) FORCE_BALANCE=true; shift;;
         --fsdp) need_value "$@"; FSDP_LEVEL="$2"; shift 2;;
         --gpu|--gpus) need_value "$@"; GPU_COUNT="$2"; shift 2;;
         --nproc-per-node) need_value "$@"; GPUS_PER_NODE="$2"; shift 2;;
@@ -183,6 +189,7 @@ if [[ -n "${MTP_NUM_LAYERS}" ]] && ! [[ "${MTP_NUM_LAYERS}" =~ ^[0-9]+$ ]]; then
 # MoE cases always use expert parallelism; the EP group folds onto the same
 # GPUs as the DP x CP mesh, so EP only needs to divide the world size.
 if [[ "${MODEL}" == 27b ]]; then
+    [[ "${FORCE_BALANCE}" == false ]] || { echo "--force-balance only applies to MoE models" >&2; exit 2; }
     EXPERT_PARALLEL="${EXPERT_PARALLEL:-1}"
     [[ "${EXPERT_PARALLEL}" == 1 ]] || { echo "dense model 27b only supports --ep 1" >&2; exit 2; }
     DISPATCHER=none
@@ -212,6 +219,8 @@ if [[ "${MODEL}" == 27b ]]; then EXPERTS_TAG=0; else EXPERTS_TAG="${NUM_EXPERTS:
 # BF16 names carry no dtype tag so earlier results stay resumable; MXFP8 adds "-mxfp8".
 DTYPE_TAG=""
 [[ "${DTYPE}" == mxfp8 ]] && DTYPE_TAG="-mxfp8"
+# Forced balanced routing adds "-fb" the same way, so default names are unchanged.
+[[ "${FORCE_BALANCE}" == true ]] && DTYPE_TAG+="-fb"
 CASE_NAME="model_${MODEL}-fsdp_${FSDP_LEVEL}${DTYPE_TAG}-layers_${LAYERS_TAG}-mtp_${MTP_TAG}-experts_${EXPERTS_TAG}-cg_${CUDA_GRAPH}-mbs_${MICRO_BATCH_SIZE}-seq_${SEQ_LENGTH}-cp_${CONTEXT_PARALLEL}-ep_${EXPERT_PARALLEL}-disp_${DISPATCHER}-gbs_${GLOBAL_BATCH_SIZE}-gpus_${GPU_COUNT}-profile_${PROFILE}-date_${RUN_DATE}"
 RESULT_DIR="${RESULTS_ROOT}/${CASE_NAME}/node${NODE_RANK}"
 if [[ "${PRINT_RESULT_DIR}" == true ]]; then
@@ -308,6 +317,9 @@ if [[ "${DTYPE}" == mxfp8 ]]; then
     OVERRIDES+=("mixed_precision.fp8=e4m3" "mixed_precision.fp8_recipe=mxfp8" "mixed_precision.fp8_param_gather=false" "mixed_precision.reuse_grad_buf_for_mxfp8_param_ag=false")
     [[ "${MODEL}" != 27b ]] && OVERRIDES+=("model.moe_router_padding_for_fp8=true")
 fi
+# MCore draws N(0,1) router logits per rank and keeps the router GEMM, top-k, dispatch
+# and expert compute; only the expert choice of each token becomes uniform random.
+[[ "${FORCE_BALANCE}" == true ]] && OVERRIDES+=("model.moe_router_force_load_balancing=true")
 if (( ${#EXTRA_OVERRIDES[@]} > 0 )); then
     OVERRIDES+=("${EXTRA_OVERRIDES[@]}")
 fi
@@ -335,7 +347,7 @@ fi
 COMMAND+=(uv run --no-sync python "${TRAIN_ARGS[@]}")
 
 if [[ "${DRY_RUN}" == true ]]; then
-    printf 'model=%s recipe=%s fsdp=%s dtype=%s layers=%s mtp=%s experts=%s cuda_graph=%s seq=%s cp=%s ep=%s dispatcher=%s mbs=%s gbs=%s gpus=%s num_microbatches=%s numa=%s\n' "${MODEL}" "${RECIPE}" "${FSDP_LEVEL}" "${DTYPE}" "${LAYERS_TAG}" "${MTP_TAG}" "${EXPERTS_TAG}" "${CUDA_GRAPH}" "${SEQ_LENGTH}" "${CONTEXT_PARALLEL}" "${EXPERT_PARALLEL}" "${DISPATCHER}" "${MICRO_BATCH_SIZE}" "${GLOBAL_BATCH_SIZE}" "${GPU_COUNT}" "${NUM_MICROBATCHES}" "${NUMA_MODE}" >&2
+    printf 'model=%s recipe=%s fsdp=%s dtype=%s layers=%s mtp=%s experts=%s force_balance=%s cuda_graph=%s seq=%s cp=%s ep=%s dispatcher=%s mbs=%s gbs=%s gpus=%s num_microbatches=%s numa=%s\n' "${MODEL}" "${RECIPE}" "${FSDP_LEVEL}" "${DTYPE}" "${LAYERS_TAG}" "${MTP_TAG}" "${EXPERTS_TAG}" "${FORCE_BALANCE}" "${CUDA_GRAPH}" "${SEQ_LENGTH}" "${CONTEXT_PARALLEL}" "${EXPERT_PARALLEL}" "${DISPATCHER}" "${MICRO_BATCH_SIZE}" "${GLOBAL_BATCH_SIZE}" "${GPU_COUNT}" "${NUM_MICROBATCHES}" "${NUMA_MODE}" >&2
     printf 'GLOO_SOCKET_IFNAME=%s\ncommand:' "${GLOO_SOCKET_IFNAME:-<unset>}" >&2
     printf ' %q' "${COMMAND[@]}" >&2; printf '\n' >&2
     exit 0
@@ -355,9 +367,9 @@ printf 'command:' >"${RESULT_DIR}/command.txt"
 printf ' %q' "${COMMAND[@]}" >>"${RESULT_DIR}/command.txt"
 printf '\n' >>"${RESULT_DIR}/command.txt"
 cat >"${RESULT_DIR}/launch.json" <<JSON
-{"model":"${MODEL_ID}","recipe":"${RECIPE}","run_name":"${RUN_NAME}","dtype":"${DTYPE}","fsdp":${FSDP_LEVEL},"num_layers":"${LAYERS_TAG}","mtp_num_layers":${MTP_TAG},"num_moe_experts":"${EXPERTS_TAG}","cuda_graph":"${CUDA_GRAPH}","seq_length":${SEQ_LENGTH},"context_parallel_size":${CONTEXT_PARALLEL},"expert_model_parallel_size":${EXPERT_PARALLEL},"dispatcher":"${DISPATCHER}","micro_batch_size":${MICRO_BATCH_SIZE},"global_batch_size":${GLOBAL_BATCH_SIZE},"num_microbatches":${NUM_MICROBATCHES},"gpu_count":${GPU_COUNT},"nnodes":${NNODES},"node_rank":${NODE_RANK},"numa_mode":"${NUMA_MODE}","run_date":"${RUN_DATE}"}
+{"model":"${MODEL_ID}","recipe":"${RECIPE}","run_name":"${RUN_NAME}","dtype":"${DTYPE}","fsdp":${FSDP_LEVEL},"num_layers":"${LAYERS_TAG}","mtp_num_layers":${MTP_TAG},"num_moe_experts":"${EXPERTS_TAG}","force_balance":${FORCE_BALANCE},"cuda_graph":"${CUDA_GRAPH}","seq_length":${SEQ_LENGTH},"context_parallel_size":${CONTEXT_PARALLEL},"expert_model_parallel_size":${EXPERT_PARALLEL},"dispatcher":"${DISPATCHER}","micro_batch_size":${MICRO_BATCH_SIZE},"global_batch_size":${GLOBAL_BATCH_SIZE},"num_microbatches":${NUM_MICROBATCHES},"gpu_count":${GPU_COUNT},"nnodes":${NNODES},"node_rank":${NODE_RANK},"numa_mode":"${NUMA_MODE}","run_date":"${RUN_DATE}"}
 JSON
-printf 'model=%s fsdp=%s dtype=%s layers=%s mtp=%s experts=%s cuda_graph=%s seq=%s cp=%s ep=%s dispatcher=%s mbs=%s gbs=%s gpus=%s num_microbatches=%s numa=%s\n' "${MODEL}" "${FSDP_LEVEL}" "${DTYPE}" "${LAYERS_TAG}" "${MTP_TAG}" "${EXPERTS_TAG}" "${CUDA_GRAPH}" "${SEQ_LENGTH}" "${CONTEXT_PARALLEL}" "${EXPERT_PARALLEL}" "${DISPATCHER}" "${MICRO_BATCH_SIZE}" "${GLOBAL_BATCH_SIZE}" "${GPU_COUNT}" "${NUM_MICROBATCHES}" "${NUMA_MODE}" | tee "${RESULT_DIR}/run_info.txt"
+printf 'model=%s fsdp=%s dtype=%s layers=%s mtp=%s experts=%s force_balance=%s cuda_graph=%s seq=%s cp=%s ep=%s dispatcher=%s mbs=%s gbs=%s gpus=%s num_microbatches=%s numa=%s\n' "${MODEL}" "${FSDP_LEVEL}" "${DTYPE}" "${LAYERS_TAG}" "${MTP_TAG}" "${EXPERTS_TAG}" "${FORCE_BALANCE}" "${CUDA_GRAPH}" "${SEQ_LENGTH}" "${CONTEXT_PARALLEL}" "${EXPERT_PARALLEL}" "${DISPATCHER}" "${MICRO_BATCH_SIZE}" "${GLOBAL_BATCH_SIZE}" "${GPU_COUNT}" "${NUM_MICROBATCHES}" "${NUMA_MODE}" | tee "${RESULT_DIR}/run_info.txt"
 set +e
 "${COMMAND[@]}" 2>&1 | tee "${RESULT_DIR}/train.log"
 STATUS=${PIPESTATUS[0]}

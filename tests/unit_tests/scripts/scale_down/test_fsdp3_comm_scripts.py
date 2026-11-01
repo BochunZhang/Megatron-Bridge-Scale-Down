@@ -227,13 +227,70 @@ def test_2_4t_fsdp1_vs_fsdp3_sweep_runs_cuda_graph_modes(tmp_path: Path):
         assert "ddp.megatron_fsdp_cuda_graph_mode=true" in command
 
 
+def test_force_balance_tags_moe_cases_and_skips_dense(tmp_path: Path):
+    for script, prefix, report in (
+        ("benchmark_397b_fsdp1_vs_fsdp3.sh", "model_397b-fsdp_3-fb-layers_4-", "/qwen35_397b-fsdp_3-fb-experts_"),
+        ("benchmark_2.4t_fsdp1_vs_fsdp3.sh", "model_2.4t-fsdp_3-fb-layers_4-", "/qwen38_2.4t-fsdp_3-fb-experts_"),
+    ):
+        result = _run(
+            EXAMPLE / script,
+            *("--dry-run", "--force-balance", "--experts", "64", "--seq", "256", "--fsdp", "3"),
+            *("--run-date", RUN_DATE, "--output-dir", str(tmp_path)),
+        )
+        assert result.returncode == 0, result.stderr
+        (command,) = _commands(result.stderr)
+        assert prefix in command and report in command
+        assert "model.moe_router_force_load_balancing=true" in command
+
+    result = _run(
+        BENCHMARK,
+        *("--dry-run", "--force-balance", "--model", "27b,397b", "--seq", "4096", "--cp", "1", "--mbs", "1"),
+        *("--cuda-graph", "off", "--run-date", RUN_DATE, "--output-dir", str(tmp_path)),
+    )
+    assert result.returncode == 0, result.stderr
+    dense, moe = _commands(result.stderr)
+    assert "model_27b-fsdp_3-layers_4-" in dense and "force_load_balancing" not in dense
+    assert "model_397b-fsdp_3-fb-layers_4-" in moe
+    assert "model.moe_router_force_load_balancing=true" in moe
+
+    default = _commands(
+        _run(
+            BENCHMARK,
+            "--dry-run",
+            "--model",
+            "397b",
+            "--seq",
+            "4096",
+            "--cp",
+            "1",
+            "--mbs",
+            "1",
+            "--cuda-graph",
+            "off",
+            "--run-date",
+            RUN_DATE,
+            "--output-dir",
+            str(tmp_path),
+        ).stderr
+    )
+    assert default and all("-fb-" not in c and "force_load_balancing" not in c for c in default)
+
+
+def test_run_one_rejects_force_balance_for_dense_model():
+    result = _run(RUN_ONE, "--model", "27b", "--recipe", "r", "--seq-length", "256", "--force-balance", "--dry-run")
+    assert result.returncode == 2
+    assert "--force-balance only applies to MoE models" in result.stderr
+
+
 def test_fsdp1_vs_fsdp3_sweeps_tag_mxfp8_in_result_dirs_and_nsys_reports(tmp_path: Path):
     for script, model_tag, report_tag in (
         ("benchmark_27b_fsdp1_vs_fsdp3.sh", "model_27b", "qwen35_27b"),
         ("benchmark_397b_fsdp1_vs_fsdp3.sh", "model_397b", "qwen35_397b"),
         ("benchmark_2.4t_fsdp1_vs_fsdp3.sh", "model_2.4t", "qwen38_2.4t"),
     ):
-        bf16 = _commands(_run(EXAMPLE / script, "--dry-run", "--run-date", RUN_DATE, "--output-dir", str(tmp_path)).stderr)
+        bf16 = _commands(
+            _run(EXAMPLE / script, "--dry-run", "--run-date", RUN_DATE, "--output-dir", str(tmp_path)).stderr
+        )
         assert bf16 and all("mxfp8" not in c and "mixed_precision.fp8=" not in c for c in bf16)
         result = _run(EXAMPLE / script, "--dry-run", "--mxfp8", "--run-date", RUN_DATE, "--output-dir", str(tmp_path))
         assert result.returncode == 0, result.stderr

@@ -117,6 +117,20 @@ bash examples/scale-down/01-analyse/04-fsdp3-comm/benchmark_397b_fsdp1_vs_fsdp3.
 bash examples/scale-down/01-analyse/04-fsdp3-comm/benchmark_2.4t_fsdp1_vs_fsdp3.sh --mxfp8
 ```
 
+### 强制均衡路由（`--force-balance`）
+
+`benchmark_fsdp3.sh`、`benchmark_397b_fsdp1_vs_fsdp3.sh`、`benchmark_2.4t_fsdp1_vs_fsdp3.sh` 与单 case 启动器都支持 `--force-balance`，它设置 MCore 的 `model.moe_router_force_load_balancing=true`：`TopKRouter.forward` 在 router GEMM 之后把 logits 换成每 rank 独立的 N(0,1) 随机数（`apply_random_logits`，反向为直通），再照常 top-k。每个 token 因此均匀随机地选 k 个 expert，各 expert 与各 EP rank 的 token 数在统计上相等；router GEMM、dispatch / combine 与 expert 计算量不变。
+
+- 只用于性能测试：路由与输入无关，loss 没有意义；
+- 只作用于 MoE case，`benchmark_fsdp3.sh` 中的 27b 不受影响，单 case 启动器对 27b 报错；
+- 结果目录与 nsys 报告名在 dtype 标记后加 `-fb`，例如 `model_2.4t-fsdp_3-fb-layers_4-...` 与 `qwen38_2.4t-fsdp_3-fb-experts_64-...-node_0.nsys-rep`；不加该选项时命名不变；
+- 默认路由是 `global_aux_loss`，系数取 HF config 的 `router_aux_loss_coef`（缺省时为 0）。10 个 iter 的 mock 数据下，路由主要由随机初始化的 router 决定，EP rank 之间可能不均；`--force-balance` 用来排除这部分干扰；
+- 与 `--cuda-graph on`（`moe_router` 在 graph 内）同时使用时，replay 是否每次重新采样随机 logits 尚未验证。
+
+```bash
+bash examples/scale-down/01-analyse/04-fsdp3-comm/benchmark_2.4t_fsdp1_vs_fsdp3.sh --force-balance
+```
+
 ## CUDA graph
 
 | `--cuda-graph` | dense（27b） | MoE（397b / 2.4t） |

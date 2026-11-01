@@ -30,6 +30,7 @@ PROFILE="${PROFILE:-nsys}"
 PROFILE_START="${PROFILE_START:-7}"
 PROFILE_END="${PROFILE_END:-8}"
 MASTER_PORT="${MASTER_PORT:-29501}"
+FORCE_BALANCE=false
 DRY_RUN=false
 RESUME=false
 
@@ -52,6 +53,7 @@ Options:
   --mtp-num-layers N           MTP layers (default: 0)
   --num-microbatches N         Microbatches per iteration (default: 4)
   --dispatcher hybridep|alltoall  MoE token dispatcher (default: hybridep)
+  --force-balance              Uniform random routing (benchmark only); names get "-fb"
   --train-iters N              Training iterations (default: 10)
   --mxfp8                      Train in MXFP8 (same as --dtype mxfp8); names get "-mxfp8"
   --dtype bf16|mxfp8           Compute mode (default: bf16)
@@ -78,6 +80,7 @@ while [[ $# -gt 0 ]]; do
         --mtp-num-layers) need_value "$@"; MTP_NUM_LAYERS="$2"; shift 2;;
         --num-microbatches) need_value "$@"; NUM_MICROBATCHES="$2"; shift 2;;
         --dispatcher) need_value "$@"; DISPATCHER="$2"; shift 2;;
+        --force-balance) FORCE_BALANCE=true; shift;;
         --train-iters) need_value "$@"; TRAIN_ITERS="$2"; shift 2;;
         --dtype|--precision) need_value "$@"; DTYPE="$2"; [[ "${DTYPE}" == fp8mx ]] && DTYPE=mxfp8; shift 2;;
         --mxfp8) DTYPE=mxfp8; shift;;
@@ -142,9 +145,10 @@ for experts in "${EXPERTS_LIST[@]}"; do
                     --profile-start "${PROFILE_START}" --profile-end "${PROFILE_END}"
                     --run-date "${RUN_DATE}" --results-root "${OUTPUT_DIR}"
                 )
+                [[ "${FORCE_BALANCE}" == true ]] && ARGS+=(--force-balance)
                 [[ "${RESUME}" == true ]] && ARGS+=(--resume)
                 [[ "${DRY_RUN}" == true ]] && ARGS+=(--dry-run)
-                printf 'launch model=2.4t dtype=%s experts=%s fsdp=%s cuda_graph=%s seq=%s gbs=%s\n' "${DTYPE}" "${experts}" "${fsdp}" "${cg}" "${seq}" "${GBS}" >&2
+                printf 'launch model=2.4t dtype=%s force_balance=%s experts=%s fsdp=%s cuda_graph=%s seq=%s gbs=%s\n' "${DTYPE}" "${FORCE_BALANCE}" "${experts}" "${fsdp}" "${cg}" "${seq}" "${GBS}" >&2
                 if ! "${RUN_ONE}" "${ARGS[@]}"; then
                     echo "case failed: dtype=${DTYPE} experts=${experts} fsdp=${fsdp} cuda_graph=${cg} seq=${seq}" >&2
                     FAILED+=("dtype=${DTYPE} experts=${experts} fsdp=${fsdp} cuda_graph=${cg} seq=${seq}")
