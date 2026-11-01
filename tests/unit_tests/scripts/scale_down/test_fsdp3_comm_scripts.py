@@ -135,6 +135,8 @@ def test_run_one_cuda_graph_disables_nccl_graph_register_with_expandable_segment
     assert result.returncode == 0, result.stderr
     assert "PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True" in result.stderr.splitlines()
     assert "NCCL_GRAPH_REGISTER=0" in result.stderr.splitlines()
+    # The op-fuser grouped MLP MoE needs for the token budget is gated on this variable.
+    assert "NVTE_CUTEDSL_FUSED_GROUPED_MLP=1" in result.stderr.splitlines()
 
 
 def test_cuda_graph_on_rejects_alltoall_for_moe(tmp_path: Path):

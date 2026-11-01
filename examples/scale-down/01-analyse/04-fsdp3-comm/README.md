@@ -148,7 +148,7 @@ Megatron-LM 在 FSDP + full-iteration graph 时会自动设置前两项 ddp 选�
 
 不用按层 graph 的原因：Megatron-FSDP 在每个 `TransformerLayer` 上注册 unshard / reshard / post-backward 的 module hook。TE `make_graphed_callables` 要求被 graph 的 module 上没有任何 hook（报 `Modules must not have hooks registered`），MCore 的 `local` 按层 graph 在 replay 时只放行 MCore DDP 的 pre-forward hook；Bridge 也只允许 `local` 用于 inference。因此 FSDP 下只有 full-iteration graph 可用。
 
-MoE 的额外设置：dropless MoE 每步把各 expert 的 token 数拷回 host、shape 随路由变化，无法进 graph。`moe_expert_rank_capacity_factor=1.5` 给每个 EP rank 固定 1.5 倍均衡负载的 token 预算，让 HybridEP 的 buffer 与 expert 输入 shape 固定（需要 TE op fuser 的 grouped MLP）；`moe_paged_stash` 把 routed expert 反向所需的激活放进固定的分页 buffer。某一步超出预算时，`PagedStashRunner` 检测到 overflow 并以 eager 重跑该步。因此：
+MoE 的额外设置：dropless MoE 每步把各 expert 的 token 数拷回 host、shape 随路由变化，无法进 graph。`moe_expert_rank_capacity_factor=1.5` 给每个 EP rank 固定 1.5 倍均衡负载的 token 预算，让 HybridEP 的 buffer 与 expert 输入 shape 固定（需要 TE op fuser 的 grouped MLP；启动器同时导出 `NVTE_CUTEDSL_FUSED_GROUPED_MLP=1`，否则 MCore 不构建 SwiGLU 的 fused grouped MLP，报 `Fused GroupedMLP is not supported for this configuration`）；`moe_paged_stash` 把 routed expert 反向所需的激活放进固定的分页 buffer。某一步超出预算时，`PagedStashRunner` 检测到 overflow 并以 eager 重跑该步。因此：
 
 - 开启模式的 MoE expert 计算走 op fuser 路径（对齐到 256 token），与关闭模式的 expert kernel 不同，关 / 开对比的不只是 graph 本身；
 - 不加 `--force-balance` 时，随机初始化的 router 可能让某些 rank 超出预算而触发 eager 重跑，`train.log` 中需要检查；
