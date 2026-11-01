@@ -301,6 +301,11 @@ if [[ "${CUDA_GRAPH}" == on ]]; then
         "model.cuda_graph_impl=transformer_engine" "model.cuda_graph_scope=null" "model.cuda_graph_modules=${GRAPH_MODULES}"
         "model.cuda_graph_warmup_steps=3" "ddp.megatron_fsdp_cuda_graph_mode=true"
     )
+    # TECudaGraphHelper asserts NCCL_GRAPH_REGISTER=0 whenever the inherited
+    # PYTORCH_CUDA_ALLOC_CONF has expandable_segments:True (NCCL graph registration of
+    # expandable segments can hit illegal memory access). The graphed scopes hold no
+    # NCCL collectives and nccl_ub stays off, so turning registration off costs nothing.
+    export NCCL_GRAPH_REGISTER=0
 else
     OVERRIDES+=("model.cuda_graph_impl=none" "model.cuda_graph_scope=null" "model.cuda_graph_modules=[]")
 fi
@@ -348,7 +353,7 @@ COMMAND+=(uv run --no-sync python "${TRAIN_ARGS[@]}")
 
 if [[ "${DRY_RUN}" == true ]]; then
     printf 'model=%s recipe=%s fsdp=%s dtype=%s layers=%s mtp=%s experts=%s force_balance=%s cuda_graph=%s seq=%s cp=%s ep=%s dispatcher=%s mbs=%s gbs=%s gpus=%s num_microbatches=%s numa=%s\n' "${MODEL}" "${RECIPE}" "${FSDP_LEVEL}" "${DTYPE}" "${LAYERS_TAG}" "${MTP_TAG}" "${EXPERTS_TAG}" "${FORCE_BALANCE}" "${CUDA_GRAPH}" "${SEQ_LENGTH}" "${CONTEXT_PARALLEL}" "${EXPERT_PARALLEL}" "${DISPATCHER}" "${MICRO_BATCH_SIZE}" "${GLOBAL_BATCH_SIZE}" "${GPU_COUNT}" "${NUM_MICROBATCHES}" "${NUMA_MODE}" >&2
-    printf 'GLOO_SOCKET_IFNAME=%s\ncommand:' "${GLOO_SOCKET_IFNAME:-<unset>}" >&2
+    printf 'GLOO_SOCKET_IFNAME=%s\nPYTORCH_CUDA_ALLOC_CONF=%s\nNCCL_GRAPH_REGISTER=%s\ncommand:' "${GLOO_SOCKET_IFNAME:-<unset>}" "${PYTORCH_CUDA_ALLOC_CONF:-<unset>}" "${NCCL_GRAPH_REGISTER:-<unset>}" >&2
     printf ' %q' "${COMMAND[@]}" >&2; printf '\n' >&2
     exit 0
 fi
@@ -367,7 +372,7 @@ printf 'command:' >"${RESULT_DIR}/command.txt"
 printf ' %q' "${COMMAND[@]}" >>"${RESULT_DIR}/command.txt"
 printf '\n' >>"${RESULT_DIR}/command.txt"
 cat >"${RESULT_DIR}/launch.json" <<JSON
-{"model":"${MODEL_ID}","recipe":"${RECIPE}","run_name":"${RUN_NAME}","dtype":"${DTYPE}","fsdp":${FSDP_LEVEL},"num_layers":"${LAYERS_TAG}","mtp_num_layers":${MTP_TAG},"num_moe_experts":"${EXPERTS_TAG}","force_balance":${FORCE_BALANCE},"cuda_graph":"${CUDA_GRAPH}","seq_length":${SEQ_LENGTH},"context_parallel_size":${CONTEXT_PARALLEL},"expert_model_parallel_size":${EXPERT_PARALLEL},"dispatcher":"${DISPATCHER}","micro_batch_size":${MICRO_BATCH_SIZE},"global_batch_size":${GLOBAL_BATCH_SIZE},"num_microbatches":${NUM_MICROBATCHES},"gpu_count":${GPU_COUNT},"nnodes":${NNODES},"node_rank":${NODE_RANK},"numa_mode":"${NUMA_MODE}","run_date":"${RUN_DATE}"}
+{"model":"${MODEL_ID}","recipe":"${RECIPE}","run_name":"${RUN_NAME}","dtype":"${DTYPE}","fsdp":${FSDP_LEVEL},"num_layers":"${LAYERS_TAG}","mtp_num_layers":${MTP_TAG},"num_moe_experts":"${EXPERTS_TAG}","force_balance":${FORCE_BALANCE},"cuda_graph":"${CUDA_GRAPH}","seq_length":${SEQ_LENGTH},"context_parallel_size":${CONTEXT_PARALLEL},"expert_model_parallel_size":${EXPERT_PARALLEL},"dispatcher":"${DISPATCHER}","micro_batch_size":${MICRO_BATCH_SIZE},"global_batch_size":${GLOBAL_BATCH_SIZE},"num_microbatches":${NUM_MICROBATCHES},"gpu_count":${GPU_COUNT},"nnodes":${NNODES},"node_rank":${NODE_RANK},"numa_mode":"${NUMA_MODE}","pytorch_cuda_alloc_conf":"${PYTORCH_CUDA_ALLOC_CONF:-}","nccl_graph_register":"${NCCL_GRAPH_REGISTER:-}","run_date":"${RUN_DATE}"}
 JSON
 printf 'model=%s fsdp=%s dtype=%s layers=%s mtp=%s experts=%s force_balance=%s cuda_graph=%s seq=%s cp=%s ep=%s dispatcher=%s mbs=%s gbs=%s gpus=%s num_microbatches=%s numa=%s\n' "${MODEL}" "${FSDP_LEVEL}" "${DTYPE}" "${LAYERS_TAG}" "${MTP_TAG}" "${EXPERTS_TAG}" "${FORCE_BALANCE}" "${CUDA_GRAPH}" "${SEQ_LENGTH}" "${CONTEXT_PARALLEL}" "${EXPERT_PARALLEL}" "${DISPATCHER}" "${MICRO_BATCH_SIZE}" "${GLOBAL_BATCH_SIZE}" "${GPU_COUNT}" "${NUM_MICROBATCHES}" "${NUMA_MODE}" | tee "${RESULT_DIR}/run_info.txt"
 set +e

@@ -112,6 +112,20 @@ def test_run_one_print_result_dir_encodes_shape_and_cuda_graph(tmp_path: Path):
     )
 
 
+def test_run_one_cuda_graph_disables_nccl_graph_register_with_expandable_segments(tmp_path: Path):
+    # TECudaGraphHelper asserts on expandable_segments:True unless NCCL_GRAPH_REGISTER=0.
+    result = _run(
+        RUN_ONE,
+        *("--model", "2.4t", "--recipe", "r", "--seq-length", "1024", "--num-experts", "64", "--cuda-graph", "on"),
+        *("--run-date", RUN_DATE, "--results-root", str(tmp_path), "--dry-run"),
+        PYTORCH_CUDA_ALLOC_CONF="expandable_segments:True",
+        NCCL_GRAPH_REGISTER="1",
+    )
+    assert result.returncode == 0, result.stderr
+    assert "PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True" in result.stderr.splitlines()
+    assert "NCCL_GRAPH_REGISTER=0" in result.stderr.splitlines()
+
+
 def test_27b_fsdp1_vs_fsdp3_sweep_selects_sharding_and_overlap(tmp_path: Path):
     result = _run(
         EXAMPLE / "benchmark_27b_fsdp1_vs_fsdp3.sh",
