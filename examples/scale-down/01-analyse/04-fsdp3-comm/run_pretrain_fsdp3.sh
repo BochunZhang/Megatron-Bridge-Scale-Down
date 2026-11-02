@@ -466,6 +466,11 @@ if [[ "${PROFILE}" == nsys ]] && (( NODE_RANK == 0 )); then
     # ranks of the node share one timeline. Every rank of the node calls
     # cudaProfilerStart / Stop, bounding the capture to the profiled steps.
     COMMAND=(nsys profile --trace=cuda,nvtx --sample=none --cpuctxsw=none --capture-range=cudaProfilerApi --capture-range-end=stop --force-overwrite=true --output="${RESULT_DIR}/${NSYS_NAME}")
+    # nsys draws each graph launch as one opaque block by default; node tracing
+    # records every kernel inside the graph (GEMMs, NCCL, HybridEP) by name.
+    if [[ "${CUDA_GRAPH}" == on ]]; then
+        COMMAND+=(--cuda-graph-trace=node)
+    fi
 fi
 COMMAND+=(uv run --no-sync python -m torch.distributed.run "${DIST_ARGS[@]}" --no-python)
 if (( ${#NUMA_WRAPPER[@]} > 0 )); then

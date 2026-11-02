@@ -122,7 +122,7 @@ bash $S --model 27b --mxfp8
 逐层 backward 时间的读法：
 
 - **graph 关**：nsys 模式下每层有 `L<i> bwd` NVTX range（见下文「Layer 的 forward / backward 标注」），直接投影到 GPU 即可得到每层 backward 时间；DDP 的梯度 reduce-scatter 在独立 stream 上，与后续层的 backward 重叠。
-- **graph 开**：MCore 的 TE graph 路径在 capture 与 replay 时都绕过 `TransformerLayer.forward()`，直接调用 `_forward_attention` / `_forward_mlp`（`megatron/core/transformer/transformer_layer.py` 的 `_te_cuda_graph_capture` / `_te_cuda_graph_replay`），而 `L<i> fwd` / `L<i> bwd` 是在 `forward()` 里注入的，因此 capture 之后（nsys 采集的 step 7）**没有这两类 range**。此时按 graph 读：nsys 默认 `--cuda-graph-trace=graph`，每次 graph launch 在 GPU 时间线上是一个整体。27b 每层的 backward 就是该层的 backward graph；MoE 层的 backward 是 graph 部分（attention / router / shared expert）加上前后 eager 的 combine、routed experts、dispatch 的 backward kernel。
+- **graph 开**：MCore 的 TE graph 路径在 capture 与 replay 时都绕过 `TransformerLayer.forward()`，直接调用 `_forward_attention` / `_forward_mlp`（`megatron/core/transformer/transformer_layer.py` 的 `_te_cuda_graph_capture` / `_te_cuda_graph_replay`），而 `L<i> fwd` / `L<i> bwd` 是在 `forward()` 里注入的，因此 capture 之后（nsys 采集的 step 7）**没有这两类 range**。此时按 graph 读：启动器在 graph 开启时给 nsys 加 `--cuda-graph-trace=node`，graph 内每个 kernel（GEMM、NCCL 等）按名字单独出现在 GPU 时间线上，同一 graph launch 的 kernel 共享 graph ID。27b 每层的 backward 就是该层 backward graph 内的全部 kernel；MoE 层的 backward 是 graph 部分（attention / router / shared expert）加上前后 eager 的 combine、routed experts、dispatch 的 backward kernel。
 - 比较 graph 关 / 开的 iteration 时间时加 `--profile none`，以排除 nsys 与 `record_shapes` 的 host 开销。
 
 ```bash
@@ -180,7 +180,7 @@ MoE 的额外设置：dropless MoE 每步把各 expert 的 token 数拷回 host�
 - graph 让中间 buffer 常驻，显存高于关闭模式；2.4t 的 expert 减半搜索会把这部分算进去；
 - op fuser 的 `te.ops.GroupedLinear` 在 Blackwell + BF16/MXFP8 上固定走 cuBLASLt grouped GEMM（GPU 端读取每组 shape），TE 必须用 **cuBLAS ≥ 13.3（CUDA ≥ 13.2）** 编译。用 CUDA 13.0 编译的 TE 会在第一个 warmup iteration 报 `nvte_get_grouped_gemm_setup_workspace_size requires cuBLAS 13.3+, but compile-time cuBLAS version is 130000`，日志最上面看到的 `Attempted to pop NVTX range ...` 只是这个异常引起的连锁错误。
 
-graph 在第 3 个 iteration 后捕获，nsys 默认采集 step 7，已处于 replay 阶段；FSDP 通信与计算 kernel 都以 graph launch 形式出现。首次运行开启模式时，建议对比同一 case 关 / 开的 `train.log` loss 是否接近。
+graph 在第 3 个 iteration 后捕获，nsys 默认采集 step 7，已处于 replay 阶段；FSDP 通信与计算 kernel 都在 graph 内，借助 `--cuda-graph-trace=node` 按 kernel 名逐个显示（见「Nsys」一节）。首次运行开启模式时，建议对比同一 case 关 / 开的 `train.log` loss 是否接近。
 
 测试 FSDP3 下 CUDA graph 的收益，用同一 case 的 graph 关 / 开对比 step 时间与 nsys 上暴露的通信，例如 2.4t 短序列（每 micro-batch 计算最少、最可能受 CPU launch 限制）：
 
@@ -299,7 +299,7 @@ results/01-analyse/04-fsdp3-comm/model_2.4t-fsdp_3-layers_4-mtp_0-experts_64-cg_
 
 `benchmark_fsdp3.sh` 默认 `--profile nsys`（单 case 脚本 `run_pretrain_fsdp3.sh` 默认 `none`）。`nsys profile --capture-range=cudaProfilerApi` 包在 torchrun 外面，跟踪 torchrun 拉起的全部 worker 进程；`profiling.profile_ranks` 为节点 0 的 4 个 rank（0..nproc-per-node-1，即一个 GB200 tray 的 4 张 GPU），Bridge 在 `profile_step_start`（默认 7）调用 `cudaProfilerStart`，在 step 计数到 `profile_step_end`（默认 8）时停止，因此每份报告只覆盖 step 7（0-based，对应日志里的 iteration 8）这一个完整 iteration（含 4 个 micro-batch）。只有节点 0 的命令外包 nsys，其他节点不录制，因此每个 case 只产生一份报告，同一时间线上按进程列出这 4 个 rank。文件名为 `<qwen35_397b|qwen35_27b|qwen38_2.4t>-<ddp|fsdp_1|fsdp_2|fsdp_3>[-mxfp8][-fb][-attn_<full|linear>]-experts_<E>-cg_<off|on>[-tp_<TP>]-cp_<CP>-ep_<EP>-mbs_<MBS>-gbs_<GBS>-seq_<N>k.nsys-rep`。
 
-- trace 范围为 `cuda,nvtx`：NCCL（FSDP all-gather / reduce-scatter、TP / SP 集合通信、CP p2p）与 HybridEP dispatch / combine kernel 以 CUDA kernel 形式出现在 GPU 时间线上，可以直接与计算 kernel 对比。CUDA graph 开启时，整轮 forward + backward（含 FSDP 通信）以 graph launch 形式出现。
+- trace 范围为 `cuda,nvtx`：NCCL（FSDP all-gather / reduce-scatter、TP / SP 集合通信、CP p2p）与 HybridEP dispatch / combine kernel 以 CUDA kernel 形式出现在 GPU 时间线上，可以直接与计算 kernel 对比。CUDA graph 开启时，启动器追加 `--cuda-graph-trace=node`（nsys 默认 `graph` 只把每次 graph launch 画成一个整体），graph 内每个 kernel 都带名字出现，例如 `ncclDevKernel_AllGather_RING_LL`、`ncclDevKernel_ReduceScatter_Sum_bf16_RING_LL` 或 symmetric memory 下的 `ncclSymkDevKernel_*`，可以直接在 Events View 按 `nccl` 过滤得到通信区间，或用 `nsys stats --report cuda_gpu_kern_sum` 汇总。replay 时不执行 Python，也不调用 NCCL host API，因此 NCCL / PyTorch 的 host 侧 NVTX range 只在 capture 那一步出现，replay 步的 kernel 不带 NVTX 投影，`nsys recipe nccl_sum` 也统计不到这些 kernel 的字节数；要把 kernel 对应到层与消息大小，可以把 `--profile-start` 设为 capture 步（`cuda_graph_warmup_steps`）并按 kernel 顺序对齐。node 模式的 trace 开销略高于 graph 模式，比较 iteration 时间仍以 `--profile none` 为准。
 - 启用 nsys 时启动器设置 `profiling.record_shapes=true`，Bridge 进入 `torch.autograd.profiler.emit_nvtx(record_shapes=True)`，每个 op 的 NVTX range 带输入形状；会增加 host 开销，比较 iteration 绝对时间时，用 `--profile none` 的 `train.log` 作为基准。
 - FSDP all-gather / reduce-scatter 的层归属看上一节的 `FSDP AG ...` / `FSDP RS ...` range。
 - NCCL 自身在 `NCCL` NVTX domain 为每次 `ncclAllGather` / `ncclReduceScatter` 打 range，payload 含消息字节数和 comm hash；启动器在 nsys 模式下设置 `NCCL_NVTX_DISABLE=0`。nsys 不会在 kernel 上直接显示带宽，需要用 recipe 关联 NVTX 和 kernel，例如 `nsys recipe nccl_sum --input <report>.nsys-rep`。

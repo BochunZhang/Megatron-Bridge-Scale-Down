@@ -179,6 +179,17 @@ def test_nsys_records_the_four_gpus_of_node_0_into_one_report(tmp_path: Path):
     assert "nsys profile" not in node1
 
 
+def test_nsys_traces_kernels_inside_cuda_graphs(tmp_path: Path):
+    common = ("--model", "27b", "--seq-length", "4096", "--run-date", RUN_DATE, "--results-root", str(tmp_path))
+    common += ("--dry-run",)
+    (on,) = _commands(_run(RUN_ONE, *common, "--profile", "nsys", "--cuda-graph", "on").stderr)
+    assert on.index("--cuda-graph-trace=node") < on.index("-m torch.distributed.run")
+    (off,) = _commands(_run(RUN_ONE, *common, "--profile", "nsys", "--cuda-graph", "off").stderr)
+    assert "--cuda-graph-trace" not in off
+    (no_profile,) = _commands(_run(RUN_ONE, *common, "--profile", "none", "--cuda-graph", "on").stderr)
+    assert "--cuda-graph-trace" not in no_profile
+
+
 def test_full_iteration_cuda_graph_for_fsdp(tmp_path: Path):
     on = _sweep(
         tmp_path, "--model", "27b,397b", "--fsdp", "3,2,1", "--experts", "64", "--seq", "1024", "--cuda-graph", "on"
