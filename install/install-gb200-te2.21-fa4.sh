@@ -54,8 +54,11 @@ export MAMBA_FORCE_BUILD=TRUE
 export CAUSAL_CONV1D_FORCE_BUILD=TRUE
 export FAST_HADAMARD_TRANSFORM_FORCE_BUILD=TRUE
 
+# --no-config: uv pip otherwise merges pyproject.toml [tool.uv] override-dependencies
+# (nvidia-cudnn-frontend==1.26.0, ...) with OVERRIDES and the resolution becomes unsatisfiable.
 UV_PIP_INSTALL=(
     uv pip install
+    --no-config
     --override "${OVERRIDES}"
     --extra-index-url https://pypi.nvidia.com
     --index-strategy unsafe-best-match
