@@ -190,6 +190,20 @@ def test_nsys_traces_kernels_inside_cuda_graphs(tmp_path: Path):
     assert "--cuda-graph-trace" not in no_profile
 
 
+def test_merge_keeps_cuda_graph_launches_as_one_block(tmp_path: Path):
+    commands = _sweep(tmp_path, "--model", "27b", "--fsdp", "3", "--seq", "256", "--cuda-graph", "off,on", "--merge")
+    off = next(c for c in commands if "-cg_off-" in c)
+    on = next(c for c in commands if "-cg_on-merge-" in c)
+    assert "--cuda-graph-trace" not in off
+    assert on.index("--cuda-graph-trace=graph") < on.index("-m torch.distributed.run")
+    assert "--cuda-graph-trace=node" not in on
+    assert "model_27b-fsdp_3-layers_8-mtp_0-experts_0-cg_on-merge-mbs_1-" in on
+    assert "/qwen35_27b-fsdp_3-experts_0-cg_on-merge-cp_1-" in on
+    common = ("--model", "27b", "--seq-length", "256", "--cuda-graph", "on", "--merge", "--dry-run")
+    (no_profile,) = _commands(_run(RUN_ONE, *common, "--results-root", str(tmp_path)).stderr)
+    assert "--cuda-graph-trace" not in no_profile and "-cg_on-mbs_" in no_profile
+
+
 def test_full_iteration_cuda_graph_for_fsdp(tmp_path: Path):
     on = _sweep(
         tmp_path, "--model", "27b,397b", "--fsdp", "3,2,1", "--experts", "64", "--seq", "1024", "--cuda-graph", "on"

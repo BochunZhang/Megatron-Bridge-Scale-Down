@@ -31,6 +31,7 @@ ATTENTION=hybrid
 MTP_NUM_LAYERS=""
 DISPATCHER="${DISPATCHER:-hybridep}"
 CUDA_GRAPH="${CUDA_GRAPH:-off}"
+MERGE_GRAPHS=false
 FORCE_BALANCE=false
 FSDP_LEVEL="${FSDP_LEVEL:-3}"
 HYBRIDEP_NUM_SMS="${HYBRIDEP_NUM_SMS:-32}"
@@ -109,6 +110,9 @@ Options:
   --profile none|nsys            Profiling mode (default: none). nsys records the GPUs
                                  of node 0 into one report
   --nsys                         Alias for --profile nsys
+  --merge                        With nsys and --cuda-graph on, draw each graph launch
+                                 as one block (--cuda-graph-trace=graph) instead of
+                                 its kernels; names get "-merge"
   --profile-start N              First profiled iteration (default: 7)
   --profile-end N                Stop iteration, exclusive (default: 8, i.e. one step)
   --run-date YYMMDD-HHMMSS       Shared matrix timestamp
@@ -158,6 +162,7 @@ while [[ $# -gt 0 ]]; do
         --master-port) need_value "$@"; MASTER_PORT="$2"; shift 2;;
         --profile) need_value "$@"; PROFILE="$2"; shift 2;;
         --nsys) PROFILE=nsys; shift;;
+        --merge) MERGE_GRAPHS=true; shift;;
         --profile-start|--profile-step-start) need_value "$@"; PROFILE_START="$2"; shift 2;;
         --profile-end|--profile-step-end) need_value "$@"; PROFILE_END="$2"; shift 2;;
         --run-date) need_value "$@"; RUN_DATE="$2"; shift 2;;
@@ -186,6 +191,12 @@ case "${DTYPE}" in bf16|mxfp8) ;; *) echo "--dtype must be bf16 or mxfp8" >&2; e
 case "${PROFILE}" in none|nsys) ;; *) echo "--profile must be none or nsys" >&2; exit 2;; esac
 case "${DISPATCHER}" in hybridep|alltoall) ;; *) echo "--dispatcher must be hybridep or alltoall" >&2; exit 2;; esac
 case "${CUDA_GRAPH}" in off|on) ;; *) echo "--cuda-graph must be off or on" >&2; exit 2;; esac
+# nsys --cuda-graph-trace mode; only a profiled graph run has one. --merge without a
+# graph or without nsys changes nothing, so a sweep can pass it to every case.
+GRAPH_TRACE=none
+if [[ "${PROFILE}" == nsys && "${CUDA_GRAPH}" == on ]]; then
+    GRAPH_TRACE=$([[ "${MERGE_GRAPHS}" == true ]] && echo graph || echo node)
+fi
 # FSDP1 keeps the recipe's settings: with the optim strategy Megatron-FSDP delays the
 # gradient reduction to the end of the iteration, so there is nothing to overlap.
 # FSDP2 reduce-scatters gradients on every backward, which Megatron-FSDP requires to be
@@ -287,7 +298,9 @@ ATTN_TAG=""
 [[ "${ATTENTION}" != hybrid ]] && ATTN_TAG="-attn_${ATTENTION}"
 TP_TAG=""
 (( TENSOR_PARALLEL > 1 )) && TP_TAG="-tp_${TENSOR_PARALLEL}"
-CASE_NAME="model_${MODEL}-${DP_TAG}${DTYPE_TAG}-layers_${LAYERS_TAG}${ATTN_TAG}-mtp_${MTP_TAG}-experts_${EXPERTS_TAG}-cg_${CUDA_GRAPH}-mbs_${MICRO_BATCH_SIZE}-seq_${SEQ_LENGTH}${TP_TAG}-cp_${CONTEXT_PARALLEL}-ep_${EXPERT_PARALLEL}-disp_${DISPATCHER}-gbs_${GLOBAL_BATCH_SIZE}-gpus_${GPU_COUNT}-profile_${PROFILE}-date_${RUN_DATE}"
+CG_TAG="${CUDA_GRAPH}"
+[[ "${GRAPH_TRACE}" == graph ]] && CG_TAG+="-merge"
+CASE_NAME="model_${MODEL}-${DP_TAG}${DTYPE_TAG}-layers_${LAYERS_TAG}${ATTN_TAG}-mtp_${MTP_TAG}-experts_${EXPERTS_TAG}-cg_${CG_TAG}-mbs_${MICRO_BATCH_SIZE}-seq_${SEQ_LENGTH}${TP_TAG}-cp_${CONTEXT_PARALLEL}-ep_${EXPERT_PARALLEL}-disp_${DISPATCHER}-gbs_${GLOBAL_BATCH_SIZE}-gpus_${GPU_COUNT}-profile_${PROFILE}-date_${RUN_DATE}"
 RESULT_DIR="${RESULTS_ROOT}/${CASE_NAME}/node${NODE_RANK}"
 if [[ "${PRINT_RESULT_DIR}" == true ]]; then
     printf '%s\n' "${RESULT_DIR}"
@@ -295,7 +308,7 @@ if [[ "${PRINT_RESULT_DIR}" == true ]]; then
 fi
 # nsys report name, e.g. qwen35_27b-fsdp_3-mxfp8-experts_0-cg_off-tp_2-cp_1-ep_1-mbs_1-gbs_8-seq_4k.
 if (( SEQ_LENGTH % 1024 == 0 )); then SEQ_TAG="$((SEQ_LENGTH / 1024))k"; else SEQ_TAG="${SEQ_LENGTH}"; fi
-NSYS_NAME="${MODEL_TAG}-${DP_TAG}${DTYPE_TAG}${ATTN_TAG}-experts_${EXPERTS_TAG}-cg_${CUDA_GRAPH}${TP_TAG}-cp_${CONTEXT_PARALLEL}-ep_${EXPERT_PARALLEL}-mbs_${MICRO_BATCH_SIZE}-gbs_${GLOBAL_BATCH_SIZE}-seq_${SEQ_TAG}"
+NSYS_NAME="${MODEL_TAG}-${DP_TAG}${DTYPE_TAG}${ATTN_TAG}-experts_${EXPERTS_TAG}-cg_${CG_TAG}${TP_TAG}-cp_${CONTEXT_PARALLEL}-ep_${EXPERT_PARALLEL}-mbs_${MICRO_BATCH_SIZE}-gbs_${GLOBAL_BATCH_SIZE}-seq_${SEQ_TAG}"
 NUM_MICROBATCHES=$((GLOBAL_BATCH_SIZE / (MICRO_BATCH_SIZE * DATA_PARALLEL)))
 
 # torchrun creates LOCAL_RANK before this worker wrapper is invoked. Prefer a
@@ -466,10 +479,11 @@ if [[ "${PROFILE}" == nsys ]] && (( NODE_RANK == 0 )); then
     # ranks of the node share one timeline. Every rank of the node calls
     # cudaProfilerStart / Stop, bounding the capture to the profiled steps.
     COMMAND=(nsys profile --trace=cuda,nvtx --sample=none --cpuctxsw=none --capture-range=cudaProfilerApi --capture-range-end=stop --force-overwrite=true --output="${RESULT_DIR}/${NSYS_NAME}")
-    # nsys draws each graph launch as one opaque block by default; node tracing
-    # records every kernel inside the graph (GEMMs, NCCL, HybridEP) by name.
-    if [[ "${CUDA_GRAPH}" == on ]]; then
-        COMMAND+=(--cuda-graph-trace=node)
+    # nsys draws each graph launch as one opaque block by default (graph, kept by
+    # --merge); node tracing records every kernel inside the graph (GEMMs, NCCL,
+    # HybridEP) by name.
+    if [[ "${GRAPH_TRACE}" != none ]]; then
+        COMMAND+=(--cuda-graph-trace="${GRAPH_TRACE}")
     fi
 fi
 COMMAND+=(uv run --no-sync python -m torch.distributed.run "${DIST_ARGS[@]}" --no-python)
@@ -480,7 +494,7 @@ COMMAND+=(uv run --no-sync python "${TRAIN_ARGS[@]}")
 
 INFO=(
     "model=${MODEL}" "recipe=${RECIPE}" "fsdp=${FSDP_LEVEL}" "dtype=${DTYPE}" "layers=${LAYERS_TAG}" "attention=${ATTENTION}"
-    "mtp=${MTP_TAG}" "experts=${EXPERTS_TAG}" "force_balance=${FORCE_BALANCE}" "cuda_graph=${CUDA_GRAPH}" "seq=${SEQ_LENGTH}"
+    "mtp=${MTP_TAG}" "experts=${EXPERTS_TAG}" "force_balance=${FORCE_BALANCE}" "cuda_graph=${CUDA_GRAPH}" "cuda_graph_trace=${GRAPH_TRACE}" "seq=${SEQ_LENGTH}"
     "tp=${TENSOR_PARALLEL}" "sp=${SEQUENCE_PARALLEL}" "cp=${CONTEXT_PARALLEL}" "dp=${DATA_PARALLEL}" "ep=${EXPERT_PARALLEL}"
     "dispatcher=${DISPATCHER}" "mbs=${MICRO_BATCH_SIZE}" "gbs=${GLOBAL_BATCH_SIZE}" "gpus=${GPU_COUNT}"
     "num_microbatches=${NUM_MICROBATCHES}" "numa=${NUMA_MODE}"
@@ -506,7 +520,7 @@ printf 'command:' >"${RESULT_DIR}/command.txt"
 printf ' %q' "${COMMAND[@]}" >>"${RESULT_DIR}/command.txt"
 printf '\n' >>"${RESULT_DIR}/command.txt"
 cat >"${RESULT_DIR}/launch.json" <<JSON
-{"model":"${MODEL_ID}","recipe":"${RECIPE}","run_name":"${RUN_NAME}","dtype":"${DTYPE}","fsdp":${FSDP_JSON},"data_parallel":"${DP_TAG}","num_layers":"${LAYERS_TAG}","attention":"${ATTENTION}","linear_attention_freq":"${LINEAR_ATTENTION_FREQ}","mtp_num_layers":${MTP_TAG},"num_moe_experts":"${EXPERTS_TAG}","force_balance":${FORCE_BALANCE},"cuda_graph":"${CUDA_GRAPH}","cuda_graph_impl":"${GRAPH_IMPL}","cuda_graph_modules":"${GRAPH_MODULES}","seq_length":${SEQ_LENGTH},"tensor_model_parallel_size":${TENSOR_PARALLEL},"sequence_parallel":${SEQUENCE_PARALLEL},"context_parallel_size":${CONTEXT_PARALLEL},"data_parallel_size":${DATA_PARALLEL},"expert_model_parallel_size":${EXPERT_PARALLEL},"dispatcher":"${DISPATCHER}","micro_batch_size":${MICRO_BATCH_SIZE},"global_batch_size":${GLOBAL_BATCH_SIZE},"num_microbatches":${NUM_MICROBATCHES},"gpu_count":${GPU_COUNT},"nnodes":${NNODES},"node_rank":${NODE_RANK},"numa_mode":"${NUMA_MODE}","pytorch_cuda_alloc_conf":"${PYTORCH_CUDA_ALLOC_CONF:-}","nccl_graph_register":"${NCCL_GRAPH_REGISTER:-}","nvte_cutedsl_fused_grouped_mlp":"${NVTE_CUTEDSL_FUSED_GROUPED_MLP:-}","run_date":"${RUN_DATE}"}
+{"model":"${MODEL_ID}","recipe":"${RECIPE}","run_name":"${RUN_NAME}","dtype":"${DTYPE}","fsdp":${FSDP_JSON},"data_parallel":"${DP_TAG}","num_layers":"${LAYERS_TAG}","attention":"${ATTENTION}","linear_attention_freq":"${LINEAR_ATTENTION_FREQ}","mtp_num_layers":${MTP_TAG},"num_moe_experts":"${EXPERTS_TAG}","force_balance":${FORCE_BALANCE},"cuda_graph":"${CUDA_GRAPH}","cuda_graph_impl":"${GRAPH_IMPL}","cuda_graph_modules":"${GRAPH_MODULES}","cuda_graph_trace":"${GRAPH_TRACE}","seq_length":${SEQ_LENGTH},"tensor_model_parallel_size":${TENSOR_PARALLEL},"sequence_parallel":${SEQUENCE_PARALLEL},"context_parallel_size":${CONTEXT_PARALLEL},"data_parallel_size":${DATA_PARALLEL},"expert_model_parallel_size":${EXPERT_PARALLEL},"dispatcher":"${DISPATCHER}","micro_batch_size":${MICRO_BATCH_SIZE},"global_batch_size":${GLOBAL_BATCH_SIZE},"num_microbatches":${NUM_MICROBATCHES},"gpu_count":${GPU_COUNT},"nnodes":${NNODES},"node_rank":${NODE_RANK},"numa_mode":"${NUMA_MODE}","pytorch_cuda_alloc_conf":"${PYTORCH_CUDA_ALLOC_CONF:-}","nccl_graph_register":"${NCCL_GRAPH_REGISTER:-}","nvte_cutedsl_fused_grouped_mlp":"${NVTE_CUTEDSL_FUSED_GROUPED_MLP:-}","run_date":"${RUN_DATE}"}
 JSON
 printf '%s\n' "${INFO[*]}" | tee "${RESULT_DIR}/run_info.txt"
 set +e

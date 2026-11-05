@@ -42,6 +42,7 @@ NODE_RANK="${NODE_RANK:-${RANK:-0}}"
 MASTER_ADDR="${MASTER_ADDR:-${DLC_MASTER_ADDR:-}}"
 MASTER_PORT="${MASTER_PORT:-29501}"
 FORCE_BALANCE=false
+MERGE_GRAPHS=false
 DRY_RUN=false
 RESUME=false
 
@@ -82,6 +83,8 @@ Options:
                                 only; 27b is unaffected); names get "-fb"
   --dtype bf16|mxfp8            Compute mode (default: bf16); --mxfp8 is an alias
   --profile none|nsys           Profiling mode (default: nsys); --nsys is an alias
+  --merge                       nsys draws each CUDA graph launch as one block
+                                instead of its kernels (cg=on cases get "-merge")
   --profile-start N             First profiled iteration (default: 7)
   --profile-end N               Stop iteration, exclusive (default: 8)
   --train-iters N               Training iterations (default: 10)
@@ -123,6 +126,7 @@ while [[ $# -gt 0 ]]; do
         --mxfp8) DTYPE=mxfp8; shift;;
         --profile) need_value "$@"; PROFILE="$2"; shift 2;;
         --nsys) PROFILE=nsys; shift;;
+        --merge) MERGE_GRAPHS=true; shift;;
         --profile-start) need_value "$@"; PROFILE_START="$2"; shift 2;;
         --profile-end) need_value "$@"; PROFILE_END="$2"; shift 2;;
         --train-iters) need_value "$@"; TRAIN_ITERS="$2"; shift 2;;
@@ -176,6 +180,7 @@ case_args() {
         [[ "${experts}" != full ]] && ARGS+=(--num-experts "${experts}")
         [[ "${FORCE_BALANCE}" == true ]] && ARGS+=(--force-balance)
     fi
+    [[ "${MERGE_GRAPHS}" == true ]] && ARGS+=(--merge)
     [[ "${RESUME}" == true ]] && ARGS+=(--resume)
     [[ "${DRY_RUN}" == true ]] && ARGS+=(--dry-run)
     return 0
