@@ -79,6 +79,13 @@ deactivate
 # UV_NO_SYNC keeps `uv run` from re-syncing this environment back to uv.lock.
 echo "export UV_PROJECT_ENVIRONMENT=\"\$VIRTUAL_ENV\"" >> "${VENV_DIR}/bin/activate"
 echo "export UV_NO_SYNC=1" >> "${VENV_DIR}/bin/activate"
+# TE loads cuDNN from CUDNN_HOME / CUDA_HOME / /usr/local/cuda / LD_LIBRARY_PATH before the pip
+# package, RTLD_GLOBAL; a system cuDNN found there then also serves torch (same libcudnn.so.9
+# soname) and torch rejects it as a version mismatch. Point both at torch's bundled cuDNN.
+cat >> "${VENV_DIR}/bin/activate" <<'EOF'
+export CUDNN_HOME="$VIRTUAL_ENV/lib/python3.12/site-packages/nvidia/cudnn"
+export LD_LIBRARY_PATH="$CUDNN_HOME/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+EOF
 source "${VENV_DIR}/bin/activate"
 echo "VIRTUAL_ENV: ${VIRTUAL_ENV}"
 
@@ -197,6 +204,7 @@ from transformer_engine.pytorch.utils import get_cudnn_version
 
 print(f"{'cuDNN (TE runtime)':30s} {get_cudnn_version()}")
 print(f"{'cuDNN (torch)':30s} {torch.backends.cudnn.version()}")
+print(f"{'libcudnn loaded':30s} {sorted({l.split()[-1] for l in open('/proc/self/maps') if 'libcudnn.so' in l})}")
 print(f"{'FA4 detected by TE':30s} {FlashAttentionUtils.v4_is_installed} ({FlashAttentionUtils.fa4_version})")
 PY
 
