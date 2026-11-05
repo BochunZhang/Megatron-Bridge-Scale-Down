@@ -1,0 +1,36 @@
+# uv pip overrides for install-gb200-te2.21-fa4.sh (installs without uv.lock).
+# Overrides replace every requirement on the named package, including hard pins
+# declared by Megatron-Core / Megatron-Bridge.
+
+# Toolchain installed first; the resolver must never move it.
+torch==2.13.0
+torchvision==0.28.0
+triton==3.7.1
+
+# FlashAttention-4 + context parallel stack.
+# TE >= 2.19 enables FA4 with cp_comm_type p2p / all_gather / a2a.
+# TE 2.21.0 recommends flash-attn-4 4.0.0b33 + nvidia-cutlass-dsl[cu13] 4.8.0 and
+# requires nvidia-cudnn-frontend >= 1.29.0 at build time.
+# Megatron-Core's dev extra pins nvidia-cudnn-frontend[cutedsl]==1.26.0, which forces
+# nvidia-cutlass-dsl==4.5.0 and conflicts with flash-attn-4 b33 (>= 4.6.2). It is only
+# used by cudnn.DSA (DeepSeek sparse attention).
+transformer-engine==2.21.0
+flash-attn-4==4.0.0b33
+nvidia-cutlass-dsl[cu13]==4.8.0
+nvidia-cudnn-frontend==1.29.0
+
+# Carried over from pyproject.toml [tool.uv] override-dependencies.
+av; sys_platform == 'never'
+imageio; sys_platform == 'never'
+imageio-ffmpeg; sys_platform == 'never'
+mlflow>=3.15.1
+cachetools>=5.0.0
+cryptography>=43.0.0,<47
+nvidia-modelopt==0.46.0rc1
+urllib3>=2.6.3
+langchain>=0.3.28
+langchain-core>=0.3.80
+onnx>=1.21.0; python_version < '3.13'
+tokenizers>=0.22.0,<0.23
+fastapi<0.139.2
+fast-hadamard-transform @ git+https://github.com/Dao-AILab/fast-hadamard-transform.git@v1.1.0
