@@ -56,13 +56,13 @@ export FAST_HADAMARD_TRANSFORM_FORCE_BUILD=TRUE
 
 # --no-config: uv pip otherwise merges pyproject.toml [tool.uv] override-dependencies
 # (nvidia-cudnn-frontend==1.26.0, ...) with OVERRIDES and the resolution becomes unsatisfiable.
-UV_PIP_INSTALL=(
+UV_PIP_BASE=(
     uv pip install
     --no-config
-    --override "${OVERRIDES}"
     --extra-index-url https://pypi.nvidia.com
     --index-strategy unsafe-best-match
 )
+UV_PIP_INSTALL=("${UV_PIP_BASE[@]}" --override "${OVERRIDES}")
 
 ##############################################################################
 ## 1. Virtual environment
@@ -117,13 +117,19 @@ if [[ ! -d "${TE_SRC_DIR}" ]]; then
         https://github.com/NVIDIA/TransformerEngine.git "${TE_SRC_DIR}"
 fi
 
+# An override replaces every requirement on its package, including this local source path,
+# so the transformer-engine pin would send uv to the registry, which has no 2.21.0. Build with
+# the remaining overrides; the pin still guards the later steps against swapping TE out.
+TE_BUILD_OVERRIDES="${TMP_DIR}/overrides-te2.21-fa4-te-build.txt"
+grep -vE '^transformer-engine([[:space:]=<>!~@;\[]|$)' "${OVERRIDES}" > "${TE_BUILD_OVERRIDES}"
+
 # NVTE_WITH_NCCL_EP=0: the NCCL-EP extension needs a newer NCCL than torch 2.13 ships.
 NVTE_FRAMEWORK=pytorch \
     NVTE_CUDA_ARCHS="100" \
     NVTE_WITH_NCCL_EP=0 \
     NVTE_NO_LOCAL_VERSION=1 \
     MAX_JOBS="${MAX_JOBS:-8}" \
-    "${UV_PIP_INSTALL[@]}" --no-build-isolation -v "${TE_SRC_DIR}"
+    "${UV_PIP_BASE[@]}" --override "${TE_BUILD_OVERRIDES}" --no-build-isolation -v "${TE_SRC_DIR}"
 
 ##############################################################################
 ## 5. FlashAttention-4

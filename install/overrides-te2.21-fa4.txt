@@ -14,6 +14,8 @@ triton==3.7.1
 # Megatron-Core's dev extra pins nvidia-cudnn-frontend[cutedsl]==1.26.0, which forces
 # nvidia-cutlass-dsl==4.5.0 and conflicts with flash-attn-4 b33 (>= 4.6.2). It is only
 # used by cudnn.DSA (DeepSeek sparse attention).
+# transformer-engine 2.21.0 is not on PyPI: the install script builds it from source with this
+# line filtered out, and the pin then keeps later steps on the installed source build.
 transformer-engine==2.21.0
 flash-attn-4==4.0.0b33
 nvidia-cutlass-dsl[cu13]==4.8.0
