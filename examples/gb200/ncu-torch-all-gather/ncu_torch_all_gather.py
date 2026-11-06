@@ -31,9 +31,10 @@ NCCL all-reduce kernel of ``dist.barrier`` enters a kernel filter or a range.
 ``--algo`` must match the NCCL environment the launcher exported:
 
 * ``ring`` / ``nvls``: ``NCCL_ALGO`` is forced, payload buffers are plain device memory. Both
-  launch the kernel symbol ``ncclDevKernel_AllGather_RING_LL`` (NCCL specializes one AllGather
-  kernel per build, ``best_kernel`` in ``src/device/generate.py``); the algorithm is dispatched
-  inside it, so only the TUNING log tells Ring and NVLS apart.
+  launch the kernel symbol ``ncclDevKernel_AllGather_RING`` (NCCL specializes one AllGather
+  kernel per build, ``best_kernel`` in ``src/device/generate.py``, and leaves the protocol out of
+  the name unless ``NCCL_EXACT_KERNEL_NAMES=1``); the algorithm is dispatched inside it, so only
+  the TUNING log tells Ring and NVLS apart.
 * ``symm``: buffers are allocated from a ``torch.cuda.MemPool`` backed by ``ncclMemAlloc`` and
   registered as ``NCCL_WIN_COLL_SYMMETRIC`` windows; NCCL runs ``ncclSymkDevKernel_AllGather_*``
   (``AllGather_STMC`` with ``NCCL_SYM_KERNEL`` pinned by the launcher).

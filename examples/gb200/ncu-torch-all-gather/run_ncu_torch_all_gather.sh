@@ -26,11 +26,23 @@ kernel on all of them together; without it the first NCCL kernel waits forever f
 torchrun itself is excluded from profiling by ncu.
 
 Algorithms (--algo), each checked against NCCL's TUNING log for every all-gather launch:
-  ring   NCCL_ALGO=Ring, plain buffers      kernel ncclDevKernel_AllGather_RING_LL
-  nvls   NCCL_ALGO=NVLS, plain buffers      kernel ncclDevKernel_AllGather_RING_LL (same symbol:
+  ring   NCCL_ALGO=Ring, plain buffers      kernel ncclDevKernel_AllGather_RING
+  nvls   NCCL_ALGO=NVLS, plain buffers      kernel ncclDevKernel_AllGather_RING (same symbol:
                                             NCCL builds one AllGather kernel and dispatches the
-                                            algorithm inside it)
+                                            algorithm inside it; the protocol is not part of the
+                                            name unless NCCL_EXACT_KERNEL_NAMES=1)
   symm   symmetric windows, AllGather_STMC  kernel ncclSymkDevKernel_AllGather_STMC
+ring keeps an inherited NCCL_NVLS_ENABLE; run it with NCCL_NVLS_ENABLE=0 for a communicator
+without multicast mappings.
+
+Multicast memory and kernel replay: a kernel replay of more than one pass first saves all memory
+the kernel can reach. With nvls (NCCL's NVLS buffers) and symm (the registered windows) that
+includes multicast-mapped memory, and ncu 2026.3 fails there with "Failed to save memory for
+replay" (ContextSaveFailed). Ways around it:
+  --metrics LIST                 metrics that fit one pass: ncu saves no memory for a single-pass
+                                 kernel replay (ncu.log shows "- 1 pass")
+  --replay-mode application|app-range
+                                 no memory is saved; with --communicator shmem needs ncu >= 2026.4
 
 What is profiled: the worker runs --warmup all-gathers, then --iters all-gathers inside the NVTX
 range "ncu_all_gather". ncu selects with --nvtx --nvtx-include "ncu_all_gather/" and
@@ -53,12 +65,14 @@ Options:
   --iters N              All-gathers inside the NVTX range (default: 1)
   --communicator MODE    shmem | none (default: shmem); none is the hang reproducer
   --set NAME             ncu --set (default: basic)
+  --metrics LIST         Collect only these comma-separated metrics instead of --set
   --replay-mode MODE     kernel | application | app-range (default: kernel)
-                           kernel       saves and restores the memory the kernel can reach before
-                                        every pass; known to fail for symm windows ("Failed to
-                                        save memory for replay", see ../nccl-tests/README.md)
+                           kernel       saves and restores the memory the kernel can reach when
+                                        more than one pass is needed; fails for nvls and symm
+                                        (see "Multicast memory and kernel replay" above)
                            application  relaunches the whole torchrun tree once per pass
                            app-range    relaunches once per pass and profiles the NVTX range
+                         application and app-range with --communicator shmem need ncu >= 2026.4
   --timeout SEC          Kill a pass after SEC seconds and report a hang (default: 1800)
   --ncu PATH             ncu binary (default: ncu in PATH)
   --nccl-lib PATH        LD_PRELOAD this libnccl.so.2 instead of the one bundled with torch
@@ -82,6 +96,7 @@ warmup=5
 iters=1
 communicator="shmem"
 ncu_set="basic"
+metrics=""
 replay_mode="kernel"
 timeout_sec=1800
 ncu_bin="ncu"
@@ -105,6 +120,7 @@ while [[ $# -gt 0 ]]; do
         --iters) iters="$2"; shift 2 ;;
         --communicator) communicator="$2"; shift 2 ;;
         --set) ncu_set="$2"; shift 2 ;;
+        --metrics) metrics="$2"; shift 2 ;;
         --replay-mode) replay_mode="$2"; shift 2 ;;
         --timeout) timeout_sec="$2"; shift 2 ;;
         --ncu) ncu_bin="$2"; shift 2 ;;
@@ -137,6 +153,11 @@ ncu_year="${ncu_version%%.*}"
 ncu_minor="${ncu_version#*.}"
 if [[ -z "$ncu_version" ]] || (( ncu_year < 2026 || (ncu_year == 2026 && ncu_minor < 1) )); then
     die "Nsight Compute ${ncu_version:-?} cannot profile NCCL kernels with --communicator shmem; need >= 2026.1"
+fi
+# 2026.4 release notes: "Added application replay support when profiling with the shmem
+# communicator". 2026.3 runs the application without profiling anything ("No kernels were profiled").
+if [[ "$communicator" == shmem && "$replay_mode" != kernel ]] && (( ncu_year == 2026 && ncu_minor < 4 )); then
+    die "--replay-mode ${replay_mode} with --communicator shmem needs Nsight Compute >= 2026.4, got ${ncu_version}"
 fi
 [[ -z "$nccl_lib" || -f "$nccl_lib" ]] || die "--nccl-lib ${nccl_lib} does not exist"
 
@@ -187,7 +208,7 @@ torchrun_cmd=(
 {
     echo "ncu=$(command -v "$ncu_bin") ${ncu_version}"
     echo "gpus=${gpus} algo=${algo} size_mib=${size_mib} dtype=${dtype} warmup=${warmup} iters=${iters}"
-    echo "communicator=${communicator} set=${ncu_set} replay=${replay_mode} extra_ncu_args=${extra_ncu_args[*]:-}"
+    echo "communicator=${communicator} set=${ncu_set} metrics=${metrics:-<from --set>} replay=${replay_mode} extra_ncu_args=${extra_ncu_args[*]:-}"
     echo "nccl_lib=${nccl_lib:-<bundled with torch>}"
     env | grep -E '^(NCCL_|CUDA_VISIBLE_DEVICES=|LD_PRELOAD=)' | sort
 } >"${output_dir}/config.txt"
@@ -228,7 +249,9 @@ run_pass() {
         die "${pass}: no permission for GPU performance counters; run as root or load nvidia with NVreg_RestrictProfilingToAdminUsers=0"
     fi
     if grep -q "Failed to save memory for replay" "${output_dir}/${pass}.log"; then
-        die "${pass}: ncu could not save the kernel's memory for kernel replay; try --replay-mode application or app-range (see the /tmp/nsight-compute-*.log named in ${output_dir}/${pass}.log)"
+        die "${pass}: ncu could not save the kernel's memory for a multi-pass kernel replay (multicast mappings of nvls / symm);" \
+            "use --metrics with a single-pass list, or ncu >= 2026.4 with --replay-mode application or app-range;" \
+            "details in the /tmp/nsight-compute-*.log named in ${output_dir}/${pass}.log"
     fi
     if grep -q "No kernels were profiled\|No ranges were profiled" "${output_dir}/${pass}.log"; then
         die "${pass}: ncu profiled nothing (communicator=${communicator}, replay=${replay_mode}); see ${output_dir}/${pass}.log"
@@ -252,19 +275,24 @@ fi
 select_args=(--nvtx --nvtx-include "ncu_all_gather/")
 if [[ "$replay_mode" == app-range ]]; then
     select_args+=(--launch-count 1)
-    metrics="gpu__time_duration.sum"
+    summary_metrics="gpu__time_duration.sum"
     expected_profiled=$nranks
 else
     select_args+=(--kernel-name "regex:^nccl(Symk)?DevKernel_AllGather" --launch-count "$iters")
-    metrics="launch__grid_size,launch__block_size,gpu__time_duration.sum,dram__throughput.avg.pct_of_peak_sustained_elapsed"
+    summary_metrics="launch__grid_size,launch__block_size,gpu__time_duration.sum,dram__throughput.avg.pct_of_peak_sustained_elapsed"
     expected_profiled=$(( nranks * iters ))
 fi
 comm_args=(--communicator none)
 [[ "$communicator" == shmem ]] && comm_args=(--communicator shmem --communicator-shmem-num-peers "$nranks")
 report="${output_dir}/all_gather"
+collect_args=(--set "$ncu_set")
+if [[ -n "$metrics" ]]; then
+    collect_args=(--metrics "$metrics")
+    summary_metrics="$metrics"
+fi
 
 run_pass ncu "$ncu_bin" "${comm_args[@]}" \
-    --set "$ncu_set" \
+    "${collect_args[@]}" \
     --replay-mode "$replay_mode" \
     "${select_args[@]}" \
     --target-processes all \
@@ -277,7 +305,7 @@ run_pass ncu "$ncu_bin" "${comm_args[@]}" \
 # Summary: one row per profiled kernel (or range)
 
 [[ -f "${report}.ncu-rep" ]] || die "ncu wrote no ${report}.ncu-rep; see ${output_dir}/ncu.log"
-rows="$("$ncu_bin" --import "${report}.ncu-rep" --page raw --csv --metrics "$metrics")"
+rows="$("$ncu_bin" --import "${report}.ncu-rep" --page raw --csv --metrics "$summary_metrics")"
 summary="${output_dir}/summary.csv"
 # Line 1 is the header, line 2 the units.
 printf '%s\n' "$rows" >"$summary"

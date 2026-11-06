@@ -10,8 +10,8 @@ ncu --communicator shmem --communicator-shmem-num-peers 2 -f -o report -k regex:
 
 本目录把文档里的 `pytorch_app.py` 换成 `ncu_torch_all_gather.py`，并加上算法固定、TUNING 校验和卡死检测。
 
-> 状态：还没在 GB200 上实际跑过。`../nccl-tests/README.md` 记录过，STMC kernel 在 kernel replay 下会报
-> `Failed to save memory for replay`，`--algo symm` 大概率需要换 replay 模式。
+> 状态：2026-11-06 在 GB200 单节点 4 卡上用 ncu 2026.3 跑过 `--algo nvls`（默认参数）：communicator 正常，
+> 失败在 kernel replay 保存显存，见下文「实测：NVLS + kernel replay 保存显存失败」。
 
 ## 文件
 
@@ -22,16 +22,20 @@ ncu --communicator shmem --communicator-shmem-num-peers 2 -f -o report -k regex:
 
 ## 用法
 
-在仓库根目录执行，需要 Nsight Compute ≥ 2026.1，并且有 GPU 性能计数器权限：
+在仓库根目录执行，需要 Nsight Compute ≥ 2026.1（shmem 下用 application / app-range replay 需要 ≥ 2026.4），
+并且有 GPU 性能计数器权限：
 
 ```bash
-# 默认：4 卡、NVLS、256 MiB bf16、kernel replay、--set basic
-bash examples/gb200/ncu-torch-all-gather/run_ncu_torch_all_gather.sh
+# ncu 2026.3 可用：单遍 metric 的 kernel replay，不保存显存
+bash examples/gb200/ncu-torch-all-gather/run_ncu_torch_all_gather.sh --metrics gpu__time_duration.sum
 
-# Ring 对照
-bash examples/gb200/ncu-torch-all-gather/run_ncu_torch_all_gather.sh --algo ring
+# 判断保存失败是否由 multicast 映射引起：Ring 且关闭 NVLS，communicator 里没有 multicast 内存
+NCCL_NVLS_ENABLE=0 bash examples/gb200/ncu-torch-all-gather/run_ncu_torch_all_gather.sh --algo ring
 
-# symmetric AllGather_STMC（NCCL >= 2.32；kernel replay 保存显存会失败，改用 app-range）
+# ncu >= 2026.4：application replay 不保存显存，可以采完整的 --set
+bash examples/gb200/ncu-torch-all-gather/run_ncu_torch_all_gather.sh --replay-mode application --set full
+
+# symmetric AllGather_STMC（NCCL >= 2.32；ncu >= 2026.4）
 bash examples/gb200/ncu-torch-all-gather/run_ncu_torch_all_gather.sh --algo symm --replay-mode app-range \
     --nccl-lib nccl/nccl-2.32.3/build/lib/libnccl.so.2
 
@@ -52,7 +56,8 @@ bash examples/gb200/ncu-torch-all-gather/run_ncu_torch_all_gather.sh --communica
 - `dist.barrier()` 走 NCCL 时会 launch 一个 AllReduce kernel，用 `nccl.*` 会把它也选进来。worker 改成
   通过 gloo group 做 barrier，进程里唯一的 NCCL 工作就是 all-gather。
 - NCCL 2.32.3 每个集合通信只编译一个特化 kernel（`src/device/generate.py` 的 `best_kernel`）。Ring 和
-  NVLS 的 AllGather 都 launch `ncclDevKernel_AllGather_RING_LL`，实际算法在 kernel 内部分派，所以
+  NVLS 的 AllGather 都 launch `ncclDevKernel_AllGather_RING`（不设置 `NCCL_EXACT_KERNEL_NAMES=1` 时
+  kernel 名里不带 protocol），实际算法在 kernel 内部分派，所以
   **单看 kernel 名分不出 Ring 和 NVLS**。脚本靠 TUNING 日志（`AllGather: <n> Bytes -> Algo NVLS ...`）
   确认每次 launch 的算法。symmetric 路径的 kernel 名是 `ncclSymkDevKernel_AllGather_STMC`。
 
@@ -76,6 +81,46 @@ NVTX range 里的那几次 launch。这样就不用按 `--launch-skip` 去数 wa
    `deregister_mem_pool`。
 6. **application / app-range replay 每个 pass 都会重新启动整个 torchrun**：程序必须能重复执行，并且
    每次 launch 顺序都相同。启动器用了 `--standalone`，每次都会自动选一个空闲的 rendezvous 端口。
+
+## 实测：NVLS + kernel replay 保存显存失败
+
+2026-11-06，GB200 单节点 4 卡，ncu 2026.3，torch 2.13 自带的 NCCL 2.32.3，默认参数（`--algo nvls`、
+`--set basic`、`--replay-mode kernel`）。baseline 通过，6 次 AllGather 都是 `Algo NVLS`。ncu 那一遍：
+
+```text
+==PROF== Profiling "ncclDevKernel_AllGather_RING" in process 220657
+==PROF== Profiling "ncclDevKernel_AllGather_RING" in process 220658
+==ERROR== Failed to save memory for replay. If the issue persists, consider using --replay-mode application ...
+==ERROR== ContextSaveFailed
+==PROF== Profiling "ncclDevKernel_AllGather_RING" in process 220659
+==ERROR== Failed to profile "ncclDevKernel_AllGather_RING" in client process 220659
+==PROF== Waiting for 3 clients
+==ERROR== Failed to wait for profiling
+==ERROR== The application returned an error code (9).
+```
+
+`/tmp/nsight-compute-*.log` 中的调用链：`cuda_context_state>> Failed to copy memory` → `Failed to transfer context
+state!` → `Failed to save context state` → `cuda_replay>> Failed to create replay state`。
+
+- **communicator 没有问题**：多个 rank 同时停在同一个 NCCL kernel 上，没有出现串行化导致的卡死。
+- **失败在复制显存**：Profiling Guide 写明，kernel replay 需要多遍时，会在第一遍之前保存 kernel 能访问的全部
+  显存；只需要一遍时完全不保存。日志里没有 `Backing up device memory in system memory`，buffer 也只有
+  256 MiB，所以不是容量不足，而是某段内存复制不了。
+- **推测是 multicast 映射**（尚未证实）：NVLS 用 `cuMemCreate`/`cuMemMap` 建 UC buffer，再用
+  `ncclMcPartitionBindMem` 绑定到 multicast 对象（2.32.3 `src/transport/nvls.cc`），进程中同时映射着 UC 和 MC。
+  `../nccl-tests/README.md` 里的 STMC（symmetric window，同样带 multicast）用 tcp 和 shmem 都是同样的错误。
+  用上面 `NCCL_NVLS_ENABLE=0 --algo ring` 那条命令可以验证。
+- **ncu 2026.3 下 application replay 用不了**：2026.4 的 release notes 才写了 *Added application replay
+  support when profiling with the shmem communicator*。这也解释了 nccl-tests 实验中 shmem + application 只得到
+  `No kernels were profiled`。脚本在 shmem + application / app-range + ncu < 2026.4 时会直接报错。注意 2026.4
+  的 CLI 文档仍然写着 shmem 只支持 kernel 和 range replay，和 release notes 不一致，以实测为准。
+- range replay 也走不通：它同样要保存和恢复内存，而且文档列出的支持 API 中 Virtual Memory Management 和
+  Peer Context Memory Access 都是 *Not supported*。
+
+截至 2026-11-06，最新版本是 2026.4。它的 release notes 和 Known Issues 都没有提到 multicast / VMM 内存的
+保存问题，所以 2026.4 下 kernel replay 的多遍采集是否仍然失败，需要实测。2026.4 的改进是可以绕开保存：
+用 application replay。另外 Known Issues 写明 NVLink Topology section 不支持 NVSwitch 拓扑，也不支持
+per-NVLink metrics。
 
 ## 输出
 
