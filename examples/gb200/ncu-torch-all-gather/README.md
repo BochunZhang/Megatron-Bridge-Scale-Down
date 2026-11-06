@@ -19,6 +19,7 @@ ncu --communicator shmem --communicator-shmem-num-peers 2 -f -o report -k regex:
 | --- | --- |
 | `ncu_torch_all_gather.py` | torchrun worker：warmup，再在 NVTX range `ncu_all_gather` 里跑 `--iters` 次 all-gather，前后都校验数据 |
 | `run_ncu_torch_all_gather.sh` | 单节点启动器：baseline（不挂 ncu）+ ncu 两遍 |
+| `bisect_ncu_sections.sh` | 逐个 section 跑启动器（application replay），找出让 kernel 卡死的 section，见下文「实测：application replay + `--set full` 卡在 pass 39」 |
 
 ## 用法
 
@@ -34,6 +35,9 @@ NCCL_NVLS_ENABLE=0 bash examples/gb200/ncu-torch-all-gather/run_ncu_torch_all_ga
 
 # ncu >= 2026.4：application replay 不保存显存，可以采完整的 --set
 bash examples/gb200/ncu-torch-all-gather/run_ncu_torch_all_gather.sh --replay-mode application --set full
+
+# ncu >= 2026.4：一次只采一个 section，找出 --set full 里卡死的那个（-- 之后是启动器参数）
+bash examples/gb200/ncu-torch-all-gather/bisect_ncu_sections.sh -- --ncu /path/to/ncu-2026.4
 
 # symmetric AllGather_STMC（NCCL >= 2.32；ncu >= 2026.4）
 bash examples/gb200/ncu-torch-all-gather/run_ncu_torch_all_gather.sh --algo symm --replay-mode app-range \
@@ -121,6 +125,23 @@ state!` → `Failed to save context state` → `cuda_replay>> Failed to create r
 保存问题，所以 2026.4 下 kernel replay 的多遍采集是否仍然失败，需要实测。2026.4 的改进是可以绕开保存：
 用 application replay。另外 Known Issues 写明 NVLink Topology section 不支持 NVSwitch 拓扑，也不支持
 per-NVLink metrics。
+
+## 实测：application replay + `--set full` 卡在 pass 39
+
+2026-11-07，GB200 单节点 4 卡，ncu 2026.4，torch 2.13（运行时 NCCL 2.29.7），`--algo nvls --replay-mode
+application --set full`：
+
+- shmem 下的 application replay 能用：每个 pass 重启一次整个 torchrun，约 15 s。pass 1–38 都是 4 个 rank 同时
+  进入 kernel，并且通过了数据校验。
+- pass 39 里 4 个 rank 都打印了 `Profiling ... pass 39`，但 kernel 一直没有跑完（没有 `output correct`），之后
+  ncu 报 `Failed to wait for profiling`。最后的 `Unexpected number of profiled kernels` 是这个 pass 没有产出
+  结果导致的，不是根因，调 `--app-replay-match` 没用。
+- NCCL 2.29.7 的 kernel 名是 `ncclDevKernel_AllGather_RING_LL`，名字里带 protocol。`-k` 正则两种名字都能匹配。
+
+不同的 section 分在不同的 pass 里，所以是某个 section 的采集方式让 NCCL kernel 跑不完。推测是 NVLink 几个
+section（Known Issues：不支持 NVSwitch 拓扑）或 SASS 插桩类的 section（`SourceCounters`、`InstructionStats`），
+尚未证实。`bisect_ncu_sections.sh` 用 `--metrics gpu__time_duration.sum -- --section <name>` 一次只采一个
+section，结果写在 `summary.txt` 里（ok / hang / fail / unknown）。
 
 ## 输出
 
