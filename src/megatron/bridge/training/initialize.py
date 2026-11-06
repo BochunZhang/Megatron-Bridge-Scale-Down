@@ -836,7 +836,22 @@ def _initialize_distributed(
                     f"{parallel_state.get_pipeline_model_parallel_world_size()}"
                 )
         # Return a ProcessGroupCollection using mpu process groups
-        return ProcessGroupCollection.use_mpu_process_groups()
+        pg_collection = ProcessGroupCollection.use_mpu_process_groups()
+        if dist_config.create_all_gather_group:
+            # Megatron-FSDP all-gathers parameters on these groups so they do not queue
+            # behind gradient reduce-scatters on the dp_cp / expt_dp communicators.
+            dp_cp_ag, expt_dp_ag = parallel_state.create_all_gather_groups(
+                for_expert_parallelism=model_config.expert_model_parallel_size > 1,
+                timeout=datetime.timedelta(minutes=dist_config.distributed_timeout_minutes),
+            )
+            pg_collection.dp_cp_ag = dp_cp_ag
+            pg_collection.expt_dp_ag = expt_dp_ag
+            if get_rank_safe() == 0:
+                print(
+                    "> created all-gather process groups for AG/RS overlap"
+                    + (" (including expert data parallel)" if expt_dp_ag is not None else "")
+                )
+        return pg_collection
 
 
 def _set_random_seed(

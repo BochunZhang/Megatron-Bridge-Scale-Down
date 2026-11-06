@@ -42,6 +42,7 @@ NODE_RANK="${NODE_RANK:-${RANK:-0}}"
 MASTER_ADDR="${MASTER_ADDR:-${DLC_MASTER_ADDR:-}}"
 MASTER_PORT="${MASTER_PORT:-29501}"
 FORCE_BALANCE=false
+OVERLAP=false
 MERGE_GRAPHS=false
 DRY_RUN=false
 RESUME=false
@@ -62,6 +63,10 @@ Options:
   --model NAME[,NAME...]        27b, 397b, 2.4t (alias 2p4t), 122b (required)
   --fsdp ddp|1|2|3[,...]        Data parallel modes (default: 3,1); see
                                 run_pretrain_fsdp3.sh --help
+  --overlap                     FSDP cases all-gather parameters on separate DP
+                                communicators (create_all_gather_group), overlapping
+                                reduce-scatter in FSDP3; ddp cases are unaffected;
+                                names get "-overlap"
   --tp N[,N...]                 Tensor parallel sizes, N > 1 with sequence
                                 parallelism (default: 1)
   --cp N[,N...]                 Context parallel sizes (default: 1)
@@ -108,6 +113,7 @@ while [[ $# -gt 0 ]]; do
     case "$1" in
         --model|--models) need_value "$@"; parse_csv "$2" MODELS; shift 2;;
         --fsdp) need_value "$@"; parse_csv "$2" FSDP_LEVELS; shift 2;;
+        --overlap) OVERLAP=true; shift;;
         --tp) need_value "$@"; parse_csv "$2" TP_SIZES; shift 2;;
         --cp) need_value "$@"; parse_csv "$2" CP_SIZES; shift 2;;
         --cuda-graph|--cuda-graphs) need_value "$@"; parse_csv "$2" CUDA_GRAPHS; shift 2;;
@@ -180,6 +186,7 @@ case_args() {
         [[ "${experts}" != full ]] && ARGS+=(--num-experts "${experts}")
         [[ "${FORCE_BALANCE}" == true ]] && ARGS+=(--force-balance)
     fi
+    [[ "${OVERLAP}" == true && "${fsdp}" != ddp ]] && ARGS+=(--overlap)
     [[ "${MERGE_GRAPHS}" == true ]] && ARGS+=(--merge)
     [[ "${RESUME}" == true ]] && ARGS+=(--resume)
     [[ "${DRY_RUN}" == true ]] && ARGS+=(--dry-run)
@@ -228,7 +235,7 @@ FAILED=()
 for case_spec in "${CASES[@]}"; do
     read -r model experts seq tp cp mbs gbs cg fsdp <<<"${case_spec}"
     case_args "${model}" "${experts}" "${seq}" "${tp}" "${cp}" "${mbs}" "${gbs}" "${cg}" "${fsdp}"
-    label="model=${model} dtype=${DTYPE} experts=${experts} fsdp=${fsdp} cuda_graph=${cg} seq=${seq} tp=${tp} cp=${cp} mbs=${mbs} gbs=${gbs}"
+    label="model=${model} dtype=${DTYPE} experts=${experts} fsdp=${fsdp} overlap=${OVERLAP} cuda_graph=${cg} seq=${seq} tp=${tp} cp=${cp} mbs=${mbs} gbs=${gbs}"
     printf 'launch %s\n' "${label}" >&2
     if ! "${RUN_ONE}" "${ARGS[@]}"; then
         echo "case failed: ${label}" >&2

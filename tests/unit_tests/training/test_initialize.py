@@ -23,7 +23,11 @@ import yaml
 
 from megatron.bridge.models.gpt_provider import GPTModelProvider
 from megatron.bridge.training.config import DistributedInitConfig
-from megatron.bridge.training.initialize import _initialize_tp_communicators, _setup_flight_recorder_env
+from megatron.bridge.training.initialize import (
+    _initialize_distributed,
+    _initialize_tp_communicators,
+    _setup_flight_recorder_env,
+)
 
 
 _FR_ENV_VARS = [
@@ -503,3 +507,33 @@ class TestSetupFlightRecorderEnv:
         _setup_flight_recorder_env(cfg)
         captured = capsys.readouterr()
         assert "Flight recorder env vars:" not in captured.out
+
+
+class TestCreateAllGatherGroup:
+    """Test that create_all_gather_group adds the Megatron-FSDP all-gather groups to the MPU pg_collection."""
+
+    @pytest.mark.parametrize("enabled,ep_size", [(True, 4), (True, 1), (False, 4)])
+    @patch("megatron.bridge.training.initialize.get_rank_safe", return_value=1)
+    @patch("megatron.bridge.training.initialize.parallel_state")
+    @patch("megatron.bridge.training.initialize.ProcessGroupCollection")
+    @patch("megatron.bridge.training.initialize.torch")
+    def test_all_gather_groups_attached(self, mock_torch, mock_pgc, mock_ps, _mock_rank, enabled, ep_size):
+        mock_torch.cuda.device_count.return_value = 1
+        mock_torch.distributed.is_initialized.return_value = True
+        mock_ps.model_parallel_is_initialized.return_value = True
+        mock_ps.create_all_gather_groups.return_value = ("dp_cp_ag", "expt_dp_ag" if ep_size > 1 else None)
+        mock_pgc.use_mpu_process_groups.return_value = Mock(spec=[])
+        model_config = Mock(expert_model_parallel_size=ep_size, expert_tensor_parallel_size=1)
+        dist_config = DistributedInitConfig(create_all_gather_group=enabled, distributed_timeout_minutes=7)
+
+        pg_collection = _initialize_distributed(model_config, dist_config, 1, None, None)
+
+        if not enabled:
+            mock_ps.create_all_gather_groups.assert_not_called()
+            assert not hasattr(pg_collection, "dp_cp_ag")
+            return
+        _, kwargs = mock_ps.create_all_gather_groups.call_args
+        assert kwargs["for_expert_parallelism"] is (ep_size > 1)
+        assert kwargs["timeout"].total_seconds() == 7 * 60
+        assert pg_collection.dp_cp_ag == "dp_cp_ag"
+        assert pg_collection.expt_dp_ag == ("expt_dp_ag" if ep_size > 1 else None)

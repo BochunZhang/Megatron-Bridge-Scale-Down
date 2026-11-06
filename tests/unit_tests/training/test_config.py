@@ -1841,6 +1841,37 @@ class TestConfigContainerValidation:
         finally:
             restore_get_world_size_safe(og_ws, cfg_mod)
 
+    @pytest.mark.parametrize(
+        "dist_kwargs,match",
+        [
+            ({"use_megatron_fsdp": True}, None),
+            ({}, "requires use_megatron_fsdp=True"),
+            (
+                {"use_megatron_fsdp": True, "use_decentralized_pg": True, "use_gloo_process_groups": False},
+                "not supported with use_decentralized_pg=True",
+            ),
+        ],
+    )
+    def test_create_all_gather_group_validation(self, dist_kwargs, match):
+        """create_all_gather_group needs Megatron-FSDP and the MPU process-group path."""
+        dist_cfg = create_test_distributed_init_config(create_all_gather_group=True, **dist_kwargs)
+        container, og_ws, cfg_mod = create_test_config_container(
+            world_size_override=1,
+            model_config=create_test_gpt_config(),
+            train_config=create_test_training_config(train_iters=500, global_batch_size=16),
+            scheduler_config=create_test_scheduler_config(),
+            dist_config=dist_cfg,
+        )
+        try:
+            if match is None:
+                container.validate()
+                assert container.dist.create_all_gather_group is True
+            else:
+                with pytest.raises(ValueError, match=match):
+                    container.validate()
+        finally:
+            restore_get_world_size_safe(og_ws, cfg_mod)
+
     def test_megatron_fsdp_config_with_dp_last_dim(self, monkeypatch):
         """Test MegatronFSDP config with use_tp_pp_dp_mapping, should raise ValueError."""
         gpt_model_cfg = create_test_gpt_config()

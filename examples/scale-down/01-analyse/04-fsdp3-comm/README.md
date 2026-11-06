@@ -26,6 +26,7 @@ Qwen3.8-2.4T-A95B 的 HF 配置是纯文本的 `Qwen3_5MoeForCausalLM`（没有 
 | --- | --- | --- |
 | `--model` | `27b`、`397b`、`2.4t`（别名 `2p4t`）、`122b`，可逗号分隔 | sweep 必填 |
 | `--fsdp` | `ddp`、`1`、`2`、`3`，可逗号分隔 | 数据并行方式，见下表；sweep 默认 `3,1`，单 case 默认 `3` |
+| `--overlap` | — | 见「AG / RS 通信组分离」；只作用于 FSDP case（sweep 中 `ddp` case 不受影响），名字中数据并行方式后加 `-overlap` |
 | `--tp` | N，可逗号分隔 | Tensor parallel；N>1 时自动打开 sequence parallel（`model.sequence_parallel=true`）。默认 1 |
 | `--cp` | N，可逗号分隔 | Context parallel，`cp_comm_type=p2p`。默认 1 |
 | `--cuda-graph` | `off`、`on`，可逗号分隔 | 默认 `off`，含义见「CUDA graph」 |
@@ -223,6 +224,16 @@ FSDP RS L3 dense 119.6M
 - 同一次 coalesced 发起的多个 bucket 以 `+` 连接，请求与预取以 `|` 分隔。nsys 会把 range 投影到对应 NCCL kernel（`nsys stats --report nvtx_gpu_proj_trace`，或在 GUI 中看 NVTX 行下的 GPU 投影）。
 
 `--profile none` 时不开启 NVTX，也就没有这些 range。
+
+## AG / RS 通信组分离（`--overlap`）
+
+`--overlap` 设置 Bridge 的 `dist.create_all_gather_group=true`（对应 Megatron-LM `--create-all-gather-group`）：初始化时再建一组与 `dp_cp` / `expt_dp` rank 完全相同的 communicator（`DATA_PARALLEL_GROUP_WITH_CP_AG`、`EXPERT_DATA_PARALLEL_GROUP_AG`），Megatron-FSDP 的参数 all-gather 改走这组 communicator，梯度 reduce-scatter 仍走原来的。
+
+- 不加时：RS 发在 `side_stream_for_buffer_copy_and_grad_accum`、AG 发在 `side_stream_for_param_gather`，两条 stream 不同，但 NCCL 对同一个 communicator 的每次 launch 都让 user stream 先等 `comm->sharedRes->deviceStream`、launch 后再把它推进到本次结束（NCCL `src/enqueue.cc` 的 `ncclLaunchPrepare` / `ncclLaunchFinish`），同一 communicator 上的操作因此按发起顺序串行。backward 中 layer i 的 pre-backward hook 预取 layer i-1 的 AG，它要排在 layer i+1（及更早未完成）的 RS 之后；
+- 加上后：AG 与 RS 属于两个 communicator，各自的 `deviceStream` 互不等待，可以在 GPU 上同时执行（仍共享 SM 与 NVLink 带宽）。RS 之间仍按顺序执行；
+- 若设置了 `NCCL_COMM_SPLIT_SHARE_RESOURCES=1`，split 出来的 communicator 共享父 communicator 的 `sharedRes`（含 `deviceStream`），AG / RS 又会串行，`--overlap` 失效；
+- 只有 FSDP3 在 backward 中同时有 AG 预取与 RS，FSDP1 / FSDP2 只是换了 AG 用的 communicator；`ddp` 不使用这组 communicator，单 case 脚本直接拒绝 `--fsdp ddp --overlap`；
+- nsys 中可以看到 `ncclDevKernel_AllGather_*` 与 `ncclDevKernel_ReduceScatter_*` 落在两条不同的 stream 上，时间区间可以重叠；不加时两者在同一条 stream 上首尾相接。
 
 ## Layer 的 forward / backward 标注
 

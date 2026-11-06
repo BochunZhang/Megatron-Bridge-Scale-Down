@@ -304,6 +304,18 @@ def test_ddp_cuda_graph_skips_preprocess_with_fp8_padding_on_alltoall(tmp_path: 
     assert r"model.cuda_graph_modules=\[attn\,moe_router\] " in mxfp8.stderr
 
 
+def test_overlap_creates_all_gather_group_for_fsdp_cases_only(tmp_path: Path):
+    fsdp3, ddp = _sweep(tmp_path, "--model", "27b", "--fsdp", "3,ddp", "--seq", "256", "--overlap", "--nsys")
+    assert "model_27b-fsdp_3-overlap-layers_8-" in fsdp3 and "/qwen35_27b-fsdp_3-overlap-experts_0-" in fsdp3
+    assert "dist.create_all_gather_group=true" in fsdp3
+    assert "model_27b-ddp-layers_8-" in ddp and "dist.create_all_gather_group=false" in ddp
+    (default,) = _sweep(tmp_path, "--model", "27b", "--fsdp", "3", "--seq", "256")
+    assert "-overlap-" not in default and "dist.create_all_gather_group=false" in default
+    result = _run(RUN_ONE, "--model", "27b", "--seq-length", "256", "--fsdp", "ddp", "--overlap", "--dry-run")
+    assert result.returncode == 2
+    assert "--overlap requires --fsdp 1, 2 or 3" in result.stderr
+
+
 def test_force_balance_tags_moe_cases_and_skips_dense(tmp_path: Path):
     dense, moe = _sweep(
         tmp_path, "--model", "27b,397b", "--force-balance", "--experts", "64", "--seq", "256", "--fsdp", "3"

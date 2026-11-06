@@ -160,6 +160,12 @@ class DistributedInitConfig(MTrainDistributedInitConfig):
     global parallel state (mpu) variables. When True, parallel groups are obtained from
     the pg_collection object rather than the global megatron.core.parallel_state module."""
 
+    create_all_gather_group: bool = False
+    """Create separate data-parallel communicators (same ranks as dp_cp / expt_dp) for Megatron-FSDP
+    parameter all-gathers, so NCCL no longer orders them behind gradient reduce-scatters on the same
+    communicator and the two can overlap. Equivalent to Megatron-LM ``--create-all-gather-group``.
+    Only Megatron-FSDP uses these groups; requires use_megatron_fsdp=True and use_decentralized_pg=False."""
+
     eval_context_parallel_size: int | None = None
     """If set and different from model.context_parallel_size, validation runs with this CP
     degree instead of the training CP degree. Requires use_decentralized_pg=True. The caller
@@ -1352,6 +1358,12 @@ class ConfigContainer(Container):
         # Validate Megatron-FSDP configuration.
         if self.dist.use_megatron_fsdp or self.ddp.use_megatron_fsdp:
             self._validate_and_apply_megatron_fsdp_configs()
+        # The separate all-gather groups are only consumed by Megatron-FSDP and only built on the MPU path.
+        if self.dist.create_all_gather_group:
+            if not (self.dist.use_megatron_fsdp or self.ddp.use_megatron_fsdp):
+                raise ValueError("create_all_gather_group requires use_megatron_fsdp=True.")
+            if self.dist.use_decentralized_pg:
+                raise ValueError("create_all_gather_group is not supported with use_decentralized_pg=True.")
 
         # Validate reuse_grad_buf_for_mxfp8_param_ag when FSDP is not enabled
         is_fsdp = self.dist.use_megatron_fsdp or self.ddp.use_megatron_fsdp
