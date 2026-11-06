@@ -524,6 +524,7 @@ while IFS='|' read -r status message; do
     case "$status" in
         ok) ok "$message" ;;
         warn) note "$message" ;;
+        bad) bad "$message" ;;
         *) bad "${status}${message:+|${message}}" ;;
     esac
 done < <("$target_py" - 2>&1 <<'PY'
@@ -535,6 +536,15 @@ def emit(cond, message, otherwise="bad"):
     print(f"{'ok' if cond else otherwise}|{message}")
 
 
+def cuda_code(version):
+    # torch.version.cuda is "13.0"; torchvision 0.28's version.cuda is the CUDA_VERSION macro, 13000.
+    text = str(version)
+    if text.isdigit():
+        return int(text)
+    major, minor = text.split(".")[:2]
+    return int(major) * 1000 + int(minor) * 10
+
+
 config = dist.ProcessGroupNCCL.Options().config
 emit(hasattr(config, "max_p2p_peers"), "NCCLConfig.max_p2p_peers is bound (NCCL_HAS_MAX_P2P_PEERS: NCCL >= 2.30 at compile time)")
 try:
@@ -544,7 +554,7 @@ except Exception as error:
     emit(False, f"import torchvision: {type(error).__name__}: {error}")
     raise SystemExit
 emit(torchvision.__version__.startswith("0.28.0"), f"torchvision {torchvision.__version__}")
-emit(torchvision.version.cuda == torch.version.cuda, f"torchvision CUDA {torchvision.version.cuda}, torch CUDA {torch.version.cuda}")
+emit(cuda_code(torchvision.version.cuda) == cuda_code(torch.version.cuda), f"torchvision CUDA {torchvision.version.cuda}, torch CUDA {torch.version.cuda}")
 image = torch.randint(0, 256, (3, 16, 16), dtype=torch.uint8)
 for codec in ("png", "jpeg"):
     try:
