@@ -134,8 +134,11 @@ grep -q '"SYMK_TmaSTMC"' "${src}/config/algorithm_registry.cc" \
     && ok "algSelection knows SYMK_TmaSTMC / SYMK_STMC / SYMK_LDMC" || bad "algorithm_registry.cc has no SYMK_TmaSTMC"
 
 echo "=== Library: ${lib}"
+# Capture the tool output before grepping: in `tool | grep -q` grep exits on the first match, the tool
+# dies of SIGPIPE (141) on its next write, and pipefail turns that into a failed check.
+exports="$(nm -D --defined-only "$lib" 2>/dev/null || true)"
 for symbol in ncclAllGatherConfig ncclReduceScatterConfig ncclCommWindowRegister ncclMemAlloc ncclCommQueryProperties; do
-    nm -D --defined-only "$lib" 2>/dev/null | grep -qw "$symbol" && ok "exports ${symbol}" || bad "does not export ${symbol}"
+    grep -qw "$symbol" <<<"$exports" && ok "exports ${symbol}" || bad "does not export ${symbol}"
 done
 # NVLS / multicast is compiled in only under CUDART_VERSION >= 12010 (src/transport/nvls.cc);
 # otherwise ncclNvlsInit is a stub and NCCL_NVLS_ENABLE=1 can never take effect. The INFO string
@@ -146,7 +149,8 @@ cuobjdump="${cuda_home}/bin/cuobjdump"
 if [[ -x "$cuobjdump" ]]; then
     # The TMA/multimem kernel bodies are compiled under __CUDA_ARCH__ >= 900
     # (src/device/symmetric/generate.py); without sm_100 SASS the kernels exist but do nothing.
-    "$cuobjdump" --list-elf "$lib" 2>/dev/null | grep -q "sm_100" && ok "fatbin holds sm_100 SASS" \
+    elfs="$("$cuobjdump" --list-elf "$lib" 2>/dev/null || true)"
+    grep -q "sm_100" <<<"$elfs" && ok "fatbin holds sm_100 SASS" \
         || bad "no sm_100 SASS in ${lib}; rebuild with NVCC_GENCODE=${GENCODE}"
     symbols="$("$cuobjdump" --dump-elf-symbols "$lib" 2>/dev/null || true)"
     for kernel in AllGather_TmaSTMC AllGather_STMC ReduceScatter_LDMC_sum_bf16 ReduceScatter_LDMC_sum_f32; do
