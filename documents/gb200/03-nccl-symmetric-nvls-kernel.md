@@ -21,11 +21,12 @@
 | 给 AG 加 pause cycle（NCCL 2.32.3-pause，4–64 卡，6.4 节） | 用 nsys 拆出 AG+RS 里各自的完成时间：pause 0 时 **AG 优先**，完成时间只比单独运行慢 1–6%，RS 在 AG 运行期间只完成 3–10%，之后才跑完。让 `AllGather_STMC` 每写完 4 KiB 空转一段时间，把 AG 压到约 470 GB/s 后，两者开始重叠：最优 pause cycle（4/8/16 卡 3072，32 卡 7168，64 卡 16384）下 makespan 降 24–31%，η = 0.49–0.68，与 symm AR 只差 0–5%，16–64 卡也有效。最优点左侧 AG 先完成，右侧 RS 先完成，最优点很尖 |
 | 硬件能否重叠 | **能**。symm 的 AR 把同样的流量放在一个 kernel 里，η = 0.55–0.70，耗时只有 AG+RS 的 1/1.33–1/1.47 |
 | AG+RS 并发谁最快 | 8–16 卡是经典 NVLS（η = 0.48–0.74，1024 MiB 时 424 / 383）；32 卡 64–512 MiB 是 copy engine 的 AG 加 LDMC 的 RS，≥1024 MiB 是经典 NVLS；64 卡 ≥256 MiB 是 copy engine 加 LDMC（372–381，经典 NVLS 未测）；4 卡是 ring |
+| ring / symm / symm-p2p（1024 MiB，nsys，3.4 节） | 8–32 卡 symm 的 AR 比 ring 快 23–32%，AG 快 2–7%，RS 慢 2–5%；AG+RS 因为不重叠，比 symm AR 慢 35–44%，只在 32 卡和 ring 持平。关掉 multicast 的 symm-p2p 能重叠（η 0.49–0.61），但 RS 是 ring 的 2.2–2.6 倍，各负载都不如 ring（4 卡 AG 除外） |
 | 两个组同时 multicast | 两个 16 卡组互不干扰，减速比在 ±4% 以内。两个 32 卡组（用满 64 卡）时 AG、AR 不受影响，RS 两组都慢 2–5% |
 
 ---
 
-## 1. 口径与五种实现
+## 1. 口径与六种实现
 
 ### 1.1 统计口径
 
@@ -49,16 +50,18 @@
 
 所以 multicast AG 的 algbw 就是每卡的入口流量，RS 的 algbw 就是每卡的出口流量。作为参照，GB200 每卡 NVLink 5 的单向标称带宽是 900 GB/s（18 条 × 50 GB/s）。
 
-### 1.2 五种实现
+### 1.2 六种实现
 
 | 名称 | NCCL | AG | RS | AR | 每卡 CTA（4 / 8 / 16 / 32 / 64 卡） | 每 CTA 线程 |
 | --- | --- | --- | --- | --- | --- | --- |
 | ring | 2.29.7 | RING（LL / LL128 / SIMPLE） | 同左 | 同左 | — | — |
 | nvls | 2.29.7 | NVLS / SIMPLE，经本地 staging | 同左 | 同左 | 24 / 24 / 24 / 24 / 未测 | 640 |
 | symm | 2.29.7 | `AllGather_STMC` | `ReduceScatter_LDMC` | `AllReduce_RSxLDMC_AGxSTMC` | AG/RS 6 / 4 / 2 / 1 / 1，AR 5 / 4 / 2 / 1 / 1 | 512 |
+| symm-p2p | 2.29.7 | `AllGather_ST` | `ReduceScatter_LD` | `AllReduce_RSxLD_AGxST` | 13 / 13 / 13 / 13 / 未测（只测了 1024 MiB，3.4 节） | 512 |
 | symm-tma | 2.32.3 | `AllGather_TmaSTMC` | `ReduceScatter_LDMC` | 未测 | AG 4 / 4 / 2 / 1 / 1，RS 同 symm | 512 |
 | copy-engine | 2.32.3 | copy engine 写 multicast 地址，前后各一次 NVLS 同步 | `ReduceScatter_LDMC` | 未测 | AG 不占 SM | — |
 
+- symm-p2p 是 symm 关掉 multicast（`NCCL_NVLS_ENABLE=0`）后的单播版本，只在 3.4 节那一轮（1024 MiB，nsys）测过。
 - symm-tma 和 copy-engine 只测了 ag 和 ag+rs。NCCL 没有 TMA 或 CE 版的 RS，计算 η 时 T_RS 借用 2.29.7 symm 的 `ReduceScatter_LDMC`（同一个内核、同样的 CTA 数；32 卡那一轮的 16 卡 cross 场景和 64 卡那一轮的 32 卡 cross 场景都校验过，256–2048 MiB 差异在 ±2% 以内，η 误差约 ±0.03）。
 - 2.32.3 那一轮跑在另外 8 个 tray 上，和 2.29.7 的对比同时混入了版本、内核、硬件三个变量，±2% 以内的差异不作解读。
 - 64 卡是单独的一轮，ring / symm（2.29.7）和 symm-tma / copy-engine（2.32.3）分别跑在两批不同的 16 个 tray 上；64 卡的 T_RS 借用同一轮 2.29.7 symm 的 64 卡数据。2.29.7 的 64 卡用的是新机器，与 4–32 卡的对比混入了硬件差异，见附录 A.1。
@@ -860,6 +863,47 @@ ring 参考（AG / RS / AR / AG+RS algbw）：4 卡 807 / 821 / 442 / 445；8 �
 6. 8–32 卡时 symm、tma、ce 三者的 AG+RS 吞吐都在 334–354 之间（2048 MiB 掉速点除外），差别只来自 AG 单独运行时的快慢（6.3 节）。64 卡三者都升到 359–381，因为 64 卡的 RS 变快了。
 7. 和 ring 比：≥1024 MiB 的 4 卡是 ring 最快（430 / 445）；8 卡以上 ring 的 AG+RS（323–372）不如经典 NVLS；64 卡时 ring 的 AG+RS（265–328）也不如 symm 的三种实现（359–381）。
 
+### 3.4 ring / symm / symm-p2p 的完成时间（1024 MiB，nsys 下测得）
+
+- **数据**：`results/nvls-collective-1024MiB-2.29.7-all-algo-simplify-1/gpu-num-<n>/<时间戳>/<algo>/results.jsonl`，NCCL 2.29.7，5 个 trial × 20 次迭代，取 trial 的中位数，单位 ms / 次迭代。
+- **symm-p2p**：symm 关掉 multicast（`NCCL_NVLS_ENABLE=0`）后的单播版本，AG / RS / AR 是 `AllGather_ST` / `ReduceScatter_LD` / `AllReduce_RSxLD_AGxST`，各卡数都是 13 个 CTA。
+
+| 卡数 | 负载 | ring | symm | symm-p2p | symm 相对 ring | p2p 相对 ring |
+|---|---|---:|---:|---:|---:|---:|
+| 4 | AG | 1.379 | 1.515 | 1.377 | +9.9% | −0.1% |
+| | RS | 1.384 | 1.952 | 3.573 | +41.0% | +158% |
+| | AR | 2.502 | 2.506 | 3.944 | +0.2% | +57.7% |
+| | AG+RS | 2.424 | 3.371 | 4.109 | +39.1% | +69.5% |
+| 8 | AG | 1.543 | 1.511 | 1.718 | −2.1% | +11.3% |
+| | RS | 1.498 | 1.578 | 3.382 | +5.3% | +126% |
+| | AR | 2.930 | 2.259 | 3.844 | **−22.9%** | +31.2% |
+| | AG+RS | 2.814 | 3.044 | 4.145 | +8.2% | +47.3% |
+| 16 | AG | 1.584 | 1.511 | 1.951 | −4.6% | +23.1% |
+| | RS | 1.568 | 1.605 | 3.389 | +2.4% | +116% |
+| | AR | 3.062 | 2.197 | 3.918 | **−28.3%** | +27.9% |
+| | AG+RS | 3.036 | 3.093 | 4.357 | +1.9% | +43.5% |
+| 32 | AG | 1.626 | 1.511 | 2.072 | −7.1% | +27.4% |
+| | RS | 1.609 | 1.652 | 3.778 | +2.6% | +135% |
+| | AR | 3.203 | 2.176 | 4.016 | **−32.1%** | +25.4% |
+| | AG+RS | 3.189 | 3.126 | 4.833 | −2.0% | +51.5% |
+
+**主要结论：**
+
+- **AR：symm 明显最快，卡数越多领先越多。** 4 卡和 ring 打平，8 / 16 / 32 卡比 ring 快 23% / 28% / 32%。p2p 的 AR 比 symm 慢 57–85%，原因是 RS 慢。
+- **AG：**
+  - symm 的 STMC 在所有卡数下都是约 1.511 ms，也就是每卡约 711 GB/s 的接收上限；ring 随卡数增加从 1.38 ms 慢到 1.63 ms。
+  - 4 卡时 p2p 的 `AllGather_ST`（13 个 CTA）是 1.377 ms，比 STMC 快 9%，和 2.32.3 在 4 卡时默认选 ST 的结论一致。8 卡以上 p2p 的 AG 越来越慢。
+- **RS：**
+  - 8 卡以上 symm 的 LDMC 和 ring 基本持平（+2–5%）。
+  - 4 卡时 LDMC 只有 6 个 CTA，慢了 41%。
+  - p2p 的 `ReduceScatter_LD` 是三者里最慢的，是 ring 的 2.2–2.6 倍。
+- **AG+RS：三种实现的瓶颈不同。**
+  - symm 的 AG 和 RS 几乎不重叠，η 只有 0.02–0.06。AG+RS 比 symm AR 慢 35–44%，所以 4 卡时比 ring 慢 39%，到 32 卡才反超 ring 2%。
+  - ring 的 AG+RS 和 ring AR 基本一样快（快 0.4–4%）。
+  - p2p 的重叠最好（η 0.49–0.61），但单个 op 太慢，AG+RS 仍比 ring 慢 44–70%。
+  - 参照：8 / 16 / 32 卡时经典 NVLS 的 AG+RS 最快（2.504 / 2.788 / 3.020 ms）。
+- 这组数据全部是在 nsys 下测的，和非 profile 的数据不要放进同一张结论表。
+
 ---
 
 ## 4. symmetric kernel 的 CTA：每个 CTA 处理多少数据
@@ -1615,6 +1659,7 @@ Megatron 分布式优化器在 DP > 1 时默认 `bucket_size = 128M` 个参数�
   - 两者用的是两批不同的 16 个 tray（按 GPU UUID 核对）。2.29.7 的 16 个 tray 和 32 卡那一轮的 8 个 tray 没有重叠；2.32.3 的前 8 个 tray（rank 0–31）就是 32 卡那一轮 2.32.3 的机器，rank 到 GPU 的映射也相同；
   - 同一轮里重跑的 16、32 卡，64–2048 MiB 与 32 卡那一轮的差异：symm −2.5% 到 +0.4%，ring −1.8% 到 +2.0%，TMA −0.2% 到 +0.7%，CE −2.1% 到 +1.1%（CE 64 MiB 为 −6.4%）；
   - 参数：`--group-sizes 16,32,64 --split-totals 32,64`，经典 NVLS 没有跑。
+- **3.4 节那一轮**（ring / nvls / symm / symm-p2p，1024 MiB，nsys）：NCCL 2.29.7，软件版本同上；4 / 8 / 16 / 32 卡各一轮，原始数据在 `results/nvls-collective-1024MiB-2.29.7-all-algo-simplify-1/gpu-num-<n>/<时间戳>/`。4 卡和 6.4 节是同一批 GPU，8–32 卡是另一批（按 GPU UUID 核对）；和 32 卡那一轮的机器没有重叠。
 - **测试框架**：`examples/gb200/nvls-collective/`，`run_nvls_collective_benchmark.sh --nnodes 8`（64 卡为 `--nnodes 16`）。
 
 ### A.2 各实现的环境变量
@@ -1626,6 +1671,7 @@ Megatron 分布式优化器在 DP > 1 时默认 `bucket_size = 128M` 个参数�
 | ring | `NCCL_ALGO=Ring`，`NCCL_NVLS_ENABLE=0` |
 | nvls | `NCCL_ALGO=NVLS`，`NCCL_NVLS_ENABLE=1` |
 | symm | `NCCL_ALGO` 不设，`NCCL_NVLS_ENABLE=1`，`NCCL_WIN_ENABLE=1`，`NCCL_SYM_CE_THRESHOLD=INT64_MAX` |
+| symm-p2p | 与 symm 相同，只是 `NCCL_NVLS_ENABLE=0` |
 | symm-tma | `NCCL_WIN_ENABLE=1`，`NCCL_NVLS_ENABLE=1`，`NCCL_SYM_KERNEL="allgather:AllGather_TmaSTMC;reducescatter:ReduceScatter_LDMC"`，`NCCL_SYM_CE_THRESHOLD=INT64_MAX` |
 | copy-engine | `NCCL_WIN_ENABLE=1`，`NCCL_NVLS_ENABLE=1`，`NCCL_SYM_CE_THRESHOLD=0`，`NCCL_CE_COLL_AG_MULTICAST_THRESHOLD=2^62`，`NCCL_SYM_KERNEL="reducescatter:ReduceScatter_LDMC"` |
 
@@ -1667,6 +1713,7 @@ Megatron 分布式优化器在 DP > 1 时默认 `bucket_size = 128M` 个参数�
 | symm | single 128 个 case + split 40 个 case | AG 全部是 `Symmetric/AllGather_STMC`，RS 全部是 `Symmetric/ReduceScatter_LDMC`，AR 全部是 `Symmetric/AllReduce_RSxLDMC_AGxSTMC`，`nthreads 512` |
 | nvls | 同上 | 全部是 NVLS / SIMPLE，AG、RS、AR 都是 `channel{Lo..Hi}={0..23}` |
 | ring | 同上 | 全部是 RING，协议随大小在 LL、LL128、SIMPLE 之间切换 |
+| symm-p2p（3.4 节） | 4 / 8 / 16 / 32 卡 × 4 个 single case | AG 全部是 `Symmetric/AllGather_ST`，RS 全部是 `Symmetric/ReduceScatter_LD`，AR 全部是 `Symmetric/AllReduce_RSxLD_AGxST`，各卡数都是 13 个 CTA；同一轮的 symm 全部是 STMC / LDMC / `AllReduce_RSxLDMC_AGxSTMC` |
 | symm-tma | single + split | AG 全部是 `Symmetric/AllGather_TmaSTMC` |
 | copy-engine | single + split | AG 全部是 `CopyEngine+NVLSSync` |
 | 两轮中的 RS | 56 个带 RS 的通信器，每个 105 次 launch | 全部是 `ReduceScatter_LDMC`，0 次回退 |
@@ -1710,6 +1757,11 @@ bash examples/gb200/nvls-collective/run_nvls_collective_benchmark.sh --nnodes 16
 # 2.7 节的 CTA 扫描：预加载 nccl-2.32.3-cta，ag / rs 各 1–8 个 CTA（ag ≤ rs）
 # 4 / 8 / 16 / 32 卡分别用 --nnodes 1 / 2 / 4 / 8 和 --group-sizes 4 / 8 / 16 / 32，每个节点运行同一条命令
 bash examples/gb200/nvls-collective/run_symm_cta_sweep.sh --nnodes 8 --group-sizes 32
+
+# 3.4 节：ring / nvls / symm / symm-p2p，1024 MiB，nsys 下运行
+# 4 / 8 / 16 / 32 卡分别用 --nnodes 1 / 2 / 4 / 8 和对应的 --group-sizes，每个节点运行同一条命令
+bash examples/gb200/nvls-collective/run_nvls_collective_benchmark.sh --nnodes 8 \
+    --algos ring,nvls,symm,symm-p2p --group-sizes 32 --sizes-mib 1024 --nsys
 
 # 6.4 节的 pause cycle 扫描：预加载 nccl-2.32.3-pause，默认 CTA 数，pause cycle 按卡数取默认列表
 # 4 / 8 / 16 / 32 / 64 卡分别用 --nnodes 1 / 2 / 4 / 8 / 16 和对应的 --group-sizes，每个节点运行同一条命令
