@@ -162,6 +162,8 @@ def fake_ncu(tmp_path: Path) -> dict[str, str]:
         if [[ "$1" == --version ]]; then echo "Version ${FAKE_NCU_VERSION:-2026.4}.0.0 (build 1)"; exit 0; fi
         if [[ "$1" == --import ]]; then
             echo "$2" >"$FAKE_NCU_IMPORTED"
+            echo "$@" >"${FAKE_NCU_IMPORTED}.args"
+            if [[ -n "${FAKE_NCU_RAW:-}" ]]; then cat "$FAKE_NCU_RAW"; exit 0; fi
             printf '"ID","gpu__time_duration.sum"\\n"","usecond"\\n"0","10"\\n"1","11"\\n'
             exit 0
         fi
@@ -432,3 +434,159 @@ def test_bisect_passes_ag_rs_and_replay_mode_and_names_the_output_after_them(tmp
     assert command[command.index("--replay-mode") + 1] == "app-range"
     out = Path(command[command.index("--output-dir") + 1])
     assert out.parent.name.startswith("symm-all-gather-reduce-scatter-") and out.name == "PmSampling"
+
+
+ANALYSE = SCRIPT_DIR / "analyse_blocking_metrics.py"
+GIB = 2**30
+
+# What decides the bottleneck and is in no section of --set full (checked against the #13
+# reports), plus the NVLink totals that only the PM-sampled .sum aggregates give correctly.
+BLOCKING_KEY_METRICS = (
+    # sender SM -> XBAR
+    "l1tex__m_l1tex2xbar_req_cycles_stalled.sum",
+    "l1tex__m_l1tex2xbar_req_cycles_active.sum",
+    "smsp__warps_active.sum",
+    "smsp__warps_issue_stalled_lg_throttle.sum",
+    "smsp__warps_issue_stalled_long_scoreboard.sum",
+    "smsp__warps_issue_stalled_membar.sum",
+    "smsp__warps_issue_stalled_barrier.sum",
+    "sm__average_inst_latency_pipe_lsu_ops_generic_cmd_read.ratio",
+    "sm__average_inst_latency_pipe_lsu_mem_lg_cmd_read.ratio",
+    "lts__lts2xbar_cycles_active.avg.pct_of_peak_sustained_elapsed",
+    "syslts__t_sectors_srcnode_gpc_aperture_peer_op_write.sum",
+    "syslts__t_sectors_srcnode_gpc_aperture_peer_op_read.sum",
+    # NVLink
+    "nvlrx__cycles_active.avg.pct_of_peak_sustained_elapsed",
+    "nvltx__cycles_active.avg.pct_of_peak_sustained_elapsed",
+    "pmsampling:nvlrx__bytes_packet_request_data_user.sum",
+    "pmsampling:nvlrx__bytes_packet_response_data_user.sum",
+    "pmsampling:nvltx__bytes_packet_request_data_user.sum",
+    "pmsampling:nvltx__bytes_packet_response_data_user.sum",
+    "pmsampling:nvlrx__bytes.sum",
+    "pmsampling:nvltx__bytes.sum",
+    # receiver L2 and HBM
+    "lts__t_sectors_op_write.sum",
+    "lts__t_sectors_srcnode_gpc_op_write.sum",
+    "lts__ltcfabric2lts_cycles_stalled.sum",
+    "lts__ltcfabric2lts_cycles_active.sum",
+    "lts__t_sectors_srcunit_ltcfabric_op_write.sum",
+    "dram__cycles_active_read.avg.pct_of_peak_sustained_elapsed",
+    "dram__cycles_active_write.avg.pct_of_peak_sustained_elapsed",
+    # timelines of the sender pressure
+    "pmsampling:smsp__warps_issue_stalled_lg_throttle.avg.pct_of_peak_sustained_elapsed",
+    "pmsampling:l1tex__m_l1tex2xbar_req_cycles_active.avg.pct_of_peak_sustained_elapsed",
+)
+
+# One STMC result of a 1 GiB all-gather on 4 GPUs (S = 256 MiB), shaped like #13: rx 4S, tx S.
+STMC_ROW = {
+    "ID": "0",
+    "Process ID": "4242",
+    "gpu__time_duration.sum": "1766000",
+    "l1tex__m_l1tex2xbar_req_cycles_stalled.sum": "300",
+    "l1tex__m_l1tex2xbar_req_cycles_active.sum": "1000",
+    "smsp__warps_active.sum": "1000",
+    "smsp__warps_issue_stalled_lg_throttle.sum": "300",
+    "pmsampling:nvlrx__bytes_packet_request_data_user.sum": str(GIB),
+    "pmsampling:nvltx__bytes_packet_request_data_user.sum": str(GIB // 4),
+    "pmsampling:nvlrx__bytes.sum": str(int(1.234 * GIB)),
+    "lts__t_sectors_op_write.sum": str((GIB + GIB // 4) // 32),
+    "lts__t_sectors_srcnode_gpc_op_write.sum": str(GIB // 4 // 32),
+    "dram__sectors_write.sum": str(GIB // 32),
+}
+
+
+def _raw_csv(path: Path, rows: list[dict[str, str]]) -> Path:
+    header = sorted({key for row in rows for key in row})
+    with path.open("w") as f:
+        f.write(",".join(f'"{h}"' for h in header) + "\n")
+        f.write(",".join('""' for _ in header) + "\n")
+        for row in rows:
+            f.write(",".join(f'"{row.get(h, "")}"' for h in header) + "\n")
+    return path
+
+
+def _blocking_line(text: str, label: str) -> list[str]:
+    (line,) = [line for line in text.splitlines() if line.strip().startswith(label)]
+    return line[len(line) - len(line.lstrip()) + len(label) :].split()
+
+
+def test_blocking_report_counts_bytes_in_shards_and_keeps_the_nvlink_cross_check_separate(tmp_path: Path):
+    summary = _raw_csv(tmp_path / "summary.csv", [STMC_ROW])
+    result = subprocess.run(
+        ["python3", str(ANALYSE), str(summary), "--size-mib", "1024", "--nranks", "4"],
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    assert result.returncode == 0, result.stderr
+    text = (tmp_path / "blocking.txt").read_text()
+    assert "256 MiB per shard" in text
+    assert _blocking_line(text, "duration [us]") == ["1766.0"]
+    assert _blocking_line(text, "l1tex2xbar stalled / active") == ["0.300"]
+    assert _blocking_line(text, "warps stalled lg_throttle") == ["30.0%"]
+    assert _blocking_line(text, "rx request user [S]") == ["4.000"]
+    assert _blocking_line(text, "tx request user [S]") == ["1.000"]
+    assert _blocking_line(text, "L2 writes not from local SMs [S]") == ["4.000"]
+    assert _blocking_line(text, "dram write [S]") == ["4.000"]
+    # Both NVLink blocks have an "rx wire [S]" line: PM sampling first, then the profiler
+    # counter, which must not borrow the PM-sampled value.
+    rx_wire = [line.split()[-1] for line in text.splitlines() if line.strip().startswith("rx wire [S]")]
+    assert rx_wire == ["4.936", "n/a"]
+
+
+def test_launcher_blocking_metrics_adds_both_collections_and_writes_the_report(
+    fake_ncu: dict[str, str], tmp_path: Path
+):
+    out = tmp_path / "out"
+    raw = _raw_csv(tmp_path / "raw.csv", [STMC_ROW, {**STMC_ROW, "ID": "1", "Process ID": "4243"}])
+    env = {
+        **fake_ncu,
+        "FAKE_NCU_EXT": "ncu-repz",
+        "FAKE_NCU_RAW": str(raw),
+        "FAKE_TUNING": "AllGather [Symmetric]: 1073741824 Bytes -> Kernel AllGather_STMC nchannels 6",
+    }
+    # Four ranks (the later --gpus wins over _launch's two): S = 1024 MiB / 4.
+    result = _launch(
+        out,
+        env,
+        "--gpus",
+        "0,1,2,3",
+        "--algo",
+        "symm",
+        "--size-mib",
+        "1024",
+        "--replay-mode",
+        "application",
+        "--blocking-metrics",
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    args = _ncu_args(fake_ncu)
+    assert "--set" not in args
+    collected = args[args.index("--metrics") + 1].split(",")
+    assert set(BLOCKING_KEY_METRICS) <= set(collected), set(BLOCKING_KEY_METRICS) - set(collected)
+    assert len(collected) == len(set(collected))
+    assert args[args.index("--clock-control") + 1] == "none"
+    # The summary is the whole raw page, so the PM-sampled aggregates are not filtered away.
+    assert "--metrics" not in Path(fake_ncu["FAKE_NCU_IMPORTED"] + ".args").read_text().split()
+    text = (out / "blocking.txt").read_text()
+    assert "#0 pid 4242" in text and "#1 pid 4243" in text
+    assert _blocking_line(text, "rx request user [S]") == ["4.000", "4.000"]
+    assert "blocking_metrics=true" in (out / "config.txt").read_text()
+
+
+def test_launcher_blocking_metrics_keeps_a_clock_control_given_after_the_separator(
+    fake_ncu: dict[str, str], tmp_path: Path
+):
+    env = {**fake_ncu, "FAKE_NCU_EXT": "ncu-repz", "FAKE_NCU_RAW": str(_raw_csv(tmp_path / "raw.csv", [STMC_ROW]))}
+    result = _launch(
+        tmp_path / "out", env, "--blocking-metrics", "--replay-mode", "application", "--", "--clock-control", "base"
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    args = _ncu_args(fake_ncu)
+    assert [args[i + 1] for i, arg in enumerate(args) if arg == "--clock-control"] == ["base"]
+
+
+def test_launcher_blocking_metrics_refuses_kernel_replay_with_multicast(fake_ncu: dict[str, str], tmp_path: Path):
+    result = _launch(tmp_path / "out", fake_ncu, "--algo", "symm", "--blocking-metrics")
+    assert result.returncode != 0
+    assert "use --replay-mode application or app-range" in result.stderr

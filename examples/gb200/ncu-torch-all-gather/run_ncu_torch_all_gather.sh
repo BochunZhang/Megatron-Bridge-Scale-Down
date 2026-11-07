@@ -90,6 +90,13 @@ Options:
                          gpu__time_duration.sum is added for the summary unless --metrics is given
   --metrics LIST         Collect only these comma-separated metrics instead of --set (together
                          with --section: the sections plus these metrics)
+  --blocking-metrics     Collect where the data path pushes back, stage by stage: sender SM -> XBAR
+                         (stalled / active, memory warp stalls, load latency), NVLink (request /
+                         response / wire bytes, PM-sampled), receiver L2 (XBAR -> LTS, writes from
+                         outside, LTC fabric stalls) and HBM (read / write activity). Added to
+                         --metrics (replaces --set), with --clock-control none unless given after
+                         "--"; writes blocking.txt (analyse_blocking_metrics.py). Needs several
+                         passes, so nvls / symm need --replay-mode application or app-range
   --replay-mode MODE     kernel | application | app-range (default: kernel)
                            kernel       saves and restores the memory the kernel can reach when
                                         more than one pass is needed; fails for nvls and symm
@@ -106,7 +113,7 @@ Options:
 
 Outputs in --output-dir: config.txt, baseline.log, ncu.log, nccl-logs/<pass>/*.log, the ncu
 report <name>.ncu-rep or <name>.ncu-repz (ncu 2026.4; <name> all_gather, or ag_rs with --ag-rs)
-and summary.csv (one row per profiled result).
+and summary.csv (one row per profiled result); blocking.txt with --blocking-metrics.
 USAGE
 }
 
@@ -123,6 +130,7 @@ iters=1
 communicator="shmem"
 ncu_set="basic"
 metrics=""
+blocking=false
 sections=()
 replay_mode="kernel"
 timeout_sec=1800
@@ -150,6 +158,7 @@ while [[ $# -gt 0 ]]; do
         --set) ncu_set="$2"; shift 2 ;;
         --section) sections+=("$2"); shift 2 ;;
         --metrics) metrics="$2"; shift 2 ;;
+        --blocking-metrics) blocking=true; shift ;;
         --replay-mode) replay_mode="$2"; shift 2 ;;
         --timeout) timeout_sec="$2"; shift 2 ;;
         --ncu) ncu_bin="$2"; shift 2 ;;
@@ -178,6 +187,72 @@ nops=${#op_funcs[@]}
 IFS=, read -r -a gpu_list <<<"$gpus"
 nranks=${#gpu_list[@]}
 (( nranks >= 2 )) || die "--gpus needs at least two GPUs"
+
+# --blocking-metrics: every name checked with `ncu --query-metrics-mode suffix --chip gb100`
+# (2026.4). The interface stall counters (*_cycles_stalled) are in no ncu section and cannot be
+# PM-sampled; NVLink bytes are PM-sampled because the profiler path reported 0 on GB200 + NVSwitch
+# (MemoryWorkloadAnalysis_Chart), the profiler counters stay as a cross-check.
+blocking_profiler_metrics=(
+    gpu__time_duration.sum
+    l1tex__m_l1tex2xbar_req_cycles_stalled.sum
+    l1tex__m_l1tex2xbar_req_cycles_active.sum
+    l1tex__m_l1tex2xbar_write_bytes.sum
+    l1tex__m_xbar2l1tex_read_bytes.sum
+    smsp__warps_active.sum
+    smsp__warps_issue_stalled_lg_throttle.sum
+    smsp__warps_issue_stalled_long_scoreboard.sum
+    smsp__warps_issue_stalled_membar.sum
+    smsp__warps_issue_stalled_barrier.sum
+    sm__average_inst_latency_pipe_lsu_ops_generic_cmd_read.ratio
+    sm__average_inst_latency_pipe_lsu_mem_lg_cmd_read.ratio
+    syslts__t_sectors_srcnode_gpc_aperture_peer_op_write.sum
+    syslts__t_sectors_srcnode_gpc_aperture_peer_op_read.sum
+    nvlrx__bytes.sum
+    nvltx__bytes.sum
+    nvlrx__cycles_active.avg.pct_of_peak_sustained_elapsed
+    nvltx__cycles_active.avg.pct_of_peak_sustained_elapsed
+    lts__xbar2lts_cycles_active.avg.pct_of_peak_sustained_elapsed
+    lts__lts2xbar_cycles_active.avg.pct_of_peak_sustained_elapsed
+    lts__t_sectors_op_write.sum
+    lts__t_sectors_srcnode_gpc_op_write.sum
+    lts__ltcfabric2lts_cycles_stalled.sum
+    lts__ltcfabric2lts_cycles_active.sum
+    lts__t_sectors_srcunit_ltcfabric_op_write.sum
+    dram__cycles_active_read.avg.pct_of_peak_sustained_elapsed
+    dram__cycles_active_write.avg.pct_of_peak_sustained_elapsed
+    dram__sectors_read.sum
+    dram__sectors_write.sum
+)
+blocking_pm_metrics=(
+    nvlrx__bytes_packet_request_data_user.sum
+    nvlrx__bytes_packet_response_data_user.sum
+    nvltx__bytes_packet_request_data_user.sum
+    nvltx__bytes_packet_response_data_user.sum
+    nvlrx__bytes.sum
+    nvltx__bytes.sum
+    nvlrx__bytes.avg.pct_of_peak_sustained_elapsed
+    nvltx__bytes.avg.pct_of_peak_sustained_elapsed
+    smsp__warps_issue_stalled_lg_throttle.avg.pct_of_peak_sustained_elapsed
+    smsp__warps_issue_stalled_long_scoreboard.avg.pct_of_peak_sustained_elapsed
+    l1tex__m_l1tex2xbar_req_cycles_active.avg.pct_of_peak_sustained_elapsed
+    lts__xbar2lts_cycles_active.avg.pct_of_peak_sustained_elapsed
+    lts__lts2xbar_cycles_active.avg.pct_of_peak_sustained_elapsed
+    dram__sectors_read.sum
+    dram__sectors_write.sum
+)
+if $blocking; then
+    if [[ "$replay_mode" == kernel && "$algo" =~ ^(nvls|symm)$ ]]; then
+        die "--blocking-metrics needs several passes; a multi-pass kernel replay cannot save the multicast memory of ${algo}: use --replay-mode application or app-range"
+    fi
+    blocking_list="$(IFS=,; echo "${blocking_profiler_metrics[*]}")"
+    for m in "${blocking_pm_metrics[@]}"; do blocking_list+=",pmsampling:${m}"; done
+    metrics="${metrics:+${metrics},}${blocking_list}"
+    # ncu locks clocks to base by default, which slows the SMs but not NVLink and so understates
+    # sender pressure.
+    if [[ " ${extra_ncu_args[*]:-} " != *" --clock-control "* ]]; then
+        extra_ncu_args=(--clock-control none ${extra_ncu_args[@]+"${extra_ncu_args[@]}"})
+    fi
+fi
 output_dir="${output_dir:-${repo_root}/results/gb200/ncu-torch-all-gather/${algo}-${case_name}-$(date +%Y%m%d-%H%M%S)}"
 
 ################################################################################
@@ -283,6 +358,7 @@ torchrun_cmd+=(--algo "$algo" --size-mib "$size_mib" --dtype "$dtype" --warmup "
     echo "ncu=$(command -v "$ncu_bin") ${ncu_version}"
     echo "gpus=${gpus} algo=${algo} ag_rs=${ag_rs} size_mib=${size_mib} dtype=${dtype} warmup=${warmup} iters=${iters}"
     echo "communicator=${communicator} set=${ncu_set} sections=${sections[*]:-<from --set>} metrics=${metrics:-<from --set>} replay=${replay_mode} extra_ncu_args=${extra_ncu_args[*]:-}"
+    echo "blocking_metrics=${blocking}"
     echo "nccl_lib=${nccl_lib:-<bundled with torch>}"
     env | grep -E '^(NCCL_|CUDA_VISIBLE_DEVICES=|LD_PRELOAD=)' | sort
 } >"${output_dir}/config.txt"
@@ -403,13 +479,24 @@ for ext in ncu-repz ncu-rep; do
     [[ -f "${report}.${ext}" ]] && { report_file="${report}.${ext}"; break; }
 done
 [[ -n "$report_file" ]] || die "ncu ${ncu_version} wrote neither ${report}.ncu-rep nor .ncu-repz; see ${output_dir}/ncu.log"
-rows="$("$ncu_bin" --import "$report_file" --page raw --csv --metrics "$summary_metrics")"
 summary="${output_dir}/summary.csv"
+if $blocking; then
+    # Every metric of the report: the raw page's names for the PM-sampled aggregates are not
+    # documented, so they are not passed back as a filter.
+    rows="$("$ncu_bin" --import "$report_file" --page raw --csv)"
+else
+    rows="$("$ncu_bin" --import "$report_file" --page raw --csv --metrics "$summary_metrics")"
+fi
 # Line 1 is the header, line 2 the units.
 printf '%s\n' "$rows" >"$summary"
 profiled="$(tail -n +3 "$summary" | grep -c . || true)"
 echo "=== ${profiled} result(s) in ${report_file} (expected ${expected_profiled})"
-column -s, -t <"$summary" 2>/dev/null || cat "$summary"
+if $blocking; then
+    python3 "${script_dir}/analyse_blocking_metrics.py" "$summary" --size-mib "$size_mib" --nranks "$nranks" \
+        || die "analyse_blocking_metrics.py failed on ${summary}"
+else
+    column -s, -t <"$summary" 2>/dev/null || cat "$summary"
+fi
 (( profiled == expected_profiled )) \
     || echo "WARNING: --launch-count may count over all ranks in shmem mode; compare with ${output_dir}/ncu.log" >&2
 echo "Open in the Nsight Compute GUI: ${report_file}"

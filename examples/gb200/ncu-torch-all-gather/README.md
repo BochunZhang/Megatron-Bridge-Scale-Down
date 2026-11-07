@@ -21,6 +21,7 @@ ncu --communicator shmem --communicator-shmem-num-peers 2 -f -o report -k regex:
 | `ncu_torch_ag_rs_overlap.py` | `--ag-rs` 用的 worker，只跑 AG + RS：两者各一个 NCCL communicator 和一条 CUDA stream，同时 launch（并发写法参照 `../nvls-collective/nvls_collective_benchmark.py`），NVTX range 为 `ncu_collectives`，前后校验两者的结果，并用 CUDA event 打出每次迭代 AG 和 RS 的重叠时间 |
 | `run_ncu_torch_all_gather.sh` | 单节点启动器：baseline（不挂 ncu）+ ncu 两遍；默认跑 all-gather，`--ag-rs` 跑 AG + RS 同时执行 |
 | `bisect_ncu_sections.sh` | 逐个 section 跑启动器（application replay），找出让 kernel 卡死的 section，见下文「实测：application replay + `--set full` 卡在 pass 39」 |
+| `analyse_blocking_metrics.py` | `--blocking-metrics` 结束后由启动器调用：把 `summary.csv` 按数据流经的各级（发端 SM→XBAR、NVLink、接收端 L2、HBM）排成 `blocking.txt`，字节数以每卡分片 S 的倍数显示 |
 | `README-test-records.md` | 各种 ncu 版本 / replay 模式 / 算法组合的成功和失败记录，以及四种 replay 模式的区别 |
 
 ## 用法
@@ -69,6 +70,11 @@ bash examples/gb200/ncu-torch-all-gather/bisect_ncu_sections.sh --ag-rs --replay
 # symmetric AllGather_STMC / AllGather_ST，换成 2.32.3 的 NCCL
 bash examples/gb200/ncu-torch-all-gather/run_ncu_torch_all_gather.sh --algo symm --replay-mode app-range \
     --nccl-lib nccl/nccl-2.32.3/build/lib/libnccl.so.2
+
+# 各级反压：发端 l1tex2xbar stalled/active、warp stall、NVLink 字节（PM sampling）、L2 入口、ltcfabric、HBM
+# 自动加 --clock-control none，结果在 blocking.txt；多 pass，symm / nvls 必须用 application 或 app-range
+bash examples/gb200/ncu-torch-all-gather/run_ncu_torch_all_gather.sh --algo symm --size-mib 1024 \
+    --replay-mode application --blocking-metrics
 
 # 复现不加 communicator 时的卡死（由 --timeout 兜底）
 bash examples/gb200/ncu-torch-all-gather/run_ncu_torch_all_gather.sh --communicator none --timeout 300
@@ -193,7 +199,8 @@ PM sampling / warp state sampling 的 pass 数是动态决定的，这两类很�
 | `baseline.log`、`ncu.log` | 两遍的输出，其中有 worker 的数据校验结果和 ncu 的 `==PROF==` 输出 |
 | `nccl-logs/<pass>/nccl-<host>-<pid>.log` | NCCL INFO 日志（INIT、ENV、TUNING） |
 | `all_gather.ncu-rep` / `all_gather.ncu-repz` | shmem 模式下所有 rank 合在一份报告里；ncu 2026.4 默认写压缩的 `.ncu-repz` |
-| `summary.csv` | 每个被 profile 的 kernel（app-range 下是每个 range）一行 |
+| `summary.csv` | 每个被 profile 的 kernel（app-range 下是每个 range）一行；`--blocking-metrics` 时是报告里的全部 metric |
+| `blocking.txt` | 仅 `--blocking-metrics`：各级反压和流量，每个结果一列 |
 
 ## 读结果时注意
 
