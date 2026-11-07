@@ -65,7 +65,10 @@ Options:
   --iters N              All-gathers inside the NVTX range (default: 1)
   --communicator MODE    shmem | none (default: shmem); none is the hang reproducer
   --set NAME             ncu --set (default: basic)
-  --metrics LIST         Collect only these comma-separated metrics instead of --set
+  --section NAME         Collect this ncu section instead of --set; repeat for several sections.
+                         gpu__time_duration.sum is added for the summary unless --metrics is given
+  --metrics LIST         Collect only these comma-separated metrics instead of --set (together
+                         with --section: the sections plus these metrics)
   --replay-mode MODE     kernel | application | app-range (default: kernel)
                            kernel       saves and restores the memory the kernel can reach when
                                         more than one pass is needed; fails for nvls and symm
@@ -98,6 +101,7 @@ iters=1
 communicator="shmem"
 ncu_set="basic"
 metrics=""
+sections=()
 replay_mode="kernel"
 timeout_sec=1800
 ncu_bin="ncu"
@@ -121,6 +125,7 @@ while [[ $# -gt 0 ]]; do
         --iters) iters="$2"; shift 2 ;;
         --communicator) communicator="$2"; shift 2 ;;
         --set) ncu_set="$2"; shift 2 ;;
+        --section) sections+=("$2"); shift 2 ;;
         --metrics) metrics="$2"; shift 2 ;;
         --replay-mode) replay_mode="$2"; shift 2 ;;
         --timeout) timeout_sec="$2"; shift 2 ;;
@@ -209,7 +214,7 @@ torchrun_cmd=(
 {
     echo "ncu=$(command -v "$ncu_bin") ${ncu_version}"
     echo "gpus=${gpus} algo=${algo} size_mib=${size_mib} dtype=${dtype} warmup=${warmup} iters=${iters}"
-    echo "communicator=${communicator} set=${ncu_set} metrics=${metrics:-<from --set>} replay=${replay_mode} extra_ncu_args=${extra_ncu_args[*]:-}"
+    echo "communicator=${communicator} set=${ncu_set} sections=${sections[*]:-<from --set>} metrics=${metrics:-<from --set>} replay=${replay_mode} extra_ncu_args=${extra_ncu_args[*]:-}"
     echo "nccl_lib=${nccl_lib:-<bundled with torch>}"
     env | grep -E '^(NCCL_|CUDA_VISIBLE_DEVICES=|LD_PRELOAD=)' | sort
 } >"${output_dir}/config.txt"
@@ -254,6 +259,13 @@ run_pass() {
             "use --metrics with a single-pass list, or ncu >= 2026.4 with --replay-mode application or app-range;" \
             "details in the /tmp/nsight-compute-*.log named in ${output_dir}/${pass}.log"
     fi
+    # ncu itself stops waiting for the ranks of a replay pass ("Failed to wait for profiling") well
+    # before --timeout; name the pass that never finished.
+    if grep -q "Failed to wait for profiling" "${output_dir}/${pass}.log"; then
+        local stuck
+        stuck="$(grep -o 'replay pass [0-9]*' "${output_dir}/${pass}.log" | tail -n 1)"
+        die "${pass}: ncu gave up waiting for the profiled kernel (hang in ${stuck:-the first pass}); see ${output_dir}/${pass}.log"
+    fi
     if grep -q "No kernels were profiled\|No ranges were profiled" "${output_dir}/${pass}.log"; then
         die "${pass}: ncu profiled nothing (communicator=${communicator}, replay=${replay_mode}); see ${output_dir}/${pass}.log"
     fi
@@ -287,7 +299,13 @@ comm_args=(--communicator none)
 [[ "$communicator" == shmem ]] && comm_args=(--communicator shmem --communicator-shmem-num-peers "$nranks")
 report="${output_dir}/all_gather"
 collect_args=(--set "$ncu_set")
-if [[ -n "$metrics" ]]; then
+if (( ${#sections[@]} > 0 )); then
+    # ncu collects the metrics of every --section plus the --metrics list.
+    collect_args=()
+    for s in "${sections[@]}"; do collect_args+=(--section "$s"); done
+    collect_args+=(--metrics "${metrics:-gpu__time_duration.sum}")
+    summary_metrics="${metrics:-gpu__time_duration.sum}"
+elif [[ -n "$metrics" ]]; then
     collect_args=(--metrics "$metrics")
     summary_metrics="$metrics"
 fi

@@ -17,40 +17,46 @@ set -euo pipefail
 
 usage() {
     cat <<'USAGE'
-Find the ncu section that hangs the NCCL AllGather kernel: run run_ncu_torch_all_gather.sh once
-per section and report which ones finish, hang or fail.
+Find what hangs the NCCL AllGather kernel in pass 39 of an ncu --set full application replay:
+run run_ncu_torch_all_gather.sh once per section (or group of sections) and report which ones
+finish, hang or fail, and how many replay passes each one needed.
 
-With ncu 2026.4, --replay-mode application --set full got through 38 application replay passes
-and then hung in pass 39 (the kernel never completed on any rank). Each pass collects a different
-group of sections, so one section's collection method stops the kernel. This script profiles one
-section at a time:
+With ncu 2026.4, --replay-mode application --set full hangs in pass 39 for nvls and ring, at
+256 MiB and at 1 MiB: all ranks enter the kernel and it never completes. Two explanations are
+told apart here:
+  - a section's collection method stops the kernel: that section hangs on its own;
+  - something breaks after 38 relaunches: every section finishes on its own, but a group of
+    sections that needs 39 or more passes hangs.
 
-  run_ncu_torch_all_gather.sh --skip-baseline --replay-mode application --timeout 300 \
-      --metrics gpu__time_duration.sum --output-dir <dir>/<section> <launcher args> -- --section <section>
+Each item of the list is one launcher run:
 
---metrics replaces --set with one single-pass metric; ncu collects the metric and the --section
-together. A hung section is killed by the launcher's --timeout; leftover workers are killed before
-the next section starts.
+  run_ncu_torch_all_gather.sh --skip-baseline --replay-mode application --timeout 600 \
+      --output-dir <dir>/<item> --section <s1> [--section <s2> ...] <launcher args>
+
+An item is a section identifier, or several joined with "+" (e.g. SourceCounters+InstructionStats)
+to collect them in one run. A hang is ncu giving up on a pass ("Failed to wait for profiling") or
+the launcher's --timeout; leftover workers are killed before the next item starts.
 
 Usage:
   bash examples/gb200/ncu-torch-all-gather/bisect_ncu_sections.sh [options] [-- launcher args]
 
 Options:
-  --sections LIST    Comma-separated ncu section identifiers
-                     (default: Nvlink_Topology,Nvlink_Tables,Nvlink,SourceCounters,InstructionStats,
-                     PmSampling,PmSampling_WarpStates,WarpStateStats). `ncu --list-sets` lists the
-                     sections of --set full. Identifiers missing from `ncu --list-sections` are
-                     reported as unknown and skipped.
+  --set NAME         Test every section of the ncu set NAME (e.g. full), one at a time. The
+                     members are read from the *.section files in --section-dir.
+  --sections LIST    Comma-separated items instead of --set (default: Nvlink_Topology,
+                     Nvlink_Tables,Nvlink,SourceCounters,InstructionStats,PmSampling,
+                     PmSampling_WarpStates,WarpStateStats). Sections missing from
+                     `ncu --list-sections` are reported as unknown and skipped.
+  --section-dir DIR  Section files for --set (default: the sections/ directory next to ncu)
   --output-dir DIR   (default: results/gb200/ncu-torch-all-gather/sections-<time>)
   --dry-run          Print the launcher commands without running them
   -h, --help
 
 Launcher args go to run_ncu_torch_all_gather.sh after the defaults above, so they can override
-them, e.g. -- --ncu /path/to/ncu --timeout 600 --algo ring. They must not contain "--"; the
-script passes --section through it.
+them, e.g. -- --ncu /path/to/ncu --size-mib 1 --warmup 1 --algo ring.
 
-Outputs in --output-dir: <section>.log (launcher output), <section>/ (launcher --output-dir) and
-summary.txt (one line per section: ok | hang | fail | unknown).
+Outputs in --output-dir: <item>.log (launcher output), <item>/ (launcher --output-dir) and
+summary.txt, one line per item: <item> ok|hang|fail|unknown <passes> <detail>.
 USAGE
 }
 
@@ -60,6 +66,8 @@ launcher="${script_dir}/run_ncu_torch_all_gather.sh"
 worker="${script_dir}/ncu_torch_all_gather.py"
 
 sections="Nvlink_Topology,Nvlink_Tables,Nvlink,SourceCounters,InstructionStats,PmSampling,PmSampling_WarpStates,WarpStateStats"
+set_name=""
+section_dir=""
 output_dir=""
 dry_run=false
 launcher_args=()
@@ -71,7 +79,9 @@ die() {
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
+        --set) set_name="$2"; shift 2 ;;
         --sections) sections="$2"; shift 2 ;;
+        --section-dir) section_dir="$2"; shift 2 ;;
         --output-dir) output_dir="$2"; shift 2 ;;
         --dry-run) dry_run=true; shift ;;
         --) shift; launcher_args=("$@"); break ;;
@@ -80,30 +90,52 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
-IFS=, read -r -a section_list <<<"$sections"
-(( ${#section_list[@]} > 0 )) || die "--sections is empty"
 # The launcher's own --ncu decides which ncu lists the sections.
 ncu_bin="ncu"
-for (( i = 0; i < ${#launcher_args[@]}; i++ )); do
-    [[ "${launcher_args[i]}" != "--" ]] || die "launcher args must not contain \"--\"; the script passes --section through it"
-    if [[ "${launcher_args[i]}" == "--ncu" ]] && (( i + 1 < ${#launcher_args[@]} )); then
-        ncu_bin="${launcher_args[i + 1]}"
-    fi
+for (( i = 0; i + 1 < ${#launcher_args[@]}; i++ )); do
+    [[ "${launcher_args[i]}" == "--ncu" ]] && ncu_bin="${launcher_args[i + 1]}"
 done
+
+# set_members <set>: section identifiers whose file has a Sets { Identifier: "<set>" } entry.
+set_members() {
+    local dir="$section_dir"
+    if [[ -z "$dir" ]]; then
+        local ncu_path
+        ncu_path="$(command -v "$ncu_bin")" || die "${ncu_bin} not found; pass -- --ncu PATH or --section-dir"
+        dir="$(dirname -- "$(readlink -f -- "$ncu_path")")/sections"
+    fi
+    compgen -G "${dir}/*.section" >/dev/null || die "no *.section files in ${dir}; pass --section-dir"
+    # Plain POSIX awk (no gawk ENDFILE): mawk is the default awk on Ubuntu.
+    awk -v pat="^[[:space:]]+Identifier:[[:space:]]*\"$1\"" '
+        function flush() { if (member && id != "") print id }
+        FNR == 1 { flush(); id = ""; member = 0 }
+        /^Identifier:/ && id == "" { id = $2; gsub(/"/, "", id) }
+        $0 ~ pat { member = 1 }
+        END { flush() }
+    ' "${dir}"/*.section | sort -u
+}
+
+if [[ -n "$set_name" ]]; then
+    sections="$(set_members "$set_name" | paste -sd, -)"
+    [[ -n "$sections" ]] || die "no section of set ${set_name} found"
+    echo "set ${set_name}: ${sections}"
+fi
+IFS=, read -r -a item_list <<<"$sections"
+(( ${#item_list[@]} > 0 )) || die "--sections is empty"
 output_dir="${output_dir:-${repo_root}/results/gb200/ncu-torch-all-gather/sections-$(date +%Y%m%d-%H%M%S)}"
 
-# section_cmd <section>: the launcher command for one section, in the array "cmd".
-section_cmd() {
-    cmd=(
-        bash "$launcher" --skip-baseline --replay-mode application --timeout 300
-        --metrics gpu__time_duration.sum --output-dir "${output_dir}/$1"
-        ${launcher_args[@]+"${launcher_args[@]}"} -- --section "$1"
-    )
+# item_cmd <item>: the launcher command for one item, in the array "cmd".
+item_cmd() {
+    local s
+    cmd=(bash "$launcher" --skip-baseline --replay-mode application --timeout 600 --output-dir "${output_dir}/$1")
+    IFS=+ read -r -a parts <<<"$1"
+    for s in "${parts[@]}"; do cmd+=(--section "$s"); done
+    cmd+=(${launcher_args[@]+"${launcher_args[@]}"})
 }
 
 if $dry_run; then
-    for s in "${section_list[@]}"; do
-        section_cmd "$s"
+    for item in "${item_list[@]}"; do
+        item_cmd "$item"
         printf '%q ' "${cmd[@]}"
         echo
     done
@@ -116,7 +148,7 @@ mkdir -p "$output_dir"
 [[ -z "$(ls -A "$output_dir")" ]] || die "${output_dir} is not empty"
 summary="${output_dir}/summary.txt"
 
-# A hung NCCL kernel can outlive the launcher's timeout; the next section must start on idle GPUs.
+# A hung NCCL kernel can outlive the launcher; the next item must start on idle GPUs.
 kill_leftover_workers() {
     pgrep -f "$worker" >/dev/null || return 0
     echo "killing leftover workers of ${worker}"
@@ -128,30 +160,39 @@ kill_leftover_workers() {
     die "workers of ${worker} still alive 60s after SIGKILL; check the GPUs before going on"
 }
 
-for s in "${section_list[@]}"; do
-    if ! grep -qxF "$s" <<<"$known_sections"; then
+for item in "${item_list[@]}"; do
+    IFS=+ read -r -a parts <<<"$item"
+    missing=""
+    for s in "${parts[@]}"; do
+        grep -qxF "$s" <<<"$known_sections" || missing+=" ${s}"
+    done
+    passes="-"
+    if [[ -n "$missing" ]]; then
         status=unknown
-        detail="not in ${ncu_bin} --list-sections"
+        detail="not in ${ncu_bin} --list-sections:${missing}"
     else
-        section_cmd "$s"
-        log="${output_dir}/${s}.log"
-        echo "=== section ${s}: ${cmd[*]}"
+        item_cmd "$item"
+        log="${output_dir}/${item}.log"
+        echo "=== ${item}: ${cmd[*]}"
         rc=0
         "${cmd[@]}" >"$log" 2>&1 || rc=$?
         if (( rc == 0 )); then
             status=ok
-        elif grep -q "did not finish in .* (hang)" "$log"; then
+        elif grep -qE "did not finish in .* \(hang\)|ncu gave up waiting" "$log"; then
             status=hang
         else
             status=fail
         fi
+        # The highest replay pass ncu reached; application replay prints one line per rank and pass.
+        passes="$(grep -o 'replay pass [0-9]*' "$log" | awk '{print $3}' | sort -n | tail -n 1 || true)"
+        passes="${passes:-1}"
         # The launcher's die message, else the first ncu error.
         detail="$(grep -m1 "^ERROR: " "$log" || grep -m1 "==ERROR==" "$log" || true)"
         detail="${detail:-exit ${rc}}; log ${log}"
         [[ "$status" == ok ]] || kill_leftover_workers
     fi
-    printf '%-24s %-8s %s\n' "$s" "$status" "$detail" | tee -a "$summary"
+    printf '%-40s %-8s %-6s %s\n' "$item" "$status" "$passes" "$detail" | tee -a "$summary"
 done
 
-echo "=== summary: ${summary}"
+echo "=== summary: ${summary} (item, status, replay passes, detail)"
 cat "$summary"

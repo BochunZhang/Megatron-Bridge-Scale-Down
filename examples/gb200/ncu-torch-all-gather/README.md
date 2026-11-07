@@ -36,8 +36,12 @@ NCCL_NVLS_ENABLE=0 bash examples/gb200/ncu-torch-all-gather/run_ncu_torch_all_ga
 # ncu >= 2026.4：application replay 不保存显存，可以采完整的 --set
 bash examples/gb200/ncu-torch-all-gather/run_ncu_torch_all_gather.sh --replay-mode application --set full
 
-# ncu >= 2026.4：一次只采一个 section，找出 --set full 里卡死的那个（-- 之后是启动器参数）
-bash examples/gb200/ncu-torch-all-gather/bisect_ncu_sections.sh -- --ncu /path/to/ncu-2026.4
+# ncu >= 2026.4：只采指定的 section（可重复，代替 --set）
+bash examples/gb200/ncu-torch-all-gather/run_ncu_torch_all_gather.sh --replay-mode application \
+    --section SpeedOfLight --section Occupancy
+
+# ncu >= 2026.4：把 --set full 的 section 逐个单独跑，找出卡死的那个（-- 之后是启动器参数）
+bash examples/gb200/ncu-torch-all-gather/bisect_ncu_sections.sh --set full -- --size-mib 1 --warmup 1
 
 # symmetric AllGather_STMC（NCCL >= 2.32；ncu >= 2026.4）
 bash examples/gb200/ncu-torch-all-gather/run_ncu_torch_all_gather.sh --algo symm --replay-mode app-range \
@@ -131,17 +135,29 @@ per-NVLink metrics。
 2026-11-07，GB200 单节点 4 卡，ncu 2026.4，torch 2.13（运行时 NCCL 2.29.7），`--algo nvls --replay-mode
 application --set full`：
 
-- shmem 下的 application replay 能用：每个 pass 重启一次整个 torchrun，约 15 s。pass 1–38 都是 4 个 rank 同时
-  进入 kernel，并且通过了数据校验。
+- shmem 下的 application replay 能用：每个 pass 重启一次整个 torchrun，约 14 s，其中被 profile 的那一段
+  （5 次 warmup + 1 次 AllGather + 校验）只要 1.2–1.7 s，各 pass 之间没有越来越慢。pass 1–38 都是 4 个 rank
+  同时进入 kernel，并且通过了数据校验。
 - pass 39 里 4 个 rank 都打印了 `Profiling ... pass 39`，但 kernel 一直没有跑完（没有 `output correct`），之后
   ncu 报 `Failed to wait for profiling`。最后的 `Unexpected number of profiled kernels` 是这个 pass 没有产出
   结果导致的，不是根因，调 `--app-replay-match` 没用。
 - NCCL 2.29.7 的 kernel 名是 `ncclDevKernel_AllGather_RING_LL`，名字里带 protocol。`-k` 正则两种名字都能匹配。
+- 重复了 4 次，都卡在 pass 39：`nvls` 256 MiB 两次，`nvls` 1 MiB 一次，`NCCL_NVLS_ENABLE=0 --algo ring` 一次。
+  所以和 multicast、NVLS 无关；数据量小了 256 倍也一样，所以不是 pass 太慢，而是卡死。
+- ncu 不是等到脚本的 `--timeout` 才退出：pass 39 开始后不到约 2.5 min 就自己报 `Failed to wait for profiling`。
+  没有找到能调整这个等待时间的选项；而且既然是卡死，调大也没用。启动器现在把这种情况报成
+  `ncu gave up waiting for the profiled kernel (hang in replay pass N)`。
 
-不同的 section 分在不同的 pass 里，所以是某个 section 的采集方式让 NCCL kernel 跑不完。推测是 NVLink 几个
-section（Known Issues：不支持 NVSwitch 拓扑）或 SASS 插桩类的 section（`SourceCounters`、`InstructionStats`），
-尚未证实。`bisect_ncu_sections.sh` 用 `--metrics gpu__time_duration.sum -- --section <name>` 一次只采一个
-section，结果写在 `summary.txt` 里（ok / hang / fail / unknown）。
+ncu 不会打印每个 pass 采了哪些 metric。Profiling Guide 写明软件插桩（SASS patching）类 metric 单独占 pass，
+PM sampling / warp state sampling 的 pass 数是动态决定的，这两类很可能排在 full 的最后几个 pass。剩下两种解释：
+
+1. 某个 section 的采集方式（推测是插桩或 sampling）让 NCCL kernel 跑不完：这个 section 单独跑也会卡；
+2. torchrun 重启到第 39 次时碰到 ncu 的某个次数上限：每个 section 单独都能跑完，只有合起来要 39 个以上
+   pass 时才卡。
+
+`bisect_ncu_sections.sh --set full` 从 ncu 的 `*.section` 文件里读出 full 的全部 section，每个单独用
+`--section` 跑一次 application replay，在 `summary.txt` 里记下 ok / hang / fail / unknown 和用了几个 pass。
+用 `A+B` 可以把几个 section 放在一次运行里，用来凑出 39 个以上 pass，检验第 2 种解释。
 
 ## 输出
 
