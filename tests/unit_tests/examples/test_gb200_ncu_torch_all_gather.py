@@ -796,3 +796,140 @@ def test_launcher_blocking_metrics_refuses_kernel_replay_with_multicast(fake_ncu
     result = _launch(tmp_path / "out", fake_ncu, "--algo", "symm", "--blocking-metrics")
     assert result.returncode != 0
     assert "use --replay-mode application or app-range" in result.stderr
+
+
+PAUSE_SWEEP = SCRIPT_DIR / "sweep_symm_ag_pause_blocking_metrics.sh"
+
+
+def test_pause_sweep_dry_run_builds_one_blocking_metrics_launch_per_pause(tmp_path: Path):
+    result = _run(
+        PAUSE_SWEEP,
+        "--dry-run",
+        "--pause-cycles",
+        "0,0512",
+        "--output-dir",
+        str(tmp_path),
+        "--",
+        "--gpus",
+        "0,1",
+        "--",
+        "--devices",
+        "0",
+    )
+    assert result.returncode == 0, result.stderr
+    commands = [shlex.split(line) for line in result.stdout.splitlines()]
+    assert len(commands) == 2
+    for pause, command in zip(("0", "512"), commands):
+        assert command[:2] == [f"NCCL_SYM_AG_STMC_PAUSE_CYCLES={pause}", "NCCL_SYM_TMA_ENABLE=0"]
+        assert command[3] == str(LAUNCHER)
+        assert command[command.index("--algo") + 1] == "symm" and "--blocking-metrics" in command
+        assert command[command.index("--replay-mode") + 1] == "application"
+        assert command[command.index("--communicator") + 1] == "shmem"
+        assert command[command.index("--size-mib") + 1] == "1024"
+        assert command[command.index("--nccl-lib") + 1].endswith("nccl/nccl-2.32.3-pause/build/lib/libnccl.so.2")
+        assert command[command.index("--output-dir") + 1] == str(tmp_path / f"pause-{pause}cyc")
+        # Launcher args come last, ncu args stay after their "--".
+        assert command[-5:] == ["--gpus", "0,1", "--", "--devices", "0"]
+
+
+def test_pause_sweep_default_output_is_named_after_the_sweep():
+    result = _run(PAUSE_SWEEP, "--dry-run", "--pause-cycles", "256")
+    assert result.returncode == 0, result.stderr
+    (command,) = [shlex.split(line) for line in result.stdout.splitlines()]
+    out = Path(command[command.index("--output-dir") + 1])
+    assert out.name == "pause-256cyc"
+    assert out.parent.name.startswith("symm-all-gather-blocking-metric-pause-")
+    assert out.parent.parent == ROOT / "results/gb200/ncu-torch-all-gather"
+
+
+@pytest.mark.parametrize("arg", ["--algo", "--ag-rs", "--nccl-lib", "--output-dir"])
+def test_pause_sweep_keeps_its_fixed_launcher_options(arg: str):
+    result = _run(PAUSE_SWEEP, "--dry-run", "--", arg, "x")
+    assert result.returncode != 0
+    assert f"{arg} is fixed by this sweep" in result.stderr
+
+
+@pytest.mark.parametrize("cycles", ["", "1,,2", "-1", "4294967296", "3,3"])
+def test_pause_sweep_rejects_bad_pause_lists(cycles: str):
+    result = _run(PAUSE_SWEEP, "--dry-run", "--pause-cycles", cycles)
+    assert result.returncode != 0
+    assert "--pause-cycles" in result.stderr
+
+
+def test_pause_sweep_checks_the_pause_of_every_nccl_process(tmp_path: Path):
+    repo = tmp_path / "repo"
+    script_dir = repo / "examples/gb200/ncu-torch-all-gather"
+    script_dir.mkdir(parents=True)
+    shutil.copy(PAUSE_SWEEP, script_dir)
+    # The fake launcher writes what the real one leaves for a pause: NCCL logs of a baseline and an
+    # ncu pass, and a blocking summary.csv. 512 drops the pause from one process, 1024 fails.
+    (script_dir / "run_ncu_torch_all_gather.sh").write_text(
+        textwrap.dedent("""\
+        args="$*"
+        while [[ $# -gt 0 ]]; do
+            [[ "$1" == --output-dir ]] && out="$2"
+            shift
+        done
+        pause="$NCCL_SYM_AG_STMC_PAUSE_CYCLES"
+        echo "$pause $NCCL_SYM_TMA_ENABLE ${NCCL_MIN_CTAS:-unset} ${UV_PROJECT_ENVIRONMENT} $args" >>"$(dirname "$0")/calls.txt"
+        [[ "$pause" == 1024 ]] && { echo "ERROR: ncu exited with 9; see $out/ncu.log" >&2; exit 1; }
+        for pass in baseline ncu; do
+            mkdir -p "$out/nccl-logs/$pass"
+            for p in 1 2; do
+                log="$out/nccl-logs/$pass/nccl-host-$p.log"
+                echo "host:$p:$p NCCL INFO NCCL version 2.32.3-pause+cuda13.0" >"$log"
+                [[ "$pause" == 512 && $p == 2 ]] && continue
+                echo "host:$p:$p NCCL INFO NCCL_SYM_AG_STMC_PAUSE_CYCLES set by environment to $pause." >>"$log"
+            done
+            echo "host:1:1 NCCL INFO AllGather [Symmetric]: 268435456 Bytes -> Kernel AllGather_STMC nchannels 4 nWarps 16" \\
+                >>"$out/nccl-logs/$pass/nccl-host-1.log"
+        done
+        printf '"ID","gpu__time_duration.sum","sm__cycles_elapsed.avg.per_second"\\n' >"$out/summary.csv"
+        printf '"","nsecond","hertz"\\n"0","1000000","2000000000"\\n"1","3000000","2000000000"\\n' >>"$out/summary.csv"
+        echo blocking >"$out/blocking.txt"
+        echo ok
+    """)
+    )
+    venv = tmp_path / "venv"
+    (venv / "bin").mkdir(parents=True)
+    (venv / "bin/activate").write_text("")
+    lib = tmp_path / "libnccl.so.2"
+    lib.write_text("NCCL version 2.32.3-pause+cuda NCCL_SYM_AG_STMC_PAUSE_CYCLES")
+    tools = tmp_path / "bin"
+    tools.mkdir()
+    (tools / "uv").write_text("#!/usr/bin/env bash\ncat >/dev/null\n")
+    (tools / "uv").chmod(0o755)
+    env = {**os.environ, "PATH": f"{tools}:{os.environ['PATH']}", "NCCL_MIN_CTAS": "4"}
+    out = tmp_path / "out"
+    result = _run(
+        script_dir / "sweep_symm_ag_pause_blocking_metrics.sh",
+        "--pause-cycles",
+        "0,512,1024",
+        "--venv",
+        str(venv),
+        "--nccl-lib",
+        str(lib),
+        "--output-dir",
+        str(out),
+        "--",
+        "--gpus",
+        "0,1",
+        env=env,
+    )
+    assert result.returncode == 1, result.stdout + result.stderr
+    rows = {line.split()[0]: line.split()[1:] for line in (out / "summary.txt").read_text().splitlines()[1:]}
+    # 2 ms mean at 2 GHz: 1 GiB / 2 ms = 536.9 GB/s, 512 cycles = 256 ns.
+    assert rows["0"][:6] == ["ok", "4", "2.000", "0.0", "2000.0", "536.9"]
+    assert rows["0"][6] == str(out / "pause-0cyc/blocking.txt")
+    assert rows["512"][:6] == ["invalid", "4", "2.000", "256.0", "2000.0", "536.9"]
+    assert "2 of 4 NCCL processes did not log NCCL_SYM_AG_STMC_PAUSE_CYCLES=512" in " ".join(rows["512"])
+    assert rows["1024"][:6] == ["fail", "-", "-", "-", "-", "-"]
+    assert "ERROR: ncu exited with 9" in " ".join(rows["1024"])
+    # One folder per pause with its console log; nothing left at the top but the sweep's own files.
+    assert all((out / f"pause-{c}cyc/launcher.log").is_file() for c in (0, 512))
+    assert (out / "pause-1024cyc.log").is_file()
+    assert sorted(p.name for p in out.iterdir() if p.is_file()) == ["pause-1024cyc.log", "summary.txt", "sweep.txt"]
+    # Every run gets its own pause, no inherited CTA variable and the virtualenv for uv run.
+    calls = [line.split() for line in (script_dir / "calls.txt").read_text().splitlines()]
+    assert [c[:4] for c in calls] == [[c, "0", "unset", str(venv.resolve())] for c in ("0", "512", "1024")]
+    assert all(c[-2:] == ["--gpus", "0,1"] and c[c.index("--nccl-lib") + 1] == str(lib.resolve()) for c in calls)
