@@ -475,12 +475,29 @@ BLOCKING_KEY_METRICS = (
     # timelines of the sender pressure
     "pmsampling:smsp__warps_issue_stalled_lg_throttle.avg.pct_of_peak_sustained_elapsed",
     "pmsampling:l1tex__m_l1tex2xbar_req_cycles_active.avg.pct_of_peak_sustained_elapsed",
+    # GB200: clocks under --clock-control none, the two-die LTC fabric, C2C / sysmem to Grace,
+    # the L2 read coalescer and the synchronization / tail warp stalls
+    "sm__cycles_elapsed.avg.per_second",
+    "lts__cycles_elapsed.avg.per_second",
+    "dram__cycles_elapsed.avg.per_second",
+    "nvlrx__cycles_elapsed.avg.per_second",
+    "pmsampling:sm__cycles_elapsed.avg.per_second",
+    "lts__t_sectors_srcunit_ltcfabric_op_read.sum",
+    "pmsampling:ctc__tx_bytes_data_user.sum",
+    "pmsampling:ctc__rx_bytes_data_user.sum",
+    "syslts__t_sectors_aperture_sysmem.sum",
+    "lrc__lrc2xbar_cycles_stalled.sum",
+    "lrc__lrc2xbar_cycles_active.sum",
+    "smsp__warps_issue_stalled_wait.sum",
+    "smsp__warps_issue_stalled_drain.sum",
 )
 
 # One STMC result of a 1 GiB all-gather on 4 GPUs (S = 256 MiB), shaped like #13: rx 4S, tx S.
 STMC_ROW = {
     "ID": "0",
     "Process ID": "4242",
+    "sm__cycles_elapsed.avg.per_second": "1965000000",
+    "pmsampling:ctc__tx_bytes_data_user.sum": str(45 * 2**20),
     "gpu__time_duration.sum": "1766000",
     "l1tex__m_l1tex2xbar_req_cycles_stalled.sum": "300",
     "l1tex__m_l1tex2xbar_req_cycles_active.sum": "1000",
@@ -522,6 +539,8 @@ def test_blocking_report_counts_bytes_in_shards_and_keeps_the_nvlink_cross_check
     text = (tmp_path / "blocking.txt").read_text()
     assert "256 MiB per shard" in text
     assert _blocking_line(text, "duration [us]") == ["1766.0"]
+    assert _blocking_line(text, "SM") == ["1965"]
+    assert _blocking_line(text, "C2C tx user [S]") == ["0.176"]
     assert _blocking_line(text, "l1tex2xbar stalled / active") == ["0.300"]
     assert _blocking_line(text, "warps stalled lg_throttle") == ["30.0%"]
     assert _blocking_line(text, "rx request user [S]") == ["4.000"]

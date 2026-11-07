@@ -18,18 +18,30 @@ Reads ``summary.csv`` (``ncu --import <report> --page raw --csv``: header, units
 profiled kernel or range) and writes ``blocking.txt`` with one column per result, stages in the
 order the data moves:
 
+* clocks: SM, L2, HBM and NVLink counter clocks of the passes (--clock-control none lets them move)
 * sender SM -> XBAR: ``l1tex2xbar`` stalled / active cycles, the warp stall reasons that wait on
-  memory (share of active warps), the average load latency and how busy L2 -> XBAR (the load
-  returns) is, peer traffic through SYSLTS
+  memory or synchronization (share of active warps), the average load latency, how busy L2 ->
+  XBAR (the load returns) is and how often the L2 read coalescer (LRC) -> XBAR stalls, peer
+  traffic through SYSLTS
 * NVLink: request / response user bytes and wire bytes (PM sampling, the only path that reports
   NVLink on NVSwitch systems so far), the plain profiler counters as a cross-check
+* Grace: C2C (ctc) bytes and sysmem sectors, which the all-gather itself should not need
 * receiver L2: XBAR -> LTS activity, L2 writes not issued by local SMs (= arriving over NVLink,
-  derived), LTC fabric (between the L2 partitions) stalled / active
+  derived), LTC fabric (between the L2 partitions, i.e. the two B200 dies) stalled / active and
+  the writes and reads crossing it
 * receiver HBM: read and write activity and bytes
 
 A stage that is busy but not stalled while the stage before it is stalled is the bottleneck. Byte
 counts are printed as multiples of one rank's shard S = size / nranks, so they can be checked
 against what the algorithm should move (e.g. AllGather_STMC: NVLink rx 4S and tx S on 4 GPUs).
+
+Two readings that are easy to get wrong:
+
+* NVLink "% of peak": ncu's peak for ``nvlrx__bytes`` on GB200 is about 1106 GB/s, and a saturated
+  receive direction plateaus near 81 % (~894 GB/s, NVLink5's 900 GB/s per direction; #13). The
+  kernel average also includes the ramp and the tail, so it is lower still.
+* PM-sampled ``.sum.per_second`` / ``.avg.per_second`` aggregates add up the per-sample rates and
+  are meaningless (#13: 7062 GHz for the HBM clock); only ``.sum`` and percentages are reported.
 """
 
 from __future__ import annotations
@@ -95,6 +107,9 @@ def build_lines(shard_bytes: float) -> list[tuple[str, Callable[[Row], float | N
     def shards(name: str, scale: float = 1.0) -> Callable[[Row], float | None]:
         return lambda row: ratio(None if (v := value(row, name)) is None else v * scale, shard_bytes)
 
+    def mhz(name: str) -> Callable[[Row], float | None]:
+        return lambda row: ratio(value(row, name), 1e6)
+
     def l2_writes_from_outside(row: Row) -> float | None:
         total, local = value(row, "lts__t_sectors_op_write.sum"), value(row, "lts__t_sectors_srcnode_gpc_op_write.sum")
         if total is None or local is None:
@@ -104,6 +119,11 @@ def build_lines(shard_bytes: float) -> list[tuple[str, Callable[[Row], float | N
     warps = "smsp__warps_active.sum"
     return [
         ("duration [us]", lambda row: ratio(value(row, "gpu__time_duration.sum"), 1e3), "{:.1f}"),
+        ("# clocks [MHz]", None, ""),
+        ("SM", mhz("sm__cycles_elapsed.avg.per_second"), "{:.0f}"),
+        ("L2", mhz("lts__cycles_elapsed.avg.per_second"), "{:.0f}"),
+        ("HBM", mhz("dram__cycles_elapsed.avg.per_second"), "{:.0f}"),
+        ("NVLink rx counter", mhz("nvlrx__cycles_elapsed.avg.per_second"), "{:.0f}"),
         ("# sender SM -> XBAR", None, ""),
         (
             "l1tex2xbar stalled / active",
@@ -116,6 +136,8 @@ def build_lines(shard_bytes: float) -> list[tuple[str, Callable[[Row], float | N
         ("warps stalled long_scoreboard", share("smsp__warps_issue_stalled_long_scoreboard.sum", warps), "{:.1%}"),
         ("warps stalled membar", share("smsp__warps_issue_stalled_membar.sum", warps), "{:.1%}"),
         ("warps stalled barrier", share("smsp__warps_issue_stalled_barrier.sum", warps), "{:.1%}"),
+        ("warps stalled wait", share("smsp__warps_issue_stalled_wait.sum", warps), "{:.1%}"),
+        ("warps stalled drain", share("smsp__warps_issue_stalled_drain.sum", warps), "{:.1%}"),
         (
             "load latency generic [cycle]",
             get("sm__average_inst_latency_pipe_lsu_ops_generic_cmd_read.ratio"),
@@ -126,6 +148,11 @@ def build_lines(shard_bytes: float) -> list[tuple[str, Callable[[Row], float | N
             "lts2xbar active % (load returns)",
             get("lts__lts2xbar_cycles_active.avg.pct_of_peak_sustained_elapsed"),
             "{:.1f}",
+        ),
+        (
+            "lrc2xbar stalled / active",
+            share("lrc__lrc2xbar_cycles_stalled.sum", "lrc__lrc2xbar_cycles_active.sum"),
+            "{:.3f}",
         ),
         (
             "SYSLTS peer writes [S]",
@@ -145,12 +172,20 @@ def build_lines(shard_bytes: float) -> list[tuple[str, Callable[[Row], float | N
         ("tx wire [S]", shards(PM + "nvltx__bytes.sum"), "{:.3f}"),
         ("rx wire [S]", shards(PM + "nvlrx__bytes.sum"), "{:.3f}"),
         ("tx % of peak (kernel avg)", get(PM + "nvltx__bytes.avg.pct_of_peak_sustained_elapsed"), "{:.1f}"),
-        ("rx % of peak (kernel avg)", get(PM + "nvlrx__bytes.avg.pct_of_peak_sustained_elapsed"), "{:.1f}"),
+        (
+            "rx % of peak (kernel avg; ~81 = full)",
+            get(PM + "nvlrx__bytes.avg.pct_of_peak_sustained_elapsed"),
+            "{:.1f}",
+        ),
         ("# NVLink (profiler counters, cross-check)", None, ""),
         ("tx wire [S]", shards("nvltx__bytes.sum"), "{:.3f}"),
         ("rx wire [S]", shards("nvlrx__bytes.sum"), "{:.3f}"),
         ("tx cycles active %", get("nvltx__cycles_active.avg.pct_of_peak_sustained_elapsed"), "{:.1f}"),
         ("rx cycles active %", get("nvlrx__cycles_active.avg.pct_of_peak_sustained_elapsed"), "{:.1f}"),
+        ("# Grace (C2C, sysmem)", None, ""),
+        ("C2C tx user [S]", shards(PM + "ctc__tx_bytes_data_user.sum"), "{:.3f}"),
+        ("C2C rx user [S]", shards(PM + "ctc__rx_bytes_data_user.sum"), "{:.3f}"),
+        ("SYSLTS sysmem [S]", shards("syslts__t_sectors_aperture_sysmem.sum", SECTOR_BYTES), "{:.3f}"),
         ("# receiver L2", None, ""),
         ("xbar2lts active %", get("lts__xbar2lts_cycles_active.avg.pct_of_peak_sustained_elapsed"), "{:.1f}"),
         ("L2 writes not from local SMs [S]", l2_writes_from_outside, "{:.3f}"),
@@ -160,6 +195,7 @@ def build_lines(shard_bytes: float) -> list[tuple[str, Callable[[Row], float | N
             "{:.3f}",
         ),
         ("ltcfabric writes [S]", shards("lts__t_sectors_srcunit_ltcfabric_op_write.sum", SECTOR_BYTES), "{:.3f}"),
+        ("ltcfabric reads [S]", shards("lts__t_sectors_srcunit_ltcfabric_op_read.sum", SECTOR_BYTES), "{:.3f}"),
         ("# receiver HBM", None, ""),
         ("dram read active %", get("dram__cycles_active_read.avg.pct_of_peak_sustained_elapsed"), "{:.1f}"),
         ("dram write active %", get("dram__cycles_active_write.avg.pct_of_peak_sustained_elapsed"), "{:.1f}"),

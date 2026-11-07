@@ -71,8 +71,10 @@ bash examples/gb200/ncu-torch-all-gather/bisect_ncu_sections.sh --ag-rs --replay
 bash examples/gb200/ncu-torch-all-gather/run_ncu_torch_all_gather.sh --algo symm --replay-mode app-range \
     --nccl-lib nccl/nccl-2.32.3/build/lib/libnccl.so.2
 
-# 各级反压：发端 l1tex2xbar stalled/active、warp stall、NVLink 字节（PM sampling）、L2 入口、ltcfabric、HBM
+# 各级反压：发端 l1tex2xbar stalled/active、warp stall、NVLink 字节（PM sampling）、L2 入口、ltcfabric、HBM，
+# 以及 GB200 的实际频率、跨 die 读写、到 Grace 的 C2C / sysmem 流量
 # 自动加 --clock-control none，结果在 blocking.txt；多 pass，symm / nvls 必须用 application 或 app-range
+# NVLink rx 的 "% of peak" 以 ncu 的约 1106 GB/s 为分母，打满时约 81%（≈ 894 GB/s），不是 100%
 bash examples/gb200/ncu-torch-all-gather/run_ncu_torch_all_gather.sh --algo symm --size-mib 1024 \
     --replay-mode application --blocking-metrics
 

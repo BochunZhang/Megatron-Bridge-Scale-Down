@@ -191,9 +191,17 @@ nranks=${#gpu_list[@]}
 # --blocking-metrics: every name checked with `ncu --query-metrics-mode suffix --chip gb100`
 # (2026.4). The interface stall counters (*_cycles_stalled) are in no ncu section and cannot be
 # PM-sampled; NVLink bytes are PM-sampled because the profiler path reported 0 on GB200 + NVSwitch
-# (MemoryWorkloadAnalysis_Chart), the profiler counters stay as a cross-check.
+# (MemoryWorkloadAnalysis_Chart), the profiler counters stay as a cross-check. GB200 specifics:
+# clocks are recorded because --clock-control none lets each replay pass (one torchrun each) run
+# at its own frequency under the power cap; a B200 is two dies on the LTC fabric, so local reads
+# can cross it too; C2C (ctc) and sysmem show traffic to Grace, which the data path should not
+# need (#13 saw ~45 MiB C2C tx during the kernel, unexplained).
 blocking_profiler_metrics=(
     gpu__time_duration.sum
+    sm__cycles_elapsed.avg.per_second
+    lts__cycles_elapsed.avg.per_second
+    dram__cycles_elapsed.avg.per_second
+    nvlrx__cycles_elapsed.avg.per_second
     l1tex__m_l1tex2xbar_req_cycles_stalled.sum
     l1tex__m_l1tex2xbar_req_cycles_active.sum
     l1tex__m_l1tex2xbar_write_bytes.sum
@@ -203,10 +211,15 @@ blocking_profiler_metrics=(
     smsp__warps_issue_stalled_long_scoreboard.sum
     smsp__warps_issue_stalled_membar.sum
     smsp__warps_issue_stalled_barrier.sum
+    smsp__warps_issue_stalled_wait.sum
+    smsp__warps_issue_stalled_drain.sum
     sm__average_inst_latency_pipe_lsu_ops_generic_cmd_read.ratio
     sm__average_inst_latency_pipe_lsu_mem_lg_cmd_read.ratio
+    lrc__lrc2xbar_cycles_stalled.sum
+    lrc__lrc2xbar_cycles_active.sum
     syslts__t_sectors_srcnode_gpc_aperture_peer_op_write.sum
     syslts__t_sectors_srcnode_gpc_aperture_peer_op_read.sum
+    syslts__t_sectors_aperture_sysmem.sum
     nvlrx__bytes.sum
     nvltx__bytes.sum
     nvlrx__cycles_active.avg.pct_of_peak_sustained_elapsed
@@ -218,12 +231,14 @@ blocking_profiler_metrics=(
     lts__ltcfabric2lts_cycles_stalled.sum
     lts__ltcfabric2lts_cycles_active.sum
     lts__t_sectors_srcunit_ltcfabric_op_write.sum
+    lts__t_sectors_srcunit_ltcfabric_op_read.sum
     dram__cycles_active_read.avg.pct_of_peak_sustained_elapsed
     dram__cycles_active_write.avg.pct_of_peak_sustained_elapsed
     dram__sectors_read.sum
     dram__sectors_write.sum
 )
 blocking_pm_metrics=(
+    sm__cycles_elapsed.avg.per_second
     nvlrx__bytes_packet_request_data_user.sum
     nvlrx__bytes_packet_response_data_user.sum
     nvltx__bytes_packet_request_data_user.sum
@@ -232,6 +247,8 @@ blocking_pm_metrics=(
     nvltx__bytes.sum
     nvlrx__bytes.avg.pct_of_peak_sustained_elapsed
     nvltx__bytes.avg.pct_of_peak_sustained_elapsed
+    ctc__tx_bytes_data_user.sum
+    ctc__rx_bytes_data_user.sum
     smsp__warps_issue_stalled_lg_throttle.avg.pct_of_peak_sustained_elapsed
     smsp__warps_issue_stalled_long_scoreboard.avg.pct_of_peak_sustained_elapsed
     l1tex__m_l1tex2xbar_req_cycles_active.avg.pct_of_peak_sustained_elapsed
