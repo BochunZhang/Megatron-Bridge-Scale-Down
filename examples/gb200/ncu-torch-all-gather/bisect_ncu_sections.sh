@@ -17,10 +17,11 @@ set -euo pipefail
 
 usage() {
     cat <<'USAGE'
-Profile the NCCL AllGather kernel one ncu section (or group of sections) at a time: run
-run_ncu_torch_all_gather.sh once per item with application replay, put every item's results in
-its own folder, and report which items finish, hang or fail and how many replay passes each one
-needed. By default: every section of --set full, --algo symm, 1 GiB per rank.
+Profile the NCCL AllGather kernel (or an AllGather + ReduceScatter running together) one ncu
+section (or group of sections) at a time: run run_ncu_torch_all_gather.sh once per item, put every
+item's results in its own folder, and report which items finish, hang or fail and how many replay
+passes each one needed. By default: every section of --set full, --algo symm, the all-gather alone,
+1 GiB per rank, application replay. For the concurrent AG + RS use --ag-rs --replay-mode app-range.
 
 With ncu 2026.4, --replay-mode application --set full hangs in pass 39 for nvls and ring, at
 256 MiB and at 1 MiB: all ranks enter the kernel and it never completes. Two explanations are
@@ -31,8 +32,8 @@ told apart here:
 
 Each item of the list is one launcher run:
 
-  run_ncu_torch_all_gather.sh --skip-baseline --replay-mode application --timeout 1800 \
-      --algo <algo> --size-mib <size> --output-dir <dir>/<item> \
+  run_ncu_torch_all_gather.sh --skip-baseline --replay-mode <mode> --timeout 1800 \
+      --algo <algo> [--ag-rs] --size-mib <size> --output-dir <dir>/<item> \
       --section <s1> [--section <s2> ...] <launcher args>
 
 An item is a section identifier, or several joined with "+" (e.g. SourceCounters+InstructionStats)
@@ -44,13 +45,17 @@ Usage:
 
 Options:
   --algo NAME        ring | nvls | symm | p2p (default: symm)
+  --ag-rs            Profile the all-gather and a reduce-scatter running together
+  --replay-mode MODE application | app-range | kernel (default: application); only app-range keeps
+                     the AG and RS of --ag-rs concurrent
   --size-mib N       All-gather output size per rank in MiB (default: 1024)
   --set NAME         Test every section of the ncu set NAME, one at a time (default: full). The
                      members are read from the *.section files in --section-dir.
   --sections LIST    Comma-separated items instead of --set. Sections missing from
                      `ncu --list-sections` are reported as unknown and skipped.
   --section-dir DIR  Section files for --set (default: the sections/ directory next to ncu)
-  --output-dir DIR   (default: results/gb200/ncu-torch-all-gather/<algo>-all-gather-<time>)
+  --output-dir DIR   (default: results/gb200/ncu-torch-all-gather/<algo>-all-gather-<time>,
+                     <algo>-all-gather-reduce-scatter-<time> with --ag-rs)
   --dry-run          Print the launcher commands without running them
   -h, --help
 
@@ -73,6 +78,8 @@ launcher="${script_dir}/run_ncu_torch_all_gather.sh"
 worker="${script_dir}/ncu_torch_all_gather.py"
 
 algo="symm"
+ag_rs=false
+replay_mode="application"
 size_mib=1024
 sections=""
 set_name="full"
@@ -89,6 +96,8 @@ die() {
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --algo) algo="$2"; shift 2 ;;
+        --ag-rs) ag_rs=true; shift ;;
+        --replay-mode) replay_mode="$2"; shift 2 ;;
         --size-mib) size_mib="$2"; shift 2 ;;
         --set) set_name="$2"; sections=""; shift 2 ;;
         --sections) sections="$2"; set_name=""; shift 2 ;;
@@ -102,6 +111,9 @@ while [[ $# -gt 0 ]]; do
 done
 
 [[ "$algo" =~ ^(ring|nvls|symm|p2p)$ ]] || die "--algo must be ring, nvls, symm or p2p"
+case_name=all-gather case_args=()
+$ag_rs && case_name=all-gather-reduce-scatter case_args=(--ag-rs)
+[[ "$replay_mode" =~ ^(application|app-range|kernel)$ ]] || die "--replay-mode must be application, app-range or kernel"
 ncu_home="${repo_root}/NVIDIA-Nsight-Compute-2026.4"
 [[ -d "$ncu_home" ]] && export PATH="${ncu_home}:${PATH}"
 # The launcher's own --ncu decides which ncu lists the sections.
@@ -136,14 +148,14 @@ if [[ -n "$set_name" ]]; then
 fi
 IFS=, read -r -a item_list <<<"$sections"
 (( ${#item_list[@]} > 0 )) || die "--sections is empty"
-output_dir="${output_dir:-${repo_root}/results/gb200/ncu-torch-all-gather/${algo}-all-gather-$(date +%Y%m%d-%H%M%S)}"
+output_dir="${output_dir:-${repo_root}/results/gb200/ncu-torch-all-gather/${algo}-${case_name}-$(date +%Y%m%d-%H%M%S)}"
 
 # item_cmd <item>: the launcher command for one item, in the array "cmd".
 item_cmd() {
     local s
     cmd=(
-        bash "$launcher" --skip-baseline --replay-mode application --timeout 1800
-        --algo "$algo" --size-mib "$size_mib" --output-dir "${output_dir}/$1"
+        bash "$launcher" --skip-baseline --replay-mode "$replay_mode" --timeout 1800
+        --algo "$algo" ${case_args[@]+"${case_args[@]}"} --size-mib "$size_mib" --output-dir "${output_dir}/$1"
     )
     IFS=+ read -r -a parts <<<"$1"
     for s in "${parts[@]}"; do cmd+=(--section "$s"); done

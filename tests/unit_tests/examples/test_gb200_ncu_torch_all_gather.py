@@ -172,7 +172,8 @@ def fake_ncu(tmp_path: Path) -> dict[str, str]:
         done
         [[ -n "$FAKE_NCU_EXT" ]] && echo report >"${report}.${FAKE_NCU_EXT}"
         log="${NCCL_DEBUG_FILE//%h/host}"
-        echo "host:1:1 NCCL INFO ${FAKE_TUNING:-AllGather: 268435456 Bytes -> Algo NVLS proto Simple}" >"${log//%p/1}"
+        IFS='|' read -r -a tuning <<<"${FAKE_TUNING:-AllGather: 268435456 Bytes -> Algo NVLS proto Simple}"
+        for t in "${tuning[@]}"; do echo "host:1:1 NCCL INFO $t"; done >"${log//%p/1}"
     """)
     )
     uv = tools / "uv"
@@ -317,3 +318,117 @@ def test_launcher_prefers_the_repo_nsight_compute_2026_4(fake_ncu: dict[str, str
     )
     assert result.returncode == 0, result.stdout + result.stderr
     assert f"ncu: {ncu_home / 'ncu'} (2026.4)" in result.stdout
+
+
+AG_STMC = "AllGather [Symmetric]: 268435456 Bytes -> Kernel AllGather_STMC nchannels 6"
+RS_LDMC = "ReduceScatter [Symmetric]: 268435456 Bytes -> Kernel ReduceScatter_LDMC nchannels 6"
+
+
+def _overlap_env(fake_ncu: dict[str, str], runtime: str, lines: list[str]) -> dict[str, str]:
+    return {**fake_ncu, "FAKE_NCU_EXT": "ncu-repz", "FAKE_NCCL_RUNTIME": runtime, "FAKE_TUNING": "|".join(lines)}
+
+
+def _ncu_args(fake_ncu: dict[str, str]) -> list[str]:
+    return shlex.split(Path(fake_ncu["FAKE_NCU_ARGS"]).read_text())
+
+
+@pytest.mark.parametrize(
+    ("runtime", "sym_kernel"),
+    [("2.29.7", None), ("2.32.3", "AllGather:AllGather_STMC;ReduceScatter:ReduceScatter_LDMC")],
+)
+def test_ag_rs_app_range_runs_the_overlap_worker_and_pins_what_nccl_allows(
+    fake_ncu: dict[str, str], tmp_path: Path, runtime: str, sym_kernel: str | None
+):
+    out = tmp_path / "out"
+    # --warmup 1 --iters 1: two launches of each op per run.
+    env = _overlap_env(fake_ncu, runtime, [AG_STMC, AG_STMC, RS_LDMC, RS_LDMC])
+    result = _launch(out, env, "--algo", "symm", "--ag-rs", "--warmup", "1", "--replay-mode", "app-range")
+    assert result.returncode == 0, result.stdout + result.stderr
+    config = (out / "config.txt").read_text().splitlines()
+    pinned = [line for line in config if line.startswith("NCCL_SYM_KERNEL=")]
+    assert pinned == ([f"NCCL_SYM_KERNEL={sym_kernel}"] if sym_kernel else [])
+    args = _ncu_args(fake_ncu)
+    assert args[args.index("--replay-mode") + 1] == "app-range"
+    assert args[args.index("--nvtx-include") + 1] == "ncu_collectives/"
+    assert args[args.index("--launch-count") + 1] == "1" and "--kernel-name" not in args
+    worker = args.index(str(SCRIPT_DIR / "ncu_torch_ag_rs_overlap.py"))
+    assert args[worker + 1 : worker + 3] == ["--algo", "symm"]
+    assert (out / "ag_rs.ncu-repz").is_file()
+    assert "2/2 AllGather launches" in result.stdout and "2/2 ReduceScatter launches" in result.stdout
+
+
+def test_ag_rs_kernel_replay_selects_both_kernels(fake_ncu: dict[str, str], tmp_path: Path):
+    env = _overlap_env(fake_ncu, "2.32.3", [AG_STMC, AG_STMC, RS_LDMC, RS_LDMC])
+    result = _launch(tmp_path / "out", env, "--algo", "symm", "--ag-rs", "--warmup", "1")
+    assert result.returncode == 0, result.stdout + result.stderr
+    args = _ncu_args(fake_ncu)
+    assert args[args.index("--kernel-name") + 1] == "regex:^nccl(Symk)?DevKernel_(AllGather|ReduceScatter)"
+    assert args[args.index("--launch-count") + 1] == "2"
+
+
+@pytest.mark.parametrize(
+    ("algo", "runtime", "sym_kernel", "lines"),
+    [
+        (
+            "p2p",
+            "2.32.3",
+            "AllGather:AllGather_ST;ReduceScatter:ReduceScatter_LD",
+            [AG_STMC.replace("STMC", "ST")] * 2 + [RS_LDMC.replace("LDMC", "LD")] * 2,
+        ),
+        (
+            "nvls",
+            "2.29.7",
+            None,
+            ["AllGather: 268435456 Bytes -> Algo NVLS proto Simple"] * 2
+            + ["ReduceScatter: 268435456 Bytes -> Algo NVLS proto Simple"] * 2,
+        ),
+    ],
+)
+def test_reduce_scatter_setups(
+    fake_ncu: dict[str, str],
+    tmp_path: Path,
+    algo: str,
+    runtime: str,
+    sym_kernel: str | None,
+    lines: list[str],
+):
+    out = tmp_path / "out"
+    result = _launch(out, _overlap_env(fake_ncu, runtime, lines), "--algo", algo, "--ag-rs", "--warmup", "1")
+    assert result.returncode == 0, result.stdout + result.stderr
+    config = (out / "config.txt").read_text().splitlines()
+    assert [line for line in config if line.startswith("NCCL_SYM_KERNEL=")] == (
+        [f"NCCL_SYM_KERNEL={sym_kernel}"] if sym_kernel else []
+    )
+
+
+def test_ag_rs_fails_when_nccl_picks_another_reduce_scatter_kernel(fake_ncu: dict[str, str], tmp_path: Path):
+    # NCCL 2.29 leaves NCCL_SYM_KERNEL unset for ag+rs, so its own choice must be checked.
+    rs_ld = RS_LDMC.replace("LDMC", "LD")
+    env = _overlap_env(fake_ncu, "2.29.7", [AG_STMC, AG_STMC, rs_ld, rs_ld])
+    result = _launch(tmp_path / "out", env, "--algo", "symm", "--ag-rs", "--warmup", "1")
+    assert result.returncode != 0
+    assert "NCCL did not run --algo symm for every ReduceScatter" in result.stderr
+
+
+def test_ag_rs_needs_a_warmup_launch(fake_ncu: dict[str, str], tmp_path: Path):
+    result = _launch(tmp_path / "out", fake_ncu, "--ag-rs")
+    assert result.returncode != 0
+    assert "--ag-rs needs --warmup >= 1" in result.stderr
+
+
+def test_bisect_passes_ag_rs_and_replay_mode_and_names_the_output_after_them(tmp_path: Path):
+    result = _run(
+        BISECT,
+        "--dry-run",
+        "--sections",
+        "PmSampling",
+        "--ag-rs",
+        "--replay-mode",
+        "app-range",
+    )
+    assert result.returncode == 0, result.stderr
+    (command,) = [shlex.split(line) for line in result.stdout.splitlines()]
+    assert "--ag-rs" in command
+    assert command[command.index("--replay-mode") + 1] == "app-range"
+    out = Path(command[command.index("--output-dir") + 1])
+    assert out.parent.name.startswith("symm-all-gather-reduce-scatter-") and out.name == "PmSampling"

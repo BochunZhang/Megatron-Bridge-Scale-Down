@@ -17,7 +17,8 @@ set -euo pipefail
 
 usage() {
     cat <<'USAGE'
-Profile the NCCL kernel of a torch all-gather with Nsight Compute >= 2026.4 on one node.
+Profile the NCCL kernel of a torch all-gather with Nsight Compute >= 2026.4 on one node, or an
+all-gather and a reduce-scatter running at the same time (--ag-rs, meant for app-range replay).
 
 ncu: <repo>/NVIDIA-Nsight-Compute-2026.4 is put first in PATH when it exists; --ncu overrides.
 2026.4 is the first version with application replay under the shmem communicator.
@@ -28,7 +29,7 @@ The shmem communicator sees every rank in its process tree and launches / replay
 kernel on all of them together; without it the first NCCL kernel waits forever for its peers.
 torchrun itself is excluded from profiling by ncu.
 
-Algorithms (--algo), each checked against NCCL's TUNING log for every all-gather launch:
+Algorithms (--algo), each checked against NCCL's TUNING log for every launch of every op:
   ring   ring all-gather                   NCCL_ALGO=Ring, plain buffers
   nvls   NVLS multicast all-gather         NCCL_ALGO=NVLS, plain buffers
   symm   symmetric kernel, multicast       AllGather_STMC on registered symmetric windows
@@ -41,6 +42,17 @@ without multicast mappings. symm and p2p pin the kernel with NCCL_SYM_KERNEL, wh
 depends on the NCCL that torch loads (probed once): "AllGather_ST" before 2.32,
 "AllGather:AllGather_ST" from 2.32 on.
 
+Two cases: the all-gather alone (ncu_torch_all_gather.py, the default), or with --ag-rs an
+all-gather and a reduce-scatter launched together on two CUDA streams (ncu_torch_ag_rs_overlap.py,
+one NCCL communicator each). The reduce-scatter runs
+  ring / nvls   the same NCCL_ALGO               kernel ncclDevKernel_ReduceScatter_*
+  symm          ReduceScatter_LDMC (multicast)   kernel ncclSymkDevKernel_ReduceScatter_LDMC
+  p2p           ReduceScatter_LD (unicast)       kernel ncclSymkDevKernel_ReduceScatter_LD
+Before NCCL 2.32, NCCL_SYM_KERNEL holds one kernel name, so with --ag-rs on symm / p2p it stays unset
+and NCCL's own choice is checked against the kernels above; from 2.32 both are pinned
+("AllGather:<k>;ReduceScatter:<k>"). Only app-range replay keeps the two kernels concurrent:
+kernel and application replay profile one kernel at a time and serialize it.
+
 Multicast memory and kernel replay: a kernel replay of more than one pass first saves all memory
 the kernel can reach. With nvls (NCCL's NVLS buffers) and symm (the registered windows) that
 includes multicast-mapped memory, and ncu 2026.3 fails there with "Failed to save memory for
@@ -50,9 +62,11 @@ replay" (ContextSaveFailed). Ways around it:
   --replay-mode application|app-range
                                  no memory is saved; with --communicator shmem needs ncu >= 2026.4
 
-What is profiled: the worker runs --warmup all-gathers, then --iters all-gathers inside the NVTX
-range "ncu_all_gather". ncu selects with --nvtx --nvtx-include "ncu_all_gather/" and
-  kernel / application replay   -k regex:^nccl(Symk)?DevKernel_AllGather, --launch-count <iters>
+What is profiled: the worker runs --warmup launches, then --iters launches inside an NVTX range
+("ncu_all_gather"; with --ag-rs "ncu_collectives", each launch one AG + one RS). ncu selects with
+--nvtx-include and
+  kernel / application replay   -k regex:^nccl(Symk)?DevKernel_AllGather (with --ag-rs
+                                ..._(AllGather|ReduceScatter)), --launch-count <iters> (x 2)
   app-range replay              the NVTX range itself (one result per rank), --launch-count 1
 
 Two passes:
@@ -65,7 +79,8 @@ Usage:
 Options:
   --gpus LIST            CUDA_VISIBLE_DEVICES, one rank per GPU (default: 0,1,2,3)
   --algo NAME            ring | nvls | symm | p2p (default: nvls)
-  --size-mib N           All-gather output size per rank in MiB (default: 256)
+  --ag-rs                Run the all-gather and a reduce-scatter together (needs --warmup >= 1)
+  --size-mib N           All-gather output (= reduce-scatter input) size per rank in MiB (default: 256)
   --dtype NAME           bf16 | fp32 (default: bf16)
   --warmup N             All-gathers before the NVTX range (default: 5)
   --iters N              All-gathers inside the NVTX range (default: 1)
@@ -84,13 +99,14 @@ Options:
   --timeout SEC          Kill a pass after SEC seconds and report a hang (default: 1800)
   --ncu PATH             ncu binary (default: ncu in PATH, NVIDIA-Nsight-Compute-2026.4 first)
   --nccl-lib PATH        LD_PRELOAD this libnccl.so.2 instead of the one bundled with torch
-  --output-dir DIR       (default: results/gb200/ncu-torch-all-gather/<algo>-all-gather-<time>)
+  --output-dir DIR       (default: results/gb200/ncu-torch-all-gather/<algo>-all-gather-<time>,
+                         <algo>-all-gather-reduce-scatter-<time> with --ag-rs)
   --skip-baseline        Only run the ncu pass
   -h, --help
 
 Outputs in --output-dir: config.txt, baseline.log, ncu.log, nccl-logs/<pass>/*.log, the ncu
-report all_gather.ncu-rep or all_gather.ncu-repz (ncu 2026.4) and summary.csv (one row per
-profiled result).
+report <name>.ncu-rep or <name>.ncu-repz (ncu 2026.4; <name> all_gather, or ag_rs with --ag-rs)
+and summary.csv (one row per profiled result).
 USAGE
 }
 
@@ -99,6 +115,7 @@ repo_root="$(cd -- "${script_dir}/../../.." && pwd)"
 
 gpus="0,1,2,3"
 algo="nvls"
+ag_rs=false
 size_mib=256
 dtype="bf16"
 warmup=5
@@ -124,6 +141,7 @@ while [[ $# -gt 0 ]]; do
     case "$1" in
         --gpus) gpus="$2"; shift 2 ;;
         --algo) algo="$2"; shift 2 ;;
+        --ag-rs) ag_rs=true; shift ;;
         --size-mib) size_mib="$2"; shift 2 ;;
         --dtype) dtype="$2"; shift 2 ;;
         --warmup) warmup="$2"; shift 2 ;;
@@ -149,10 +167,18 @@ done
 [[ "$communicator" =~ ^(shmem|none)$ ]] || die "--communicator must be shmem or none"
 [[ "$replay_mode" =~ ^(kernel|application|app-range)$ ]] || die "--replay-mode must be kernel, application or app-range"
 (( iters >= 1 )) || die "--iters must be at least 1"
+if $ag_rs; then
+    # The overlap worker connects each communicator in the first warmup launch, serially.
+    (( warmup >= 1 )) || die "--ag-rs needs --warmup >= 1"
+    op_funcs=(AllGather ReduceScatter) case_name=all-gather-reduce-scatter report_name=ag_rs nvtx_range=ncu_collectives
+else
+    op_funcs=(AllGather) case_name=all-gather report_name=all_gather nvtx_range=ncu_all_gather
+fi
+nops=${#op_funcs[@]}
 IFS=, read -r -a gpu_list <<<"$gpus"
 nranks=${#gpu_list[@]}
 (( nranks >= 2 )) || die "--gpus needs at least two GPUs"
-output_dir="${output_dir:-${repo_root}/results/gb200/ncu-torch-all-gather/${algo}-all-gather-$(date +%Y%m%d-%H%M%S)}"
+output_dir="${output_dir:-${repo_root}/results/gb200/ncu-torch-all-gather/${algo}-${case_name}-$(date +%Y%m%d-%H%M%S)}"
 
 ################################################################################
 # Preflight
@@ -186,8 +212,10 @@ unset NCCL_ALGO NCCL_PROTO NCCL_CTA_POLICY NCCL_SYM_KERNEL NCCL_SYM_CTAS NCCL_SY
     NCCL_CE_COLL_AG_MULTICAST_THRESHOLD NCCL_WIN_ENABLE NCCL_NVTX_DISABLE
 [[ -n "$nccl_lib" ]] && export LD_PRELOAD="${nccl_lib}${LD_PRELOAD:+:${LD_PRELOAD}}"
 
-# sym_kernel <name>: NCCL_SYM_KERNEL for one AllGather kernel in the NCCL torch loads. Before 2.32
-# NCCL compares the whole value with a kernel name; from 2.32 it parses "<func>:<kernel>".
+# sym_kernel <func>:<kernel>...: NCCL_SYM_KERNEL for these kernels in the NCCL torch loads. From
+# 2.32 NCCL parses "<func>:<kernel>;<func>:<kernel>" (parseList in tuning/cost_model.cc); before,
+# it compares the whole value with one kernel name, so two functions cannot both be pinned and the
+# output is empty (unset): pinning one kernel would leave the other function no symmetric kernel.
 sym_kernel() {
     local version major minor
     version="$(cd "$repo_root" && uv run --no-sync python -c \
@@ -196,37 +224,46 @@ sym_kernel() {
     IFS=. read -r major minor _ <<<"$version"
     echo "runtime NCCL ${version}" >&2
     if (( major > 2 || (major == 2 && minor >= 32) )); then
-        echo "AllGather:$1"
+        (IFS=';'; echo "$*")
+    elif (( $# == 1 )); then
+        echo "${1#*:}"
     else
-        echo "$1"
+        echo "NCCL ${version} takes one NCCL_SYM_KERNEL name; leaving it unset for $*" >&2
     fi
 }
 
+# tuning_re_<func>: what every TUNING line of that function must match (no associative arrays:
+# the unit tests run this under macOS's bash 3.2).
 case "$algo" in
-    ring)
-        export NCCL_ALGO=Ring
-        tuning_re='AllGather: [0-9]+ Bytes -> Algo Ring '
-        ;;
-    nvls)
-        export NCCL_ALGO=NVLS NCCL_NVLS_ENABLE=1
-        tuning_re='AllGather: [0-9]+ Bytes -> Algo NVLS '
+    ring|nvls)
+        if [[ "$algo" == ring ]]; then
+            export NCCL_ALGO=Ring
+        else
+            export NCCL_ALGO=NVLS NCCL_NVLS_ENABLE=1
+        fi
+        for f in "${op_funcs[@]}"; do printf -v "tuning_re_${f}" '%s' "${f}: [0-9]+ Bytes -> Algo ${NCCL_ALGO} "; done
         ;;
     symm|p2p)
         # Window registration selects the symmetric kernels, not NCCL_ALGO. NCCL_SYM_KERNEL does
         # not stop large AllGathers going to the copy engines on Blackwell (enqueue.cc); only an
-        # INT64_MAX NCCL_SYM_CE_THRESHOLD does. p2p turns NVLS off: AllGather_ST stores through
-        # peer pointers and the communicator then has no multicast mappings at all.
+        # INT64_MAX NCCL_SYM_CE_THRESHOLD does. p2p turns NVLS off: AllGather_ST / ReduceScatter_LD
+        # go through peer pointers and the communicator then has no multicast mappings at all.
         if [[ "$algo" == symm ]]; then
-            kernel=AllGather_STMC
+            kernel_AllGather=AllGather_STMC kernel_ReduceScatter=ReduceScatter_LDMC
             export NCCL_NVLS_ENABLE=1
         else
-            kernel=AllGather_ST
+            kernel_AllGather=AllGather_ST kernel_ReduceScatter=ReduceScatter_LD
             export NCCL_NVLS_ENABLE=0
         fi
         export NCCL_WIN_ENABLE=1 NCCL_SYM_CE_THRESHOLD=9223372036854775807
-        NCCL_SYM_KERNEL="$(sym_kernel "$kernel")" || exit 1
-        export NCCL_SYM_KERNEL
-        tuning_re="AllGather \\[Symmetric\\]: [0-9]+ Bytes -> Kernel ${kernel} "
+        pins=()
+        for f in "${op_funcs[@]}"; do
+            k="kernel_${f}"
+            pins+=("${f}:${!k}")
+            printf -v "tuning_re_${f}" '%s' "${f} \\[Symmetric\\]: [0-9]+ Bytes -> Kernel ${!k} "
+        done
+        NCCL_SYM_KERNEL="$(sym_kernel "${pins[@]}")" || exit 1
+        if [[ -n "$NCCL_SYM_KERNEL" ]]; then export NCCL_SYM_KERNEL; else unset NCCL_SYM_KERNEL; fi
         ;;
 esac
 export CUDA_VISIBLE_DEVICES="$gpus"
@@ -234,15 +271,17 @@ export NCCL_DEBUG=INFO
 export NCCL_DEBUG_SUBSYS=INIT,ENV,TUNING
 
 # --standalone picks a free rendezvous port, so application replay can relaunch torchrun at once.
-torchrun_cmd=(
-    uv run --no-sync python -m torch.distributed.run --standalone --nproc_per_node "$nranks"
-    "${script_dir}/ncu_torch_all_gather.py"
-    --algo "$algo" --size-mib "$size_mib" --dtype "$dtype" --warmup "$warmup" --iters "$iters"
-)
+torchrun_cmd=(uv run --no-sync python -m torch.distributed.run --standalone --nproc_per_node "$nranks")
+if $ag_rs; then
+    torchrun_cmd+=("${script_dir}/ncu_torch_ag_rs_overlap.py")
+else
+    torchrun_cmd+=("${script_dir}/ncu_torch_all_gather.py")
+fi
+torchrun_cmd+=(--algo "$algo" --size-mib "$size_mib" --dtype "$dtype" --warmup "$warmup" --iters "$iters")
 
 {
     echo "ncu=$(command -v "$ncu_bin") ${ncu_version}"
-    echo "gpus=${gpus} algo=${algo} size_mib=${size_mib} dtype=${dtype} warmup=${warmup} iters=${iters}"
+    echo "gpus=${gpus} algo=${algo} ag_rs=${ag_rs} size_mib=${size_mib} dtype=${dtype} warmup=${warmup} iters=${iters}"
     echo "communicator=${communicator} set=${ncu_set} sections=${sections[*]:-<from --set>} metrics=${metrics:-<from --set>} replay=${replay_mode} extra_ncu_args=${extra_ncu_args[*]:-}"
     echo "nccl_lib=${nccl_lib:-<bundled with torch>}"
     env | grep -E '^(NCCL_|CUDA_VISIBLE_DEVICES=|LD_PRELOAD=)' | sort
@@ -250,22 +289,27 @@ torchrun_cmd=(
 cat "${output_dir}/config.txt"
 cd "$repo_root"
 
-# Every AllGather in the TUNING log of the pass must match tuning_re, warmup + iters per run.
-# NCCL prints the line on comm rank 0 only, one log per process; application and app-range replay
-# start torchrun again for every ncu pass, so <runs> is the number of logs that contain one.
+# For every op, each of its TUNING lines in the pass must match tuning_re_<func>, warmup + iters
+# per run. NCCL prints the line on comm rank 0 only, one log per process; application and app-range
+# replay start torchrun again for every ncu pass, so <runs> is the number of logs that contain one.
 check_tuning() {
-    local pass="$1" expected=$(( warmup + iters )) logs ag ok total runs
+    local pass="$1" expected=$(( warmup + iters )) logs f any re lines ok total runs
     logs=("${output_dir}/nccl-logs/${pass}"/*.log)
-    ag="$(cat "${logs[@]}" | grep -E 'NCCL INFO AllGather( \[[^]]*\])?: [0-9]+ Bytes -> ' || true)"
-    ok="$(grep -cE "$tuning_re" <<<"$ag" || true)"
-    total="$(grep -c . <<<"$ag" || true)"
-    runs="$(grep -lE 'NCCL INFO AllGather( \[[^]]*\])?: [0-9]+ Bytes -> ' "${logs[@]}" | wc -l | tr -d ' ')"
-    if (( runs == 0 || total != ok || total != runs * expected )); then
-        echo "${pass}: expected ${expected} launches matching /${tuning_re}/ per run (${runs} run(s)), got:" >&2
-        sort <<<"$ag" | sed 's/.*NCCL INFO //; s/ Bytes -> \(\S* \S*\).*/ Bytes -> \1/' | uniq -c >&2
-        die "${pass}: NCCL did not run --algo ${algo} for every all-gather; logs in ${output_dir}/nccl-logs/${pass}"
-    fi
-    echo "${pass}: ${ok}/${total} AllGather launches match --algo ${algo} (${runs} run(s) x ${expected})"
+    for f in "${op_funcs[@]}"; do
+        any="NCCL INFO ${f}( \\[[^]]*\\])?: [0-9]+ Bytes -> "
+        re="tuning_re_${f}"
+        re="${!re}"
+        lines="$(cat "${logs[@]}" | grep -E "$any" || true)"
+        ok="$(grep -cE "$re" <<<"$lines" || true)"
+        total="$(grep -c . <<<"$lines" || true)"
+        runs="$(grep -lE "$any" "${logs[@]}" | wc -l | tr -d ' ')"
+        if (( runs == 0 || total != ok || total != runs * expected )); then
+            echo "${pass}: expected ${expected} ${f} launches matching /${re}/ per run (${runs} run(s)), got:" >&2
+            sort <<<"$lines" | sed 's/.*NCCL INFO //; s/ Bytes -> \(\S* \S*\).*/ Bytes -> \1/' | uniq -c >&2
+            die "${pass}: NCCL did not run --algo ${algo} for every ${f}; logs in ${output_dir}/nccl-logs/${pass}"
+        fi
+        echo "${pass}: ${ok}/${total} ${f} launches match --algo ${algo} (${runs} run(s) x ${expected})"
+    done
 }
 
 # run_pass <name> <cmd...>
@@ -312,21 +356,22 @@ fi
 ################################################################################
 # 2. ncu
 
-# The worker's NVTX range holds exactly the --iters all-gathers. The kernel name filter keeps the
-# warmup and any non-NCCL kernel out even if a future torch launches one inside the range.
-select_args=(--nvtx --nvtx-include "ncu_all_gather/")
+# The worker's NVTX range holds exactly the --iters launches. The kernel name filter keeps
+# the warmup and any non-NCCL kernel out even if a future torch launches one inside the range.
+select_args=(--nvtx --nvtx-include "${nvtx_range}/")
 if [[ "$replay_mode" == app-range ]]; then
     select_args+=(--launch-count 1)
     summary_metrics="gpu__time_duration.sum"
     expected_profiled=$nranks
 else
-    select_args+=(--kernel-name "regex:^nccl(Symk)?DevKernel_AllGather" --launch-count "$iters")
+    kernel_re="$(IFS='|'; echo "${op_funcs[*]}")"
+    select_args+=(--kernel-name "regex:^nccl(Symk)?DevKernel_(${kernel_re})" --launch-count $(( iters * nops )))
     summary_metrics="launch__grid_size,launch__block_size,gpu__time_duration.sum,dram__throughput.avg.pct_of_peak_sustained_elapsed"
-    expected_profiled=$(( nranks * iters ))
+    expected_profiled=$(( nranks * iters * nops ))
 fi
 comm_args=(--communicator none)
 [[ "$communicator" == shmem ]] && comm_args=(--communicator shmem --communicator-shmem-num-peers "$nranks")
-report="${output_dir}/all_gather"
+report="${output_dir}/${report_name}"
 collect_args=(--set "$ncu_set")
 if (( ${#sections[@]} > 0 )); then
     # ncu collects the metrics of every --section plus the --metrics list.

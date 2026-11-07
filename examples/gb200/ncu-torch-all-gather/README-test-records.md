@@ -80,7 +80,7 @@ nccl-tests 的测试用 `../nccl-tests/run_ncu_all_gather_stmc.sh`（见 [../ncc
 | 组合 | 预期（都未验证） | 用途 |
 | --- | --- | --- |
 | 2026.4 + kernel replay，多遍 | nvls / symm 可能仍在保存显存时失败；ring（关 NVLS）、p2p 没有 multicast 内存，可能可以 | 比 application replay 快得多 |
-| 2026.4 + **app-range** | 不保存显存、不串行化，理论上可以 | AG 与 RS **重叠**测试；需确认 PmSampling、SourceCounters 在 range 下是否可用 |
+| 2026.4 + **app-range** | 不保存显存、不串行化，理论上可以 | AG 与 RS **重叠**测试（`--ag-rs --replay-mode app-range`，脚本已就绪，未在 GPU 上跑过）；需确认 PmSampling、SourceCounters 在 range 下是否可用 |
 | 2026.4 + range | 预计失败：要保存显存，文档写着不支持 VMM、peer 访问；启动器目前也不接受 `range` | — |
 | **p2p**（`ncclSymkDevKernel_AllGather_ST`） | 任何 replay 模式都没跑过 | 和 symm 对照：不经 multicast，每卡只收 3 份 |
 | 4 个 rank 的结果 | 现在每份报告只有 primary 进程（rank 0）的结果 | 看各 rank 是否一致 |

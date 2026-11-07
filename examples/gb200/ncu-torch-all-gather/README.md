@@ -18,7 +18,8 @@ ncu --communicator shmem --communicator-shmem-num-peers 2 -f -o report -k regex:
 | 文件 | 作用 |
 | --- | --- |
 | `ncu_torch_all_gather.py` | torchrun worker：warmup，再在 NVTX range `ncu_all_gather` 里跑 `--iters` 次 all-gather，前后都校验数据 |
-| `run_ncu_torch_all_gather.sh` | 单节点启动器：baseline（不挂 ncu）+ ncu 两遍 |
+| `ncu_torch_ag_rs_overlap.py` | `--ag-rs` 用的 worker，只跑 AG + RS：两者各一个 NCCL communicator 和一条 CUDA stream，同时 launch（并发写法参照 `../nvls-collective/nvls_collective_benchmark.py`），NVTX range 为 `ncu_collectives`，前后校验两者的结果，并用 CUDA event 打出每次迭代 AG 和 RS 的重叠时间 |
+| `run_ncu_torch_all_gather.sh` | 单节点启动器：baseline（不挂 ncu）+ ncu 两遍；默认跑 all-gather，`--ag-rs` 跑 AG + RS 同时执行 |
 | `bisect_ncu_sections.sh` | 逐个 section 跑启动器（application replay），找出让 kernel 卡死的 section，见下文「实测：application replay + `--set full` 卡在 pass 39」 |
 | `README-test-records.md` | 各种 ncu 版本 / replay 模式 / 算法组合的成功和失败记录，以及四种 replay 模式的区别 |
 
@@ -58,6 +59,12 @@ bash examples/gb200/ncu-torch-all-gather/run_ncu_torch_all_gather.sh --replay-mo
 # 默认：symm、1 GiB、--set full 的每个 section 单独跑，结果在 results/gb200/ncu-torch-all-gather/symm-all-gather-<时间>/<section>/
 bash examples/gb200/ncu-torch-all-gather/bisect_ncu_sections.sh
 bash examples/gb200/ncu-torch-all-gather/bisect_ncu_sections.sh --algo p2p --size-mib 256
+
+# AG 和 RS 同时执行，用 app-range replay 采（只有 range / app-range 不把两个 kernel 串行化）
+bash examples/gb200/ncu-torch-all-gather/run_ncu_torch_all_gather.sh --algo symm --ag-rs \
+    --replay-mode app-range --size-mib 1024 --section SpeedOfLight
+# 按 section 拆开采 AG + RS 重叠
+bash examples/gb200/ncu-torch-all-gather/bisect_ncu_sections.sh --ag-rs --replay-mode app-range
 
 # symmetric AllGather_STMC / AllGather_ST，换成 2.32.3 的 NCCL
 bash examples/gb200/ncu-torch-all-gather/run_ncu_torch_all_gather.sh --algo symm --replay-mode app-range \
@@ -195,3 +202,17 @@ PM sampling / warp state sampling 的 pass 数是动态决定的，这两类很�
 - 文档提到，shmem 模式下 `--communicator-shmem-num-peers` 不是必填，但建议填。不填时，如果各 rank 没有
   同时到达同一个 kernel，ncu 可能在参与者没到齐的情况下就开始 profile。
 - 默认只 profile 每组的第一个 CUDA context；需要选 GPU 时，用 `-- --devices ...` 透传给 ncu。
+
+## AG + RS 同时执行（`--ag-rs`）
+
+- RS 用的实现：ring / nvls 和 AG 一样由 `NCCL_ALGO` 决定；symm 是 `ReduceScatter_LDMC`（multicast load-reduce），
+  p2p 是 `ReduceScatter_LD`。TUNING 检查对 AllGather 和 ReduceScatter 分别逐条核对。
+- NCCL 2.29.7 的 `NCCL_SYM_KERNEL` 只能写一个 kernel 名，固定了 AG 的 kernel 会让 RS 没有 symmetric kernel 可用，
+  所以 symm / p2p 的 `--ag-rs` 在 2.29.7 上不设它，由 NCCL 自己选，再由 TUNING 检查确认选的是上面那两个；
+  2.32 起写成 `AllGather:<k>;ReduceScatter:<k>` 两个都固定。
+- 第一次 AG 和 RS 串行执行（中间同步），先把两个 communicator 的 channel 连好：一个 communicator 在建连接时，
+  另一个的 kernel 正在等对端，可能卡死。所以 `--ag-rs` 要求 `--warmup >= 1`；`--warmup N` 是 1 次串行加
+  N−1 次 AG + RS 并发。
+- 只有 **app-range** replay 能看到重叠：kernel / application replay 一次只 profile 一个 kernel，并把它串行化。
+  app-range 的 metric 属于整个 NVTX range（AG + RS 合在一起），分不出 AG 和 RS 各自的部分。
+- `baseline.log` 里有每次迭代 AG 和 RS 的起止时间和重叠时长（CUDA event，以最早的 start 为 0），用来确认确实重叠了。
