@@ -18,16 +18,25 @@ set -euo pipefail
 usage() {
     cat <<'USAGE'
 Profile the NCCL kernel of a torch all-gather with Nsight Compute >= 2026.4 on one node, or an
-all-gather and a reduce-scatter running at the same time (--ag-rs, meant for app-range replay).
+all-gather and a reduce-scatter running at the same time (--ag-rs, meant for a range replay).
 
 ncu: <repo>/NVIDIA-Nsight-Compute-2026.4 is put first in PATH when it exists; --ncu overrides.
 2026.4 is the first version with application replay under the shmem communicator.
 
-One ncu wraps torchrun (the NVIDIA docs' pattern):
+--communicator shmem (default): one ncu wraps torchrun (the NVIDIA docs' pattern):
   ncu --communicator shmem --communicator-shmem-num-peers <n> ... torchrun --nproc_per_node=<n> ncu_torch_all_gather.py
 The shmem communicator sees every rank in its process tree and launches / replays each selected
 kernel on all of them together; without it the first NCCL kernel waits forever for its peers.
-torchrun itself is excluded from profiling by ncu.
+torchrun itself is excluded from profiling by ncu. The 2026.4 CLI docs say shmem "only supports
+kernel and range replay modes"; the 2026.4 release notes add application replay. app-range is in
+neither, and shmem + app-range fails at the range's start ("Failed to profile "range"").
+
+--communicator tcp: one ncu per rank (ncu_tcp_ranks.sh), the docs' MPI pattern, without torchrun
+(whose agent store would outlive the relaunches of application / app-range replay):
+  RANK=<r> ... ncu --communicator tcp --communicator-tcp-num-peers <n> --lockstep-kernel-launch \
+      --lockstep-nvtx-include <range>/ ... -o <report>-rank<r> python ncu_torch_all_gather.py
+Each rank is a process tree of its own, so ncu writes one report per rank. --no-lockstep drops
+the two --lockstep-* options.
 
 Algorithms (--algo), each checked against NCCL's TUNING log for every launch of every op:
   ring   ring all-gather                   NCCL_ALGO=Ring, plain buffers
@@ -50,8 +59,8 @@ one NCCL communicator each). The reduce-scatter runs
   p2p           ReduceScatter_LD (unicast)       kernel ncclSymkDevKernel_ReduceScatter_LD
 Before NCCL 2.32, NCCL_SYM_KERNEL holds one kernel name, so with --ag-rs on symm / p2p it stays unset
 and NCCL's own choice is checked against the kernels above; from 2.32 both are pinned
-("AllGather:<k>;ReduceScatter:<k>"). Only app-range replay keeps the two kernels concurrent:
-kernel and application replay profile one kernel at a time and serialize it.
+("AllGather:<k>;ReduceScatter:<k>"). Only range and app-range replay keep the two kernels
+concurrent: kernel and application replay profile one kernel at a time and serialize it.
 
 Multicast memory and kernel replay: a kernel replay of more than one pass first saves all memory
 the kernel can reach. With nvls (NCCL's NVLS buffers) and symm (the registered windows) that
@@ -61,13 +70,15 @@ replay" (ContextSaveFailed). Ways around it:
                                  kernel replay (ncu.log shows "- 1 pass")
   --replay-mode application|app-range
                                  no memory is saved; with --communicator shmem needs ncu >= 2026.4
+range replay saves and restores memory like kernel replay, and the docs list Virtual Memory
+Management, peer context access and cuLaunchKernelEx as unsupported inside the range.
 
 What is profiled: the worker runs --warmup launches, then --iters launches inside an NVTX range
 ("ncu_all_gather"; with --ag-rs "ncu_collectives", each launch one AG + one RS). ncu selects with
 --nvtx-include and
   kernel / application replay   -k regex:^nccl(Symk)?DevKernel_AllGather (with --ag-rs
                                 ..._(AllGather|ReduceScatter)), --launch-count <iters> (x 2)
-  app-range replay              the NVTX range itself (one result per rank), --launch-count 1
+  range / app-range replay      the NVTX range itself (one result per rank), --launch-count 1
 
 Two passes:
   1. baseline  no ncu: the worker checks the gathered data, the TUNING log the algorithm
@@ -84,7 +95,9 @@ Options:
   --dtype NAME           bf16 | fp32 (default: bf16)
   --warmup N             All-gathers before the NVTX range (default: 5)
   --iters N              All-gathers inside the NVTX range (default: 1)
-  --communicator MODE    shmem | none (default: shmem); none is the hang reproducer
+  --communicator MODE    shmem | tcp | none (default: shmem); none is the hang reproducer
+  --no-lockstep          With --communicator tcp: leave out --lockstep-kernel-launch and
+                         --lockstep-nvtx-include
   --set NAME             ncu --set (default: basic)
   --section NAME         Collect this ncu section instead of --set; repeat for several sections.
                          gpu__time_duration.sum is added for the summary unless --metrics is given
@@ -97,11 +110,12 @@ Options:
                          --metrics (replaces --set), with --clock-control none unless given after
                          "--"; writes blocking.txt (analyse_blocking_metrics.py). Needs several
                          passes, so nvls / symm need --replay-mode application or app-range
-  --replay-mode MODE     kernel | application | app-range (default: kernel)
+  --replay-mode MODE     kernel | application | range | app-range (default: kernel)
                            kernel       saves and restores the memory the kernel can reach when
                                         more than one pass is needed; fails for nvls and symm
                                         (see "Multicast memory and kernel replay" above)
                            application  relaunches the whole torchrun tree once per pass
+                           range        captures the NVTX range and replays it in the process
                            app-range    relaunches once per pass and profiles the NVTX range
   --timeout SEC          Kill a pass after SEC seconds and report a hang (default: 1800)
   --ncu PATH             ncu binary (default: ncu in PATH, NVIDIA-Nsight-Compute-2026.4 first)
@@ -112,8 +126,9 @@ Options:
   -h, --help
 
 Outputs in --output-dir: config.txt, baseline.log, ncu.log, nccl-logs/<pass>/*.log, the ncu
-report <name>.ncu-rep or <name>.ncu-repz (ncu 2026.4; <name> all_gather, or ag_rs with --ag-rs)
-and summary.csv (one row per profiled result); blocking.txt with --blocking-metrics.
+report <name>.ncu-rep or <name>.ncu-repz (ncu 2026.4; <name> all_gather, or ag_rs with --ag-rs;
+<name>-rank<r> for each rank with --communicator tcp, whose ncu.log prefixes every line with
+[rank <r>]) and summary.csv (one row per profiled result); blocking.txt with --blocking-metrics.
 USAGE
 }
 
@@ -128,6 +143,7 @@ dtype="bf16"
 warmup=5
 iters=1
 communicator="shmem"
+lockstep=true
 ncu_set="basic"
 metrics=""
 blocking=false
@@ -155,6 +171,7 @@ while [[ $# -gt 0 ]]; do
         --warmup) warmup="$2"; shift 2 ;;
         --iters) iters="$2"; shift 2 ;;
         --communicator) communicator="$2"; shift 2 ;;
+        --no-lockstep) lockstep=false; shift ;;
         --set) ncu_set="$2"; shift 2 ;;
         --section) sections+=("$2"); shift 2 ;;
         --metrics) metrics="$2"; shift 2 ;;
@@ -173,8 +190,9 @@ done
 
 [[ "$algo" =~ ^(ring|nvls|symm|p2p)$ ]] || die "--algo must be ring, nvls, symm or p2p"
 [[ "$dtype" =~ ^(bf16|fp32)$ ]] || die "--dtype must be bf16 or fp32"
-[[ "$communicator" =~ ^(shmem|none)$ ]] || die "--communicator must be shmem or none"
-[[ "$replay_mode" =~ ^(kernel|application|app-range)$ ]] || die "--replay-mode must be kernel, application or app-range"
+[[ "$communicator" =~ ^(shmem|tcp|none)$ ]] || die "--communicator must be shmem, tcp or none"
+[[ "$replay_mode" =~ ^(kernel|application|range|app-range)$ ]] \
+    || die "--replay-mode must be kernel, application, range or app-range"
 (( iters >= 1 )) || die "--iters must be at least 1"
 if $ag_rs; then
     # The overlap worker connects each communicator in the first warmup launch, serially.
@@ -363,18 +381,19 @@ export NCCL_DEBUG=INFO
 export NCCL_DEBUG_SUBSYS=INIT,ENV,TUNING
 
 # --standalone picks a free rendezvous port, so application replay can relaunch torchrun at once.
-torchrun_cmd=(uv run --no-sync python -m torch.distributed.run --standalone --nproc_per_node "$nranks")
 if $ag_rs; then
-    torchrun_cmd+=("${script_dir}/ncu_torch_ag_rs_overlap.py")
+    worker_cmd=("${script_dir}/ncu_torch_ag_rs_overlap.py")
 else
-    torchrun_cmd+=("${script_dir}/ncu_torch_all_gather.py")
+    worker_cmd=("${script_dir}/ncu_torch_all_gather.py")
 fi
-torchrun_cmd+=(--algo "$algo" --size-mib "$size_mib" --dtype "$dtype" --warmup "$warmup" --iters "$iters")
+worker_cmd+=(--algo "$algo" --size-mib "$size_mib" --dtype "$dtype" --warmup "$warmup" --iters "$iters")
+torchrun_cmd=(uv run --no-sync python -m torch.distributed.run --standalone --nproc_per_node "$nranks" "${worker_cmd[@]}")
+worker_cmd=(uv run --no-sync python "${worker_cmd[@]}")
 
 {
     echo "ncu=$(command -v "$ncu_bin") ${ncu_version}"
     echo "gpus=${gpus} algo=${algo} ag_rs=${ag_rs} size_mib=${size_mib} dtype=${dtype} warmup=${warmup} iters=${iters}"
-    echo "communicator=${communicator} set=${ncu_set} sections=${sections[*]:-<from --set>} metrics=${metrics:-<from --set>} replay=${replay_mode} extra_ncu_args=${extra_ncu_args[*]:-}"
+    echo "communicator=${communicator} lockstep=${lockstep} set=${ncu_set} sections=${sections[*]:-<from --set>} metrics=${metrics:-<from --set>} replay=${replay_mode} extra_ncu_args=${extra_ncu_args[*]:-}"
     echo "blocking_metrics=${blocking}"
     echo "nccl_lib=${nccl_lib:-<bundled with torch>}"
     env | grep -E '^(NCCL_|CUDA_VISIBLE_DEVICES=|LD_PRELOAD=)' | sort
@@ -384,7 +403,7 @@ cd "$repo_root"
 
 # For every op, each of its TUNING lines in the pass must match tuning_re_<func>, warmup + iters
 # per run. NCCL prints the line on comm rank 0 only, one log per process; application and app-range
-# replay start torchrun again for every ncu pass, so <runs> is the number of logs that contain one.
+# replay start the workers again for every ncu pass, so <runs> is the number of logs that contain one.
 check_tuning() {
     local pass="$1" expected=$(( warmup + iters )) logs f any re lines ok total runs
     logs=("${output_dir}/nccl-logs/${pass}"/*.log)
@@ -403,6 +422,10 @@ check_tuning() {
         fi
         echo "${pass}: ${ok}/${total} ${f} launches match --algo ${algo} (${runs} run(s) x ${expected})"
     done
+}
+
+free_port() {
+    python3 -c 'import socket; s = socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1])'
 }
 
 # run_pass <name> <cmd...>
@@ -435,6 +458,10 @@ run_pass() {
     if grep -q "No kernels were profiled\|No ranges were profiled" "${output_dir}/${pass}.log"; then
         die "${pass}: ncu profiled nothing (communicator=${communicator}, replay=${replay_mode}); see ${output_dir}/${pass}.log"
     fi
+    if grep -q 'Failed to profile "range"' "${output_dir}/${pass}.log"; then
+        die "${pass}: ncu could not profile the NVTX range (communicator=${communicator}, replay=${replay_mode});" \
+            "see ${output_dir}/${pass}.log and the /tmp/nsight-compute-*.log of the failure"
+    fi
     (( status == 0 )) || die "${pass} exited with ${status}; see ${output_dir}/${pass}.log"
     check_tuning "$pass"
 }
@@ -452,7 +479,7 @@ fi
 # The worker's NVTX range holds exactly the --iters launches. The kernel name filter keeps
 # the warmup and any non-NCCL kernel out even if a future torch launches one inside the range.
 select_args=(--nvtx --nvtx-include "${nvtx_range}/")
-if [[ "$replay_mode" == app-range ]]; then
+if [[ "$replay_mode" == range || "$replay_mode" == app-range ]]; then
     select_args+=(--launch-count 1)
     summary_metrics="gpu__time_duration.sum"
     expected_profiled=$nranks
@@ -462,8 +489,6 @@ else
     summary_metrics="launch__grid_size,launch__block_size,gpu__time_duration.sum,dram__throughput.avg.pct_of_peak_sustained_elapsed"
     expected_profiled=$(( nranks * iters * nops ))
 fi
-comm_args=(--communicator none)
-[[ "$communicator" == shmem ]] && comm_args=(--communicator shmem --communicator-shmem-num-peers "$nranks")
 report="${output_dir}/${report_name}"
 collect_args=(--set "$ncu_set")
 if (( ${#sections[@]} > 0 )); then
@@ -476,38 +501,72 @@ elif [[ -n "$metrics" ]]; then
     collect_args=(--metrics "$metrics")
     summary_metrics="$metrics"
 fi
+ncu_cmd=("$ncu_bin")
+case "$communicator" in
+    shmem) ncu_cmd+=(--communicator shmem --communicator-shmem-num-peers "$nranks") ;;
+    tcp) ncu_cmd+=(--communicator tcp --communicator-tcp-num-peers "$nranks" --communicator-tcp-port "$(free_port)") ;;
+    none) ncu_cmd+=(--communicator none) ;;
+esac
+if [[ "$communicator" == tcp ]] && $lockstep; then
+    ncu_cmd+=(--lockstep-kernel-launch --lockstep-nvtx-include "${nvtx_range}/")
+fi
+ncu_cmd+=(
+    "${collect_args[@]}"
+    --replay-mode "$replay_mode"
+    "${select_args[@]}"
+    --target-processes all
+    --force-overwrite
+)
 
-run_pass ncu "$ncu_bin" "${comm_args[@]}" \
-    "${collect_args[@]}" \
-    --replay-mode "$replay_mode" \
-    "${select_args[@]}" \
-    --target-processes all \
-    --force-overwrite \
-    --export "$report" \
-    ${extra_ncu_args[@]+"${extra_ncu_args[@]}"} \
-    "${torchrun_cmd[@]}"
+if [[ "$communicator" == tcp ]]; then
+    # ncu expands %q{RANK} from each rank's environment.
+    ncu_cmd+=(--export "${report}-rank%q{RANK}" ${extra_ncu_args[@]+"${extra_ncu_args[@]}"})
+    report_bases=()
+    for (( r = 0; r < nranks; r++ )); do report_bases+=("${report}-rank${r}"); done
+    # rank 0's worker hosts the TCPStore on MASTER_PORT again in every relaunch.
+    export MASTER_ADDR=127.0.0.1 MASTER_PORT
+    MASTER_PORT="$(free_port)"
+    run_pass ncu bash "${script_dir}/ncu_tcp_ranks.sh" "$nranks" "${ncu_cmd[@]}" -- "${worker_cmd[@]}"
+else
+    ncu_cmd+=(--export "$report" ${extra_ncu_args[@]+"${extra_ncu_args[@]}"})
+    report_bases=("$report")
+    run_pass ncu "${ncu_cmd[@]}" "${torchrun_cmd[@]}"
+fi
 
 ################################################################################
 # Summary: one row per profiled kernel (or range)
 
 # ncu 2026.4 writes a compressed all_gather.ncu-repz; accept either format.
-report_file=""
-for ext in ncu-repz ncu-rep; do
-    [[ -f "${report}.${ext}" ]] && { report_file="${report}.${ext}"; break; }
+report_files=()
+for base in "${report_bases[@]}"; do
+    found=""
+    for ext in ncu-repz ncu-rep; do
+        [[ -f "${base}.${ext}" ]] && { found="${base}.${ext}"; break; }
+    done
+    [[ -n "$found" ]] || die "ncu ${ncu_version} wrote neither ${base}.ncu-rep nor .ncu-repz; see ${output_dir}/ncu.log"
+    report_files+=("$found")
 done
-[[ -n "$report_file" ]] || die "ncu ${ncu_version} wrote neither ${report}.ncu-rep nor .ncu-repz; see ${output_dir}/ncu.log"
 summary="${output_dir}/summary.csv"
-if $blocking; then
-    # Every metric of the report: the raw page's names for the PM-sampled aggregates are not
-    # documented, so they are not passed back as a filter.
-    rows="$("$ncu_bin" --import "$report_file" --page raw --csv)"
-else
-    rows="$("$ncu_bin" --import "$report_file" --page raw --csv --metrics "$summary_metrics")"
-fi
-# Line 1 is the header, line 2 the units.
-printf '%s\n' "$rows" >"$summary"
+: >"$summary"
+for f in "${report_files[@]}"; do
+    if $blocking; then
+        # Every metric of the report: the raw page's names for the PM-sampled aggregates are not
+        # documented, so they are not passed back as a filter.
+        rows="$("$ncu_bin" --import "$f" --page raw --csv)"
+    else
+        rows="$("$ncu_bin" --import "$f" --page raw --csv --metrics "$summary_metrics")"
+    fi
+    # Line 1 is the header, line 2 the units; the reports of the tcp ranks share them.
+    if [[ ! -s "$summary" ]]; then
+        printf '%s\n' "$rows" >"$summary"
+    else
+        [[ "$(head -n 1 <<<"$rows")" == "$(head -n 1 "$summary")" ]] \
+            || die "${f} has other columns than ${report_files[0]}; compare them with ncu --import --page raw --csv"
+        tail -n +3 <<<"$rows" >>"$summary"
+    fi
+done
 profiled="$(tail -n +3 "$summary" | grep -c . || true)"
-echo "=== ${profiled} result(s) in ${report_file} (expected ${expected_profiled})"
+echo "=== ${profiled} result(s) in ${report_files[*]} (expected ${expected_profiled})"
 if $blocking; then
     python3 "${script_dir}/analyse_blocking_metrics.py" "$summary" --size-mib "$size_mib" --nranks "$nranks" \
         || die "analyse_blocking_metrics.py failed on ${summary}"
@@ -516,4 +575,4 @@ else
 fi
 (( profiled == expected_profiled )) \
     || echo "WARNING: --launch-count may count over all ranks in shmem mode; compare with ${output_dir}/ncu.log" >&2
-echo "Open in the Nsight Compute GUI: ${report_file}"
+echo "Open in the Nsight Compute GUI: ${report_files[*]}"

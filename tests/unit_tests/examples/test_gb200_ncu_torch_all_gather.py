@@ -167,9 +167,10 @@ def fake_ncu(tmp_path: Path) -> dict[str, str]:
             printf '"ID","gpu__time_duration.sum"\\n"","usecond"\\n"0","10"\\n"1","11"\\n'
             exit 0
         fi
-        echo "$@" >"$FAKE_NCU_ARGS"
+        echo "$@" >"${FAKE_NCU_ARGS}${RANK:+.rank${RANK}}"
+        [[ -n "${RANK:-}" ]] && echo "${RANK} ${LOCAL_RANK} ${WORLD_SIZE} ${MASTER_ADDR} ${MASTER_PORT}" >"${FAKE_NCU_ARGS}.env${RANK}"
         while [[ $# -gt 0 ]]; do
-            [[ "$1" == --export ]] && report="$2"
+            [[ "$1" == --export ]] && report="$(sed "s/%q{RANK}/${RANK:-}/" <<<"$2")"
             shift
         done
         [[ -n "$FAKE_NCU_EXT" ]] && echo report >"${report}.${FAKE_NCU_EXT}"
@@ -240,7 +241,7 @@ def test_launcher_names_the_pass_ncu_gave_up_on(fake_ncu: dict[str, str], tmp_pa
     ncu = tools / "ncu"
     ncu.write_text(
         ncu.read_text().replace(
-            'echo "$@" >"$FAKE_NCU_ARGS"',
+            'echo "$@" >"${FAKE_NCU_ARGS}${RANK:+.rank${RANK}}"',
             'echo "==PROF== Profiling k: Application replay pass 38"; echo "==PROF== Profiling k: Application replay pass 39"\n'
             'echo "==ERROR== Failed to wait for profiling"; exit 1',
         )
@@ -416,6 +417,153 @@ def test_ag_rs_needs_a_warmup_launch(fake_ncu: dict[str, str], tmp_path: Path):
     result = _launch(tmp_path / "out", fake_ncu, "--ag-rs")
     assert result.returncode != 0
     assert "--ag-rs needs --warmup >= 1" in result.stderr
+
+
+def test_range_replay_profiles_the_nvtx_range(fake_ncu: dict[str, str], tmp_path: Path):
+    env = _overlap_env(fake_ncu, "2.29.7", [AG_STMC, AG_STMC, RS_LDMC, RS_LDMC])
+    result = _launch(tmp_path / "out", env, "--algo", "symm", "--ag-rs", "--warmup", "1", "--replay-mode", "range")
+    assert result.returncode == 0, result.stdout + result.stderr
+    args = _ncu_args(fake_ncu)
+    assert args[args.index("--replay-mode") + 1] == "range"
+    assert args[args.index("--nvtx-include") + 1] == "ncu_collectives/"
+    assert args[args.index("--launch-count") + 1] == "1" and "--kernel-name" not in args
+    assert args[args.index("--communicator") + 1] == "shmem"
+
+
+def test_launcher_names_a_range_ncu_could_not_profile(fake_ncu: dict[str, str], tmp_path: Path):
+    tools = Path(fake_ncu["PATH"].split(":")[0])
+    ncu = tools / "ncu"
+    ncu.write_text(
+        ncu.read_text().replace(
+            'echo "$@" >"${FAKE_NCU_ARGS}${RANK:+.rank${RANK}}"',
+            "echo '==ERROR== Failed to profile \"range\" in client process 7'; exit 9",
+        )
+    )
+    env = _overlap_env(fake_ncu, "2.29.7", [])
+    result = _launch(tmp_path / "out", env, "--algo", "symm", "--ag-rs", "--warmup", "1", "--replay-mode", "app-range")
+    assert result.returncode != 0
+    assert "ncu could not profile the NVTX range (communicator=shmem, replay=app-range)" in result.stderr
+
+
+@pytest.mark.parametrize("lockstep", [True, False])
+def test_tcp_runs_one_ncu_per_rank_and_summarizes_every_report(
+    fake_ncu: dict[str, str], tmp_path: Path, lockstep: bool
+):
+    out = tmp_path / "out"
+    tools = Path(fake_ncu["PATH"].split(":")[0])
+    ncu = tools / "ncu"
+    ncu.write_text(
+        ncu.read_text().replace('echo "$@" >"${FAKE_NCU_ARGS}', 'echo "==PROF== fake"; echo "$@" >"${FAKE_NCU_ARGS}')
+    )
+    env = _overlap_env(fake_ncu, "2.29.7", [AG_STMC, AG_STMC, RS_LDMC, RS_LDMC])
+    extra = () if lockstep else ("--no-lockstep",)
+    result = _launch(
+        out,
+        env,
+        "--algo",
+        "symm",
+        "--ag-rs",
+        "--warmup",
+        "1",
+        "--replay-mode",
+        "app-range",
+        "--communicator",
+        "tcp",
+        *extra,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    ranks = [shlex.split(Path(f"{fake_ncu['FAKE_NCU_ARGS']}.rank{r}").read_text()) for r in (0, 1)]
+    assert ranks[0] == ranks[1]
+    args = ranks[0]
+    assert args[args.index("--communicator") + 1] == "tcp"
+    assert args[args.index("--communicator-tcp-num-peers") + 1] == "2"
+    assert int(args[args.index("--communicator-tcp-port") + 1]) > 0
+    assert args[args.index("--export") + 1] == str(out / "ag_rs-rank%q{RANK}")
+    if lockstep:
+        assert "--lockstep-kernel-launch" in args
+        assert args[args.index("--lockstep-nvtx-include") + 1] == "ncu_collectives/"
+    else:
+        assert "--lockstep-kernel-launch" not in args and "--lockstep-nvtx-include" not in args
+    # No torchrun: each ncu wraps one worker, with the variables torchrun would have set.
+    assert "torch.distributed.run" not in args
+    worker = args.index(str(SCRIPT_DIR / "ncu_torch_ag_rs_overlap.py"))
+    assert args[worker - 4 : worker] == ["uv", "run", "--no-sync", "python"]
+    envs = [Path(f"{fake_ncu['FAKE_NCU_ARGS']}.env{r}").read_text().split() for r in (0, 1)]
+    assert [e[:3] for e in envs] == [["0", "0", "2"], ["1", "1", "2"]]
+    assert envs[0][3:] == envs[1][3:] and envs[0][3] == "127.0.0.1"
+    # Both reports are summarized, each with the fake's two rows, under one header.
+    assert (out / "ag_rs-rank0.ncu-repz").is_file() and (out / "ag_rs-rank1.ncu-repz").is_file()
+    assert "4 result(s)" in result.stdout
+    summary = (out / "summary.csv").read_text().splitlines()
+    assert len(summary) == 2 + 4 and summary[0].startswith('"ID"')
+    log = (out / "ncu.log").read_text().splitlines()
+    assert sorted(log) == ["[rank 0] ==PROF== fake", "[rank 1] ==PROF== fake"]
+
+
+def test_tcp_fails_when_a_rank_wrote_no_report(fake_ncu: dict[str, str], tmp_path: Path):
+    tools = Path(fake_ncu["PATH"].split(":")[0])
+    ncu = tools / "ncu"
+    ncu.write_text(ncu.read_text().replace('[[ -n "$FAKE_NCU_EXT" ]]', '[[ -n "$FAKE_NCU_EXT" && "$RANK" == 0 ]]'))
+    out = tmp_path / "out"
+    result = _launch(out, {**fake_ncu, "FAKE_NCU_EXT": "ncu-repz"}, "--communicator", "tcp")
+    assert result.returncode != 0
+    assert f"wrote neither {out / 'all_gather-rank1'}.ncu-rep" in result.stderr
+
+
+def test_launcher_rejects_an_unknown_communicator(fake_ncu: dict[str, str], tmp_path: Path):
+    result = _launch(tmp_path / "out", fake_ncu, "--communicator", "mpi")
+    assert result.returncode != 0
+    assert "--communicator must be shmem, tcp or none" in result.stderr
+
+
+SWEEP = SCRIPT_DIR / "sweep_ncu_replay_modes.sh"
+
+
+def test_sweep_dry_run_builds_one_launch_per_combination(tmp_path: Path):
+    result = _run(
+        SWEEP,
+        "--dry-run",
+        "--combos",
+        "range:shmem,app-range:tcp:nolockstep",
+        "--output-dir",
+        str(tmp_path),
+        "--",
+        "--warmup",
+        "2",
+    )
+    assert result.returncode == 0, result.stderr
+    commands = [shlex.split(line) for line in result.stdout.splitlines()]
+    assert len(commands) == 2
+    for (replay, comm, lockstep, folder), command in zip(
+        (("range", "shmem", True, "range_shmem"), ("app-range", "tcp", False, "app-range_tcp_nolockstep")), commands
+    ):
+        assert command[1] == str(LAUNCHER)
+        assert command[command.index("--replay-mode") + 1] == replay
+        assert command[command.index("--communicator") + 1] == comm
+        assert ("--no-lockstep" not in command) == lockstep
+        assert command[command.index("--output-dir") + 1] == str(tmp_path / folder)
+        assert "--ag-rs" in command and "--skip-baseline" in command
+        assert command[command.index("--algo") + 1] == "symm"
+        assert command[command.index("--section") + 1] == "SpeedOfLight"
+        assert command[command.index("--timeout") + 1] == "900"
+        assert command[-2:] == ["--warmup", "2"]
+
+
+def test_sweep_default_starts_with_the_application_replay_control():
+    result = _run(SWEEP, "--dry-run", "--no-ag-rs")
+    assert result.returncode == 0, result.stderr
+    commands = [shlex.split(line) for line in result.stdout.splitlines()]
+    pairs = [(c[c.index("--replay-mode") + 1], c[c.index("--communicator") + 1]) for c in commands]
+    assert pairs[0] == ("application", "shmem")
+    assert ("app-range", "tcp") in pairs and ("range", "tcp") in pairs and ("app-range", "none") in pairs
+    assert all("--ag-rs" not in c for c in commands)
+
+
+@pytest.mark.parametrize("combo", ["app-range", "range:mpi", "app-range:shmem:nolockstep", "graph:tcp"])
+def test_sweep_rejects_bad_combinations(combo: str):
+    result = _run(SWEEP, "--dry-run", "--combos", combo)
+    assert result.returncode != 0
+    assert combo in result.stderr
 
 
 def test_bisect_passes_ag_rs_and_replay_mode_and_names_the_output_after_them(tmp_path: Path):

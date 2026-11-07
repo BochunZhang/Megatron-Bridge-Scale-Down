@@ -20,7 +20,9 @@ ncu --communicator shmem --communicator-shmem-num-peers 2 -f -o report -k regex:
 | `ncu_torch_all_gather.py` | torchrun worker：warmup，再在 NVTX range `ncu_all_gather` 里跑 `--iters` 次 all-gather，前后都校验数据 |
 | `ncu_torch_ag_rs_overlap.py` | `--ag-rs` 用的 worker，只跑 AG + RS：两者各一个 NCCL communicator 和一条 CUDA stream，同时 launch（并发写法参照 `../nvls-collective/nvls_collective_benchmark.py`），NVTX range 为 `ncu_collectives`，前后校验两者的结果，并用 CUDA event 打出每次迭代 AG 和 RS 的重叠时间 |
 | `run_ncu_torch_all_gather.sh` | 单节点启动器：baseline（不挂 ncu）+ ncu 两遍；默认跑 all-gather，`--ag-rs` 跑 AG + RS 同时执行 |
+| `ncu_tcp_ranks.sh` | `--communicator tcp` 时由启动器调用：每个 rank 起一个 ncu、各包一个 worker，设好 torchrun 会设的 `RANK` 等变量，每行输出加 `[rank <r>]` 前缀 |
 | `bisect_ncu_sections.sh` | 逐个 section 跑启动器（application replay），找出让 kernel 卡死的 section，见下文「实测：application replay + `--set full` 卡在 pass 39」 |
+| `sweep_ncu_replay_modes.sh` | 逐个 replay 模式 × communicator 组合跑启动器（默认 `--ag-rs`），找出哪些组合能 profile 并发的 AG + RS，见下文「AG + RS：replay 模式 × communicator」 |
 | `analyse_blocking_metrics.py` | `--blocking-metrics` 结束后由启动器调用：把 `summary.csv` 按数据流经的各级（发端 SM→XBAR、NVLink、接收端 L2、HBM）排成 `blocking.txt`，字节数以每卡分片 S 的倍数显示 |
 | `README-test-records.md` | 各种 ncu 版本 / replay 模式 / 算法组合的成功和失败记录，以及四种 replay 模式的区别 |
 
@@ -61,11 +63,15 @@ bash examples/gb200/ncu-torch-all-gather/run_ncu_torch_all_gather.sh --replay-mo
 bash examples/gb200/ncu-torch-all-gather/bisect_ncu_sections.sh
 bash examples/gb200/ncu-torch-all-gather/bisect_ncu_sections.sh --algo p2p --size-mib 256
 
-# AG 和 RS 同时执行，用 app-range replay 采（只有 range / app-range 不把两个 kernel 串行化）
+# AG 和 RS 同时执行：只有 range / app-range 不把两个 kernel 串行化。
+# shmem + app-range 在 2026.4 上失败（#14），先用 sweep 找出能用的 replay × communicator 组合
+bash examples/gb200/ncu-torch-all-gather/sweep_ncu_replay_modes.sh
+bash examples/gb200/ncu-torch-all-gather/sweep_ncu_replay_modes.sh --combos range:tcp,app-range:tcp -- --warmup 2
+# 单个组合：每个 rank 一个 ncu（tcp communicator），报告是 ag_rs-rank<r>.ncu-repz
 bash examples/gb200/ncu-torch-all-gather/run_ncu_torch_all_gather.sh --algo symm --ag-rs \
-    --replay-mode app-range --size-mib 1024 --section SpeedOfLight
-# 按 section 拆开采 AG + RS 重叠
-bash examples/gb200/ncu-torch-all-gather/bisect_ncu_sections.sh --ag-rs --replay-mode app-range
+    --replay-mode app-range --communicator tcp --size-mib 1024 --section SpeedOfLight
+# 按 section 拆开采 AG + RS 重叠（换成 sweep 找到的组合）
+bash examples/gb200/ncu-torch-all-gather/bisect_ncu_sections.sh --ag-rs --replay-mode app-range -- --communicator tcp
 
 # symmetric AllGather_STMC / AllGather_ST，换成 2.32.3 的 NCCL
 bash examples/gb200/ncu-torch-all-gather/run_ncu_torch_all_gather.sh --algo symm --replay-mode app-range \
@@ -152,9 +158,11 @@ state!` → `Failed to save context state` → `cuda_replay>> Failed to create r
 - **ncu 2026.3 下 application replay 用不了**：2026.4 的 release notes 才写了 *Added application replay
   support when profiling with the shmem communicator*。这也解释了 nccl-tests 实验中 shmem + application 只得到
   `No kernels were profiled`。脚本在 shmem + application / app-range + ncu < 2026.4 时会直接报错。注意 2026.4
-  的 CLI 文档仍然写着 shmem 只支持 kernel 和 range replay，和 release notes 不一致，以实测为准。
-- range replay 也走不通：它同样要保存和恢复内存，而且文档列出的支持 API 中 Virtual Memory Management 和
-  Peer Context Memory Access 都是 *Not supported*。
+  的 CLI 文档仍然写着 shmem 只支持 kernel 和 range replay；release notes 只加了 application，**没有 app-range**，
+  实测 shmem + app-range 失败（见 [README-test-records.md](README-test-records.md) #14）。
+- range replay 预计也走不通（未实测）：它同样要保存和恢复内存，而且文档列出的支持 API 中 Virtual Memory
+  Management 和 Peer Context Memory Access 都是 *Not supported*，Execution Control 里也没有 NCCL 用的
+  `cuLaunchKernelEx`。不过这些限制只针对 range **内部**的 API 调用，range 里只有 event 和 NCCL launch。
 
 截至 2026-11-06，最新版本是 2026.4。它的 release notes 和 Known Issues 都没有提到 multicast / VMM 内存的
 保存问题，所以 2026.4 下 kernel replay 的多遍采集是否仍然失败，需要实测。2026.4 的改进是可以绕开保存：
@@ -200,8 +208,8 @@ PM sampling / warp state sampling 的 pass 数是动态决定的，这两类很�
 | `config.txt` | ncu 版本、参数、所有 `NCCL_*` 环境变量 |
 | `baseline.log`、`ncu.log` | 两遍的输出，其中有 worker 的数据校验结果和 ncu 的 `==PROF==` 输出 |
 | `nccl-logs/<pass>/nccl-<host>-<pid>.log` | NCCL INFO 日志（INIT、ENV、TUNING） |
-| `all_gather.ncu-rep` / `all_gather.ncu-repz` | shmem 模式下所有 rank 合在一份报告里；ncu 2026.4 默认写压缩的 `.ncu-repz` |
-| `summary.csv` | 每个被 profile 的 kernel（app-range 下是每个 range）一行；`--blocking-metrics` 时是报告里的全部 metric |
+| `all_gather.ncu-rep` / `all_gather.ncu-repz` | shmem 模式下所有 rank 合在一份报告里；ncu 2026.4 默认写压缩的 `.ncu-repz`；`--communicator tcp` 时每个 rank 一份 `all_gather-rank<r>.ncu-repz` |
+| `summary.csv` | 每个被 profile 的 kernel（range / app-range 下是每个 range）一行，tcp 时把各 rank 的报告接在一起；`--blocking-metrics` 时是报告里的全部 metric |
 | `blocking.txt` | 仅 `--blocking-metrics`：各级反压和流量，每个结果一列 |
 
 ## 读结果时注意
@@ -222,6 +230,26 @@ PM sampling / warp state sampling 的 pass 数是动态决定的，这两类很�
 - 第一次 AG 和 RS 串行执行（中间同步），先把两个 communicator 的 channel 连好：一个 communicator 在建连接时，
   另一个的 kernel 正在等对端，可能卡死。所以 `--ag-rs` 要求 `--warmup >= 1`；`--warmup N` 是 1 次串行加
   N−1 次 AG + RS 并发。
-- 只有 **app-range** replay 能看到重叠：kernel / application replay 一次只 profile 一个 kernel，并把它串行化。
-  app-range 的 metric 属于整个 NVTX range（AG + RS 合在一起），分不出 AG 和 RS 各自的部分。
+- 只有 **range / app-range** replay 能看到重叠：kernel / application replay 一次只 profile 一个 kernel，并把它串行化。
+  range 类模式的 metric 属于整个 NVTX range（AG + RS 合在一起），分不出 AG 和 RS 各自的部分。
 - `baseline.log` 里有每次迭代 AG 和 RS 的起止时间和重叠时长（CUDA event，以最早的 start 为 0），用来确认确实重叠了。
+
+## AG + RS：replay 模式 × communicator
+
+2026-11-07 实测 shmem + app-range 失败（#14）：4 个 rank 都跑完了 warmup，一进 NVTX range，ncu 就报
+`Failed to profile "range" in client process <rank 0>`，第 1 遍都没开始，退出码 9。2026.4 的文档也没说 shmem
+支持 app-range（见上文）。`sweep_ncu_replay_modes.sh` 把剩下的组合各跑一遍：
+
+| 组合 | 做法 | 预期（未验证） |
+| --- | --- | --- |
+| `application:shmem` | 对照组，#13 成功过 | ok；但 AG、RS 被串行化，看不到重叠 |
+| `range:shmem` | 文档写明 shmem 支持 range | 要保存显存（multicast 可能和 #1/#3/#4 一样失败），`cuLaunchKernelEx` 不在支持列表里 |
+| `app-range:shmem` | #14 | fail |
+| `range:tcp` / `app-range:tcp` | 每个 rank 一个 ncu，`--lockstep-kernel-launch --lockstep-nvtx-include <range>/` | 文档没说 tcp 支持哪些 replay 模式；app-range 每个 rank 各自重启 worker，rank 0 每次重建 TCPStore |
+| `app-range:tcp:nolockstep` | 同上，不加 `--lockstep-*` | lockstep 是按 kernel 同步的，对 range 可能多余，也可能必需 |
+| `app-range:none` | 不用 communicator | 预计卡死：同一进程树里 ncu 串行化各进程，rank 0 占着 range 时其他 rank 进不来 |
+
+`--communicator tcp` 不经过 torchrun：torchrun 的 agent 进程持有 TCPStore，application / app-range 每遍只重启
+worker，旧 store 里上一轮留下的 key（例如 NCCL unique id）可能被新一轮读到（推测，未验证）。启动器改为直接起
+`ncu_tcp_ranks.sh`，每个 rank 设 `RANK` / `LOCAL_RANK` / `WORLD_SIZE` / `LOCAL_WORLD_SIZE`，`MASTER_ADDR=127.0.0.1`、
+`MASTER_PORT` 和 `--communicator-tcp-port` 各取一个空闲端口。一个 rank 的 ncu 先退出时，其他 rank 会等到 `--timeout`。

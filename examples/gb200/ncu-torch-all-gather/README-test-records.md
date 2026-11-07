@@ -5,7 +5,7 @@
 nccl-tests 的测试用 `../nccl-tests/run_ncu_all_gather_stmc.sh`（见 [../nccl-tests/README.md](../nccl-tests/README.md)）。
 “证据”一列的 `ncu*.log` 是当时从集群取回的 ncu 输出，结果目录在 `results/gb200/ncu-torch-all-gather/` 下。
 
-最后更新：2026-11-07。
+最后更新：2026-11-07（#14）。
 
 ## 环境
 
@@ -63,6 +63,7 @@ nccl-tests 的测试用 `../nccl-tests/run_ncu_all_gather_stmc.sh`（见 [../ncc
 | 11 | 11-07 | 2026.4 | shmem | application | torch, nvls | — | 8 个 section，`--metrics` + `-- --section` | ⚠️ | 都 ok，但每个约 1 个 pass，不到 2 min：怀疑 `--section` 没生效，之后改成启动器的 `--section` | 用户口述 |
 | 12 | 11-07 | 2026.4 | shmem | application | torch, nvls | 1 MiB | full 的每个 section 单独跑 | ✅ | 全部 ok，没有卡住的 | 用户口述 |
 | 13 | 11-07 | 2026.4 | shmem | application | torch, **symm**（`ncclSymkDevKernel_AllGather_STMC`，2.29.7） | **1 GiB** | full 的 24 个 section 单独跑 | ✅ | 全部 ok，每个 1–32 个 pass，kernel 1.78–1.90 ms；每份报告只有 1 个结果（primary 进程，即 rank 0） | `symm-all-gather-20261107-140128/`（见下文「#13 的数据」） |
+| 14 | 11-07 | 2026.4 | shmem | **app-range** | torch `--ag-rs`, symm（2.29.7） | 1 GiB | `--section SpeedOfLight` | ❌ | 4 个 rank 跑完 warmup，一进 NVTX range `ncu_collectives` 就 `Failed to profile "range" in client process <rank 0>`，第 1 遍都没开始，退出码 9。2026.4 CLI 文档：shmem "only supports kernel and range replay modes"，release notes 只加了 application | `ncu (7).log` |
 
 ### 由这些记录得出的结论
 
@@ -74,14 +75,17 @@ nccl-tests 的测试用 `../nccl-tests/run_ncu_all_gather_stmc.sh`（见 [../ncc
   同一个 ncu 会话里程序重启到第 39 次时碰到某个上限，尚未区分。可行的做法是按 section 拆开采（#13）。
 - **ncu 在 pass 卡住时会自己放弃**，不会等到脚本的 `--timeout`；没有找到能调整这个等待时间的选项。
 - 2026.4 默认写**压缩的 `.ncu-repz`**（#6）。
+- **shmem + app-range 不可用**（#14），和文档一致：shmem 只写了 kernel / range，2026.4 又加了 application。
+  AG + RS 重叠剩下的路是 range（shmem）或 tcp communicator，用 `sweep_ncu_replay_modes.sh` 逐个试。
 
 ## 还没有测过的组合
 
 | 组合 | 预期（都未验证） | 用途 |
 | --- | --- | --- |
 | 2026.4 + kernel replay，多遍 | nvls / symm 可能仍在保存显存时失败；ring（关 NVLS）、p2p 没有 multicast 内存，可能可以 | 比 application replay 快得多 |
-| 2026.4 + **app-range** | 不保存显存、不串行化，理论上可以 | AG 与 RS **重叠**测试（`--ag-rs --replay-mode app-range`，脚本已就绪，未在 GPU 上跑过）；需确认 PmSampling、SourceCounters 在 range 下是否可用 |
-| 2026.4 + range | 预计失败：要保存显存，文档写着不支持 VMM、peer 访问；启动器目前也不接受 `range` | — |
+| 2026.4 + app-range + **tcp**（每个 rank 一个 ncu，`--communicator tcp`），有 / 没有 `--lockstep-*` | 文档没写 tcp 支持哪些 replay 模式 | AG 与 RS **重叠**测试；`sweep_ncu_replay_modes.sh` 默认包含；需确认 PmSampling、SourceCounters 在 range 下是否可用 |
+| 2026.4 + range（shmem / tcp） | 预计失败：要保存显存，文档写着 range 内不支持 VMM、peer 访问，`cuLaunchKernelEx` 也不在支持列表里 | 启动器已接受 `--replay-mode range`，sweep 默认包含 |
+| 2026.4 + app-range + none | 预计卡死：ncu 在同一进程树里串行化各进程 | sweep 默认包含，作为反例 |
 | **p2p**（`ncclSymkDevKernel_AllGather_ST`） | 任何 replay 模式都没跑过 | 和 symm 对照：不经 multicast，每卡只收 3 份 |
 | 4 个 rank 的结果 | 现在每份报告只有 primary 进程（rank 0）的结果 | 看各 rank 是否一致 |
 | `PmSampling+SourceCounters` 同一次运行 | 预计约 9 个 pass，应该可以 | 时间序列和指令级数据来自同一次执行 |

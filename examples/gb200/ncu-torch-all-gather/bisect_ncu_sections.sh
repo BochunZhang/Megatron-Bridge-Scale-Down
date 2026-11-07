@@ -21,7 +21,8 @@ Profile the NCCL AllGather kernel (or an AllGather + ReduceScatter running toget
 section (or group of sections) at a time: run run_ncu_torch_all_gather.sh once per item, put every
 item's results in its own folder, and report which items finish, hang or fail and how many replay
 passes each one needed. By default: every section of --set full, --algo symm, the all-gather alone,
-1 GiB per rank, application replay. For the concurrent AG + RS use --ag-rs --replay-mode app-range.
+1 GiB per rank, application replay. For the concurrent AG + RS use --ag-rs with a range or
+app-range replay and a communicator that sweep_ncu_replay_modes.sh found to work.
 
 With ncu 2026.4, --replay-mode application --set full hangs in pass 39 for nvls and ring, at
 256 MiB and at 1 MiB: all ranks enter the kernel and it never completes. Two explanations are
@@ -46,8 +47,8 @@ Usage:
 Options:
   --algo NAME        ring | nvls | symm | p2p (default: symm)
   --ag-rs            Profile the all-gather and a reduce-scatter running together
-  --replay-mode MODE application | app-range | kernel (default: application); only app-range keeps
-                     the AG and RS of --ag-rs concurrent
+  --replay-mode MODE application | range | app-range | kernel (default: application); only range and
+                     app-range keep the AG and RS of --ag-rs concurrent
   --size-mib N       All-gather output size per rank in MiB (default: 1024)
   --set NAME         Test every section of the ncu set NAME, one at a time (default: full). The
                      members are read from the *.section files in --section-dir.
@@ -113,7 +114,8 @@ done
 [[ "$algo" =~ ^(ring|nvls|symm|p2p)$ ]] || die "--algo must be ring, nvls, symm or p2p"
 case_name=all-gather case_args=()
 $ag_rs && case_name=all-gather-reduce-scatter case_args=(--ag-rs)
-[[ "$replay_mode" =~ ^(application|app-range|kernel)$ ]] || die "--replay-mode must be application, app-range or kernel"
+[[ "$replay_mode" =~ ^(application|range|app-range|kernel)$ ]] \
+    || die "--replay-mode must be application, range, app-range or kernel"
 ncu_home="${repo_root}/NVIDIA-Nsight-Compute-2026.4"
 [[ -d "$ncu_home" ]] && export PATH="${ncu_home}:${PATH}"
 # The launcher's own --ncu decides which ncu lists the sections.
