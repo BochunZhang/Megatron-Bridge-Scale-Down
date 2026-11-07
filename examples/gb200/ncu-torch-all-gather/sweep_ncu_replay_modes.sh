@@ -22,6 +22,11 @@ run_ncu_torch_all_gather.sh once per combination, put each one's results in its 
 report which finish, hang or fail. By default: the all-gather and a reduce-scatter running
 together (--ag-rs), --algo symm, 1 GiB per rank, the SpeedOfLight section.
 
+--algo symm (the default) runs NCCL's symmetric multicast kernels on registered symmetric windows:
+ncclSymkDevKernel_AllGather_STMC and, with --ag-rs, ncclSymkDevKernel_ReduceScatter_LDMC. The
+launcher checks every launch against NCCL's TUNING log and fails a combination whose NCCL picked
+another kernel; summary.txt names the kernels the TUNING log of each combination shows.
+
 Why: ncu 2026.4 + shmem + app-range fails at the start of the NVTX range ("Failed to profile
 "range""); the 2026.4 CLI docs list only kernel and range replay for shmem, the release notes add
 application replay. Only range and app-range keep the AG and RS concurrent.
@@ -30,8 +35,9 @@ A combination is <replay>:<communicator>[:nolockstep], e.g. app-range:tcp:nolock
   replay        kernel | application | range | app-range
   communicator  shmem | tcp | none
   nolockstep    tcp without --lockstep-kernel-launch / --lockstep-nvtx-include
-Default list (application:shmem first as the control that worked in #13):
-  application:shmem,range:shmem,app-range:shmem,range:tcp,app-range:tcp,app-range:tcp:nolockstep,app-range:none
+Default list: app-range:tcp first, the only combination that profiled the concurrent AG + RS of
+the symmetric multicast kernels in the first sweep (#15); application:shmem is the serialized control:
+  app-range:tcp,app-range:tcp:nolockstep,application:shmem,range:shmem,app-range:shmem,range:tcp,app-range:none
 
 Each combination is one launcher run:
 
@@ -47,7 +53,7 @@ Usage:
 
 Options:
   --combos LIST      Comma-separated combinations (default: the list above)
-  --algo NAME        ring | nvls | symm | p2p (default: symm)
+  --algo NAME        symm | p2p | nvls | ring (default: symm, the multicast symmetric kernels)
   --no-ag-rs         Profile the all-gather alone
   --size-mib N       All-gather output size per rank in MiB (default: 1024)
   --section NAME     Collect this ncu section; repeat for several (default: SpeedOfLight)
@@ -62,7 +68,9 @@ them, e.g. -- --ncu /path/to/ncu --warmup 1 -- --devices 0.
 Outputs in --output-dir:
   <combo>/       the launcher's output (config.txt, ncu.log, nccl-logs/, reports, summary.csv)
                  plus launcher.log, its console output
-  summary.txt    one line per combination: <combo> ok|hang|fail <passes> <detail>
+  summary.txt    one line per combination: <combo> ok|hang|fail <passes> <kernels> <detail>, where
+                 <kernels> lists <function>:<kernel or algorithm> from the TUNING lines of the ncu
+                 pass, e.g. AllGather:AllGather_STMC,ReduceScatter:ReduceScatter_LDMC (- if none)
 USAGE
 }
 
@@ -70,7 +78,7 @@ script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 repo_root="$(cd -- "${script_dir}/../../.." && pwd)"
 launcher="${script_dir}/run_ncu_torch_all_gather.sh"
 
-combos="application:shmem,range:shmem,app-range:shmem,range:tcp,app-range:tcp,app-range:tcp:nolockstep,app-range:none"
+combos="app-range:tcp,app-range:tcp:nolockstep,application:shmem,range:shmem,app-range:shmem,range:tcp,app-range:none"
 algo="symm"
 ag_rs=true
 size_mib=1024
@@ -156,6 +164,17 @@ kill_leftovers() {
     die "processes matching ${pattern} still alive 60s after SIGKILL; check the GPUs before going on"
 }
 
+# tuned_kernels <dir>: <function>:<kernel or algorithm> pairs from the TUNING lines of the ncu pass,
+# e.g. "AllGather:AllGather_STMC,ReduceScatter:ReduceScatter_LDMC"; "-" without any.
+tuned_kernels() {
+    local logs=("${1}/nccl-logs/ncu/"*.log) pairs
+    [[ -f "${logs[0]}" ]] || { echo -; return 0; }
+    pairs="$(cat "${logs[@]}" \
+        | sed -nE 's/.*NCCL INFO ([A-Za-z]+)( \[[^]]*\])?: [0-9]+ Bytes -> (Kernel|Algo) ([A-Za-z0-9_]+).*/\1:\4/p' \
+        | sort -u | paste -sd, -)"
+    echo "${pairs:--}"
+}
+
 for combo in "${combo_list[@]}"; do
     combo_cmd "$combo"
     log="${output_dir}/${combo//:/_}.log"
@@ -180,13 +199,14 @@ for combo in "${combo_list[@]}"; do
         log="${dir}/launcher.log"
     fi
     detail="${detail:-exit ${rc}}; log ${log}"
+    kernels="$(tuned_kernels "$dir")"
     [[ "$status" == ok ]] || kill_leftovers "$dir"
-    printf '%-28s %-6s %-6s %s\n' "$combo" "$status" "$passes" "$detail" | tee -a "$summary"
+    printf '%-28s %-6s %-6s %-44s %s\n' "$combo" "$status" "$passes" "$kernels" "$detail" | tee -a "$summary"
     # A wrong algorithm fails every combination the same way.
     if [[ "$detail" == *"NCCL did not run --algo"* ]]; then
         die "NCCL did not run --algo ${algo}; fix the NCCL environment first (${log})"
     fi
 done
 
-echo "=== summary: ${summary} (combination, status, replay passes, detail)"
+echo "=== summary: ${summary} (combination, status, replay passes, NCCL kernels, detail)"
 cat "$summary"

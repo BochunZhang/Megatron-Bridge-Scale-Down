@@ -549,13 +549,13 @@ def test_sweep_dry_run_builds_one_launch_per_combination(tmp_path: Path):
         assert command[-2:] == ["--warmup", "2"]
 
 
-def test_sweep_default_starts_with_the_application_replay_control():
+def test_sweep_default_starts_with_app_range_over_tcp():
     result = _run(SWEEP, "--dry-run", "--no-ag-rs")
     assert result.returncode == 0, result.stderr
     commands = [shlex.split(line) for line in result.stdout.splitlines()]
     pairs = [(c[c.index("--replay-mode") + 1], c[c.index("--communicator") + 1]) for c in commands]
-    assert pairs[0] == ("application", "shmem")
-    assert ("app-range", "tcp") in pairs and ("range", "tcp") in pairs and ("app-range", "none") in pairs
+    assert pairs[0] == ("app-range", "tcp") and "--no-lockstep" not in commands[0]
+    assert ("application", "shmem") in pairs and ("range", "tcp") in pairs and ("app-range", "none") in pairs
     assert all("--ag-rs" not in c for c in commands)
 
 
@@ -564,6 +564,45 @@ def test_sweep_rejects_bad_combinations(combo: str):
     result = _run(SWEEP, "--dry-run", "--combos", combo)
     assert result.returncode != 0
     assert combo in result.stderr
+
+
+def test_sweep_defaults_to_the_symmetric_multicast_kernels():
+    result = _run(SWEEP, "--dry-run", "--combos", "app-range:tcp")
+    assert result.returncode == 0, result.stderr
+    (command,) = [shlex.split(line) for line in result.stdout.splitlines()]
+    assert command[command.index("--algo") + 1] == "symm" and "--ag-rs" in command
+
+
+def test_sweep_names_the_kernels_nccl_ran_in_each_combination(tmp_path: Path):
+    script_dir = tmp_path / "repo/examples/gb200/ncu-torch-all-gather"
+    script_dir.mkdir(parents=True)
+    shutil.copy(SWEEP, script_dir)
+    # The fake launcher leaves the ncu pass's NCCL logs: two ranks, AG + RS TUNING lines on rank 0.
+    (script_dir / "run_ncu_torch_all_gather.sh").write_text(
+        textwrap.dedent(f"""\
+        while [[ $# -gt 0 ]]; do
+            [[ "$1" == --output-dir ]] && out="$2"
+            [[ "$1" == --replay-mode ]] && replay="$2"
+            shift
+        done
+        mkdir -p "$out/nccl-logs/ncu"
+        [[ "$replay" == range ]] && {{ echo "ERROR: ncu: could not save memory"; exit 1; }}
+        echo "host:1:1 NCCL INFO {AG_STMC}" >"$out/nccl-logs/ncu/nccl-host-1.log"
+        echo "host:1:1 NCCL INFO {RS_LDMC}" >>"$out/nccl-logs/ncu/nccl-host-1.log"
+        echo "host:2:2 NCCL INFO comm 0x1 rank 1 nRanks 2" >"$out/nccl-logs/ncu/nccl-host-2.log"
+        echo ok
+    """)
+    )
+    out = tmp_path / "out"
+    result = _run(
+        script_dir / "sweep_ncu_replay_modes.sh", "--combos", "app-range:tcp,range:tcp", "--output-dir", str(out)
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    rows = {line.split()[0]: line.split()[1:4] for line in (out / "summary.txt").read_text().splitlines()}
+    assert rows == {
+        "app-range:tcp": ["ok", "-", "AllGather:AllGather_STMC,ReduceScatter:ReduceScatter_LDMC"],
+        "range:tcp": ["fail", "-", "-"],
+    }
 
 
 def test_bisect_passes_ag_rs_and_replay_mode_and_names_the_output_after_them(tmp_path: Path):

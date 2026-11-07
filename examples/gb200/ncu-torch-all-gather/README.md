@@ -238,16 +238,17 @@ PM sampling / warp state sampling 的 pass 数是动态决定的，这两类很�
 
 2026-11-07 实测 shmem + app-range 失败（#14）：4 个 rank 都跑完了 warmup，一进 NVTX range，ncu 就报
 `Failed to profile "range" in client process <rank 0>`，第 1 遍都没开始，退出码 9。2026.4 的文档也没说 shmem
-支持 app-range（见上文）。`sweep_ncu_replay_modes.sh` 把剩下的组合各跑一遍：
+支持 app-range（见上文）。`sweep_ncu_replay_modes.sh` 把各个组合跑了一遍（#15，`--ag-rs --algo symm`，即 symmetric
+multicast kernel `AllGather_STMC` + `ReduceScatter_LDMC`，1 GiB，SpeedOfLight）：
 
-| 组合 | 做法 | 预期（未验证） |
+| 组合 | 做法 | 结果（#15） |
 | --- | --- | --- |
-| `application:shmem` | 对照组，#13 成功过 | ok；但 AG、RS 被串行化，看不到重叠 |
-| `range:shmem` | 文档写明 shmem 支持 range | 要保存显存（multicast 可能和 #1/#3/#4 一样失败），`cuLaunchKernelEx` 不在支持列表里 |
-| `app-range:shmem` | #14 | fail |
-| `range:tcp` / `app-range:tcp` | 每个 rank 一个 ncu，`--lockstep-kernel-launch --lockstep-nvtx-include <range>/` | 文档没说 tcp 支持哪些 replay 模式；app-range 每个 rank 各自重启 worker，rank 0 每次重建 TCPStore |
-| `app-range:tcp:nolockstep` | 同上，不加 `--lockstep-*` | lockstep 是按 kernel 同步的，对 range 可能多余，也可能必需 |
-| `app-range:none` | 不用 communicator | 预计卡死：同一进程树里 ncu 串行化各进程，rank 0 占着 range 时其他 rank 进不来 |
+| **`app-range:tcp`** | 每个 rank 一个 ncu，`--lockstep-kernel-launch --lockstep-nvtx-include <range>/` | ✅ 8 个 pass。**唯一能 profile 并发 AG + RS 的组合**，sweep 默认第一个跑 |
+| **`app-range:tcp:nolockstep`** | 同上，不加 `--lockstep-*` | ✅ 8 个 pass：app-range 下 lockstep 不是必需的 |
+| `application:shmem` | 串行化的对照组 | ✅ 9 个 pass；但 AG、RS 被串行化，看不到重叠 |
+| `range:shmem` / `range:tcp` | 在进程内录制、重放 range | ❌ 保存显存失败（symm window 的 multicast 映射，同 #1/#3/#4） |
+| `app-range:shmem` | — | ❌ 同 #14 |
+| `app-range:none` | 不用 communicator | ❌ 卡死 900 s：同一进程树里 ncu 串行化各进程 |
 
 `--communicator tcp` 不经过 torchrun：torchrun 的 agent 进程持有 TCPStore，application / app-range 每遍只重启
 worker，旧 store 里上一轮留下的 key（例如 NCCL unique id）可能被新一轮读到（推测，未验证）。启动器改为直接起
