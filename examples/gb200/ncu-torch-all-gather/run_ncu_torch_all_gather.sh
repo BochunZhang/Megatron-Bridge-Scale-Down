@@ -81,7 +81,8 @@ Options:
   -h, --help
 
 Outputs in --output-dir: config.txt, baseline.log, ncu.log, nccl-logs/<pass>/*.log, the ncu
-report all_gather.ncu-rep and summary.csv (one row per profiled result).
+report all_gather.ncu-rep or all_gather.ncu-repz (ncu 2026.4) and summary.csv (one row per
+profiled result).
 USAGE
 }
 
@@ -298,20 +299,25 @@ run_pass ncu "$ncu_bin" "${comm_args[@]}" \
     --target-processes all \
     --force-overwrite \
     --export "$report" \
-    "${extra_ncu_args[@]}" \
+    ${extra_ncu_args[@]+"${extra_ncu_args[@]}"} \
     "${torchrun_cmd[@]}"
 
 ################################################################################
 # Summary: one row per profiled kernel (or range)
 
-[[ -f "${report}.ncu-rep" ]] || die "ncu wrote no ${report}.ncu-rep; see ${output_dir}/ncu.log"
-rows="$("$ncu_bin" --import "${report}.ncu-rep" --page raw --csv --metrics "$summary_metrics")"
+# ncu 2026.4 writes a compressed all_gather.ncu-repz; accept either format.
+report_file=""
+for ext in ncu-repz ncu-rep; do
+    [[ -f "${report}.${ext}" ]] && { report_file="${report}.${ext}"; break; }
+done
+[[ -n "$report_file" ]] || die "ncu ${ncu_version} wrote neither ${report}.ncu-rep nor .ncu-repz; see ${output_dir}/ncu.log"
+rows="$("$ncu_bin" --import "$report_file" --page raw --csv --metrics "$summary_metrics")"
 summary="${output_dir}/summary.csv"
 # Line 1 is the header, line 2 the units.
 printf '%s\n' "$rows" >"$summary"
 profiled="$(tail -n +3 "$summary" | grep -c . || true)"
-echo "=== ${profiled} result(s) in ${report}.ncu-rep (expected ${expected_profiled})"
+echo "=== ${profiled} result(s) in ${report_file} (expected ${expected_profiled})"
 column -s, -t <"$summary" 2>/dev/null || cat "$summary"
 (( profiled == expected_profiled )) \
     || echo "WARNING: --launch-count may count over all ranks in shmem mode; compare with ${output_dir}/ncu.log" >&2
-echo "Open in the Nsight Compute GUI: ${report}.ncu-rep"
+echo "Open in the Nsight Compute GUI: ${report_file}"

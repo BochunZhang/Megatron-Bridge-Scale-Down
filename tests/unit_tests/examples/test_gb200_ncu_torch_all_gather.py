@@ -1,7 +1,7 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""CPU coverage for bisect_ncu_sections.sh: launcher commands and per-section status."""
+"""CPU coverage for examples/gb200/ncu-torch-all-gather: section bisection and the report summary."""
 
 import os
 import shlex
@@ -107,3 +107,69 @@ def test_sections_are_classified_and_unknown_ones_skipped(fake_tree: tuple[Path,
     # Missing never reaches the launcher.
     calls = (script_dir / "calls.txt").read_text().splitlines()
     assert [call.split()[-1] for call in calls] == ["Good", "Hangs", "Breaks"]
+
+
+LAUNCHER = SCRIPT_DIR / "run_ncu_torch_all_gather.sh"
+
+
+@pytest.fixture
+def fake_ncu(tmp_path: Path) -> dict[str, str]:
+    """A fake ncu 2026.4 that writes the report as $FAKE_NCU_EXT plus one NVLS TUNING log, and a fake nvidia-smi."""
+    tools = tmp_path / "fake-bin"
+    tools.mkdir()
+    ncu = tools / "ncu"
+    ncu.write_text(
+        textwrap.dedent("""\
+        #!/usr/bin/env bash
+        if [[ "$1" == --version ]]; then echo "Version 2026.4.0.0 (build 1)"; exit 0; fi
+        if [[ "$1" == --import ]]; then
+            echo "$2" >"$FAKE_NCU_IMPORTED"
+            printf '"ID","gpu__time_duration.sum"\\n"","usecond"\\n"0","10"\\n"1","11"\\n'
+            exit 0
+        fi
+        while [[ $# -gt 0 ]]; do
+            [[ "$1" == --export ]] && report="$2"
+            shift
+        done
+        [[ -n "$FAKE_NCU_EXT" ]] && echo report >"${report}.${FAKE_NCU_EXT}"
+        log="${NCCL_DEBUG_FILE//%h/host}"
+        echo "host:1:1 NCCL INFO AllGather: 268435456 Bytes -> Algo NVLS proto Simple" >"${log//%p/1}"
+    """)
+    )
+    smi = tools / "nvidia-smi"
+    smi.write_text("#!/usr/bin/env bash\nfor g in 0 1 2 3; do echo GPU $g; done\n")
+    for tool in (ncu, smi):
+        tool.chmod(0o755)
+    return {**os.environ, "PATH": f"{tools}:{os.environ['PATH']}", "FAKE_NCU_IMPORTED": str(tmp_path / "imported")}
+
+
+def _launch(out: Path, env: dict[str, str]) -> subprocess.CompletedProcess[str]:
+    return _run(
+        LAUNCHER,
+        "--skip-baseline",
+        "--gpus",
+        "0,1",
+        "--warmup",
+        "0",
+        "--iters",
+        "1",
+        "--output-dir",
+        str(out),
+        env=env,
+    )
+
+
+@pytest.mark.parametrize("ext", ["ncu-repz", "ncu-rep"])
+def test_launcher_summarizes_the_report_in_either_format(fake_ncu: dict[str, str], tmp_path: Path, ext: str):
+    out = tmp_path / "out"
+    result = _launch(out, {**fake_ncu, "FAKE_NCU_EXT": ext})
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert Path(fake_ncu["FAKE_NCU_IMPORTED"]).read_text().strip() == str(out / f"all_gather.{ext}")
+    assert "2 result(s)" in result.stdout
+    assert (out / "summary.csv").exists()
+
+
+def test_launcher_fails_when_ncu_writes_no_report(fake_ncu: dict[str, str], tmp_path: Path):
+    result = _launch(tmp_path / "out", {**fake_ncu, "FAKE_NCU_EXT": ""})
+    assert result.returncode != 0
+    assert "wrote neither" in result.stderr

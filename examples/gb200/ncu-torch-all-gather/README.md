@@ -152,7 +152,7 @@ section，结果写在 `summary.txt` 里（ok / hang / fail / unknown）。
 | `config.txt` | ncu 版本、参数、所有 `NCCL_*` 环境变量 |
 | `baseline.log`、`ncu.log` | 两遍的输出，其中有 worker 的数据校验结果和 ncu 的 `==PROF==` 输出 |
 | `nccl-logs/<pass>/nccl-<host>-<pid>.log` | NCCL INFO 日志（INIT、ENV、TUNING） |
-| `all_gather.ncu-rep` | shmem 模式下所有 rank 合在一份报告里 |
+| `all_gather.ncu-rep` / `all_gather.ncu-repz` | shmem 模式下所有 rank 合在一份报告里；ncu 2026.4 默认写压缩的 `.ncu-repz` |
 | `summary.csv` | 每个被 profile 的 kernel（app-range 下是每个 range）一行 |
 
 ## 读结果时注意
