@@ -17,9 +17,10 @@ set -euo pipefail
 
 usage() {
     cat <<'USAGE'
-Find what hangs the NCCL AllGather kernel in pass 39 of an ncu --set full application replay:
-run run_ncu_torch_all_gather.sh once per section (or group of sections) and report which ones
-finish, hang or fail, and how many replay passes each one needed.
+Profile the NCCL AllGather kernel one ncu section (or group of sections) at a time: run
+run_ncu_torch_all_gather.sh once per item with application replay, put every item's results in
+its own folder, and report which items finish, hang or fail and how many replay passes each one
+needed. By default: every section of --set full, --algo symm, 1 GiB per rank.
 
 With ncu 2026.4, --replay-mode application --set full hangs in pass 39 for nvls and ring, at
 256 MiB and at 1 MiB: all ranks enter the kernel and it never completes. Two explanations are
@@ -30,8 +31,9 @@ told apart here:
 
 Each item of the list is one launcher run:
 
-  run_ncu_torch_all_gather.sh --skip-baseline --replay-mode application --timeout 600 \
-      --output-dir <dir>/<item> --section <s1> [--section <s2> ...] <launcher args>
+  run_ncu_torch_all_gather.sh --skip-baseline --replay-mode application --timeout 1800 \
+      --algo <algo> --size-mib <size> --output-dir <dir>/<item> \
+      --section <s1> [--section <s2> ...] <launcher args>
 
 An item is a section identifier, or several joined with "+" (e.g. SourceCounters+InstructionStats)
 to collect them in one run. A hang is ncu giving up on a pass ("Failed to wait for profiling") or
@@ -41,22 +43,27 @@ Usage:
   bash examples/gb200/ncu-torch-all-gather/bisect_ncu_sections.sh [options] [-- launcher args]
 
 Options:
-  --set NAME         Test every section of the ncu set NAME (e.g. full), one at a time. The
+  --algo NAME        ring | nvls | symm | p2p (default: symm)
+  --size-mib N       All-gather output size per rank in MiB (default: 1024)
+  --set NAME         Test every section of the ncu set NAME, one at a time (default: full). The
                      members are read from the *.section files in --section-dir.
-  --sections LIST    Comma-separated items instead of --set (default: Nvlink_Topology,
-                     Nvlink_Tables,Nvlink,SourceCounters,InstructionStats,PmSampling,
-                     PmSampling_WarpStates,WarpStateStats). Sections missing from
+  --sections LIST    Comma-separated items instead of --set. Sections missing from
                      `ncu --list-sections` are reported as unknown and skipped.
   --section-dir DIR  Section files for --set (default: the sections/ directory next to ncu)
-  --output-dir DIR   (default: results/gb200/ncu-torch-all-gather/sections-<time>)
+  --output-dir DIR   (default: results/gb200/ncu-torch-all-gather/<algo>-all-gather-<time>)
   --dry-run          Print the launcher commands without running them
   -h, --help
 
-Launcher args go to run_ncu_torch_all_gather.sh after the defaults above, so they can override
-them, e.g. -- --ncu /path/to/ncu --size-mib 1 --warmup 1 --algo ring.
+ncu: <repo>/NVIDIA-Nsight-Compute-2026.4 is put first in PATH when it exists, as the launcher
+does; the launcher refuses ncu < 2026.4.
 
-Outputs in --output-dir: <item>.log (launcher output), <item>/ (launcher --output-dir) and
-summary.txt, one line per item: <item> ok|hang|fail|unknown <passes> <detail>.
+Launcher args go to run_ncu_torch_all_gather.sh after the defaults above, so they can override
+them, e.g. -- --ncu /path/to/ncu --warmup 1 --timeout 3600.
+
+Outputs in --output-dir:
+  <item>/        the launcher's output for that item (config.txt, ncu.log, nccl-logs/,
+                 all_gather.ncu-repz, summary.csv) plus launcher.log, its console output
+  summary.txt    one line per item: <item> ok|hang|fail|unknown <passes> <detail>
 USAGE
 }
 
@@ -65,8 +72,10 @@ repo_root="$(cd -- "${script_dir}/../../.." && pwd)"
 launcher="${script_dir}/run_ncu_torch_all_gather.sh"
 worker="${script_dir}/ncu_torch_all_gather.py"
 
-sections="Nvlink_Topology,Nvlink_Tables,Nvlink,SourceCounters,InstructionStats,PmSampling,PmSampling_WarpStates,WarpStateStats"
-set_name=""
+algo="symm"
+size_mib=1024
+sections=""
+set_name="full"
 section_dir=""
 output_dir=""
 dry_run=false
@@ -79,8 +88,10 @@ die() {
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
-        --set) set_name="$2"; shift 2 ;;
-        --sections) sections="$2"; shift 2 ;;
+        --algo) algo="$2"; shift 2 ;;
+        --size-mib) size_mib="$2"; shift 2 ;;
+        --set) set_name="$2"; sections=""; shift 2 ;;
+        --sections) sections="$2"; set_name=""; shift 2 ;;
         --section-dir) section_dir="$2"; shift 2 ;;
         --output-dir) output_dir="$2"; shift 2 ;;
         --dry-run) dry_run=true; shift ;;
@@ -90,6 +101,9 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
+[[ "$algo" =~ ^(ring|nvls|symm|p2p)$ ]] || die "--algo must be ring, nvls, symm or p2p"
+ncu_home="${repo_root}/NVIDIA-Nsight-Compute-2026.4"
+[[ -d "$ncu_home" ]] && export PATH="${ncu_home}:${PATH}"
 # The launcher's own --ncu decides which ncu lists the sections.
 ncu_bin="ncu"
 for (( i = 0; i + 1 < ${#launcher_args[@]}; i++ )); do
@@ -122,12 +136,15 @@ if [[ -n "$set_name" ]]; then
 fi
 IFS=, read -r -a item_list <<<"$sections"
 (( ${#item_list[@]} > 0 )) || die "--sections is empty"
-output_dir="${output_dir:-${repo_root}/results/gb200/ncu-torch-all-gather/sections-$(date +%Y%m%d-%H%M%S)}"
+output_dir="${output_dir:-${repo_root}/results/gb200/ncu-torch-all-gather/${algo}-all-gather-$(date +%Y%m%d-%H%M%S)}"
 
 # item_cmd <item>: the launcher command for one item, in the array "cmd".
 item_cmd() {
     local s
-    cmd=(bash "$launcher" --skip-baseline --replay-mode application --timeout 600 --output-dir "${output_dir}/$1")
+    cmd=(
+        bash "$launcher" --skip-baseline --replay-mode application --timeout 1800
+        --algo "$algo" --size-mib "$size_mib" --output-dir "${output_dir}/$1"
+    )
     IFS=+ read -r -a parts <<<"$1"
     for s in "${parts[@]}"; do cmd+=(--section "$s"); done
     cmd+=(${launcher_args[@]+"${launcher_args[@]}"})
@@ -188,10 +205,19 @@ for item in "${item_list[@]}"; do
         passes="${passes:-1}"
         # The launcher's die message, else the first ncu error.
         detail="$(grep -m1 "^ERROR: " "$log" || grep -m1 "==ERROR==" "$log" || true)"
+        # The launcher needs an empty --output-dir, so its console log is moved in afterwards.
+        if [[ -d "${output_dir}/${item}" ]]; then
+            mv "$log" "${output_dir}/${item}/launcher.log"
+            log="${output_dir}/${item}/launcher.log"
+        fi
         detail="${detail:-exit ${rc}}; log ${log}"
         [[ "$status" == ok ]] || kill_leftover_workers
     fi
     printf '%-40s %-8s %-6s %s\n' "$item" "$status" "$passes" "$detail" | tee -a "$summary"
+    # A wrong algorithm fails every item the same way; stop instead of profiling the wrong kernel.
+    if [[ "$detail" == *"NCCL did not run --algo"* ]]; then
+        die "NCCL did not run --algo ${algo}; fix the NCCL environment first (${log})"
+    fi
 done
 
 echo "=== summary: ${summary} (item, status, replay passes, detail)"

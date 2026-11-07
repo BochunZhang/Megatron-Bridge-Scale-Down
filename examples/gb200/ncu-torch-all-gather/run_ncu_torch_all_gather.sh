@@ -17,7 +17,10 @@ set -euo pipefail
 
 usage() {
     cat <<'USAGE'
-Profile the NCCL kernel of a torch all-gather with Nsight Compute >= 2026.1 on one node.
+Profile the NCCL kernel of a torch all-gather with Nsight Compute >= 2026.4 on one node.
+
+ncu: <repo>/NVIDIA-Nsight-Compute-2026.4 is put first in PATH when it exists; --ncu overrides.
+2026.4 is the first version with application replay under the shmem communicator.
 
 One ncu wraps torchrun (the NVIDIA docs' pattern):
   ncu --communicator shmem --communicator-shmem-num-peers <n> ... torchrun --nproc_per_node=<n> ncu_torch_all_gather.py
@@ -26,14 +29,17 @@ kernel on all of them together; without it the first NCCL kernel waits forever f
 torchrun itself is excluded from profiling by ncu.
 
 Algorithms (--algo), each checked against NCCL's TUNING log for every all-gather launch:
-  ring   NCCL_ALGO=Ring, plain buffers      kernel ncclDevKernel_AllGather_RING
-  nvls   NCCL_ALGO=NVLS, plain buffers      kernel ncclDevKernel_AllGather_RING (same symbol:
-                                            NCCL builds one AllGather kernel and dispatches the
-                                            algorithm inside it; the protocol is not part of the
-                                            name unless NCCL_EXACT_KERNEL_NAMES=1)
-  symm   symmetric windows, AllGather_STMC  kernel ncclSymkDevKernel_AllGather_STMC
-ring keeps an inherited NCCL_NVLS_ENABLE; run it with NCCL_NVLS_ENABLE=0 for a communicator
-without multicast mappings.
+  ring   ring all-gather                   NCCL_ALGO=Ring, plain buffers
+  nvls   NVLS multicast all-gather         NCCL_ALGO=NVLS, plain buffers
+  symm   symmetric kernel, multicast       AllGather_STMC on registered symmetric windows
+  p2p    symmetric kernel, peer-to-peer    AllGather_ST on registered symmetric windows,
+                                           NCCL_NVLS_ENABLE=0 (no multicast mappings at all)
+Kernels: ring and nvls launch ncclDevKernel_AllGather_RING[_<proto>] (NCCL builds one AllGather
+kernel and dispatches the algorithm inside it), symm and p2p ncclSymkDevKernel_AllGather_STMC /
+_ST. ring keeps an inherited NCCL_NVLS_ENABLE; run it with NCCL_NVLS_ENABLE=0 for a communicator
+without multicast mappings. symm and p2p pin the kernel with NCCL_SYM_KERNEL, whose syntax
+depends on the NCCL that torch loads (probed once): "AllGather_ST" before 2.32,
+"AllGather:AllGather_ST" from 2.32 on.
 
 Multicast memory and kernel replay: a kernel replay of more than one pass first saves all memory
 the kernel can reach. With nvls (NCCL's NVLS buffers) and symm (the registered windows) that
@@ -58,7 +64,7 @@ Usage:
 
 Options:
   --gpus LIST            CUDA_VISIBLE_DEVICES, one rank per GPU (default: 0,1,2,3)
-  --algo NAME            ring | nvls | symm (default: nvls)
+  --algo NAME            ring | nvls | symm | p2p (default: nvls)
   --size-mib N           All-gather output size per rank in MiB (default: 256)
   --dtype NAME           bf16 | fp32 (default: bf16)
   --warmup N             All-gathers before the NVTX range (default: 5)
@@ -75,11 +81,10 @@ Options:
                                         (see "Multicast memory and kernel replay" above)
                            application  relaunches the whole torchrun tree once per pass
                            app-range    relaunches once per pass and profiles the NVTX range
-                         application and app-range with --communicator shmem need ncu >= 2026.4
   --timeout SEC          Kill a pass after SEC seconds and report a hang (default: 1800)
-  --ncu PATH             ncu binary (default: ncu in PATH)
+  --ncu PATH             ncu binary (default: ncu in PATH, NVIDIA-Nsight-Compute-2026.4 first)
   --nccl-lib PATH        LD_PRELOAD this libnccl.so.2 instead of the one bundled with torch
-  --output-dir DIR       (default: results/gb200/ncu-torch-all-gather/<algo>-<time>)
+  --output-dir DIR       (default: results/gb200/ncu-torch-all-gather/<algo>-all-gather-<time>)
   --skip-baseline        Only run the ncu pass
   -h, --help
 
@@ -139,7 +144,7 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
-[[ "$algo" =~ ^(ring|nvls|symm)$ ]] || die "--algo must be ring, nvls or symm"
+[[ "$algo" =~ ^(ring|nvls|symm|p2p)$ ]] || die "--algo must be ring, nvls, symm or p2p"
 [[ "$dtype" =~ ^(bf16|fp32)$ ]] || die "--dtype must be bf16 or fp32"
 [[ "$communicator" =~ ^(shmem|none)$ ]] || die "--communicator must be shmem or none"
 [[ "$replay_mode" =~ ^(kernel|application|app-range)$ ]] || die "--replay-mode must be kernel, application or app-range"
@@ -147,23 +152,22 @@ done
 IFS=, read -r -a gpu_list <<<"$gpus"
 nranks=${#gpu_list[@]}
 (( nranks >= 2 )) || die "--gpus needs at least two GPUs"
-output_dir="${output_dir:-${repo_root}/results/gb200/ncu-torch-all-gather/${algo}-$(date +%Y%m%d-%H%M%S)}"
+output_dir="${output_dir:-${repo_root}/results/gb200/ncu-torch-all-gather/${algo}-all-gather-$(date +%Y%m%d-%H%M%S)}"
 
 ################################################################################
 # Preflight
 
-command -v "$ncu_bin" >/dev/null || die "${ncu_bin} not found; pass --ncu"
+ncu_home="${repo_root}/NVIDIA-Nsight-Compute-2026.4"
+[[ -d "$ncu_home" ]] && export PATH="${ncu_home}:${PATH}"
+command -v "$ncu_bin" >/dev/null || die "${ncu_bin} not found; put Nsight Compute 2026.4 in ${ncu_home} or pass --ncu"
 ncu_version="$("$ncu_bin" --version | sed -n 's/.*Version \([0-9]*\.[0-9]*\).*/\1/p' | head -1)"
 echo "ncu: $(command -v "$ncu_bin") (${ncu_version:-unknown version})"
 ncu_year="${ncu_version%%.*}"
 ncu_minor="${ncu_version#*.}"
-if [[ -z "$ncu_version" ]] || (( ncu_year < 2026 || (ncu_year == 2026 && ncu_minor < 1) )); then
-    die "Nsight Compute ${ncu_version:-?} cannot profile NCCL kernels with --communicator shmem; need >= 2026.1"
-fi
 # 2026.4 release notes: "Added application replay support when profiling with the shmem
-# communicator". 2026.3 runs the application without profiling anything ("No kernels were profiled").
-if [[ "$communicator" == shmem && "$replay_mode" != kernel ]] && (( ncu_year == 2026 && ncu_minor < 4 )); then
-    die "--replay-mode ${replay_mode} with --communicator shmem needs Nsight Compute >= 2026.4, got ${ncu_version}"
+# communicator"; 2026.3 runs the application without profiling anything ("No kernels were profiled").
+if [[ -z "$ncu_version" ]] || (( ncu_year < 2026 || (ncu_year == 2026 && ncu_minor < 4) )); then
+    die "Nsight Compute ${ncu_version:-?} is too old; need >= 2026.4 (put it in ${ncu_home} or pass --ncu)"
 fi
 [[ -z "$nccl_lib" || -f "$nccl_lib" ]] || die "--nccl-lib ${nccl_lib} does not exist"
 
@@ -180,6 +184,24 @@ mkdir -p "$output_dir"
 # Drop inherited selectors that would compete with the per-algorithm settings below.
 unset NCCL_ALGO NCCL_PROTO NCCL_CTA_POLICY NCCL_SYM_KERNEL NCCL_SYM_CTAS NCCL_SYM_CE_THRESHOLD \
     NCCL_CE_COLL_AG_MULTICAST_THRESHOLD NCCL_WIN_ENABLE NCCL_NVTX_DISABLE
+[[ -n "$nccl_lib" ]] && export LD_PRELOAD="${nccl_lib}${LD_PRELOAD:+:${LD_PRELOAD}}"
+
+# sym_kernel <name>: NCCL_SYM_KERNEL for one AllGather kernel in the NCCL torch loads. Before 2.32
+# NCCL compares the whole value with a kernel name; from 2.32 it parses "<func>:<kernel>".
+sym_kernel() {
+    local version major minor
+    version="$(cd "$repo_root" && uv run --no-sync python -c \
+        'import torch.distributed as d; print(".".join(map(str, d.ProcessGroupNCCL.get_runtime_nccl_version())))')" \
+        || die "could not read the runtime NCCL version from torch"
+    IFS=. read -r major minor _ <<<"$version"
+    echo "runtime NCCL ${version}" >&2
+    if (( major > 2 || (major == 2 && minor >= 32) )); then
+        echo "AllGather:$1"
+    else
+        echo "$1"
+    fi
+}
+
 case "$algo" in
     ring)
         export NCCL_ALGO=Ring
@@ -189,20 +211,27 @@ case "$algo" in
         export NCCL_ALGO=NVLS NCCL_NVLS_ENABLE=1
         tuning_re='AllGather: [0-9]+ Bytes -> Algo NVLS '
         ;;
-    symm)
+    symm|p2p)
         # Window registration selects the symmetric kernels, not NCCL_ALGO. NCCL_SYM_KERNEL does
         # not stop large AllGathers going to the copy engines on Blackwell (enqueue.cc); only an
-        # INT64_MAX NCCL_SYM_CE_THRESHOLD does. The "<func>:<kernel>" syntax needs NCCL >= 2.32.
-        export NCCL_NVLS_ENABLE=1 NCCL_WIN_ENABLE=1
-        export NCCL_SYM_KERNEL="AllGather:AllGather_STMC"
-        export NCCL_SYM_CE_THRESHOLD=9223372036854775807
-        tuning_re='AllGather \[Symmetric\]: [0-9]+ Bytes -> Kernel AllGather_STMC '
+        # INT64_MAX NCCL_SYM_CE_THRESHOLD does. p2p turns NVLS off: AllGather_ST stores through
+        # peer pointers and the communicator then has no multicast mappings at all.
+        if [[ "$algo" == symm ]]; then
+            kernel=AllGather_STMC
+            export NCCL_NVLS_ENABLE=1
+        else
+            kernel=AllGather_ST
+            export NCCL_NVLS_ENABLE=0
+        fi
+        export NCCL_WIN_ENABLE=1 NCCL_SYM_CE_THRESHOLD=9223372036854775807
+        NCCL_SYM_KERNEL="$(sym_kernel "$kernel")" || exit 1
+        export NCCL_SYM_KERNEL
+        tuning_re="AllGather \\[Symmetric\\]: [0-9]+ Bytes -> Kernel ${kernel} "
         ;;
 esac
 export CUDA_VISIBLE_DEVICES="$gpus"
 export NCCL_DEBUG=INFO
 export NCCL_DEBUG_SUBSYS=INIT,ENV,TUNING
-[[ -n "$nccl_lib" ]] && export LD_PRELOAD="${nccl_lib}${LD_PRELOAD:+:${LD_PRELOAD}}"
 
 # --standalone picks a free rendezvous port, so application replay can relaunch torchrun at once.
 torchrun_cmd=(

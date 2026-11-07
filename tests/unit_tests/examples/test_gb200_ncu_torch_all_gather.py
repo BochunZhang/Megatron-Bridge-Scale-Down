@@ -50,9 +50,11 @@ def test_dry_run_builds_one_application_replay_launch_per_item(tmp_path: Path):
         assert command[command.index("--replay-mode") + 1] == "application"
         assert command[command.index("--output-dir") + 1] == str(tmp_path / item)
         assert "--skip-baseline" in command and "--metrics" not in command
+        assert command[command.index("--algo") + 1] == "symm"
+        assert command[command.index("--size-mib") + 1] == "1024"
         assert [command[i + 1] for i, arg in enumerate(command) if arg == "--section"] == sections
         # Launcher args come last: the launcher's last --timeout wins, ncu args stay after "--".
-        assert command.index("900") > command.index("600")
+        assert command.index("900") > command.index("1800")
         assert command[-3:] == ["--", "--devices", "0"]
 
 
@@ -88,9 +90,11 @@ def fake_tree(tmp_path: Path) -> tuple[Path, dict[str, str]]:
         sections=()
         while [[ $# -gt 0 ]]; do
             [[ "$1" == --section ]] && sections+=("$2")
+            [[ "$1" == --output-dir ]] && OUT="$(dirname "$2")"
             shift
         done
         item="$(IFS=+; echo "${sections[*]}")"
+        [[ "$item" == Missing ]] || mkdir -p "$OUT/$item"
         echo "$item" >>"$(dirname "$0")/calls.txt"
         for p in 1 2 3; do echo "==PROF== Profiling kernel: Application replay pass $p"; done
         case "$item" in
@@ -136,6 +140,9 @@ def test_items_are_classified_with_their_pass_counts(fake_tree: tuple[Path, dict
         "Missing": ["unknown", "-"],
     }
     assert "Failed to profile" in (out / "summary.txt").read_text()
+    # Every item that ran keeps its console log in its own folder.
+    assert all((out / item / "launcher.log").is_file() for item in ("Good", "Hangs", "Breaks", "Good+Breaks2"))
+    assert not list(out.glob("*.log"))
     # Missing never reaches the launcher; a group is one launcher run with all its sections.
     assert (script_dir / "calls.txt").read_text().splitlines() == ["Good", "Hangs", "Breaks", "Good+Breaks2"]
 
@@ -152,7 +159,7 @@ def fake_ncu(tmp_path: Path) -> dict[str, str]:
     ncu.write_text(
         textwrap.dedent("""\
         #!/usr/bin/env bash
-        if [[ "$1" == --version ]]; then echo "Version 2026.4.0.0 (build 1)"; exit 0; fi
+        if [[ "$1" == --version ]]; then echo "Version ${FAKE_NCU_VERSION:-2026.4}.0.0 (build 1)"; exit 0; fi
         if [[ "$1" == --import ]]; then
             echo "$2" >"$FAKE_NCU_IMPORTED"
             printf '"ID","gpu__time_duration.sum"\\n"","usecond"\\n"0","10"\\n"1","11"\\n'
@@ -165,12 +172,14 @@ def fake_ncu(tmp_path: Path) -> dict[str, str]:
         done
         [[ -n "$FAKE_NCU_EXT" ]] && echo report >"${report}.${FAKE_NCU_EXT}"
         log="${NCCL_DEBUG_FILE//%h/host}"
-        echo "host:1:1 NCCL INFO AllGather: 268435456 Bytes -> Algo NVLS proto Simple" >"${log//%p/1}"
+        echo "host:1:1 NCCL INFO ${FAKE_TUNING:-AllGather: 268435456 Bytes -> Algo NVLS proto Simple}" >"${log//%p/1}"
     """)
     )
+    uv = tools / "uv"
+    uv.write_text('#!/usr/bin/env bash\necho "${FAKE_NCCL_RUNTIME:-2.29.7}"\n')
     smi = tools / "nvidia-smi"
     smi.write_text("#!/usr/bin/env bash\nfor g in 0 1 2 3; do echo GPU $g; done\n")
-    for tool in (ncu, smi):
+    for tool in (ncu, uv, smi):
         tool.chmod(0o755)
     return {
         **os.environ,
@@ -236,3 +245,75 @@ def test_launcher_names_the_pass_ncu_gave_up_on(fake_ncu: dict[str, str], tmp_pa
     result = _launch(tmp_path / "out", fake_ncu)
     assert result.returncode != 0
     assert "ncu gave up waiting for the profiled kernel (hang in replay pass 39)" in result.stderr
+
+
+@pytest.mark.parametrize(
+    ("algo", "runtime", "sym_kernel", "nvls"),
+    [
+        ("symm", "2.29.7", "AllGather_STMC", "1"),
+        ("p2p", "2.29.7", "AllGather_ST", "0"),
+        ("symm", "2.32.3", "AllGather:AllGather_STMC", "1"),
+        ("p2p", "2.32.3", "AllGather:AllGather_ST", "0"),
+    ],
+)
+def test_symmetric_algorithms_pin_the_kernel_for_the_runtime_nccl(
+    fake_ncu: dict[str, str], tmp_path: Path, algo: str, runtime: str, sym_kernel: str, nvls: str
+):
+    kernel = sym_kernel.split(":")[-1]
+    env = {
+        **fake_ncu,
+        "FAKE_NCU_EXT": "ncu-repz",
+        "FAKE_NCCL_RUNTIME": runtime,
+        "FAKE_TUNING": f"AllGather [Symmetric]: 1073741824 Bytes -> Kernel {kernel} nchannels 32",
+    }
+    out = tmp_path / "out"
+    result = _launch(out, env, "--algo", algo)
+    assert result.returncode == 0, result.stdout + result.stderr
+    config = (out / "config.txt").read_text().splitlines()
+    assert f"NCCL_SYM_KERNEL={sym_kernel}" in config
+    assert f"NCCL_NVLS_ENABLE={nvls}" in config
+    assert "NCCL_WIN_ENABLE=1" in config and "NCCL_SYM_CE_THRESHOLD=9223372036854775807" in config
+    assert not any(line.startswith("NCCL_ALGO=") for line in config)
+
+
+def test_p2p_rejects_a_multicast_kernel(fake_ncu: dict[str, str], tmp_path: Path):
+    env = {
+        **fake_ncu,
+        "FAKE_NCU_EXT": "ncu-repz",
+        "FAKE_TUNING": "AllGather [Symmetric]: 1073741824 Bytes -> Kernel AllGather_STMC nchannels 32",
+    }
+    result = _launch(tmp_path / "out", env, "--algo", "p2p")
+    assert result.returncode != 0
+    assert "NCCL did not run --algo p2p" in result.stderr
+
+
+def test_launcher_refuses_ncu_older_than_2026_4(fake_ncu: dict[str, str], tmp_path: Path):
+    result = _launch(tmp_path / "out", {**fake_ncu, "FAKE_NCU_VERSION": "2026.3"})
+    assert result.returncode != 0
+    assert "need >= 2026.4" in result.stderr
+
+
+def test_launcher_prefers_the_repo_nsight_compute_2026_4(fake_ncu: dict[str, str], tmp_path: Path):
+    repo = tmp_path / "repo"
+    script_dir = repo / "examples/gb200/ncu-torch-all-gather"
+    script_dir.mkdir(parents=True)
+    shutil.copy(LAUNCHER, script_dir)
+    # Only the repo copy of ncu exists; the fake on PATH is renamed away.
+    tools = Path(fake_ncu["PATH"].split(":")[0])
+    ncu_home = repo / "NVIDIA-Nsight-Compute-2026.4"
+    ncu_home.mkdir()
+    (tools / "ncu").rename(ncu_home / "ncu")
+    out = tmp_path / "out"
+    result = _run(
+        script_dir / "run_ncu_torch_all_gather.sh",
+        "--skip-baseline",
+        "--gpus",
+        "0,1",
+        "--warmup",
+        "0",
+        "--output-dir",
+        str(out),
+        env={**fake_ncu, "FAKE_NCU_EXT": "ncu-repz"},
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert f"ncu: {ncu_home / 'ncu'} (2026.4)" in result.stdout

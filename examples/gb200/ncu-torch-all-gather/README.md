@@ -23,8 +23,21 @@ ncu --communicator shmem --communicator-shmem-num-peers 2 -f -o report -k regex:
 
 ## 用法
 
-在仓库根目录执行，需要 Nsight Compute ≥ 2026.1（shmem 下用 application / app-range replay 需要 ≥ 2026.4），
-并且有 GPU 性能计数器权限：
+在仓库根目录执行，需要 Nsight Compute ≥ 2026.4 和 GPU 性能计数器权限。仓库根目录下有
+`NVIDIA-Nsight-Compute-2026.4/` 时，脚本会自动把它放到 PATH 最前面，不用传 `--ncu`；版本低于 2026.4 会直接报错。
+
+`--algo` 的四种 all-gather，每次 launch 都用 TUNING 日志核对：
+
+| `--algo` | 实现 | NCCL 设置 | kernel |
+| --- | --- | --- | --- |
+| `ring` | ring all-gather | `NCCL_ALGO=Ring` | `ncclDevKernel_AllGather_RING[_<proto>]` |
+| `nvls` | NVLS multicast all-gather | `NCCL_ALGO=NVLS NCCL_NVLS_ENABLE=1` | 同上（算法在 kernel 内部分派） |
+| `symm` | symmetric kernel，multicast 实现 | 注册 symmetric window，`NCCL_SYM_KERNEL` 固定 `AllGather_STMC` | `ncclSymkDevKernel_AllGather_STMC` |
+| `p2p` | symmetric kernel，p2p 实现 | 注册 symmetric window，固定 `AllGather_ST`，`NCCL_NVLS_ENABLE=0` | `ncclSymkDevKernel_AllGather_ST` |
+
+`symm` / `p2p` 都把 `NCCL_SYM_CE_THRESHOLD` 设成 INT64_MAX，否则 Blackwell 上大 AllGather 会走 copy engine。
+`NCCL_SYM_KERNEL` 的写法取决于 torch 实际加载的 NCCL（脚本启动时探测一次）：2.32 之前是裸 kernel 名
+`AllGather_STMC`，2.32 起是 `AllGather:AllGather_STMC`。
 
 ```bash
 # ncu 2026.3 可用：单遍 metric 的 kernel replay，不保存显存
@@ -41,9 +54,11 @@ bash examples/gb200/ncu-torch-all-gather/run_ncu_torch_all_gather.sh --replay-mo
     --section SpeedOfLight --section Occupancy
 
 # ncu >= 2026.4：把 --set full 的 section 逐个单独跑，找出卡死的那个（-- 之后是启动器参数）
-bash examples/gb200/ncu-torch-all-gather/bisect_ncu_sections.sh --set full -- --size-mib 1 --warmup 1
+# 默认：symm、1 GiB、--set full 的每个 section 单独跑，结果在 results/gb200/ncu-torch-all-gather/symm-all-gather-<时间>/<section>/
+bash examples/gb200/ncu-torch-all-gather/bisect_ncu_sections.sh
+bash examples/gb200/ncu-torch-all-gather/bisect_ncu_sections.sh --algo p2p --size-mib 256
 
-# symmetric AllGather_STMC（NCCL >= 2.32；ncu >= 2026.4）
+# symmetric AllGather_STMC / AllGather_ST，换成 2.32.3 的 NCCL
 bash examples/gb200/ncu-torch-all-gather/run_ncu_torch_all_gather.sh --algo symm --replay-mode app-range \
     --nccl-lib nccl/nccl-2.32.3/build/lib/libnccl.so.2
 
@@ -161,7 +176,8 @@ PM sampling / warp state sampling 的 pass 数是动态决定的，这两类很�
 
 ## 输出
 
-默认目录是 `results/gb200/ncu-torch-all-gather/<algo>-<时间>/`：
+默认目录是 `results/gb200/ncu-torch-all-gather/<algo>-all-gather-<时间>/`。`bisect_ncu_sections.sh` 在同一个目录下
+每个 section 一个子目录（内容同下表，外加 `launcher.log`），顶层是 `summary.txt`：
 
 | 文件 | 内容 |
 | --- | --- |

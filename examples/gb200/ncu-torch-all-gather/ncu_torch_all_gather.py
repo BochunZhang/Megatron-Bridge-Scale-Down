@@ -35,9 +35,10 @@ NCCL all-reduce kernel of ``dist.barrier`` enters a kernel filter or a range.
   kernel per build, ``best_kernel`` in ``src/device/generate.py``, and leaves the protocol out of
   the name unless ``NCCL_EXACT_KERNEL_NAMES=1``); the algorithm is dispatched inside it, so only
   the TUNING log tells Ring and NVLS apart.
-* ``symm``: buffers are allocated from a ``torch.cuda.MemPool`` backed by ``ncclMemAlloc`` and
-  registered as ``NCCL_WIN_COLL_SYMMETRIC`` windows; NCCL runs ``ncclSymkDevKernel_AllGather_*``
-  (``AllGather_STMC`` with ``NCCL_SYM_KERNEL`` pinned by the launcher).
+* ``symm`` / ``p2p``: buffers are allocated from a ``torch.cuda.MemPool`` backed by
+  ``ncclMemAlloc`` and registered as ``NCCL_WIN_COLL_SYMMETRIC`` windows; NCCL runs the symmetric
+  kernel the launcher pins with ``NCCL_SYM_KERNEL``: ``ncclSymkDevKernel_AllGather_STMC``
+  (multicast stores) for ``symm``, ``ncclSymkDevKernel_AllGather_ST`` (peer stores) for ``p2p``.
 """
 
 import argparse
@@ -57,10 +58,13 @@ NVTX_RANGE = "ncu_all_gather"
 
 DTYPES = {"bf16": torch.bfloat16, "fp32": torch.float32}
 
+# Algorithms that run NCCL's symmetric kernels on registered windows.
+SYMMETRIC_ALGOS = ("symm", "p2p")
+
 
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--algo", choices=("ring", "nvls", "symm"), required=True)
+    parser.add_argument("--algo", choices=("ring", "nvls", "symm", "p2p"), required=True)
     parser.add_argument("--size-mib", type=int, required=True, help="All-gather output size per rank in MiB")
     parser.add_argument("--dtype", choices=tuple(DTYPES), required=True)
     parser.add_argument("--warmup", type=int, required=True, help="All-gathers before the NVTX range")
@@ -73,11 +77,13 @@ def _check_env(algo: str) -> None:
     nccl_algo = os.environ.get("NCCL_ALGO", "")
     if algo in ("ring", "nvls") and nccl_algo.lower() != algo:
         raise RuntimeError(f"--algo {algo} requires NCCL_ALGO={algo}, got {nccl_algo!r}")
-    if algo == "symm":
+    if algo in SYMMETRIC_ALGOS:
         if nccl_algo:
-            raise RuntimeError(f"--algo symm requires NCCL_ALGO to be unset, got {nccl_algo!r}")
+            raise RuntimeError(f"--algo {algo} requires NCCL_ALGO to be unset, got {nccl_algo!r}")
         if os.environ.get("NCCL_WIN_ENABLE") != "1":
-            raise RuntimeError("--algo symm requires NCCL_WIN_ENABLE=1 to register symmetric windows")
+            raise RuntimeError(f"--algo {algo} requires NCCL_WIN_ENABLE=1 to register symmetric windows")
+        if not os.environ.get("NCCL_SYM_KERNEL"):
+            raise RuntimeError(f"--algo {algo} requires NCCL_SYM_KERNEL to pin the symmetric kernel")
 
 
 def _nccl_backend(pg: dist.ProcessGroup) -> dist.ProcessGroupNCCL:
@@ -118,7 +124,7 @@ def main() -> None:
     backend = _nccl_backend(dist.group.WORLD)
     # Symmetric windows need ncclMemAlloc memory; a pool with its own allocator never uses
     # expandable segments, whose multi-handle segments NCCL would only partly map to peers.
-    pool = torch.cuda.MemPool(backend.mem_allocator) if args.algo == "symm" else None
+    pool = torch.cuda.MemPool(backend.mem_allocator) if args.algo in SYMMETRIC_ALGOS else None
     with torch.cuda.use_mem_pool(pool) if pool else contextlib.nullcontext():
         inp = torch.full((shard,), float(rank + 1), dtype=dtype, device=device)
         out = torch.empty(numel, dtype=dtype, device=device)
