@@ -24,6 +24,7 @@ ncu --communicator shmem --communicator-shmem-num-peers 2 -f -o report -k regex:
 | `bisect_ncu_sections.sh` | 逐个 section 跑启动器（application replay），找出让 kernel 卡死的 section，见下文「实测：application replay + `--set full` 卡在 pass 39」 |
 | `sweep_ncu_replay_modes.sh` | 逐个 replay 模式 × communicator 组合跑启动器（默认 `--ag-rs`），找出哪些组合能 profile 并发的 AG + RS，见下文「AG + RS：replay 模式 × communicator」 |
 | `sweep_symm_ag_pause_blocking_metrics.sh` | 用 `.venv/python3.12-torch2.13-nccl2.32.3` + `nccl-2.32.3-pause` 逐个 `NCCL_SYM_AG_STMC_PAUSE_CYCLES` 跑启动器的 `--blocking-metrics`（symm，application + shmem），每个 pause 一个文件夹，见下文用法 |
+| `sweep_symm_ag_pause_rs_blocking_metrics.sh` | 同上，但 AG（加 pause）和 RS（不加）同时执行：启动器 `--ag-rs --blocking-metrics`，ncu 2026.4 + app-range + tcp；默认 pause 点取自 4 卡 AG + RS pause 图，summary.txt 同时列出 baseline 的 AG done / RS done 和 ncu range 时长 |
 | `analyse_blocking_metrics.py` | `--blocking-metrics` 结束后由启动器调用：把 `summary.csv` 按数据流经的各级（发端 SM→XBAR、NVLink、接收端 L2、HBM）排成 `blocking.txt`，字节数以每卡分片 S 的倍数显示 |
 | `README-test-records.md` | 各种 ncu 版本 / replay 模式 / 算法组合的成功和失败记录，以及四种 replay 模式的区别 |
 
@@ -91,6 +92,14 @@ bash examples/gb200/ncu-torch-all-gather/run_ncu_torch_all_gather.sh --algo symm
 # summary.txt 每个 pause 一行：CTA 数、SM 频率、pause 折成的 ns、kernel 时长、algbw
 bash examples/gb200/ncu-torch-all-gather/sweep_symm_ag_pause_blocking_metrics.sh
 bash examples/gb200/ncu-torch-all-gather/sweep_symm_ag_pause_blocking_metrics.sh --pause-cycles 0,1024,4096 -- --gpus 0,1
+
+# AG（加 pause）+ RS（不加）同时执行时逐个 pause 采各级反压：ncu 2026.4、app-range + tcp（#15 唯一能 profile
+# 并发 AG + RS 的组合），metric 属于整个 NVTX range（AG + RS 合在一起），每个 rank 一个结果；
+# 默认 pause 点 0,128,...,3072,4096,6144 即 4 卡 AG + RS pause 图上的点（makespan 最低在 3072）。
+# 结果在 results/gb200/ncu-torch-all-gather/symm-ag-pause-rs-blocking-metric-<时间>/pause-<C>cyc/，
+# summary.txt 每个 pause 一行：AG / RS 的 CTA 数、SM 频率、pause 折成的 ns、baseline 的 AG done / RS done、range 时长
+bash examples/gb200/ncu-torch-all-gather/sweep_symm_ag_pause_rs_blocking_metrics.sh
+bash examples/gb200/ncu-torch-all-gather/sweep_symm_ag_pause_rs_blocking_metrics.sh --pause-cycles 0,2048,3072,4096 -- --no-lockstep
 
 # 复现不加 communicator 时的卡死（由 --timeout 兜底）
 bash examples/gb200/ncu-torch-all-gather/run_ncu_torch_all_gather.sh --communicator none --timeout 300
