@@ -145,6 +145,9 @@ fi
 [[ -f "${venv}/bin/activate" ]] || die "no virtualenv at ${venv}; build it with install/install-torch-2.13.0-nccl-2.32.3.sh"
 # shellcheck source=/dev/null
 source "${venv}/bin/activate"
+# uv run ignores an activated VIRTUAL_ENV that is not the project's .venv (it warns and uses .venv);
+# UV_PROJECT_ENVIRONMENT makes every uv run here and in the launcher (torchrun included) use ${venv}.
+export UV_PROJECT_ENVIRONMENT="$venv"
 # GB200 images export some of these; they would decide ring's channel count instead of NCCL.
 unset NCCL_MIN_CTAS NCCL_MAX_CTAS NCCL_MIN_NCHANNELS NCCL_MAX_NCHANNELS NCCL_MIN_NRINGS NCCL_MAX_NRINGS \
     NCCL_SYM_CTAS NCCL_SYM_KERNEL
