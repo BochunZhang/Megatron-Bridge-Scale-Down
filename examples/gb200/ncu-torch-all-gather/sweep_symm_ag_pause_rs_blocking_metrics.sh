@@ -18,8 +18,8 @@ set -euo pipefail
 usage() {
     cat <<'USAGE'
 Sweep the AllGather_STMC pause of nccl-2.32.3-pause while a reduce-scatter runs at the same time,
-and collect the --blocking-metrics of the NVTX range holding both: one run_ncu_torch_all_gather.sh
---ag-rs run per pause, profiled with Nsight Compute 2026.4, app-range replay and the tcp communicator.
+and collect blocking metrics and SourceCounters. Each pause runs run_ncu_torch_all_gather.sh
+with --ag-rs, Nsight Compute 2026.4, app-range replay and the tcp communicator.
 
 nccl-2.32.3-pause (install/install-nccl-2.32.3-pause.sh) is stock 2.32.3 plus
 NCCL_SYM_AG_STMC_PAUSE_CYCLES: AllGather_STMC makes every warp spin <cycles> SM cycles (clock64)
@@ -28,13 +28,13 @@ while the RS, which shares NVLink and the SMs with it, gets faster. 0 runs both 
 NCCL reads the variable once per process, so every pause is its own launcher run:
 
   NCCL_SYM_AG_STMC_PAUSE_CYCLES=<cycles> NCCL_SYM_TMA_ENABLE=0 \
-  run_ncu_torch_all_gather.sh --algo symm --ag-rs --blocking-metrics --replay-mode app-range \
-      --communicator tcp --ncu <ncu 2026.4> --size-mib <size> --nccl-lib <nccl-lib> \
+  run_ncu_torch_all_gather.sh --algo symm --ag-rs --blocking-metrics --section SourceCounters \
+      --replay-mode app-range --communicator tcp --ncu <ncu 2026.4> --size-mib <size> --nccl-lib <nccl-lib> \
       --output-dir <dir>/pause-<cycles>cyc <launcher args>
 
 app-range + tcp is the only combination that profiled the concurrent AG + RS of the symmetric
 multicast kernels (#15): one ncu per rank, no memory save (multicast windows), no serialization.
-The metrics belong to the whole NVTX range "ncu_collectives" (AG + RS together), one result per
+The blocking metrics belong to the NVTX range "ncu_collectives" (AG + RS together), one result per
 rank; gpu__time_duration.sum of a range is the AG + RS makespan under ncu. NCCL_SYM_TMA_ENABLE=0
 keeps the all-gather off AllGather_TmaSTMC, and the launcher pins
 NCCL_SYM_KERNEL=AllGather:AllGather_STMC;ReduceScatter:ReduceScatter_LDMC and fails a run whose
@@ -79,6 +79,7 @@ Launcher args go to run_ncu_torch_all_gather.sh after the defaults above, so the
 them, e.g. -- --gpus 0,1 --no-lockstep --timeout 900, or ncu args after a second "--".
 --algo, --ag-rs, --replay-mode, --communicator, --ncu, --nccl-lib and --output-dir are fixed by
 the sweep.
+Explicit --section arguments replace the default SourceCounters section.
 
 Outputs in --output-dir:
   sweep.txt          the sweep's settings
@@ -151,6 +152,12 @@ for arg in ${launcher_args[@]+"${launcher_args[@]}"}; do
             die "${arg} is fixed by this sweep (symm AG + RS, app-range over tcp, ncu ${ncu_want}, ${nccl_lib##*/}, one folder per pause)" ;;
     esac
 done
+section_args=(--section SourceCounters)
+for arg in ${launcher_args[@]+"${launcher_args[@]}"}; do
+    case "$arg" in
+        --section|--section=*) section_args=(); break ;;
+    esac
+done
 output_dir="${output_dir:-${repo_root}/results/gb200/ncu-torch-all-gather/symm-ag-pause-rs-blocking-metric-$(date +%Y%m%d-%H%M%S)}"
 
 # pause_cmd <cycles>: the launcher command for one pause, in the array "cmd"; its folder in "dir".
@@ -159,6 +166,7 @@ pause_cmd() {
     cmd=(
         bash "$launcher" --algo symm --ag-rs --blocking-metrics --replay-mode app-range --communicator tcp
         --ncu "$ncu_bin" --size-mib "$size_mib" --nccl-lib "$nccl_lib" --output-dir "$dir"
+        ${section_args[@]+"${section_args[@]}"}
         ${launcher_args[@]+"${launcher_args[@]}"}
     )
 }

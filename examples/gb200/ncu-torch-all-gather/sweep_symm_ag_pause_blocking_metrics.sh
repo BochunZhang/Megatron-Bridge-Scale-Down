@@ -17,8 +17,8 @@ set -euo pipefail
 
 usage() {
     cat <<'USAGE'
-Sweep the AllGather_STMC pause of nccl-2.32.3-pause and collect the --blocking-metrics of the
-symmetric multicast all-gather at every pause: one run_ncu_torch_all_gather.sh run per pause.
+Sweep the AllGather_STMC pause of nccl-2.32.3-pause and collect blocking metrics and SourceCounters
+for the symmetric multicast all-gather. Each pause runs run_ncu_torch_all_gather.sh once.
 
 nccl-2.32.3-pause (install/install-nccl-2.32.3-pause.sh) is stock 2.32.3 plus
 NCCL_SYM_AG_STMC_PAUSE_CYCLES: AllGather_STMC makes every warp spin <cycles> SM cycles (clock64)
@@ -29,8 +29,8 @@ summary.txt converts the pause with it. NCCL reads the variable once per process
 is its own launcher run:
 
   NCCL_SYM_AG_STMC_PAUSE_CYCLES=<cycles> NCCL_SYM_TMA_ENABLE=0 \
-  run_ncu_torch_all_gather.sh --algo symm --blocking-metrics --replay-mode application \
-      --communicator shmem --size-mib <size> --nccl-lib <nccl-lib> \
+  run_ncu_torch_all_gather.sh --algo symm --blocking-metrics --section SourceCounters \
+      --replay-mode application --communicator shmem --size-mib <size> --nccl-lib <nccl-lib> \
       --output-dir <dir>/pause-<cycles>cyc <launcher args>
 
 application + shmem is the setup that profiled AllGather_STMC section by section (#13);
@@ -69,6 +69,7 @@ Options:
 Launcher args go to run_ncu_torch_all_gather.sh after the defaults above, so they can override
 them, e.g. -- --gpus 0,1 --replay-mode app-range --communicator tcp --timeout 900, or ncu args after
 a second "--". --algo, --ag-rs, --nccl-lib and --output-dir are fixed by the sweep.
+Explicit --section arguments replace the default SourceCounters section.
 
 Outputs in --output-dir:
   sweep.txt          the sweep's settings
@@ -133,6 +134,12 @@ for arg in ${launcher_args[@]+"${launcher_args[@]}"}; do
         --algo|--ag-rs|--nccl-lib|--output-dir) die "${arg} is fixed by this sweep (symm all-gather, ${nccl_lib##*/}, one folder per pause)" ;;
     esac
 done
+section_args=(--section SourceCounters)
+for arg in ${launcher_args[@]+"${launcher_args[@]}"}; do
+    case "$arg" in
+        --section|--section=*) section_args=(); break ;;
+    esac
+done
 output_dir="${output_dir:-${repo_root}/results/gb200/ncu-torch-all-gather/symm-all-gather-blocking-metric-pause-$(date +%Y%m%d-%H%M%S)}"
 
 # pause_cmd <cycles>: the launcher command for one pause, in the array "cmd"; its folder in "dir".
@@ -141,6 +148,7 @@ pause_cmd() {
     cmd=(
         bash "$launcher" --algo symm --blocking-metrics --replay-mode application --communicator shmem
         --size-mib "$size_mib" --nccl-lib "$nccl_lib" --output-dir "$dir"
+        ${section_args[@]+"${section_args[@]}"}
         ${launcher_args[@]+"${launcher_args[@]}"}
     )
 }
