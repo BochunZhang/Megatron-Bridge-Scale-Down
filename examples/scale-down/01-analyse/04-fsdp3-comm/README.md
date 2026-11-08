@@ -26,7 +26,9 @@ Qwen3.8-2.4T-A95B 的 HF 配置是纯文本的 `Qwen3_5MoeForCausalLM`（没有 
 | --- | --- | --- |
 | `--model` | `27b`、`397b`、`2.4t`（别名 `2p4t`）、`122b`，可逗号分隔 | sweep 必填 |
 | `--fsdp` | `ddp`、`1`、`2`、`3`，可逗号分隔 | 数据并行方式，见下表；sweep 默认 `3,1`，单 case 默认 `3` |
+| `--ddp-sync-param-gather` | — | DDP 在 optimizer step 内同步聚合参数，结果目录和 nsys 报告名加 `-sync-ag` |
 | `--overlap` | — | 见「AG / RS 通信组分离」；只作用于 FSDP case（sweep 中 `ddp` case 不受影响），名字中数据并行方式后加 `-overlap` |
+| `--symmetric` | — | 见「Symmetric memory」；只作用于 FSDP case（sweep 中 `ddp` case 不受影响），名字中加 `-symm`（与 `--overlap` 同用时为 `-overlap-symm`） |
 | `--tp` | N，可逗号分隔 | Tensor parallel；N>1 时自动打开 sequence parallel（`model.sequence_parallel=true`）。默认 1 |
 | `--cp` | N，可逗号分隔 | Context parallel，`cp_comm_type=p2p`。默认 1 |
 | `--cuda-graph` | `off`、`on`，可逗号分隔 | 默认 `off`，含义见「CUDA graph」 |
@@ -66,14 +68,16 @@ FSDP 每个 micro-batch 的单次通信量与 seq、MBS 无关，因此计算强
 
 4 卡 EP=4 时，expert 的数据并行组大小为 1，routed expert 参数在任何 FSDP 级别下都不切分，也没有 FSDP 通信；各 FSDP 级别之间的差别只来自 dense 参数（attention / GDN、shared expert、router、embedding、LM head）。expert 数只改变每卡的 routed expert 参数量，不改变 EP dispatch / combine 的通信量。2.4t 的 hidden=8192，单层 dense 参数约为 397b 的 3.7 倍，短序列下通信更难被盖住。
 
-按 BF16 混合精度 + Adam 估算，FSDP3 每参数 18 B（bf16 参数 2 + fp32 main grad 4 + fp32 master/m/v 12，`grad_reduce_in_fp32=true`），EP=4 时 expert 也按 4 路切分，每卡模型状态如下：
+按 BF16 混合精度 + Adam 估算，FSDP3 每参数 16 B（bf16 参数 2 + bf16 main grad 2 + fp32 master/m/v 12），EP=4 时 expert 也按 4 路切分，每卡模型状态如下：
 
 | 模型（4 层 + 1 层 MTP） | dense 参数 | routed expert 参数 | 每卡模型状态 |
 | --- | --- | --- | --- |
-| 27b | 约 4.5B | — | 约 19 GiB |
-| 397b（512 experts） | 约 2.7B | 约 32.2B | 约 147 GiB |
-| 2.4t，128 experts | 约 6.6B | 约 32.2B | 约 163 GiB |
-| 2.4t，64 experts | 约 6.6B | 约 16.1B | 约 95 GiB |
+| 27b | 约 4.5B | — | 约 17 GiB |
+| 397b（512 experts） | 约 2.7B | 约 32.2B | 约 130 GiB |
+| 2.4t，128 experts | 约 6.6B | 约 32.2B | 约 145 GiB |
+| 2.4t，64 experts | 约 6.6B | 约 16.1B | 约 85 GiB |
+
+梯度精度：启动器传的 `grad_reduce_in_fp32=true` 只作用于 MCore DDP（`--fsdp ddp` 的梯度 buffer 与 reduce-scatter 都是 fp32）。Megatron-FSDP 不读这个字段，梯度 buffer 的 dtype 由 `ddp.megatron_fsdp_main_grads_dtype` 决定，默认 `None` 即跟随参数 dtype；Bridge 在包 FSDP 之前已用 `Float16Module` 把参数转成 bf16，所以 FSDP 的梯度累加、reduce-scatter（`megatron_fsdp_grad_comm_dtype=None` 时等于梯度 dtype）和参数 all-gather 都是 bf16，只有 main weight（`megatron_fsdp_main_params_dtype`，默认 fp32）与 Adam 状态是 fp32。
 
 GB200 每卡约 185 GiB。此外还要加上 FSDP double buffer、激活、248K 词表的 fp32 logits（seq 4096 时每份约 3.8 GiB），以及 CUDA graph 的内存池。FSDP1 / FSDP2 / DDP 不切分参数，2.4t 64 experts 的 dense 部分每卡约多 30 GiB。TP 会把 dense 参数和激活再按 TP 切分。
 
@@ -95,6 +99,8 @@ bash $S --model 397b --experts 64 --seq 1024 --full
 bash $S --model 397b --experts 64 --seq 1024 --linear
 # MXFP8
 bash $S --model 27b --mxfp8
+# AG 独立 communicator + symmetric memory，观察 FSDP3 中预取 AG 与 RS 的重叠
+bash $S --model 2.4t --experts 64 --seq 1024 --fsdp 3 --overlap --symmetric
 ```
 
 结果目录名中，非默认设置会追加标记，默认设置不加任何标记，因此以前的结果名仍可用 `--resume` 续跑：MXFP8 为 `-mxfp8`，强制均衡为 `-fb`，`--full` / `--linear` 为层数后的 `-attn_full` / `-attn_linear`，TP>1 为 CP 前的 `-tp_<N>`。例如 `model_27b-fsdp_3-mxfp8-layers_8-attn_full-mtp_0-experts_0-cg_off-mbs_1-seq_4096-tp_2-cp_1-...`。
@@ -111,13 +117,15 @@ bash $S --model 27b --mxfp8
 | checkpoint | `checkpoint.ckpt_format=torch_dist`（`fsdp_dtensor` 只支持 Megatron-FSDP；本实验不保存） |
 | 命名 | 结果目录 `model_<m>-ddp-...`，nsys 报告 `<qwen35_27b\|qwen35_397b\|qwen38_2.4t>-ddp-...`；`launch.json` 中 `fsdp` 为 `null`、`data_parallel` 为 `ddp` |
 
+加 `--ddp-sync-param-gather` 后，distributed optimizer 在更新参数分片后同步执行参数 all-gather，下一轮第一个 micro-batch 直接使用已聚合的参数。梯度 reduce-scatter 仍与 backward 重叠。该选项在混合 sweep 中只应用于 `ddp` case。
+
 `--cuda-graph on` 时设置 `cuda_graph_impl=transformer_engine`、`cuda_graph_warmup_steps=3`、`use_te_rng_tracker=true`、`rng.te_rng_tracker=true` 与 `NCCL_GRAPH_REGISTER=0`（`TECudaGraphHelper` 在 expandable segments 下要求关闭）。每层每个 micro-batch 分别有一个 forward graph 和一个 backward graph：
 
 - dense（27b）：`cuda_graph_modules=[attn,mlp]`，整层进 graph；
 - MoE（397b / 2.4t）：`cuda_graph_modules=[attn,moe_router,moe_preprocess]`，attention、router、shared expert 与 preprocess 进 graph，dispatch、routed experts、combine 保持 eager。MoE 仍是 dropless，不需要容量因子、paged stash 或 TE op fuser，expert 走与关闭模式相同的非融合 `TEGroupedMLP`，因此不受上文 cuBLAS 13.3 的限制，hybridep 与 alltoall 都可以用；
 - MXFP8 + alltoall 时 `moe_router_padding_for_fp8` 让 alltoall 的 preprocess 把 token 数拷回 host，MCore 不允许 graph 它，启动器改用 `[attn,moe_router]`；
 - 不需要关闭 NaN 检查，recipe 的 `check_for_nan_in_loss` / `check_for_nan_in_grad` 保持开启；
-- DDP 的参数 all-gather 是 forward pre-hook：Bridge 在 capture 时摘掉它，capture 后改为每层的 manual hook（`train.py` 的 `cuda_graph_set_manual_hooks`）。
+- 默认预取参数时，Bridge 在 capture 时摘掉 DDP 的 forward pre-hook，capture 后改为每层的 manual hook（`train.py` 的 `cuda_graph_set_manual_hooks`）。使用 `--ddp-sync-param-gather` 时，参数 all-gather 在 optimizer step 内执行。
 
 显存：DDP 每卡保留完整的 bf16 参数与 fp32 梯度，dense 部分约 9 B/参数（2 + 4 + 12/4），EP=4 时 routed expert 的数据并行组为 1，与 FSDP 相同。2.4t 64 experts 每卡模型状态约 120 GiB，与 FSDP1 相当；397b 与 27b 余量更大。
 
@@ -131,6 +139,8 @@ bash $S --model 27b --mxfp8
 bash examples/scale-down/01-analyse/04-fsdp3-comm/benchmark_fsdp3.sh --model 27b,397b,2.4t --fsdp ddp --cuda-graph off,on
 # 与 FSDP 放在同一矩阵里（FSDP 的 graph 开需要 cuBLAS >= 13.3 编译的 TE）
 bash examples/scale-down/01-analyse/04-fsdp3-comm/benchmark_fsdp3.sh --model 2.4t --fsdp 3,2,1,ddp --experts 64 --seq 1024 --cuda-graph off,on
+# 把 DDP 参数 all-gather 放在 optimizer step 内
+bash examples/scale-down/01-analyse/04-fsdp3-comm/benchmark_fsdp3.sh --model 27b --fsdp ddp --seq 4096 --ddp-sync-param-gather
 ```
 
 第一条命令的矩阵：27b 为 seq `256,1024,4096` × graph `off,on` 共 6 次；397b / 2.4t 为 experts `64,32` × seq `256,1024,4096` × graph `off,on` 各 12 次。
@@ -233,7 +243,44 @@ FSDP RS L3 dense 119.6M
 - 加上后：AG 与 RS 属于两个 communicator，各自的 `deviceStream` 互不等待，可以在 GPU 上同时执行（仍共享 SM 与 NVLink 带宽）。RS 之间仍按顺序执行；
 - 若设置了 `NCCL_COMM_SPLIT_SHARE_RESOURCES=1`，split 出来的 communicator 共享父 communicator 的 `sharedRes`（含 `deviceStream`），AG / RS 又会串行，`--overlap` 失效；
 - 只有 FSDP3 在 backward 中同时有 AG 预取与 RS，FSDP1 / FSDP2 只是换了 AG 用的 communicator；`ddp` 不使用这组 communicator，单 case 脚本直接拒绝 `--fsdp ddp --overlap`；
-- nsys 中可以看到 `ncclDevKernel_AllGather_*` 与 `ncclDevKernel_ReduceScatter_*` 落在两条不同的 stream 上，时间区间可以重叠；不加时两者在同一条 stream 上首尾相接。
+- nsys 中可以看到 `ncclDevKernel_AllGather_*` 与 `ncclDevKernel_ReduceScatter_*`（`--symmetric` 时为 `ncclSymkDevKernel_*`）落在两条不同的 stream 上，时间区间可以重叠；不加时两者在同一条 stream 上首尾相接。
+
+## Symmetric memory（`--symmetric`）
+
+`--symmetric` 用 Megatron 已有的 `ddp.nccl_ub` 把 Megatron-FSDP 的通信 buffer 注册为 NCCL symmetric window（`ncclCommWindowRegister(..., NCCL_WIN_COLL_SYMMETRIC)`），让 NCCL 选用 symmetric kernel。启动器加的覆盖：
+
+| 覆盖 | 作用 |
+| --- | --- |
+| `ddp.nccl_ub=true` | 创建全局 `NCCL_MEMORY_POOL`（MCore `nccl_allocator`，JIT 编译的 `ncclMemAlloc` 分配器）；Bridge 随之强制 `fsdp_manual_registration=true` |
+| `ddp.disable_symmetric_registration=false` | 注册为 symmetric window（为 true 时退回 `ncclCommRegister` 的普通 user buffer 注册） |
+| `ddp.fsdp_double_buffer=true`、`ddp.megatron_fsdp_max_pool_double_buffer=true` | MaxPool double buffer：full attention 层与 GatedDeltaNet 层的 bucket 大小不同，FixedPool 只能覆盖其中一种，MaxPool 按最大 bucket 建槽位，所有层共用两份固定地址的 buffer |
+| `ddp.fsdp_db_use_persist_buf_on_alloc_fail=true` | 不是 FSDP unit 的模块（embedding、LM head、final norm）在池内分配常驻 buffer；为 false 时它们走动态分配，不在池里，通信不走 symmetric |
+| `NCCL_NVLS_ENABLE=1` | `AllGather_STMC` / `ReduceScatter_LDMC` 依赖 multicast；`run_recipe.py` 只 `setdefault`，shell 里设成 0 时会退化为单播的 `AllGather_ST` / `ReduceScatter_LD`，所以启动器强制 export |
+
+以上 double buffer 选项与 recipe 当前值相同，显式写出是为了 `--recipe` 换成别的 recipe 时行为不变。`NCCL_ALGO` 会把集合通信钉在经典 ring / NVLS kernel 上，`--symmetric` 下启动器直接拒绝；`--fsdp ddp` 也拒绝（MCore DDP 不用 MaxPool）。
+
+**注册的范围不只是 double buffer。** 注册以内存池为单位：`mem_alloc_context` 内分配的 buffer 都在池里，`manual_buffer_registration()` 在第 1 个 iteration 之后（`train.py` 的 `_maybe_register_fsdp_buffers`）把整个池在每个 FSDP communicator 上各注册一次——dense FSDP group、expert FSDP group，以及 `--overlap` 新建的两组 AG communicator。池里有：
+
+- 常驻的参数分片（`model_weight_buffer`，AG 的 send buffer）；
+- 常驻的梯度分片（all-in-one `main_grad_buffer`，RS 结果累加的目标）；
+- MaxPool double buffer：`fsdp_params_*`（FSDP3 AG 的 recv buffer）、`fsdp_grads_*`（RS 的 send buffer，RS 的输出是同一 bucket 中本 rank 那一段）、MXFP8 时的 `fsdp_fp8_transpose_params_*`；
+- 非 FSDP unit 的常驻 fallback buffer。
+
+fp32 main weight（`main_weight_buffer`）在 `mem_alloc_context` 之外分配，不在池里，它也不参与 FSDP 通信。NCCL 选 kernel 时只看 AG 的 recv、RS 的 send 是否落在 symmetric window 中，其余已注册的 buffer 只是顺带。
+
+**确认生效：**
+
+- 第 1 个 iteration 在注册之前，必然走经典 kernel，计时与 profile 都要跳过它（默认 profile 第 7 步）；
+- nsys 中 FSDP 的 AG / RS kernel 名为 `ncclSymkDevKernel_AllGather_STMC`、`ncclSymkDevKernel_ReduceScatter_LDMC`；不加时为 `ncclDevKernel_AllGather_*` / `ncclDevKernel_ReduceScatter_*`；
+- NCCL 2.29 在 Blackwell 上会把每 rank 元素数超过 `NCCL_SYM_CE_THRESHOLD`（默认 8Mi）的 AllGather 交给 copy engine（nsys 中是 memcpy，而不是 kernel），想强制 SM kernel 可以 `export NCCL_SYM_CE_THRESHOLD=<更大的值>`；
+- 启动器把 `NCCL_DEBUG` 固定为 `WARN`，看不到 `NCCL_DEBUG_SUBSYS=TUNING` 的选核日志，以 nsys kernel 名为准。
+
+**注意：**
+
+- MaxPool 的槽位按需增长；若注册之后又有更大的 bucket 请求，新分配的 segment 不在已注册的 window 中，对应通信退回经典 kernel；
+- 4 卡 EP=4 时 expert FSDP group 只有 1 个 rank，也会注册一次（没有通信）；
+- 与 `--cuda-graph on` 同用时：注册发生在第 1 步，graph 在 `cuda_graph_warmup_steps=3` 之后 capture，replay 直接使用 capture 时选定的 symmetric kernel；`NCCL_GRAPH_REGISTER=0` 只关闭 capture 期间对经典算法 buffer 的自动注册，不影响 symmetric window。这一组合尚未实测；
+- `--symmetric --overlap` 时 AG 与 RS 分属两个 communicator，各自在自己注册的 window 上运行，可以在 nsys 中看到两条 stream 上的 `ncclSymkDevKernel_*` 重叠。
 
 ## Layer 的 forward / backward 标注
 

@@ -35,6 +35,8 @@ MERGE_GRAPHS=false
 FORCE_BALANCE=false
 FSDP_LEVEL="${FSDP_LEVEL:-3}"
 OVERLAP=false
+SYMMETRIC=false
+DDP_SYNC_PARAM_GATHER=false
 HYBRIDEP_NUM_SMS="${HYBRIDEP_NUM_SMS:-32}"
 GPU_COUNT="${GPU_COUNT:-4}"
 GPUS_PER_NODE="${GPUS_PER_NODE:-4}"
@@ -70,12 +72,22 @@ Options:
                                  the distributed optimizer; bucketed gradient
                                  reduce-scatter overlapped with backward, parameter
                                  all-gather with the next forward (default: 3)
+  --ddp-sync-param-gather        DDP only: synchronously all-gather parameters in the
+                                 optimizer step. Names get "-sync-ag"
   --overlap                      Megatron-FSDP only: give parameter all-gathers their
                                  own DP communicators (dist.create_all_gather_group,
                                  Megatron-LM --create-all-gather-group), so they no
                                  longer queue behind gradient reduce-scatters on one
                                  NCCL communicator; only FSDP3 overlaps the two. Names get
                                  "-overlap"
+  --symmetric                    Megatron-FSDP only: allocate the FSDP buffers (sharded
+                                 weights and gradients, max-pool double buffers holding
+                                 the all-gather output and reduce-scatter input) from an
+                                 ncclMemAlloc pool and register it once, after the first
+                                 step, as NCCL_WIN_COLL_SYMMETRIC windows on every FSDP
+                                 communicator (ddp.nccl_ub), so NCCL runs its symmetric
+                                 kernels. Exports NCCL_NVLS_ENABLE=1 and refuses
+                                 NCCL_ALGO. Names get "-symm"
   --tp N                         Tensor parallel size; N > 1 turns on sequence
                                  parallelism (default: 1)
   --cp N                         Context parallel size (default: 1)
@@ -161,7 +173,9 @@ while [[ $# -gt 0 ]]; do
         --cuda-graph) need_value "$@"; CUDA_GRAPH="$2"; shift 2;;
         --force-balance) FORCE_BALANCE=true; shift;;
         --fsdp) need_value "$@"; FSDP_LEVEL="$2"; shift 2;;
+        --ddp-sync-param-gather) DDP_SYNC_PARAM_GATHER=true; shift;;
         --overlap) OVERLAP=true; shift;;
+        --symmetric) SYMMETRIC=true; shift;;
         --gpu|--gpus) need_value "$@"; GPU_COUNT="$2"; shift 2;;
         --nproc-per-node) need_value "$@"; GPUS_PER_NODE="$2"; shift 2;;
         --nnodes) need_value "$@"; NNODES="$2"; shift 2;;
@@ -219,8 +233,16 @@ case "${FSDP_LEVEL}" in
     ddp) SHARDING_STRATEGY=no_shard; GRAD_OVERLAP=true; PARAM_OVERLAP=true; DP_TAG=ddp; FSDP_JSON=null;;
     *) echo "--fsdp must be ddp, 1, 2, or 3" >&2; exit 2;;
 esac
+if [[ "${DDP_SYNC_PARAM_GATHER}" == true ]]; then
+    [[ "${FSDP_LEVEL}" == ddp ]] || { echo "--ddp-sync-param-gather requires --fsdp ddp" >&2; exit 2; }
+    PARAM_OVERLAP=false
+fi
 # Only Megatron-FSDP builds its parameter all-gathers on the separate communicators.
 [[ "${OVERLAP}" == false || "${FSDP_LEVEL}" != ddp ]] || { echo "--overlap requires --fsdp 1, 2 or 3" >&2; exit 2; }
+# The max-pool double buffers are Megatron-FSDP's. A forced NCCL_ALGO keeps every
+# collective on the classic ring / NVLS kernels even on registered windows.
+[[ "${SYMMETRIC}" == false || "${FSDP_LEVEL}" != ddp ]] || { echo "--symmetric requires --fsdp 1, 2 or 3" >&2; exit 2; }
+[[ "${SYMMETRIC}" == false || -z "${NCCL_ALGO:-}" ]] || { echo "--symmetric requires NCCL_ALGO to be unset (got ${NCCL_ALGO})" >&2; exit 2; }
 for name in SEQ_LENGTH TENSOR_PARALLEL CONTEXT_PARALLEL MICRO_BATCH_SIZE GLOBAL_BATCH_SIZE TRAIN_ITERS GPU_COUNT GPUS_PER_NODE MASTER_PORT HYBRIDEP_NUM_SMS; do
     [[ "${!name}" =~ ^[1-9][0-9]*$ ]] || { echo "${name} must be a positive integer" >&2; exit 2; }
 done
@@ -299,11 +321,13 @@ LAYERS_TAG="${NUM_LAYERS:-full}"
 MTP_TAG="${MTP_NUM_LAYERS:-0}"
 if [[ "${MODEL}" == 27b ]]; then EXPERTS_TAG=0; else EXPERTS_TAG="${NUM_EXPERTS:-full}"; fi
 # Default settings add no tag, so earlier result names stay resumable: --overlap adds
-# "-overlap" after the data parallel mode, MXFP8 "-mxfp8", forced balanced routing "-fb",
-# --full / --linear "-attn_<full|linear>" after the layer count, and TP > 1 "-tp_<N>"
-# before the CP size.
+# "-overlap" and --symmetric "-symm" after the data parallel mode, MXFP8 "-mxfp8", forced
+# balanced routing "-fb", --full / --linear "-attn_<full|linear>" after the layer count,
+# and TP > 1 "-tp_<N>" before the CP size.
 OVERLAP_TAG=""
 [[ "${OVERLAP}" == true ]] && OVERLAP_TAG="-overlap"
+[[ "${SYMMETRIC}" == true ]] && OVERLAP_TAG+="-symm"
+[[ "${DDP_SYNC_PARAM_GATHER}" == true ]] && OVERLAP_TAG+="-sync-ag"
 DTYPE_TAG=""
 [[ "${DTYPE}" == mxfp8 ]] && DTYPE_TAG="-mxfp8"
 [[ "${FORCE_BALANCE}" == true ]] && DTYPE_TAG+="-fb"
@@ -375,11 +399,14 @@ OVERRIDES=(
     "model.recompute_granularity=null" "model.recompute_method=null" "model.recompute_num_layers=null"
     "model.recompute_modules=[]" "model.fine_grained_activation_offloading=false" "model.offload_modules=[]"
     "${DP_OVERRIDES[@]}" "dist.create_all_gather_group=${OVERLAP}" "ddp.use_distributed_optimizer=true"
+    "ddp.nccl_ub=${SYMMETRIC}"
+    # grad_reduce_in_fp32 only reaches MCore DDP (fp32 gradient buffer and reduce-scatter).
+    # Megatron-FSDP ignores it: its gradient buffer follows megatron_fsdp_main_grads_dtype,
+    # which defaults to the bf16 parameter dtype, so FSDP reduce-scatters and all-gathers
+    # both move bf16 (main weights and Adam state stay fp32).
     "ddp.data_parallel_sharding_strategy=${SHARDING_STRATEGY}" "ddp.average_in_collective=false"
     "ddp.overlap_grad_reduce=${GRAD_OVERLAP}" "ddp.overlap_param_gather=${PARAM_OVERLAP}" "ddp.grad_reduce_in_fp32=true"
-    # The recipe pins comm_overlap.overlap_*=false, and CommOverlapConfig.setup()
-    # copies those values back into ddp at runtime. Override both layers so
-    # FSDP3 / FSDP2 and DDP keep parameter prefetch and asynchronous gradient reduction.
+    # CommOverlapConfig.setup() applies these settings to DDP at runtime.
     "comm_overlap.overlap_grad_reduce=${GRAD_OVERLAP}" "comm_overlap.overlap_param_gather=${PARAM_OVERLAP}"
     "checkpoint.save=null" "checkpoint.load=null"
     "logger.log_interval=1" "logger.tensorboard_dir=null" "logger.save_config_filepath=${RESULT_DIR}/config.yaml"
@@ -393,13 +420,37 @@ OVERRIDES=(
     # record_param_comms for FSDP all-gather / reduce-scatter, carries tensor shapes.
     "profiling.record_shapes=$([[ "${PROFILE}" == nsys ]] && echo true || echo false)"
 )
+if [[ "${DDP_SYNC_PARAM_GATHER}" == true ]]; then
+    # Bridge re-enables gather overlap if either DDP or the optimizer requests it.
+    OVERRIDES+=("optimizer.overlap_param_gather=false"
+        "optimizer.overlap_param_gather_with_optimizer_step=false"
+        "comm_overlap.overlap_param_gather_with_optimizer_step=false")
+fi
 GRAPH_IMPL=none
 GRAPH_MODULES="[]"
+if [[ "${SYMMETRIC}" == true ]]; then
+    # nccl_ub allocates every Megatron-FSDP buffer created under its allocation context
+    # (sharded weights, gradients, the max-pool double buffers that hold the all-gather
+    # output and reduce-scatter input) from one ncclMemAlloc MemPool. Bridge turns on
+    # fsdp_manual_registration, so train.py registers the whole pool once after the
+    # first step on every FSDP communicator (including the --overlap all-gather ones)
+    # as NCCL_WIN_COLL_SYMMETRIC windows. The double-buffer settings are pinned here
+    # rather than inherited from the recipe: the max pool gives the full- and
+    # linear-attention layers one fixed set of slots, and units outside it (embedding,
+    # LM head) get persistent buffers inside the pool instead of dynamic, unregistered
+    # memory. The multicast symmetric kernels (AllGather_STMC, ReduceScatter_LDMC)
+    # need NVLS; run_recipe.py only defaults NCCL_NVLS_ENABLE, so force it.
+    OVERRIDES+=(
+        "ddp.disable_symmetric_registration=false" "ddp.fsdp_double_buffer=true"
+        "ddp.megatron_fsdp_max_pool_double_buffer=true" "ddp.fsdp_db_use_persist_buf_on_alloc_fail=true"
+    )
+    export NCCL_NVLS_ENABLE=1
+fi
 if [[ "${CUDA_GRAPH}" == on && "${FSDP_LEVEL}" == ddp ]]; then
     # TE per-layer graphs: one make_graphed_callables() graph per layer and micro-batch
-    # for forward and one for backward. Bridge removes DDP's forward pre-hook
-    # (parameter all-gather) for the capture and re-installs it as the layers'
-    # manual hooks. Dense layers are captured whole. MoE layers stop after the router
+    # for forward and one for backward. With parameter prefetch, Bridge replaces
+    # the forward pre-hook with per-layer manual hooks after capture.
+    # Dense layers are captured whole. MoE layers stop after the router
     # and preprocess, so the dropless HybridEP / alltoall dispatch, routed experts and
     # combine stay eager and keep the unfused TEGroupedMLP of the off mode.
     GRAPH_IMPL=transformer_engine
@@ -453,7 +504,9 @@ if [[ "${CUDA_GRAPH}" == on ]]; then
     # Keep NCCL graph registration off. The full-iteration graph holds NCCL
     # collectives, where registering expandable segments (often inherited through
     # PYTORCH_CUDA_ALLOC_CONF) can hit illegal memory access, and TECudaGraphHelper
-    # asserts it under expandable segments. nccl_ub stays off either way.
+    # asserts it under expandable segments. This only stops NCCL from registering
+    # buffers during capture; the --symmetric windows are registered explicitly after
+    # the first step, before capture.
     export NCCL_GRAPH_REGISTER=0
 else
     OVERRIDES+=("model.cuda_graph_impl=none" "model.cuda_graph_scope=null" "model.cuda_graph_modules=[]")
@@ -506,7 +559,8 @@ fi
 COMMAND+=(uv run --no-sync python "${TRAIN_ARGS[@]}")
 
 INFO=(
-    "model=${MODEL}" "recipe=${RECIPE}" "fsdp=${FSDP_LEVEL}" "overlap=${OVERLAP}" "dtype=${DTYPE}" "layers=${LAYERS_TAG}" "attention=${ATTENTION}"
+    "model=${MODEL}" "recipe=${RECIPE}" "fsdp=${FSDP_LEVEL}" "overlap=${OVERLAP}" "symmetric=${SYMMETRIC}" "dtype=${DTYPE}" "layers=${LAYERS_TAG}" "attention=${ATTENTION}"
+    "ddp_sync_param_gather=${DDP_SYNC_PARAM_GATHER}"
     "mtp=${MTP_TAG}" "experts=${EXPERTS_TAG}" "force_balance=${FORCE_BALANCE}" "cuda_graph=${CUDA_GRAPH}" "cuda_graph_trace=${GRAPH_TRACE}" "seq=${SEQ_LENGTH}"
     "tp=${TENSOR_PARALLEL}" "sp=${SEQUENCE_PARALLEL}" "cp=${CONTEXT_PARALLEL}" "dp=${DATA_PARALLEL}" "ep=${EXPERT_PARALLEL}"
     "dispatcher=${DISPATCHER}" "mbs=${MICRO_BATCH_SIZE}" "gbs=${GLOBAL_BATCH_SIZE}" "gpus=${GPU_COUNT}"
@@ -514,7 +568,7 @@ INFO=(
 )
 if [[ "${DRY_RUN}" == true ]]; then
     printf '%s\n' "${INFO[*]}" >&2
-    printf 'GLOO_SOCKET_IFNAME=%s\nPYTORCH_CUDA_ALLOC_CONF=%s\nNCCL_GRAPH_REGISTER=%s\nNVTE_CUTEDSL_FUSED_GROUPED_MLP=%s\ncommand:' "${GLOO_SOCKET_IFNAME:-<unset>}" "${PYTORCH_CUDA_ALLOC_CONF:-<unset>}" "${NCCL_GRAPH_REGISTER:-<unset>}" "${NVTE_CUTEDSL_FUSED_GROUPED_MLP:-<unset>}" >&2
+    printf 'GLOO_SOCKET_IFNAME=%s\nPYTORCH_CUDA_ALLOC_CONF=%s\nNCCL_GRAPH_REGISTER=%s\nNCCL_NVLS_ENABLE=%s\nNVTE_CUTEDSL_FUSED_GROUPED_MLP=%s\ncommand:' "${GLOO_SOCKET_IFNAME:-<unset>}" "${PYTORCH_CUDA_ALLOC_CONF:-<unset>}" "${NCCL_GRAPH_REGISTER:-<unset>}" "${NCCL_NVLS_ENABLE:-<unset>}" "${NVTE_CUTEDSL_FUSED_GROUPED_MLP:-<unset>}" >&2
     printf ' %q' "${COMMAND[@]}" >&2; printf '\n' >&2
     exit 0
 fi
@@ -533,7 +587,7 @@ printf 'command:' >"${RESULT_DIR}/command.txt"
 printf ' %q' "${COMMAND[@]}" >>"${RESULT_DIR}/command.txt"
 printf '\n' >>"${RESULT_DIR}/command.txt"
 cat >"${RESULT_DIR}/launch.json" <<JSON
-{"model":"${MODEL_ID}","recipe":"${RECIPE}","run_name":"${RUN_NAME}","dtype":"${DTYPE}","fsdp":${FSDP_JSON},"data_parallel":"${DP_TAG}","create_all_gather_group":${OVERLAP},"num_layers":"${LAYERS_TAG}","attention":"${ATTENTION}","linear_attention_freq":"${LINEAR_ATTENTION_FREQ}","mtp_num_layers":${MTP_TAG},"num_moe_experts":"${EXPERTS_TAG}","force_balance":${FORCE_BALANCE},"cuda_graph":"${CUDA_GRAPH}","cuda_graph_impl":"${GRAPH_IMPL}","cuda_graph_modules":"${GRAPH_MODULES}","cuda_graph_trace":"${GRAPH_TRACE}","seq_length":${SEQ_LENGTH},"tensor_model_parallel_size":${TENSOR_PARALLEL},"sequence_parallel":${SEQUENCE_PARALLEL},"context_parallel_size":${CONTEXT_PARALLEL},"data_parallel_size":${DATA_PARALLEL},"expert_model_parallel_size":${EXPERT_PARALLEL},"dispatcher":"${DISPATCHER}","micro_batch_size":${MICRO_BATCH_SIZE},"global_batch_size":${GLOBAL_BATCH_SIZE},"num_microbatches":${NUM_MICROBATCHES},"gpu_count":${GPU_COUNT},"nnodes":${NNODES},"node_rank":${NODE_RANK},"numa_mode":"${NUMA_MODE}","pytorch_cuda_alloc_conf":"${PYTORCH_CUDA_ALLOC_CONF:-}","nccl_graph_register":"${NCCL_GRAPH_REGISTER:-}","nvte_cutedsl_fused_grouped_mlp":"${NVTE_CUTEDSL_FUSED_GROUPED_MLP:-}","run_date":"${RUN_DATE}"}
+{"model":"${MODEL_ID}","recipe":"${RECIPE}","run_name":"${RUN_NAME}","dtype":"${DTYPE}","fsdp":${FSDP_JSON},"data_parallel":"${DP_TAG}","create_all_gather_group":${OVERLAP},"nccl_ub":${SYMMETRIC},"num_layers":"${LAYERS_TAG}","attention":"${ATTENTION}","linear_attention_freq":"${LINEAR_ATTENTION_FREQ}","mtp_num_layers":${MTP_TAG},"num_moe_experts":"${EXPERTS_TAG}","force_balance":${FORCE_BALANCE},"cuda_graph":"${CUDA_GRAPH}","cuda_graph_impl":"${GRAPH_IMPL}","cuda_graph_modules":"${GRAPH_MODULES}","cuda_graph_trace":"${GRAPH_TRACE}","seq_length":${SEQ_LENGTH},"tensor_model_parallel_size":${TENSOR_PARALLEL},"sequence_parallel":${SEQUENCE_PARALLEL},"context_parallel_size":${CONTEXT_PARALLEL},"data_parallel_size":${DATA_PARALLEL},"expert_model_parallel_size":${EXPERT_PARALLEL},"dispatcher":"${DISPATCHER}","micro_batch_size":${MICRO_BATCH_SIZE},"global_batch_size":${GLOBAL_BATCH_SIZE},"num_microbatches":${NUM_MICROBATCHES},"gpu_count":${GPU_COUNT},"nnodes":${NNODES},"node_rank":${NODE_RANK},"numa_mode":"${NUMA_MODE}","pytorch_cuda_alloc_conf":"${PYTORCH_CUDA_ALLOC_CONF:-}","nccl_graph_register":"${NCCL_GRAPH_REGISTER:-}","nccl_nvls_enable":"${NCCL_NVLS_ENABLE:-}","nvte_cutedsl_fused_grouped_mlp":"${NVTE_CUTEDSL_FUSED_GROUPED_MLP:-}","run_date":"${RUN_DATE}"}
 JSON
 printf '%s\n' "${INFO[*]}" | tee "${RESULT_DIR}/run_info.txt"
 set +e
