@@ -251,6 +251,34 @@ PM sampling / warp state sampling 的 pass 数是动态决定的，这两类很�
   range 类模式的 metric 属于整个 NVTX range（AG + RS 合在一起），分不出 AG 和 RS 各自的部分。
 - `baseline.log` 里有每次迭代 AG 和 RS 的起止时间和重叠时长（CUDA event，以最早的 start 为 0），用来确认确实重叠了。
 
+## NCCL 2.32.3 的 clock64 与 ncu 对照
+
+在 GB200 节点从仓库根目录运行以下命令。编译脚本每次从 `v2.32.3-1` 重新 clone 两个插桩版本，
+新构建通过检查后替换旧目录。如果缺少 `2.32.3-pause`，也会调用已有脚本编译 ncu 基线。
+
+```bash
+bash install/install-nccl-2.32.3-clock64.sh
+bash examples/gb200/ncu-torch-all-gather/sweep_symm_ag_rs_clock64.sh
+```
+
+三个任务使用同一组 12 个 pause 点，默认 4 卡、BF16、1024 MiB。两个插桩任务走 `--baseline-only`，
+第三个复用已有的 AG + RS ncu sweep，以 `app-range` 和 `tcp` 采集。可用 `--dry-run` 查看计划。
+
+| NCCL 构建 | AG 计时 | RS 计时 |
+| --- | --- | --- |
+| `2.32.3-pause-store-clock64` | 8 条 multicast store 的发射窗口 | 本地 store 的发射窗口 |
+| `2.32.3-pause-split-clock64` | `ld_issue`、依赖 XOR 的 `ld_wait`、`st_issue` | 同样三段，load 为 multicast 读取归约 |
+| `2.32.3-pause` | ncu 采集 | ncu 采集，指标属于同一个 AG + RS range |
+
+两种 clock64 构建默认每个 warp 每 32 个对齐 tile 错峰采样一次，每 8 个样本记录一组，保留尾组。
+每个 warp 的 lane 0 把 `sum`、`max` 和样本数写入独占的 GPU 槽位，host 在同步后导出
+`clock64.csv`。`launch` 从 warmup 后的第一个 launch（0）开始，`tile_first` 和 `tile_last` 从 1 开始。
+所有周期列的单位是 SM cycles，空列表示该构建没有采集对应窗口。每个 pause 的独立 rank CSV、TUNING
+日志和 CUDA event 耗时也会保留。第三组的 `ncu/pause-<C>cyc/summary.csv` 是已有 ncu 指标表。
+
+旧窗口会包含尚未就绪的 load 操作数带来的等待。分段窗口的 XOR 会前移数据依赖，且包含探针和调度开销。
+这些窗口可用于对照插桩后的时序，ncu 的 warp stall 计数有独立的硬件口径。
+
 ## AG + RS：replay 模式 × communicator
 
 2026-11-07 实测 shmem + app-range 失败（#14）：4 个 rank 都跑完了 warmup，一进 NVTX range，ncu 就报

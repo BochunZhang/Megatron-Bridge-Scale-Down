@@ -52,6 +52,7 @@ import os
 
 import torch
 import torch.distributed as dist
+from symm_clock64_csv import Clock64Capture
 from torch.cuda import nvtx
 
 
@@ -216,14 +217,24 @@ def main() -> None:
 
     ag_out.zero_()
     rs_out.zero_()
+    capture = None
+    if profile := os.environ.get("NCCL_SYM_CLOCK64_CSV_PROFILE"):
+        if args.algo != "symm":
+            raise ValueError("Clock64 CSV capture requires --algo symm")
+        capture = Clock64Capture(profile=profile, device=device, shard_bytes=shard * elem, launches=args.iters)
     torch.cuda.synchronize()
     # 3. The profiled launches. range_push/pop must run on the thread that launches the kernels.
-    nvtx.range_push(NVTX_RANGE)
-    timings = [launch() for _ in range(args.iters)]
-    torch.cuda.synchronize()
-    nvtx.range_pop()
+    with capture.arm() if capture is not None else contextlib.nullcontext():
+        nvtx.range_push(NVTX_RANGE)
+        try:
+            timings = [launch() for _ in range(args.iters)]
+            torch.cuda.synchronize()
+        finally:
+            nvtx.range_pop()
     _check_ag(ag_out, world_size, shard)
     _check_rs(rs_out, world_size)
+    if capture is not None:
+        capture.write(rank=rank)
     dist.barrier()
 
     if rank == 0:

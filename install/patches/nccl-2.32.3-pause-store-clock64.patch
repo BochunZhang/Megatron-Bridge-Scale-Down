@@ -1,0 +1,34 @@
+diff --git a/makefiles/version.mk b/makefiles/version.mk
+index b85b491..08ae1a5 100644
+--- a/makefiles/version.mk
++++ b/makefiles/version.mk
+@@ -13,5 +13,5 @@ NCCL_PATCH   := 3
+ # kernels, NCCL_SYM_AG_ST_PAUSE_CYCLES for the unicast ones). "NCCL version
+ # 2.32.3-pause+cudaX.Y" in the NCCL_DEBUG=VERSION banner and NCCL_SUFFIX in nccl.h, so a run shows which libnccl it
+ # loaded. NCCL_VERSION_CODE (ncclGetVersion) and the soname are unchanged.
+-NCCL_SUFFIX  := -pause
++NCCL_SUFFIX  := -pause-store-clock64
+ PKG_REVISION := 1
+diff --git a/src/device/symmetric/primitives.cuh b/src/device/symmetric/primitives.cuh
+index 641d8e6..2ec138d 100644
+--- a/src/device/symmetric/primitives.cuh
++++ b/src/device/symmetric/primitives.cuh
+@@ -391,7 +391,17 @@ static __device__ __forceinline__ uint32_t ncclSymClock64FirstTile(ncclSymClock6
+ }
+ 
+ template <int BytePerPack, int UnrollPacks, typename Load, typename Store>
+-static __device__ __noinline__ ncclSymClock64Sample ncclSymClock64MeasureTile(Load load, Store store);
++static __device__ __noinline__ ncclSymClock64Sample ncclSymClock64MeasureTile(Load load, Store store) {
++  BytePack<BytePerPack> tmp[UnrollPacks];
++  NVCC_PRAGMA_UNROLL_AUTO
++  for (int u = 0; u < UnrollPacks; ++u) tmp[u] = load(u);
++  uint64_t loaded = ncclSymClock64();
++  NVCC_PRAGMA_UNROLL_AUTO
++  for (int u = 0; u < UnrollPacks; ++u) store(u, tmp[u]);
++  uint64_t end = ncclSymClock64();
++  // Stores may still wait for load operands. This window ends at issue.
++  return {{end - loaded, 0, 0}, true};
++}
+ 
+ // TODO: move this into data_ops.cuh
+ // nccl-2.32.3-pause: with pauseCycles > 0 each warp spins pauseCycles SM cycles after every chunk of its main
