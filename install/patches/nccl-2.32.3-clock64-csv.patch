@@ -1,0 +1,331 @@
+diff --git a/src/device/symmetric/all_gather.cuh b/src/device/symmetric/all_gather.cuh
+index 2735007..89b187a 100644
+--- a/src/device/symmetric/all_gather.cuh
++++ b/src/device/symmetric/all_gather.cuh
+@@ -304,8 +304,13 @@ __device__ __forceinline__ void ncclSymkRun_AllGather_STMC_impl(ncclSymkDevWorkA
+     int t =
+       flattenIx(threadIdx.x % WARP_SIZE, WARP_SIZE, block, nBlocks, threadIdx.x / WARP_SIZE, blockDim.x / WARP_SIZE);
+     int tn = nBlocks * blockDim.x;
+-    bcastMultimem<char, EnableTma>(handler, tn, t, input, output + rank * nAllElts, nElts, rank,
+-                                   args->agStmcPauseCycles);
++    if (!EnableTma && args->clock64.rows) {
++      bcastMultimem<char, false, true>(handler, tn, t, input, output + rank * nAllElts, nElts, rank,
++                                      args->agStmcPauseCycles, args->clock64);
++    } else {
++      bcastMultimem<char, EnableTma>(handler, tn, t, input, output + rank * nAllElts, nElts, rank,
++                                    args->agStmcPauseCycles);
++    }
+   });
+ 
+   if NCCL_IF_CONSTEXPR (EnableProfiler) ncclSymkProfilerPhase(args, NCCL_KERNEL_PHASE_BEFORE_CLOSE);
+diff --git a/src/device/symmetric/primitives.cuh b/src/device/symmetric/primitives.cuh
+index 530e989..641d8e6 100644
+--- a/src/device/symmetric/primitives.cuh
++++ b/src/device/symmetric/primitives.cuh
+@@ -345,13 +345,62 @@ static __device__ __forceinline__ void ncclSymkPauseCycles(uint32_t pauseCycles)
+   }
+ }
+ 
++static __device__ __forceinline__ uint64_t ncclSymClock64() {
++  uint64_t cycles;
++  asm volatile("mov.u64 %0, %%clock64;" : "=l"(cycles) :: "memory");
++  return cycles;
++}
++
++struct ncclSymClock64Sample {
++  uint64_t cycles[3];
++  bool valid;
++};
++
++// Each row is written by one lane. No atomics or in-kernel printing are needed.
++struct ncclSymClock64Stats {
++  ncclSymClock64Row row = {};
++  uint32_t group = 0;
++
++  __device__ void flush(ncclSymClock64Args args) {
++    if (row.n == 0) return;
++    uint32_t warpsPerCta = blockDim.x / WARP_SIZE;
++    row.cta = blockIdx.x;
++    row.warp = threadIdx.x / WARP_SIZE;
++    size_t warp = size_t(row.cta) * warpsPerCta + row.warp;
++    args.rows[size_t(group++) * gridDim.x * warpsPerCta + warp] = row;
++    row = {};
++  }
++
++  __device__ void add(ncclSymClock64Args args, uint32_t tile, ncclSymClock64Sample sample) {
++    if (threadIdx.x % WARP_SIZE != 0 || !sample.valid) return;
++    if (row.n++ == 0) row.firstTile = tile;
++    row.lastTile = tile;
++    NVCC_PRAGMA_UNROLL_AUTO
++    for (int i = 0; i < 3; ++i) {
++      row.sum[i] += sample.cycles[i];
++      row.max[i] = row.max[i] < sample.cycles[i] ? sample.cycles[i] : row.max[i];
++    }
++    if (row.n == args.groupSize) flush(args);
++  }
++};
++
++static __device__ __forceinline__ uint32_t ncclSymClock64FirstTile(ncclSymClock64Args args) {
++  if (args.rows == nullptr) return 0;
++  uint32_t warp = blockIdx.x * (blockDim.x / WARP_SIZE) + threadIdx.x / WARP_SIZE;
++  return 1 + warp % args.stride;
++}
++
++template <int BytePerPack, int UnrollPacks, typename Load, typename Store>
++static __device__ __noinline__ ncclSymClock64Sample ncclSymClock64MeasureTile(Load load, Store store);
++
+ // TODO: move this into data_ops.cuh
+ // nccl-2.32.3-pause: with pauseCycles > 0 each warp spins pauseCycles SM cycles after every chunk of its main
+ // loop (one UnrollPacks x WARP_SIZE x BytePerPack = 4 KiB tile) before it issues the next one. Only
+ // AllGather_STMC / AllGather_TmaSTMC pass it; the prefix / suffix bytes are not paused.
+-template <typename T, bool EnableTma = false>
++template <typename T, bool EnableTma = false, bool EnableClock64 = false>
+ static __device__ void bcastMultimem(ncclSymkArgsHandler& handler, int tn, int t, ncclSymPtr<T> input,
+-                                     ncclSymPtr<T> output, size_t nElts, uint32_t rank = 0, uint32_t pauseCycles = 0) {
++                                     ncclSymPtr<T> output, size_t nElts, uint32_t rank = 0, uint32_t pauseCycles = 0,
++                                     ncclSymClock64Args clock64 = {}) {
+   size_t nBytes = nElts * sizeof(T);
+   uintptr_t inputUptr = reinterpret_cast<uintptr_t>(input.localPtr());
+   uintptr_t outputUptr = reinterpret_cast<uintptr_t>(output.multimemPtr(handler.comm.lsaMultimem));
+@@ -400,6 +449,9 @@ static __device__ void bcastMultimem(ncclSymkArgsHandler& handler, int tn, int t
+     cursor += (t / WARP_SIZE) * UnrollPacks * WARP_SIZE * BytePerPack;
+     cursor += (t % WARP_SIZE) * BytePerPack;
+     int nIters = (int)nChunks - (int)(t / WARP_SIZE);
++    uint32_t tile = 0;
++    uint64_t nextTile = EnableClock64 ? ncclSymClock64FirstTile(clock64) : 0;
++    ncclSymClock64Stats stats;
+     NVCC_PRAGMA_UNROLL_DISABLED
+     while (0 < nIters) {
+       if (cursor >= wrapAt) cursor -= nMainBytes;
+@@ -410,7 +462,17 @@ static __device__ void bcastMultimem(ncclSymkArgsHandler& handler, int tn, int t
+                          tmaSmem->bar);
+       } else
+ #endif
+-      {
++      if (EnableClock64 && ++tile == nextTile) {
++        auto load = [=] __device__(int u) {
++          return *reinterpret_cast<BytePack<BytePerPack>*>(inputUptr + cursor + u * WARP_SIZE * BytePerPack);
++        };
++        auto store = [=] __device__(int u, BytePack<BytePerPack> val) {
++          multimem_st_global(outputUptr + cursor + u * WARP_SIZE * BytePerPack, val);
++        };
++        auto sample = ncclSymClock64MeasureTile<BytePerPack, UnrollPacks>(load, store);
++        stats.add(clock64, tile, sample);
++        nextTile += clock64.stride;
++      } else {
+         BytePack<BytePerPack> tmp[UnrollPacks];
+         NVCC_PRAGMA_UNROLL_AUTO
+         for (int u = 0; u < UnrollPacks; u++) {
+@@ -425,6 +487,7 @@ static __device__ void bcastMultimem(ncclSymkArgsHandler& handler, int tn, int t
+       cursor += tn * UnrollPacks * BytePerPack;
+       nIters -= tn / WARP_SIZE;
+     }
++    if (EnableClock64) stats.flush(clock64);
+   } else {
+     nPreBytes = 0;
+     nSufBytes = nBytes;
+diff --git a/src/device/symmetric/reduce_scatter.cuh b/src/device/symmetric/reduce_scatter.cuh
+index 091805e..c3d4ab3 100644
+--- a/src/device/symmetric/reduce_scatter.cuh
++++ b/src/device/symmetric/reduce_scatter.cuh
+@@ -398,8 +398,9 @@ __device__ __forceinline__ void ncclSymkRun_ReduceScatter_TmaLD(ncclSymkDevWorkA
+   ncclSymkRun_ReduceScatter_LD_impl<EnableProfiler, Red, T, /*EnableTma=*/true>(args);
+ }
+ 
+-template <typename Red, typename T>
+-static __device__ void reduceMultimem(int tn, int t, Red red, T* input, T* output, size_t nElts, uint32_t rank = 0) {
++template <bool EnableClock64 = false, typename Red, typename T>
++static __device__ void reduceMultimem(int tn, int t, Red red, T* input, T* output, size_t nElts, uint32_t rank,
++                                     ncclSymClock64Args clock64 = {}) {
+   uintptr_t inputUptr = reinterpret_cast<uintptr_t>(input);
+   uintptr_t outputUptr = reinterpret_cast<uintptr_t>(output);
+   size_t nBytes = nElts * sizeof(T);
+@@ -427,22 +428,39 @@ static __device__ void reduceMultimem(int tn, int t, Red red, T* input, T* outpu
+     cursor += (t / WARP_SIZE) * UnrollPacks * WARP_SIZE * BytePerPack;
+     cursor += (t % WARP_SIZE) * BytePerPack;
+     int nIters = (int)nChunks - (int)(t / WARP_SIZE);
++    uint32_t tile = 0;
++    uint64_t nextTile = EnableClock64 ? ncclSymClock64FirstTile(clock64) : 0;
++    ncclSymClock64Stats stats;
+     NVCC_PRAGMA_UNROLL_DISABLED
+     while (0 < nIters) {
+       if (cursor >= wrapAt) cursor -= nMainBytes;
+-      BytePack<BytePerPack> tmp[UnrollPacks];
+-      NVCC_PRAGMA_UNROLL_AUTO
+-      for (int u = 0; u < UnrollPacks; u++) {
+-        tmp[u] =
+-          applyPostOp(red, applyLoadMultimem<Red, BytePerPack>(red, inputUptr + cursor + u * WARP_SIZE * BytePerPack));
+-      }
+-      NVCC_PRAGMA_UNROLL_AUTO
+-      for (int u = 0; u < UnrollPacks; u++) {
+-        *reinterpret_cast<BytePack<BytePerPack>*>(outputUptr + cursor + u * WARP_SIZE * BytePerPack) = tmp[u];
++      if (EnableClock64 && ++tile == nextTile) {
++        auto load = [=] __device__(int u) {
++          return applyLoadMultimem<Red, BytePerPack>(red, inputUptr + cursor + u * WARP_SIZE * BytePerPack);
++        };
++        auto store = [=] __device__(int u, BytePack<BytePerPack> val) {
++          *reinterpret_cast<BytePack<BytePerPack>*>(outputUptr + cursor + u * WARP_SIZE * BytePerPack) =
++            applyPostOp(red, val);
++        };
++        auto sample = ncclSymClock64MeasureTile<BytePerPack, UnrollPacks>(load, store);
++        stats.add(clock64, tile, sample);
++        nextTile += clock64.stride;
++      } else {
++        BytePack<BytePerPack> tmp[UnrollPacks];
++        NVCC_PRAGMA_UNROLL_AUTO
++        for (int u = 0; u < UnrollPacks; u++) {
++          tmp[u] =
++            applyPostOp(red, applyLoadMultimem<Red, BytePerPack>(red, inputUptr + cursor + u * WARP_SIZE * BytePerPack));
++        }
++        NVCC_PRAGMA_UNROLL_AUTO
++        for (int u = 0; u < UnrollPacks; u++) {
++          *reinterpret_cast<BytePack<BytePerPack>*>(outputUptr + cursor + u * WARP_SIZE * BytePerPack) = tmp[u];
++        }
+       }
+       cursor += tn * UnrollPacks * BytePerPack;
+       nIters -= tn / WARP_SIZE;
+     }
++    if (EnableClock64) stats.flush(clock64);
+   } else {
+     nPreBytes = 0;
+     nSufBytes = nBytes;
+@@ -476,7 +494,13 @@ __device__ __forceinline__ void ncclSymkRun_ReduceScatter_LDMC(ncclSymkDevWorkAr
+       flattenIx(threadIdx.x % WARP_SIZE, WARP_SIZE, block, nBlocks, threadIdx.x / WARP_SIZE, blockDim.x / WARP_SIZE);
+     int tn = nBlocks * blockDim.x;
+ 
+-    reduceMultimem(tn, t, red, input.multimemPtr(multimem) + rank * nAllElts, output.localPtr(), nElts, rank);
++    T* src = input.multimemPtr(multimem) + rank * nAllElts;
++    T* dst = output.localPtr();
++    if (args->clock64.rows) {
++      reduceMultimem<true>(tn, t, red, src, dst, nElts, rank, args->clock64);
++    } else {
++      reduceMultimem(tn, t, red, src, dst, nElts, rank);
++    }
+   });
+ 
+   if NCCL_IF_CONSTEXPR (EnableProfiler) ncclSymkProfilerPhase(args, NCCL_KERNEL_PHASE_BEFORE_CLOSE);
+diff --git a/src/include/sym_kernels.h b/src/include/sym_kernels.h
+index ec5523a..e17f3d5 100644
+--- a/src/include/sym_kernels.h
++++ b/src/include/sym_kernels.h
+@@ -122,6 +122,18 @@ enum ncclDevProfilerMode : uint8_t {
+   ncclDevProfilerModeKernelPhase = 1 << 1,
+ };
+ 
++// Private layout shared with the clock64 benchmark's CUDA tensor.
++struct ncclSymClock64Row {
++  uint64_t cta, warp, firstTile, lastTile, n;
++  uint64_t sum[3], max[3];
++};
++static_assert(sizeof(ncclSymClock64Row) == 11 * sizeof(uint64_t));
++
++struct ncclSymClock64Args {
++  ncclSymClock64Row* rows;
++  uint32_t stride, groupSize;
++};
++
+ struct alignas(16) ncclSymkDevWorkArgs {
+   struct ncclSymkDevComm kcomm;
+   int nMaxChannels;
+@@ -133,6 +145,7 @@ struct alignas(16) ncclSymkDevWorkArgs {
+   // nccl-2.32.3-pause: NCCL_SYM_AG_ST_PAUSE_CYCLES. AllGather_ST / AllGather_TmaST make every warp spin this
+   // many SM cycles (clock64) after each tile it stores to every peer; 0 leaves the kernels as in stock NCCL.
+   uint32_t agStPauseCycles;
++  ncclSymClock64Args clock64;
+   // Variable-length trailing data layout:
+   //   if profilerMode: uint64_t profilerWorkCounters[nMaxChannels] (aligned to 16)
+   //   ncclSymkChannelWorkRange[nChannels] (aligned to 16)
+diff --git a/src/scheduler/symmetric_sched.cc b/src/scheduler/symmetric_sched.cc
+index 94ad659..01f8fd2 100644
+--- a/src/scheduler/symmetric_sched.cc
++++ b/src/scheduler/symmetric_sched.cc
+@@ -16,6 +16,7 @@
+ #include "config/algorithm_registry.h"
+ #include "profiler.h"
+ #include <cuda_fp16.h>
++#include <mutex>
+ #if defined(__CUDA_FP8_TYPES_EXIST__)
+ #include <cuda_fp8.h>
+ #endif
+@@ -28,6 +29,60 @@ NCCL_PARAM(SymAgStmcPauseCycles, "SYM_AG_STMC_PAUSE_CYCLES", 0)
+ // stores to all peers (all_gather.cuh bcastDeep: 2 KiB per peer on the 16 B path); 0 (default) is stock.
+ NCCL_PARAM(SymAgStPauseCycles, "SYM_AG_ST_PAUSE_CYCLES", 0)
+ 
++namespace {
++struct SymClock64Capture {
++  ncclSymClock64Row* rows;
++  uint32_t capacity, launches, stride, groupSize;
++  uint32_t next[2];
++  int device;
++};
++
++std::mutex symClock64Mutex;
++SymClock64Capture symClock64Capture = {};
++}
++
++// Private benchmark entry point. The caller owns the zeroed device buffer and
++// keeps it alive through device synchronization. One capture per process.
++extern "C" __attribute__((visibility("default"))) ncclResult_t ncclSymClock64Register(
++    void* rows, uint32_t capacity, uint32_t launches, uint32_t stride, uint32_t groupSize) {
++  std::lock_guard<std::mutex> lock(symClock64Mutex);
++  if (rows == nullptr) {
++    symClock64Capture = {};
++    return ncclSuccess;
++  }
++  if (symClock64Capture.rows || !capacity || !launches || !stride || !groupSize)
++    return ncclInvalidUsage;
++  cudaPointerAttributes attr;
++  if (cudaPointerGetAttributes(&attr, rows) != cudaSuccess || attr.type != cudaMemoryTypeDevice)
++    return ncclInvalidArgument;
++  symClock64Capture = {static_cast<ncclSymClock64Row*>(rows), capacity, launches, stride, groupSize, {}, attr.device};
++  return ncclSuccess;
++}
++
++static ncclResult_t symClock64Bind(ncclComm* comm, ncclSymkKernelId kernelId, const ncclKernelPlan* plan,
++                                  int workCount, int nMaxChannels, size_t nBytes, ncclSymClock64Args* clock64) {
++  int op = kernelId == ncclSymkKernelId_AllGather_STMC ? 0 :
++           kernelId == ncclSymkKernelId_ReduceScatter_LDMC ? 1 : -1;
++  if (op < 0) return ncclSuccess;
++  std::lock_guard<std::mutex> lock(symClock64Mutex);
++  auto& capture = symClock64Capture;
++  if (capture.rows == nullptr || comm->cudaDev != capture.device) return ncclSuccess;
++
++  // A group-major table has at most ceil(nTiles / tilesPerGroup) + nWarps
++  // slots, including unused slots in the last group. Each warp owns its slots.
++  uint64_t nTiles = nBytes / 4096;
++  uint64_t tilesPerGroup = uint64_t(capture.stride) * capture.groupSize;
++  uint64_t nWarps = uint64_t(nMaxChannels) * (plan->threadPerBlock / WARP_SIZE);
++  uint64_t required = nTiles / tilesPerGroup + (nTiles % tilesPerGroup != 0) + nWarps;
++  if (plan->persistent || workCount != 1 || capture.next[op] >= capture.launches || required > capture.capacity) {
++    WARN("Clock64 capture expects one non-graph work item per launch and a sufficiently large buffer");
++    return ncclInvalidUsage;
++  }
++  size_t slot = size_t(op) * capture.launches + capture.next[op]++;
++  *clock64 = {capture.rows + slot * capture.capacity, capture.stride, capture.groupSize};
++  return ncclSuccess;
++}
++
+ ncclDevRedOp_t symkRedOp(ncclRedOp_t redOp, ncclDevRedOp_t devRedOp) {
+   if (redOp == ncclAvg) {
+     return ncclDevSumPostDiv;
+@@ -292,6 +347,7 @@ ncclResult_t ncclSymmetricTaskScheduler(struct ncclComm* comm,
+   const char* funcName = ncclFuncToString(headTask->func);
+   const char* kernelName = ncclSymkKernelIdToString(headTask->devFuncId);
+   struct ncclSymkDevWorkArgs* argsBuf = NULL;
++  ncclSymClock64Args clock64 = {};
+ 
+   plan->isSymColl = true;
+   plan->threadPerBlock = headTask->nWarps * WARP_SIZE;
+@@ -323,9 +379,12 @@ ncclResult_t ncclSymmetricTaskScheduler(struct ncclComm* comm,
+     task = task->next;
+   }
+ 
++  NCCLCHECK(symClock64Bind(comm, kernelId, plan, workCount, nMaxChannels,
++                              logCount * ncclTypeSize(headTask->datatype), &clock64));
+   plan->kernelArgsSize = ncclSymkDevWorkArgs::calcArgsSize(nMaxChannels, workCount, profilerEnabled);
+   argsBuf = (struct ncclSymkDevWorkArgs*)calloc(1, plan->kernelArgsSize);
+ 
++  argsBuf->clock64 = clock64;
+   argsBuf->nMaxChannels = nMaxChannels;
+   argsBuf->maxDynamicSmem = maxDynamicSmem;
+   // KernelCh-only launches leave the phase bit clear, so the profile variant skips the

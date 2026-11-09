@@ -123,6 +123,7 @@ Options:
   --output-dir DIR       (default: results/gb200/ncu-torch-all-gather/<algo>-all-gather-<time>,
                          <algo>-all-gather-reduce-scatter-<time> with --ag-rs)
   --skip-baseline        Only run the ncu pass
+  --baseline-only        Only run the correctness/timing pass, without ncu
   -h, --help
 
 Outputs in --output-dir: config.txt, baseline.log, ncu.log, nccl-logs/<pass>/*.log, the ncu
@@ -154,6 +155,7 @@ ncu_bin="ncu"
 nccl_lib=""
 output_dir=""
 run_baseline=true
+baseline_only=false
 extra_ncu_args=()
 
 die() {
@@ -182,6 +184,7 @@ while [[ $# -gt 0 ]]; do
         --nccl-lib) nccl_lib="$2"; shift 2 ;;
         --output-dir) output_dir="$2"; shift 2 ;;
         --skip-baseline) run_baseline=false; shift ;;
+        --baseline-only) baseline_only=true; shift ;;
         --) shift; extra_ncu_args=("$@"); break ;;
         -h|--help) usage; exit 0 ;;
         *) die "unknown argument: $1 (see --help)" ;;
@@ -194,6 +197,9 @@ done
 [[ "$replay_mode" =~ ^(kernel|application|range|app-range)$ ]] \
     || die "--replay-mode must be kernel, application, range or app-range"
 (( iters >= 1 )) || die "--iters must be at least 1"
+if $baseline_only && ! $run_baseline; then
+    die "--baseline-only and --skip-baseline cannot be combined"
+fi
 if $ag_rs; then
     # The overlap worker connects each communicator in the first warmup launch, serially.
     (( warmup >= 1 )) || die "--ag-rs needs --warmup >= 1"
@@ -293,17 +299,18 @@ output_dir="${output_dir:-${repo_root}/results/gb200/ncu-torch-all-gather/${algo
 ################################################################################
 # Preflight
 
-ncu_home="${repo_root}/NVIDIA-Nsight-Compute-2026.4"
-[[ -d "$ncu_home" ]] && export PATH="${ncu_home}:${PATH}"
-command -v "$ncu_bin" >/dev/null || die "${ncu_bin} not found; put Nsight Compute 2026.4 in ${ncu_home} or pass --ncu"
-ncu_version="$("$ncu_bin" --version | sed -n 's/.*Version \([0-9]*\.[0-9]*\).*/\1/p' | head -1)"
-echo "ncu: $(command -v "$ncu_bin") (${ncu_version:-unknown version})"
-ncu_year="${ncu_version%%.*}"
-ncu_minor="${ncu_version#*.}"
-# 2026.4 release notes: "Added application replay support when profiling with the shmem
-# communicator"; 2026.3 runs the application without profiling anything ("No kernels were profiled").
-if [[ -z "$ncu_version" ]] || (( ncu_year < 2026 || (ncu_year == 2026 && ncu_minor < 4) )); then
-    die "Nsight Compute ${ncu_version:-?} is too old; need >= 2026.4 (put it in ${ncu_home} or pass --ncu)"
+if ! $baseline_only; then
+    ncu_home="${repo_root}/NVIDIA-Nsight-Compute-2026.4"
+    [[ -d "$ncu_home" ]] && export PATH="${ncu_home}:${PATH}"
+    command -v "$ncu_bin" >/dev/null || die "${ncu_bin} not found; put Nsight Compute 2026.4 in ${ncu_home} or pass --ncu"
+    ncu_version="$("$ncu_bin" --version | sed -n 's/.*Version \([0-9]*\.[0-9]*\).*/\1/p' | head -1)"
+    echo "ncu: $(command -v "$ncu_bin") (${ncu_version:-unknown version})"
+    ncu_year="${ncu_version%%.*}"
+    ncu_minor="${ncu_version#*.}"
+    # Nsight Compute 2026.4 added application replay with the shmem communicator.
+    if [[ -z "$ncu_version" ]] || (( ncu_year < 2026 || (ncu_year == 2026 && ncu_minor < 4) )); then
+        die "Nsight Compute ${ncu_version:-?} is too old; need >= 2026.4 (put it in ${ncu_home} or pass --ncu)"
+    fi
 fi
 [[ -z "$nccl_lib" || -f "$nccl_lib" ]] || die "--nccl-lib ${nccl_lib} does not exist"
 
@@ -391,7 +398,11 @@ torchrun_cmd=(uv run --no-sync python -m torch.distributed.run --standalone --np
 worker_cmd=(uv run --no-sync python "${worker_cmd[@]}")
 
 {
-    echo "ncu=$(command -v "$ncu_bin") ${ncu_version}"
+    if $baseline_only; then
+        echo "ncu=disabled"
+    else
+        echo "ncu=$(command -v "$ncu_bin") ${ncu_version}"
+    fi
     echo "gpus=${gpus} algo=${algo} ag_rs=${ag_rs} size_mib=${size_mib} dtype=${dtype} warmup=${warmup} iters=${iters}"
     echo "communicator=${communicator} lockstep=${lockstep} set=${ncu_set} sections=${sections[*]:-<from --set>} metrics=${metrics:-<from --set>} replay=${replay_mode} extra_ncu_args=${extra_ncu_args[*]:-}"
     echo "blocking_metrics=${blocking}"
@@ -471,6 +482,9 @@ run_pass() {
 
 if $run_baseline; then
     run_pass baseline "${torchrun_cmd[@]}"
+fi
+if $baseline_only; then
+    exit 0
 fi
 
 ################################################################################
