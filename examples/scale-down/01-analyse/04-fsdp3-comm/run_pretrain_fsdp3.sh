@@ -35,6 +35,7 @@ MERGE_GRAPHS=false
 FORCE_BALANCE=false
 FSDP_LEVEL="${FSDP_LEVEL:-3}"
 OVERLAP=false
+TP_COMM_OVERLAP=false
 SYMMETRIC=false
 DDP_OVERLAP=false
 HYBRIDEP_NUM_SMS="${HYBRIDEP_NUM_SMS:-32}"
@@ -90,6 +91,8 @@ Options:
                                  NCCL_ALGO. Names get "-symm"
   --tp N                         Tensor parallel size; N > 1 turns on sequence
                                  parallelism (default: 1)
+  --tp-comm-overlap              Enable TE TP communication overlap (requires TP > 1);
+                                 names get "-tp-overlap"
   --cp N                         Context parallel size (default: 1)
   --cuda-graph off|on            off: no CUDA graph. on with FSDP: full-iteration graph
                                  of forward+backward, FSDP all-gather / reduce-scatter
@@ -157,6 +160,7 @@ while [[ $# -gt 0 ]]; do
         --dtype|--precision) need_value "$@"; DTYPE="$2"; shift 2;;
         --mxfp8) DTYPE=mxfp8; shift;;
         --tp|--tensor-parallel) need_value "$@"; TENSOR_PARALLEL="$2"; shift 2;;
+        --tp-comm-overlap) TP_COMM_OVERLAP=true; shift;;
         --cp|--context-parallel) need_value "$@"; CONTEXT_PARALLEL="$2"; shift 2;;
         --mbs|--micro-batch-size) need_value "$@"; MICRO_BATCH_SIZE="$2"; shift 2;;
         --gbs|--global-batch-size) need_value "$@"; GLOBAL_BATCH_SIZE="$2"; shift 2;;
@@ -243,6 +247,7 @@ esac
 for name in SEQ_LENGTH TENSOR_PARALLEL CONTEXT_PARALLEL MICRO_BATCH_SIZE GLOBAL_BATCH_SIZE TRAIN_ITERS GPU_COUNT GPUS_PER_NODE MASTER_PORT HYBRIDEP_NUM_SMS; do
     [[ "${!name}" =~ ^[1-9][0-9]*$ ]] || { echo "${name} must be a positive integer" >&2; exit 2; }
 done
+[[ "${TP_COMM_OVERLAP}" == false ]] || (( TENSOR_PARALLEL > 1 )) || { echo "--tp-comm-overlap requires --tp > 1" >&2; exit 2; }
 for name in NODE_RANK PROFILE_START PROFILE_END; do
     [[ "${!name}" =~ ^[0-9]+$ ]] || { echo "${name} must be a non-negative integer" >&2; exit 2; }
 done
@@ -332,6 +337,7 @@ ATTN_TAG=""
 [[ "${ATTENTION}" != hybrid ]] && ATTN_TAG="-attn_${ATTENTION}"
 TP_TAG=""
 (( TENSOR_PARALLEL > 1 )) && TP_TAG="-tp_${TENSOR_PARALLEL}"
+[[ "${TP_COMM_OVERLAP}" == true ]] && TP_TAG+="-tp-overlap"
 CG_TAG="${CUDA_GRAPH}"
 [[ "${GRAPH_TRACE}" == graph ]] && CG_TAG+="-merge"
 CASE_NAME="model_${MODEL}-${DP_TAG}${OVERLAP_TAG}${DTYPE_TAG}-layers_${LAYERS_TAG}${ATTN_TAG}-mtp_${MTP_TAG}-experts_${EXPERTS_TAG}-cg_${CG_TAG}-mbs_${MICRO_BATCH_SIZE}-seq_${SEQ_LENGTH}${TP_TAG}-cp_${CONTEXT_PARALLEL}-ep_${EXPERT_PARALLEL}-disp_${DISPATCHER}-gbs_${GLOBAL_BATCH_SIZE}-gpus_${GPU_COUNT}-profile_${PROFILE}-date_${RUN_DATE}"
@@ -387,8 +393,7 @@ OVERRIDES=(
     "train.train_iters=${TRAIN_ITERS}" "train.global_batch_size=${GLOBAL_BATCH_SIZE}" "train.micro_batch_size=${MICRO_BATCH_SIZE}"
     "scheduler.lr_warmup_iters=1" "scheduler.lr_decay_iters=${TRAIN_ITERS}"
     "validation.eval_iters=0" "validation.eval_interval=0"
-    # TP > 1 always runs with sequence parallelism; the recipe keeps
-    # comm_overlap.tp_comm_overlap=false, so TP / SP collectives are plain NCCL.
+    # TP > 1 always runs with sequence parallelism.
     "model.tensor_model_parallel_size=${TENSOR_PARALLEL}" "model.sequence_parallel=${SEQUENCE_PARALLEL}"
     "model.context_parallel_size=${CONTEXT_PARALLEL}" "model.pipeline_model_parallel_size=1"
     "model.expert_model_parallel_size=${EXPERT_PARALLEL}" "model.expert_tensor_parallel_size=1"
@@ -526,6 +531,7 @@ fi
 if (( ${#EXTRA_OVERRIDES[@]} > 0 )); then
     OVERRIDES+=("${EXTRA_OVERRIDES[@]}")
 fi
+[[ "${TP_COMM_OVERLAP}" == true ]] && OVERRIDES+=("comm_overlap.tp_comm_overlap=true")
 
 TRAIN_ARGS=("${REPO_ROOT}/scripts/training/run_recipe.py" --recipe "${RECIPE}" --mode pretrain --dataset mock --step-func llm_step "${OVERRIDES[@]}")
 if (( NNODES == 1 )); then

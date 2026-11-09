@@ -30,6 +30,7 @@ Qwen3.8-2.4T-A95B 的 HF 配置是纯文本的 `Qwen3_5MoeForCausalLM`（没有 
 | `--overlap` | — | 见「AG / RS 通信组分离」；只作用于 FSDP case（sweep 中 `ddp` case 不受影响），名字中数据并行方式后加 `-overlap` |
 | `--symmetric` | — | 见「Symmetric memory」；只作用于 FSDP case（sweep 中 `ddp` case 不受影响），名字中加 `-symm`（与 `--overlap` 同用时为 `-overlap-symm`） |
 | `--tp` | N，可逗号分隔 | Tensor parallel；N>1 时自动打开 sequence parallel（`model.sequence_parallel=true`）。默认 1 |
+| `--tp-comm-overlap` | — | 为 TP > 1 的 case 设置 `comm_overlap.tp_comm_overlap=true`，结果目录和 nsys 报告名带 `-tp-overlap`。混合 sweep 中的 TP=1 case 作为基线，单 case 启动时要求 TP > 1 |
 | `--cp` | N，可逗号分隔 | Context parallel，`cp_comm_type=p2p`。默认 1 |
 | `--cuda-graph` | `off`、`on`，可逗号分隔 | 默认 `off`，含义见「CUDA graph」 |
 | `--seq` | N，可逗号分隔 | sweep 默认 `256,1024,4096` |

@@ -112,6 +112,20 @@ def test_tp_turns_on_sequence_parallel_and_shrinks_data_parallel(tmp_path: Path)
     # 4 microbatches x MBS 1 x DP 2.
     assert "train.global_batch_size=8" in tp2 and "-gbs_8-" in tp2
     assert "/qwen35_27b-fsdp_3-experts_0-cg_off-tp_2-cp_1-" in tp2
+    assert "comm_overlap.tp_comm_overlap=true" not in tp2
+
+
+def test_tp_comm_overlap_applies_only_to_tp_cases(tmp_path: Path):
+    tp1, tp2 = _sweep(tmp_path, "--model", "27b", "--tp", "1,2", "--tp-comm-overlap", "--seq", "4096", "--fsdp", "3")
+    assert "model.tensor_model_parallel_size=1" in tp1
+    assert "comm_overlap.tp_comm_overlap=true" not in tp1 and "-tp-overlap" not in tp1
+    assert "model.sequence_parallel=true" in tp2 and "comm_overlap.tp_comm_overlap=true" in tp2
+    assert "-seq_4096-tp_2-tp-overlap-cp_1-" in tp2
+    assert "/qwen35_27b-fsdp_3-experts_0-cg_off-tp_2-tp-overlap-cp_1-" in tp2
+    assert "dist.create_all_gather_group=false" in tp2
+
+    result = _run(RUN_ONE, "--model", "27b", "--seq-length", "4096", "--tp-comm-overlap", "--dry-run")
+    assert result.returncode == 2 and "--tp-comm-overlap requires --tp > 1" in result.stderr
 
 
 def test_cp_and_tp_combine_and_are_validated_before_any_launch(tmp_path: Path):

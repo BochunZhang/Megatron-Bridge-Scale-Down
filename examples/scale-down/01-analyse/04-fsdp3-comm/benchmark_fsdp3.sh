@@ -43,6 +43,7 @@ MASTER_ADDR="${MASTER_ADDR:-${DLC_MASTER_ADDR:-}}"
 MASTER_PORT="${MASTER_PORT:-29501}"
 FORCE_BALANCE=false
 OVERLAP=false
+TP_COMM_OVERLAP=false
 SYMMETRIC=false
 DDP_OVERLAP=false
 MERGE_GRAPHS=false
@@ -77,6 +78,8 @@ Options:
                                 "-symm"
   --tp N[,N...]                 Tensor parallel sizes, N > 1 with sequence
                                 parallelism (default: 1)
+  --tp-comm-overlap             Enable TE TP communication overlap for cases
+                                with TP > 1
   --cp N[,N...]                 Context parallel sizes (default: 1)
   --cuda-graph off|on[,...]     CUDA graph modes (default: off); on = full-iteration
                                 graph for FSDP (MoE needs hybridep), TE per-layer
@@ -125,6 +128,7 @@ while [[ $# -gt 0 ]]; do
         --overlap) OVERLAP=true; shift;;
         --symmetric) SYMMETRIC=true; shift;;
         --tp) need_value "$@"; parse_csv "$2" TP_SIZES; shift 2;;
+        --tp-comm-overlap) TP_COMM_OVERLAP=true; shift;;
         --cp) need_value "$@"; parse_csv "$2" CP_SIZES; shift 2;;
         --cuda-graph|--cuda-graphs) need_value "$@"; parse_csv "$2" CUDA_GRAPHS; shift 2;;
         --seq|--seq-length|--seq-lengths) need_value "$@"; parse_csv "$2" SEQUENCES; shift 2;;
@@ -197,6 +201,7 @@ case_args() {
         [[ "${FORCE_BALANCE}" == true ]] && ARGS+=(--force-balance)
     fi
     [[ "${OVERLAP}" == true && "${fsdp}" != ddp ]] && ARGS+=(--overlap)
+    [[ "${TP_COMM_OVERLAP}" == true && "${tp}" -gt 1 ]] && ARGS+=(--tp-comm-overlap)
     [[ "${SYMMETRIC}" == true && "${fsdp}" != ddp ]] && ARGS+=(--symmetric)
     [[ "${DDP_OVERLAP}" == true && "${fsdp}" == ddp ]] && ARGS+=(--ddp-overlap)
     [[ "${MERGE_GRAPHS}" == true ]] && ARGS+=(--merge)
