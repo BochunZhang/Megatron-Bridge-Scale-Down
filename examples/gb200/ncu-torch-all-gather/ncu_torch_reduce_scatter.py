@@ -15,11 +15,13 @@
 """Run a standalone NCCL ReduceScatter_LDMC capture with registered symmetric buffers."""
 
 import argparse
+import contextlib
 import logging
 import os
 
 import torch
 import torch.distributed as dist
+from symm_clock64_csv import Clock64Capture
 from torch.cuda import nvtx
 
 
@@ -56,7 +58,8 @@ def main() -> None:
         raise ValueError("ReduceScatter_LDMC requires at least two ranks")
     dtype = DTYPES[args.dtype]
     size_bytes = args.size_mib << 20
-    shard, remainder = divmod(size_bytes, world_size * torch.empty((), dtype=dtype).element_size())
+    elem = torch.empty((), dtype=dtype).element_size()
+    shard, remainder = divmod(size_bytes, world_size * elem)
     if remainder:
         raise ValueError(f"{size_bytes} bytes cannot be split into {world_size} equal {args.dtype} shards")
 
@@ -86,12 +89,20 @@ def main() -> None:
     _check_output(out, rank=rank, world_size=world_size)
 
     out.zero_()
+    capture = None
+    if profile := os.environ.get("NCCL_SYM_CLOCK64_CSV_PROFILE"):
+        capture = Clock64Capture(
+            profile=profile, device=device, shard_bytes=shard * elem, launches=1, kernels=("ReduceScatter_LDMC",)
+        )
     torch.cuda.synchronize()
     dist.barrier(group=cpu_group)
-    with nvtx.range(NVTX_RANGE):
-        dist.reduce_scatter_tensor(out, inp)
-        torch.cuda.synchronize()
+    with capture.arm() if capture is not None else contextlib.nullcontext():
+        with nvtx.range(NVTX_RANGE):
+            dist.reduce_scatter_tensor(out, inp)
+            torch.cuda.synchronize()
     _check_output(out, rank=rank, world_size=world_size)
+    if capture is not None:
+        capture.write(rank=rank)
     dist.barrier(group=cpu_group)
     if rank == 0:
         logger.info(

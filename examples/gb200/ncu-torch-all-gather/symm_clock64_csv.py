@@ -57,15 +57,24 @@ def _unsigned(value: int) -> int:
 class Clock64Capture:
     """Own the zeroed GPU table for the measured launches on one rank."""
 
-    def __init__(self, *, profile: str, device: torch.device, shard_bytes: int, launches: int) -> None:
+    def __init__(
+        self,
+        *,
+        profile: str,
+        device: torch.device,
+        shard_bytes: int,
+        launches: int,
+        kernels: tuple[str, ...] = _KERNELS,
+    ) -> None:
         if profile not in ("store", "split"):
             raise ValueError(f"Unknown clock64 profile {profile!r}")
         self.profile = profile
         self.output = Path(os.environ["NCCL_SYM_CLOCK64_CSV_DIR"])
-        self.pause = int(os.environ["NCCL_SYM_AG_STMC_PAUSE_CYCLES"])
+        self.pause = int(os.environ.get("NCCL_SYM_AG_STMC_PAUSE_CYCLES", "0"))
         self.stride = int(os.environ["NCCL_SYM_CLOCK64_STRIDE"])
         self.group_size = int(os.environ["NCCL_SYM_CLOCK64_GROUP"])
         self.launches = launches
+        self.kernels = kernels
         path = Path(os.environ["NCCL_SYM_CLOCK64_CSV_LIB"]).resolve(strict=True)
         # Only bind the already-preloaded library. Loading a second copy would
         # register the buffer with a different scheduler from PyTorch's.
@@ -99,13 +108,15 @@ class Clock64Capture:
             self.register(None, 0, 0, 0, 0)
 
     def write(self, *, rank: int) -> None:
-        """Write the completed per-warp groups for both collectives."""
+        """Write the completed per-warp groups for the selected kernels."""
         batches = self.buffer.cpu().tolist()
         self.output.mkdir(parents=True, exist_ok=True)
         with (self.output / f"rank-{rank}.csv").open("x", newline="") as stream:
             writer = csv.writer(stream)
             writer.writerow(_FIELDS)
             for kernel, launches in zip(_KERNELS, batches, strict=True):
+                if kernel not in self.kernels:
+                    continue
                 for launch, rows in enumerate(launches):
                     valid = sorted(row for row in rows if row[4])
                     if not valid:

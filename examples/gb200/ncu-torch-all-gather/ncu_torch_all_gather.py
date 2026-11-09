@@ -48,6 +48,7 @@ import os
 
 import torch
 import torch.distributed as dist
+from symm_clock64_csv import Clock64Capture
 from torch.cuda import nvtx
 
 
@@ -156,13 +157,23 @@ def main() -> None:
     dist.barrier(group=cpu_group)
 
     out.zero_()
+    capture = None
+    if profile := os.environ.get("NCCL_SYM_CLOCK64_CSV_PROFILE"):
+        if args.algo != "symm":
+            raise ValueError("Clock64 CSV capture requires --algo symm")
+        capture = Clock64Capture(
+            profile=profile, device=device, shard_bytes=shard * elem, launches=args.iters, kernels=("AllGather_STMC",)
+        )
+        torch.cuda.synchronize()
     # range_push/pop must run on the thread that launches the kernels; torch enqueues NCCL from it.
-    nvtx.range_push(NVTX_RANGE)
-    for _ in range(args.iters):
-        dist.all_gather_into_tensor(out, inp)
-    torch.cuda.synchronize()
-    nvtx.range_pop()
+    with capture.arm() if capture is not None else contextlib.nullcontext():
+        with nvtx.range(NVTX_RANGE):
+            for _ in range(args.iters):
+                dist.all_gather_into_tensor(out, inp)
+            torch.cuda.synchronize()
     _check_output(out, world_size, shard)
+    if capture is not None:
+        capture.write(rank=rank)
     dist.barrier(group=cpu_group)
     if rank == 0:
         logger.info("all-gather output correct after warmup and the %s range", NVTX_RANGE)

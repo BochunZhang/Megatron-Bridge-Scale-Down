@@ -29,6 +29,7 @@ Usage: run_ncu_torch_reduce_scatter.sh [options]
   --timeout SEC        Time limit for each ncu session (default: 1800)
   --ncu PATH           ncu binary (default: ncu in PATH, NVIDIA-Nsight-Compute-2026.4 first)
   --nccl-lib PATH      Optional libnccl.so.2 to preload
+  --baseline-only     Run ReduceScatter_LDMC once after warmup, without ncu
   --output-dir DIR     Default: results/gb200/ncu-torch-all-gather/symm-reduce-scatter-<time>
   -h, --help
 
@@ -45,10 +46,12 @@ script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 repo_root="$(cd -- "${script_dir}/../../.." && pwd)"
 gpus="${CUDA_VISIBLE_DEVICES:-0,1,2,3}"
 size_mib=1024 dtype=bf16 warmup=5 group=all timeout_sec=1800 ncu_bin=ncu nccl_lib="" output_dir=""
+baseline_only=false
 
 while (( $# > 0 )); do
     case "$1" in
         -h|--help) usage; exit 0 ;;
+        --baseline-only) baseline_only=true; shift ;;
         --gpus|--size-mib|--dtype|--warmup|--group|--timeout|--ncu|--nccl-lib|--output-dir)
             [[ -n "${2:-}" && "$2" != --* ]] || die "$1 needs a value"
             case "$1" in
@@ -79,15 +82,20 @@ case "$group" in
     *) die "--group must be all, source, memory or nvlink" ;;
 esac
 
-ncu_home="${repo_root}/NVIDIA-Nsight-Compute-2026.4"
-[[ -d "$ncu_home" ]] && export PATH="${ncu_home}:${PATH}"
-ncu_bin="$(command -v "$ncu_bin")" || die "ncu not found; pass --ncu PATH"
-# Resolve paths from the caller's cwd before entering the uv project.
-ncu_bin="$(cd -- "$(dirname -- "$ncu_bin")" && pwd)/$(basename -- "$ncu_bin")"
-ncu_version="$("$ncu_bin" --version | sed -nE 's/.*Version ([0-9]+\.[0-9]+).*/\1/p')"
-IFS=. read -r ncu_year ncu_minor <<<"$ncu_version"
-[[ -n "$ncu_version" ]] && (( ncu_year > 2026 || (ncu_year == 2026 && ncu_minor >= 4) )) \
-    || die "need ncu >= 2026.4 for application replay with shmem; found ${ncu_version:-unknown}"
+if $baseline_only; then
+    ncu_bin=disabled
+    ncu_version=""
+else
+    ncu_home="${repo_root}/NVIDIA-Nsight-Compute-2026.4"
+    [[ -d "$ncu_home" ]] && export PATH="${ncu_home}:${PATH}"
+    ncu_bin="$(command -v "$ncu_bin")" || die "ncu not found; pass --ncu PATH"
+    # Resolve paths from the caller's cwd before entering the uv project.
+    ncu_bin="$(cd -- "$(dirname -- "$ncu_bin")" && pwd)/$(basename -- "$ncu_bin")"
+    ncu_version="$("$ncu_bin" --version | sed -nE 's/.*Version ([0-9]+\.[0-9]+).*/\1/p')"
+    IFS=. read -r ncu_year ncu_minor <<<"$ncu_version"
+    [[ -n "$ncu_version" ]] && (( ncu_year > 2026 || (ncu_year == 2026 && ncu_minor >= 4) )) \
+        || die "need ncu >= 2026.4 for application replay with shmem; found ${ncu_version:-unknown}"
+fi
 command -v uv >/dev/null || die "uv is required"
 timeout_bin="$(command -v timeout || command -v gtimeout)" || die "GNU timeout is required"
 
@@ -230,6 +238,14 @@ profile_group() {
 }
 
 shopt -s nullglob
+if $baseline_only; then
+    mkdir -p "${output_dir}/nccl-logs"
+    NCCL_DEBUG_FILE="${output_dir}/nccl-logs/nccl-%h-%p.log" \
+        "$timeout_bin" --signal=TERM --kill-after=30 "$timeout_sec" "${worker_cmd[@]}" 2>&1 \
+        | tee "${output_dir}/baseline.log" || die "baseline failed; see ${output_dir}/baseline.log"
+    check_tuning "${output_dir}/nccl-logs"
+    exit 0
+fi
 for group in "${groups[@]}"; do
     profile_group "$group"
 done

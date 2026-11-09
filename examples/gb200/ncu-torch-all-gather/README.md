@@ -258,17 +258,18 @@ PM sampling / warp state sampling 的 pass 数是动态决定的，这两类很�
 
 ```bash
 bash install/install-nccl-2.32.3-clock64.sh
-bash examples/gb200/ncu-torch-all-gather/sweep_symm_ag_rs_clock64.sh
+bash examples/gb200/ncu-torch-all-gather/sweep_symm_ag_clock64.sh
 ```
 
-三个任务使用同一组 12 个 pause 点，默认 4 卡、BF16、1024 MiB。两个插桩任务走 `--baseline-only`，
-第三个复用已有的 AG + RS ncu sweep，以 `app-range` 和 `tcp` 采集。可用 `--dry-run` 查看计划。
+三个任务都单跑 `AllGather_STMC`，使用同一组 12 个 pause 点，默认 4 卡、BF16、1024 MiB。
+两个插桩任务走 `--baseline-only`，第三个复用已有的单跑 AG ncu sweep，默认使用 `application`
+replay 和 `shmem` communicator。可用 `--dry-run` 查看计划。
 
 | NCCL 构建 | AG 计时 | RS 计时 |
 | --- | --- | --- |
 | `2.32.3-pause-store-clock64` | 8 条 multicast store 的发射窗口 | 本地 store 的发射窗口 |
 | `2.32.3-pause-split-clock64` | `ld_issue`、依赖 XOR 的 `ld_wait`、`st_issue` | 同样三段，load 为 multicast 读取归约 |
-| `2.32.3-pause` | ncu 采集 | ncu 采集，指标属于同一个 AG + RS range |
+| `2.32.3-pause` | ncu 采集 AG | 单独使用 RS ncu 启动器 |
 
 两种 clock64 构建默认每个 warp 每 32 个对齐 tile 错峰采样一次，每 8 个样本记录一组，保留尾组。
 每个 warp 的 lane 0 把 `sum`、`max` 和样本数写入独占的 GPU 槽位，host 在同步后导出
@@ -278,6 +279,20 @@ bash examples/gb200/ncu-torch-all-gather/sweep_symm_ag_rs_clock64.sh
 
 旧窗口会包含尚未就绪的 load 操作数带来的等待。分段窗口的 XOR 会前移数据依赖，且包含探针和调度开销。
 这些窗口可用于对照插桩后的时序，ncu 的 warp stall 计数有独立的硬件口径。
+
+两个插桩版本也支持单独采集 `ReduceScatter_LDMC`。RS 单跑没有 AG pause sweep。以下命令采集
+`store` 版本，改为 `profile=split` 可采集另一版。
+
+```bash
+profile=store
+lib="$PWD/nccl/nccl-2.32.3-pause-${profile}-clock64/build/lib/libnccl.so.2"
+out="$PWD/results/rs-clock64-${profile}-$(date +%Y%m%d-%H%M%S)"
+NCCL_SYM_AG_STMC_PAUSE_CYCLES=0 NCCL_SYM_CLOCK64_CSV_PROFILE="$profile" \
+  NCCL_SYM_CLOCK64_CSV_LIB="$lib" NCCL_SYM_CLOCK64_CSV_DIR="$out/clock64-ranks" \
+  NCCL_SYM_CLOCK64_STRIDE=32 NCCL_SYM_CLOCK64_GROUP=8 \
+  bash examples/gb200/ncu-torch-all-gather/run_ncu_torch_reduce_scatter.sh \
+    --baseline-only --nccl-lib "$lib" --output-dir "$out"
+```
 
 ## AG + RS：replay 模式 × communicator
 
