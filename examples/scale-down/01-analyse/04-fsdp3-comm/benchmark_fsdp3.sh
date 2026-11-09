@@ -44,7 +44,7 @@ MASTER_PORT="${MASTER_PORT:-29501}"
 FORCE_BALANCE=false
 OVERLAP=false
 SYMMETRIC=false
-DDP_SYNC_PARAM_GATHER=false
+DDP_OVERLAP=false
 MERGE_GRAPHS=false
 DRY_RUN=false
 RESUME=false
@@ -65,8 +65,8 @@ Options:
   --model NAME[,NAME...]        27b, 397b, 2.4t (alias 2p4t), 122b (required)
   --fsdp ddp|1|2|3[,...]        Data parallel modes (default: 3,1); see
                                 run_pretrain_fsdp3.sh --help
-  --ddp-sync-param-gather       DDP cases synchronously all-gather parameters in the
-                                optimizer step; names get "-sync-ag"
+  --ddp-overlap                 DDP cases prefetch parameters during the first
+                                micro-batch forward (default: sync in optimizer step)
   --overlap                     FSDP cases all-gather parameters on separate DP
                                 communicators (create_all_gather_group), overlapping
                                 reduce-scatter in FSDP3; ddp cases are unaffected;
@@ -121,7 +121,7 @@ while [[ $# -gt 0 ]]; do
     case "$1" in
         --model|--models) need_value "$@"; parse_csv "$2" MODELS; shift 2;;
         --fsdp) need_value "$@"; parse_csv "$2" FSDP_LEVELS; shift 2;;
-        --ddp-sync-param-gather) DDP_SYNC_PARAM_GATHER=true; shift;;
+        --ddp-overlap) DDP_OVERLAP=true; shift;;
         --overlap) OVERLAP=true; shift;;
         --symmetric) SYMMETRIC=true; shift;;
         --tp) need_value "$@"; parse_csv "$2" TP_SIZES; shift 2;;
@@ -198,7 +198,7 @@ case_args() {
     fi
     [[ "${OVERLAP}" == true && "${fsdp}" != ddp ]] && ARGS+=(--overlap)
     [[ "${SYMMETRIC}" == true && "${fsdp}" != ddp ]] && ARGS+=(--symmetric)
-    [[ "${DDP_SYNC_PARAM_GATHER}" == true && "${fsdp}" == ddp ]] && ARGS+=(--ddp-sync-param-gather)
+    [[ "${DDP_OVERLAP}" == true && "${fsdp}" == ddp ]] && ARGS+=(--ddp-overlap)
     [[ "${MERGE_GRAPHS}" == true ]] && ARGS+=(--merge)
     [[ "${RESUME}" == true ]] && ARGS+=(--resume)
     [[ "${DRY_RUN}" == true ]] && ARGS+=(--dry-run)

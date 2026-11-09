@@ -267,11 +267,13 @@ def test_ddp_replaces_megatron_fsdp_and_uses_te_per_layer_graphs(tmp_path: Path)
         )
         assert len(commands) == 2
         for command in commands:
-            assert f"model_{model}-ddp-layers_" in command and f"/{report_tag}-ddp-experts_" in command
+            assert f"model_{model}-ddp-sync-ag-layers_" in command and f"/{report_tag}-ddp-sync-ag-experts_" in command
             assert "dist.use_megatron_fsdp=false" in command and "ddp.use_megatron_fsdp=false" in command
             assert "ddp.use_distributed_optimizer=true" in command
             assert "ddp.data_parallel_sharding_strategy=no_shard " in command
-            assert "ddp.overlap_grad_reduce=true" in command and "comm_overlap.overlap_param_gather=true" in command
+            assert "ddp.overlap_grad_reduce=true" in command
+            for config in ("ddp", "comm_overlap", "optimizer"):
+                assert f"{config}.overlap_param_gather=false" in command
             assert "checkpoint.ckpt_format=torch_dist" in command
         off = next(c for c in commands if "-cg_off-" in c)
         assert "model.cuda_graph_impl=none" in off
@@ -288,6 +290,16 @@ def test_ddp_replaces_megatron_fsdp_and_uses_te_per_layer_graphs(tmp_path: Path)
             "check_for_nan_in_loss=false",
         ):
             assert fsdp_only not in on
+
+
+def test_ddp_overlap_enables_forward_parameter_prefetch(tmp_path: Path):
+    fsdp2, ddp = _sweep(tmp_path, "--model", "27b", "--fsdp", "2,ddp", "--seq", "256", "--ddp-overlap", "--nsys")
+    assert "ddp.overlap_param_gather=false" in fsdp2
+    assert "ddp.overlap_param_gather=true" in ddp and "comm_overlap.overlap_param_gather=true" in ddp
+    assert "model_27b-ddp-layers_8-" in ddp and "/qwen35_27b-ddp-experts_0-" in ddp
+
+    result = _run(RUN_ONE, "--model", "27b", "--seq-length", "256", "--fsdp", "2", "--ddp-overlap", "--dry-run")
+    assert result.returncode == 2 and "--ddp-overlap requires --fsdp ddp" in result.stderr
 
 
 def test_ddp_cuda_graph_skips_preprocess_with_fp8_padding_on_alltoall(tmp_path: Path):
@@ -308,7 +320,7 @@ def test_overlap_creates_all_gather_group_for_fsdp_cases_only(tmp_path: Path):
     fsdp3, ddp = _sweep(tmp_path, "--model", "27b", "--fsdp", "3,ddp", "--seq", "256", "--overlap", "--nsys")
     assert "model_27b-fsdp_3-overlap-layers_8-" in fsdp3 and "/qwen35_27b-fsdp_3-overlap-experts_0-" in fsdp3
     assert "dist.create_all_gather_group=true" in fsdp3
-    assert "model_27b-ddp-layers_8-" in ddp and "dist.create_all_gather_group=false" in ddp
+    assert "model_27b-ddp-sync-ag-layers_8-" in ddp and "dist.create_all_gather_group=false" in ddp
     (default,) = _sweep(tmp_path, "--model", "27b", "--fsdp", "3", "--seq", "256")
     assert "-overlap-" not in default and "dist.create_all_gather_group=false" in default
     result = _run(RUN_ONE, "--model", "27b", "--seq-length", "256", "--fsdp", "ddp", "--overlap", "--dry-run")

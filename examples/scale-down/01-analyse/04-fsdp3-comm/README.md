@@ -26,7 +26,7 @@ Qwen3.8-2.4T-A95B 的 HF 配置是纯文本的 `Qwen3_5MoeForCausalLM`（没有 
 | --- | --- | --- |
 | `--model` | `27b`、`397b`、`2.4t`（别名 `2p4t`）、`122b`，可逗号分隔 | sweep 必填 |
 | `--fsdp` | `ddp`、`1`、`2`、`3`，可逗号分隔 | 数据并行方式，见下表；sweep 默认 `3,1`，单 case 默认 `3` |
-| `--ddp-sync-param-gather` | — | DDP 在 optimizer step 内同步聚合参数，结果目录和 nsys 报告名加 `-sync-ag` |
+| `--ddp-overlap` | — | DDP 在首个 micro-batch 的 forward 预取参数。默认在 optimizer step 内同步聚合参数，默认模式的结果名带 `-sync-ag` |
 | `--overlap` | — | 见「AG / RS 通信组分离」；只作用于 FSDP case（sweep 中 `ddp` case 不受影响），名字中数据并行方式后加 `-overlap` |
 | `--symmetric` | — | 见「Symmetric memory」；只作用于 FSDP case（sweep 中 `ddp` case 不受影响），名字中加 `-symm`（与 `--overlap` 同用时为 `-overlap-symm`） |
 | `--tp` | N，可逗号分隔 | Tensor parallel；N>1 时自动打开 sequence parallel（`model.sequence_parallel=true`）。默认 1 |
@@ -54,7 +54,7 @@ DP = GPU 数 / (TP × CP)；MoE 的 EP=4 与 TP×DP×CP mesh 共用同一组 GPU
 | `3` | `optim_grads_params` | 参数、梯度、optimizer state 都切分；每个 micro-batch 做 fwd AG、bwd AG、RS，预取并重叠 |
 | `2` | `optim_grads` | 切分梯度和 optimizer state，参数保持完整；每个 micro-batch 的 backward 都做梯度 RS（Megatron-FSDP 要求重叠），optimizer step 后做一次同步的参数 AG |
 | `1` | `optim`（recipe 默认） | 只切 optimizer state；整个 iteration 只在最后做一次梯度 RS、optimizer step 后做一次参数 AG，不重叠 |
-| `ddp` | `no_shard` + MCore DDP | 分布式优化器；梯度按 bucket 在 backward 中 RS，参数 AG 与下一次 forward 重叠。见「DDP：逐层 backward 时间」 |
+| `ddp` | `no_shard` + MCore DDP | 分布式优化器。梯度按 bucket 在 backward 中 RS，参数 AG 默认在 optimizer step 内同步执行。见「DDP：逐层 backward 时间」 |
 
 FSDP 每个 micro-batch 的单次通信量与 seq、MBS 无关，因此计算强度主要取决于“每个 micro-batch 每个 rank 的 token 数 = MBS × seq / CP”（SP 再把非 attention 部分按 TP 切分）。默认的短序列（256 / 1024 / 4096）让每层计算盖不住 FSDP 通信，用来观察 FSDP3 / FSDP2 / FSDP1 / DDP 之间的差异；每个 iteration 4 个 micro-batch，这样一个 iteration 里既有每个 micro-batch 都重复的通信，也有每个 iteration 只发生一次的开销。
 
@@ -113,11 +113,13 @@ bash $S --model 2.4t --experts 64 --seq 1024 --fsdp 3 --overlap --symmetric
 | --- | --- |
 | 数据并行 | `dist.use_megatron_fsdp=false`、`ddp.use_megatron_fsdp=false`、`ddp.data_parallel_sharding_strategy=no_shard`（该字段只有 FSDP 使用） |
 | 优化器 | `ddp.use_distributed_optimizer=true`：参数与梯度在每卡完整保留，只切 optimizer state |
-| 通信重叠 | `ddp.overlap_grad_reduce=true`、`ddp.overlap_param_gather=true`（`comm_overlap.*` 同步覆盖）：梯度按 bucket 在 backward 中 reduce-scatter，参数 all-gather 与下一轮 forward 重叠 |
+| 通信重叠 | `ddp.overlap_grad_reduce=true`。`ddp.overlap_param_gather` 默认 `false`，加 `--ddp-overlap` 后设为 `true`（`comm_overlap.*` 同步覆盖） |
 | checkpoint | `checkpoint.ckpt_format=torch_dist`（`fsdp_dtensor` 只支持 Megatron-FSDP；本实验不保存） |
 | 命名 | 结果目录 `model_<m>-ddp-...`，nsys 报告 `<qwen35_27b\|qwen35_397b\|qwen38_2.4t>-ddp-...`；`launch.json` 中 `fsdp` 为 `null`、`data_parallel` 为 `ddp` |
 
-加 `--ddp-sync-param-gather` 后，distributed optimizer 在更新参数分片后同步执行参数 all-gather，下一轮第一个 micro-batch 直接使用已聚合的参数。梯度 reduce-scatter 仍与 backward 重叠。该选项在混合 sweep 中只应用于 `ddp` case。
+默认由 distributed optimizer 在更新参数分片后同步执行参数 all-gather，下一轮第一个 micro-batch 直接使用已聚合的参数。加 `--ddp-overlap` 后，参数 bucket 在下一轮第一个 micro-batch 的 forward 中预取。两种模式都开启梯度 reduce-scatter 与 backward 的重叠。混合 sweep 只给 `ddp` case 传 `--ddp-overlap`。
+
+同步模式的结果目录和 nsys 报告名带 `ddp-sync-ag`。前向预取模式沿用 `ddp` 命名，可续跑已有的前向预取实验。
 
 `--cuda-graph on` 时设置 `cuda_graph_impl=transformer_engine`、`cuda_graph_warmup_steps=3`、`use_te_rng_tracker=true`、`rng.te_rng_tracker=true` 与 `NCCL_GRAPH_REGISTER=0`（`TECudaGraphHelper` 在 expandable segments 下要求关闭）。每层每个 micro-batch 分别有一个 forward graph 和一个 backward graph：
 
@@ -125,7 +127,7 @@ bash $S --model 2.4t --experts 64 --seq 1024 --fsdp 3 --overlap --symmetric
 - MoE（397b / 2.4t）：`cuda_graph_modules=[attn,moe_router,moe_preprocess]`，attention、router、shared expert 与 preprocess 进 graph，dispatch、routed experts、combine 保持 eager。MoE 仍是 dropless，不需要容量因子、paged stash 或 TE op fuser，expert 走与关闭模式相同的非融合 `TEGroupedMLP`，因此不受上文 cuBLAS 13.3 的限制，hybridep 与 alltoall 都可以用；
 - MXFP8 + alltoall 时 `moe_router_padding_for_fp8` 让 alltoall 的 preprocess 把 token 数拷回 host，MCore 不允许 graph 它，启动器改用 `[attn,moe_router]`；
 - 不需要关闭 NaN 检查，recipe 的 `check_for_nan_in_loss` / `check_for_nan_in_grad` 保持开启；
-- 默认预取参数时，Bridge 在 capture 时摘掉 DDP 的 forward pre-hook，capture 后改为每层的 manual hook（`train.py` 的 `cuda_graph_set_manual_hooks`）。使用 `--ddp-sync-param-gather` 时，参数 all-gather 在 optimizer step 内执行。
+- 使用 `--ddp-overlap` 时，Bridge 在 capture 时摘掉 DDP 的 forward pre-hook，capture 后改为每层的 manual hook（`train.py` 的 `cuda_graph_set_manual_hooks`）。
 
 显存：DDP 每卡保留完整的 bf16 参数与 fp32 梯度，dense 部分约 9 B/参数（2 + 4 + 12/4），EP=4 时 routed expert 的数据并行组为 1，与 FSDP 相同。2.4t 64 experts 每卡模型状态约 120 GiB，与 FSDP1 相当；397b 与 27b 余量更大。
 
@@ -139,8 +141,8 @@ bash $S --model 2.4t --experts 64 --seq 1024 --fsdp 3 --overlap --symmetric
 bash examples/scale-down/01-analyse/04-fsdp3-comm/benchmark_fsdp3.sh --model 27b,397b,2.4t --fsdp ddp --cuda-graph off,on
 # 与 FSDP 放在同一矩阵里（FSDP 的 graph 开需要 cuBLAS >= 13.3 编译的 TE）
 bash examples/scale-down/01-analyse/04-fsdp3-comm/benchmark_fsdp3.sh --model 2.4t --fsdp 3,2,1,ddp --experts 64 --seq 1024 --cuda-graph off,on
-# 把 DDP 参数 all-gather 放在 optimizer step 内
-bash examples/scale-down/01-analyse/04-fsdp3-comm/benchmark_fsdp3.sh --model 27b --fsdp ddp --seq 4096 --ddp-sync-param-gather
+# 开启 DDP 的首个 micro-batch forward 参数预取
+bash examples/scale-down/01-analyse/04-fsdp3-comm/benchmark_fsdp3.sh --model 27b --fsdp ddp --seq 4096 --ddp-overlap
 ```
 
 第一条命令的矩阵：27b 为 seq `256,1024,4096` × graph `off,on` 共 6 次；397b / 2.4t 为 experts `64,32` × seq `256,1024,4096` × graph `off,on` 各 12 次。

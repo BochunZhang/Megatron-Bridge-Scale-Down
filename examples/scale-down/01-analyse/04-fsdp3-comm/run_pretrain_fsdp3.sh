@@ -36,7 +36,7 @@ FORCE_BALANCE=false
 FSDP_LEVEL="${FSDP_LEVEL:-3}"
 OVERLAP=false
 SYMMETRIC=false
-DDP_SYNC_PARAM_GATHER=false
+DDP_OVERLAP=false
 HYBRIDEP_NUM_SMS="${HYBRIDEP_NUM_SMS:-32}"
 GPU_COUNT="${GPU_COUNT:-4}"
 GPUS_PER_NODE="${GPUS_PER_NODE:-4}"
@@ -70,10 +70,10 @@ Options:
                                  reduce-scatter and parameter all-gather once per
                                  iteration, not overlapped). ddp: Megatron DDP with
                                  the distributed optimizer; bucketed gradient
-                                 reduce-scatter overlapped with backward, parameter
-                                 all-gather with the next forward (default: 3)
-  --ddp-sync-param-gather        DDP only: synchronously all-gather parameters in the
-                                 optimizer step. Names get "-sync-ag"
+                                 reduce-scatter overlapped with backward and parameter
+                                 all-gather in the optimizer step (default: 3)
+  --ddp-overlap                  DDP only: prefetch parameter buckets during the first
+                                 micro-batch forward of the next iteration
   --overlap                      Megatron-FSDP only: give parameter all-gathers their
                                  own DP communicators (dist.create_all_gather_group,
                                  Megatron-LM --create-all-gather-group), so they no
@@ -173,7 +173,7 @@ while [[ $# -gt 0 ]]; do
         --cuda-graph) need_value "$@"; CUDA_GRAPH="$2"; shift 2;;
         --force-balance) FORCE_BALANCE=true; shift;;
         --fsdp) need_value "$@"; FSDP_LEVEL="$2"; shift 2;;
-        --ddp-sync-param-gather) DDP_SYNC_PARAM_GATHER=true; shift;;
+        --ddp-overlap) DDP_OVERLAP=true; shift;;
         --overlap) OVERLAP=true; shift;;
         --symmetric) SYMMETRIC=true; shift;;
         --gpu|--gpus) need_value "$@"; GPU_COUNT="$2"; shift 2;;
@@ -230,13 +230,10 @@ case "${FSDP_LEVEL}" in
     3) SHARDING_STRATEGY=optim_grads_params; GRAD_OVERLAP=true; PARAM_OVERLAP=true; DP_TAG=fsdp_3; FSDP_JSON=3;;
     2) SHARDING_STRATEGY=optim_grads; GRAD_OVERLAP=true; PARAM_OVERLAP=false; DP_TAG=fsdp_2; FSDP_JSON=2;;
     1) SHARDING_STRATEGY=optim; GRAD_OVERLAP=false; PARAM_OVERLAP=false; DP_TAG=fsdp_1; FSDP_JSON=1;;
-    ddp) SHARDING_STRATEGY=no_shard; GRAD_OVERLAP=true; PARAM_OVERLAP=true; DP_TAG=ddp; FSDP_JSON=null;;
+    ddp) SHARDING_STRATEGY=no_shard; GRAD_OVERLAP=true; PARAM_OVERLAP="${DDP_OVERLAP}"; DP_TAG=ddp; FSDP_JSON=null;;
     *) echo "--fsdp must be ddp, 1, 2, or 3" >&2; exit 2;;
 esac
-if [[ "${DDP_SYNC_PARAM_GATHER}" == true ]]; then
-    [[ "${FSDP_LEVEL}" == ddp ]] || { echo "--ddp-sync-param-gather requires --fsdp ddp" >&2; exit 2; }
-    PARAM_OVERLAP=false
-fi
+[[ "${DDP_OVERLAP}" == false || "${FSDP_LEVEL}" == ddp ]] || { echo "--ddp-overlap requires --fsdp ddp" >&2; exit 2; }
 # Only Megatron-FSDP builds its parameter all-gathers on the separate communicators.
 [[ "${OVERLAP}" == false || "${FSDP_LEVEL}" != ddp ]] || { echo "--overlap requires --fsdp 1, 2 or 3" >&2; exit 2; }
 # The max-pool double buffers are Megatron-FSDP's. A forced NCCL_ALGO keeps every
@@ -320,14 +317,14 @@ SEQUENCE_PARALLEL=false
 LAYERS_TAG="${NUM_LAYERS:-full}"
 MTP_TAG="${MTP_NUM_LAYERS:-0}"
 if [[ "${MODEL}" == 27b ]]; then EXPERTS_TAG=0; else EXPERTS_TAG="${NUM_EXPERTS:-full}"; fi
-# Default settings add no tag, so earlier result names stay resumable: --overlap adds
-# "-overlap" and --symmetric "-symm" after the data parallel mode, MXFP8 "-mxfp8", forced
-# balanced routing "-fb", --full / --linear "-attn_<full|linear>" after the layer count,
-# and TP > 1 "-tp_<N>" before the CP size.
+# --overlap adds "-overlap" and --symmetric adds "-symm". Synchronous DDP uses
+# "-sync-ag" while --ddp-overlap uses the existing DDP name for forward prefetch.
+# MXFP8 uses "-mxfp8", forced balanced routing "-fb", --full / --linear
+# "-attn_<full|linear>" after the layer count, and TP > 1 "-tp_<N>" before CP.
 OVERLAP_TAG=""
 [[ "${OVERLAP}" == true ]] && OVERLAP_TAG="-overlap"
 [[ "${SYMMETRIC}" == true ]] && OVERLAP_TAG+="-symm"
-[[ "${DDP_SYNC_PARAM_GATHER}" == true ]] && OVERLAP_TAG+="-sync-ag"
+[[ "${FSDP_LEVEL}" == ddp && "${DDP_OVERLAP}" == false ]] && OVERLAP_TAG+="-sync-ag"
 DTYPE_TAG=""
 [[ "${DTYPE}" == mxfp8 ]] && DTYPE_TAG="-mxfp8"
 [[ "${FORCE_BALANCE}" == true ]] && DTYPE_TAG+="-fb"
@@ -420,7 +417,7 @@ OVERRIDES=(
     # record_param_comms for FSDP all-gather / reduce-scatter, carries tensor shapes.
     "profiling.record_shapes=$([[ "${PROFILE}" == nsys ]] && echo true || echo false)"
 )
-if [[ "${DDP_SYNC_PARAM_GATHER}" == true ]]; then
+if [[ "${FSDP_LEVEL}" == ddp && "${DDP_OVERLAP}" == false ]]; then
     # Bridge re-enables gather overlap if either DDP or the optimizer requests it.
     OVERRIDES+=("optimizer.overlap_param_gather=false"
         "optimizer.overlap_param_gather_with_optimizer_step=false"
@@ -560,7 +557,7 @@ COMMAND+=(uv run --no-sync python "${TRAIN_ARGS[@]}")
 
 INFO=(
     "model=${MODEL}" "recipe=${RECIPE}" "fsdp=${FSDP_LEVEL}" "overlap=${OVERLAP}" "symmetric=${SYMMETRIC}" "dtype=${DTYPE}" "layers=${LAYERS_TAG}" "attention=${ATTENTION}"
-    "ddp_sync_param_gather=${DDP_SYNC_PARAM_GATHER}"
+    "ddp_overlap=${DDP_OVERLAP}"
     "mtp=${MTP_TAG}" "experts=${EXPERTS_TAG}" "force_balance=${FORCE_BALANCE}" "cuda_graph=${CUDA_GRAPH}" "cuda_graph_trace=${GRAPH_TRACE}" "seq=${SEQ_LENGTH}"
     "tp=${TENSOR_PARALLEL}" "sp=${SEQUENCE_PARALLEL}" "cp=${CONTEXT_PARALLEL}" "dp=${DATA_PARALLEL}" "ep=${EXPERT_PARALLEL}"
     "dispatcher=${DISPATCHER}" "mbs=${MICRO_BATCH_SIZE}" "gbs=${GLOBAL_BATCH_SIZE}" "gpus=${GPU_COUNT}"
