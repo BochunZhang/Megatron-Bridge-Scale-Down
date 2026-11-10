@@ -177,7 +177,7 @@ def test_run_one_print_result_dir_encodes_shape_and_cuda_graph(tmp_path: Path):
     )
     assert result.returncode == 0, result.stderr
     assert Path(result.stdout.strip()).parent.name.startswith(
-        "model_2.4t-fsdp_3-layers_4-mtp_1-experts_64-cg_on-mbs_1-seq_4096-cp_1-ep_4-"
+        "model_2.4t-fsdp_3-layers_4-mtp_1-experts_64-cg_on-partial-mbs_1-seq_4096-cp_1-ep_4-"
     )
 
 
@@ -218,11 +218,9 @@ def test_merge_keeps_cuda_graph_launches_as_one_block(tmp_path: Path):
     assert "--cuda-graph-trace" not in no_profile and "-cg_on-mbs_" in no_profile
 
 
-def test_full_iteration_cuda_graph_for_fsdp(tmp_path: Path):
-    on = _sweep(
-        tmp_path, "--model", "27b,397b", "--fsdp", "3,2,1", "--experts", "64", "--seq", "1024", "--cuda-graph", "on"
-    )
-    assert len(on) == 6
+def test_full_iteration_cuda_graph_for_dense_fsdp(tmp_path: Path):
+    on = _sweep(tmp_path, "--model", "27b", "--fsdp", "3,2,1", "--seq", "1024", "--cuda-graph", "on")
+    assert len(on) == 3
     for command in on:
         assert "model.cuda_graph_impl=full_iteration" in command
         assert r"model.cuda_graph_modules=\[\]" in command
@@ -232,11 +230,41 @@ def test_full_iteration_cuda_graph_for_fsdp(tmp_path: Path):
             "rerun_state_machine.check_for_nan_in_loss=false" in command
             and "ddp.check_for_nan_in_grad=false" in command
         )
-    dense = next(c for c in on if "model_27b-" in c)
-    assert "moe_expert_rank_capacity_factor" not in dense and "moe_paged_stash" not in dense
-    moe = next(c for c in on if "model_397b-" in c)
-    assert "model.moe_expert_rank_capacity_factor=1.5" in moe and "model.moe_paged_stash=true" in moe
-    assert "model.use_transformer_engine_op_fuser=true" in moe
+
+
+def test_partial_cuda_graph_for_moe_fsdp(tmp_path: Path):
+    for dispatcher in ("hybridep", "alltoall"):
+        commands = _sweep(
+            tmp_path,
+            "--model", "397b,2.4t,122b", "--fsdp", "3", "--experts", "64",
+            "--seq", "1024", "--cuda-graph", "on", "--dispatcher", dispatcher,
+        )
+        assert len(commands) == 3
+        for command in commands:
+            assert "-cg_on-partial-" in command
+            assert "model.cuda_graph_impl=local" in command
+            assert r"model.cuda_graph_modules=\[attn\]" in command
+            assert "model.gradient_accumulation_fusion=false" in command
+            assert "ddp.megatron_fsdp_max_pool_double_buffer=true" in command
+            assert "ddp.fsdp_all_gather_in_start_param_sync=true" in command
+            assert "model.use_te_rng_tracker=true" in command and "rng.te_rng_tracker=true" in command
+            assert f"-disp_{dispatcher}-" in command
+            for full_graph_only in (
+                "moe_expert_rank_capacity_factor",
+                "moe_paged_stash",
+                "use_transformer_engine_op_fuser",
+                "megatron_fsdp_cuda_graph_mode=true",
+                "check_for_nan_in_loss=false",
+                "check_for_nan_in_grad=false",
+            ):
+                assert full_graph_only not in command
+
+
+def test_default_moe_sweep_keeps_fsdp1_for_graph_off_only(tmp_path: Path):
+    commands = _sweep(tmp_path, "--model", "397b", "--experts", "64", "--seq", "1024", "--cuda-graph", "off,on")
+    assert len(commands) == 3
+    assert sum("model_397b-fsdp_1-" in command and "-cg_off-" in command for command in commands) == 1
+    assert sum("-cg_on-partial-" in command for command in commands) == 1
 
 
 def test_run_one_cuda_graph_disables_nccl_graph_register_with_expandable_segments(tmp_path: Path):
@@ -251,23 +279,27 @@ def test_run_one_cuda_graph_disables_nccl_graph_register_with_expandable_segment
     assert result.returncode == 0, result.stderr
     assert "PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True" in result.stderr.splitlines()
     assert "NCCL_GRAPH_REGISTER=0" in result.stderr.splitlines()
-    # The op-fuser grouped MLP MoE needs for the token budget is gated on this variable.
-    assert "NVTE_CUTEDSL_FUSED_GROUPED_MLP=1" in result.stderr.splitlines()
 
 
-def test_cuda_graph_on_rejects_alltoall_for_moe_with_fsdp(tmp_path: Path):
-    common = ("--run-date", RUN_DATE, "--dry-run", "--dispatcher", "alltoall", "--cuda-graph", "on")
-    for script, args in (
-        (RUN_ONE, ("--model", "2.4t", "--seq-length", "1024", "--num-experts", "64")),
-        (BENCHMARK, ("--model", "397b", "--fsdp", "3,ddp", "--seq", "256", "--output-dir", str(tmp_path))),
+def test_moe_partial_cuda_graph_rejects_unsupported_fsdp_configs(tmp_path: Path):
+    common = ("--model", "2.4t", "--seq-length", "1024", "--cuda-graph", "on", "--dry-run")
+    for args, message in (
+        (("--fsdp", "1"), "require --fsdp 3"),
+        (("--fsdp", "2"), "require --fsdp 3"),
+        (("--dtype", "mxfp8"), "require --dtype bf16"),
+        (("--tp", "2"), "require --tp 1 and --cp 1"),
+        (("--cp", "2"), "require --tp 1 and --cp 1"),
+        (("--symmetric",), "require --symmetric to be off"),
     ):
-        result = _run(script, *args, *common)
+        result = _run(RUN_ONE, *common, *args, NCCL_ALGO="")
         assert result.returncode == 2, result.stderr
-        assert "requires --dispatcher hybridep" in result.stderr
-    # Dense 27b has no dispatcher, and DDP per-layer graphs keep the dispatch eager.
-    for args in (("--model", "27b"), ("--model", "397b", "--fsdp", "ddp")):
-        result = _run(BENCHMARK, *args, "--seq", "256", "--output-dir", str(tmp_path), *common)
-        assert result.returncode == 0, result.stderr
+        assert message in result.stderr
+    result = _run(
+        BENCHMARK,
+        "--model", "397b", "--fsdp", "3,1", "--seq", "256", "--cuda-graph", "on",
+        "--output-dir", str(tmp_path), "--dry-run",
+    )
+    assert result.returncode == 2 and "require --fsdp 3" in result.stderr
 
 
 def test_ddp_replaces_megatron_fsdp_and_uses_te_per_layer_graphs(tmp_path: Path):

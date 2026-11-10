@@ -1271,7 +1271,11 @@ class ConfigContainer(Container):
 
         # Guard post-construction CUDA graph overrides before MCore post-init can
         # migrate deprecated scope fields into a different implementation.
-        validate_cuda_graph_configuration(self.model)
+        uses_fsdp3 = (
+            (self.dist.use_megatron_fsdp or self.ddp.use_megatron_fsdp)
+            and self.ddp.data_parallel_sharding_strategy == "optim_grads_params"
+        )
+        validate_cuda_graph_configuration(self.model, fsdp3=uses_fsdp3)
         if hasattr(self.model, "finalize"):
             self.model.finalize()
 
@@ -1392,7 +1396,7 @@ class ConfigContainer(Container):
                 "check_for_nan_in_loss must be disabled when using full_iteration CUDA graph. "
                 "Set rerun_state_machine.check_for_nan_in_loss=False."
             )
-        validate_cuda_graph_configuration(self.model)
+        validate_cuda_graph_configuration(self.model, fsdp3=uses_fsdp3)
 
         # ModelOpt/Quantization checks
         if getattr(self.model, "restore_modelopt_state", False):

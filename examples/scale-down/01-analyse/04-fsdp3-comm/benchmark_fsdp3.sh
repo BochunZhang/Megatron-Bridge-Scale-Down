@@ -15,6 +15,7 @@ RUN_DATE="${RUN_DATE:-$(date +%y%m%d-%H%M%S)}"
 
 MODELS=()
 FSDP_LEVELS=(3 1)
+FSDP_LEVELS_EXPLICIT=false
 SEQUENCES=(256 1024 4096)
 TP_SIZES=(1)
 CP_SIZES=(1)
@@ -81,9 +82,10 @@ Options:
   --tp-comm-overlap             Enable TE TP communication overlap for cases
                                 with TP > 1
   --cp N[,N...]                 Context parallel sizes (default: 1)
-  --cuda-graph off|on[,...]     CUDA graph modes (default: off); on = full-iteration
-                                graph for FSDP (MoE needs hybridep), TE per-layer
-                                graphs for DDP
+  --cuda-graph off|on[,...]     CUDA graph modes (default: off). on uses full-iteration
+                                for dense FSDP, native partial graphs for MoE FSDP3,
+                                and TE per-layer graphs for DDP. The default FSDP
+                                matrix skips FSDP1 for MoE graph-on cases.
   --seq N[,N...]                Sequence lengths (default: 256,1024,4096)
   --mbs N[,N...]                Micro batch sizes (default: 1)
   --gbs N[,N...]                Fixed global batch sizes, multiples of MBS*DP;
@@ -123,7 +125,7 @@ parse_csv() { local value="$1"; IFS=',' read -r -a "$2" <<<"${value}"; }
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --model|--models) need_value "$@"; parse_csv "$2" MODELS; shift 2;;
-        --fsdp) need_value "$@"; parse_csv "$2" FSDP_LEVELS; shift 2;;
+        --fsdp) need_value "$@"; parse_csv "$2" FSDP_LEVELS; FSDP_LEVELS_EXPLICIT=true; shift 2;;
         --ddp-overlap) DDP_OVERLAP=true; shift;;
         --overlap) OVERLAP=true; shift;;
         --symmetric) SYMMETRIC=true; shift;;
@@ -230,6 +232,9 @@ for model in "${MODELS[@]}"; do
                             if [[ "${batch}" == gbs=* ]]; then gbs="${batch#gbs=}"; else gbs=$((${batch#nmb=} * mbs * dp)); fi
                             for cg in "${CUDA_GRAPHS[@]}"; do
                                 for fsdp in "${FSDP_LEVELS[@]}"; do
+                                    if [[ "${FSDP_LEVELS_EXPLICIT}" == false && "${model}" != 27b && "${cg}" == on && "${fsdp}" == 1 ]]; then
+                                        continue
+                                    fi
                                     case_args "${model}" "${experts}" "${seq}" "${tp}" "${cp}" "${mbs}" "${gbs}" "${cg}" "${fsdp}"
                                     "${RUN_ONE}" "${ARGS[@]}" --print-result-dir >/dev/null || {
                                         echo "invalid case: model=${model} experts=${experts} seq=${seq} tp=${tp} cp=${cp} mbs=${mbs} gbs=${gbs} cuda_graph=${cg} fsdp=${fsdp}" >&2

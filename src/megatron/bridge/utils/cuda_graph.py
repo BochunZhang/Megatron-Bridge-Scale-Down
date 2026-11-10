@@ -131,8 +131,8 @@ def is_full_iteration_cuda_graph(config: Any) -> bool:
     ) or "full_iteration" in _member_names(getattr(config, "cuda_graph_scope", None))
 
 
-def validate_cuda_graph_configuration(config: Any, *, config_name: str = "model") -> None:
-    """Validate Bridge-supported CUDA graph implementation/scope combinations."""
+def validate_cuda_graph_configuration(config: Any, *, config_name: str = "model", fsdp3: bool | None = None) -> None:
+    """Validate CUDA graph scopes, using the resolved FSDP3 mode when available."""
     cuda_graph_impl = getattr(config, "cuda_graph_impl", "none")
     if cuda_graph_impl == "none":
         clear_cuda_graph_modules(config)
@@ -144,6 +144,18 @@ def validate_cuda_graph_configuration(config: Any, *, config_name: str = "model"
         cuda_graph_impl == "local" and not graph_modules and bool(inference_scopes & {"layer", "block"})
     )
     if cuda_graph_impl == "local" and not is_full_iteration_cuda_graph(config) and not is_local_inference_graph:
+        if graph_modules == ["attn"]:
+            # The provider validates again after the container has resolved the FSDP strategy.
+            if fsdp3 is not None:
+                config._bridge_fsdp3_attention_graph = fsdp3
+            if getattr(config, "_bridge_fsdp3_attention_graph", False):
+                from megatron.core.transformer import cuda_graphs
+
+                if not hasattr(cuda_graphs, "_configure_fsdp_attention_cuda_graphs"):
+                    raise ValueError(
+                        "Local FSDP3 attention CUDA graphs require a Megatron-LM checkout with that support."
+                    )
+                return
         modules_msg = f" with scopes {graph_modules}" if graph_modules else ""
         raise ValueError(
             f'Megatron Bridge supports {config_name}.cuda_graph_impl="local" only for '

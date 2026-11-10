@@ -94,13 +94,11 @@ Options:
   --tp-comm-overlap              Enable TE TP communication overlap (requires TP > 1);
                                  names get "-tp-overlap"
   --cp N                         Context parallel size (default: 1)
-  --cuda-graph off|on            off: no CUDA graph. on with FSDP: full-iteration graph
-                                 of forward+backward, FSDP all-gather / reduce-scatter
-                                 included; MoE models add a per-rank token budget
-                                 (capacity factor 1.5) and paged stash, hybridep
-                                 only. on with DDP: TE per-layer graphs, dense
-                                 attn+mlp, MoE attn+moe_router+moe_preprocess with
-                                 dispatch / experts / combine eager (default: off)
+  --cuda-graph off|on            off: no CUDA graph (default). on with FSDP: dense uses
+                                 full_iteration; MoE uses native attention and prefetch
+                                 graphs with BF16 FSDP3, TP=CP=1 and no --symmetric.
+                                 on with DDP: TE per-layer graphs, dense attn+mlp,
+                                 MoE attn+moe_router+moe_preprocess where supported.
   --mbs|--micro-batch-size N     Micro batch size (default: 1)
   --gbs|--global-batch-size N    Global batch size, a multiple of MBS*DP with
                                  DP = gpus / (TP*CP) (default: 16)
@@ -293,18 +291,39 @@ else
     if [[ "${DISPATCHER}" == hybridep ]]; then
         (( EXPERT_PARALLEL <= 72 )) || { echo "HybridEP ep must fit in the 72-rank NVLink domain" >&2; exit 2; }
     fi
-    # The FSDP full-iteration graph needs static MoE shapes, which only the HybridEP
-    # per-rank token budget (moe_expert_rank_capacity_factor) provides. DDP per-layer
-    # graphs stop before the dispatch and keep dropless MoE eager.
-    if [[ "${CUDA_GRAPH}" == on && "${FSDP_LEVEL}" != ddp && "${DISPATCHER}" != hybridep ]]; then
-        echo "--cuda-graph on for MoE models with FSDP requires --dispatcher hybridep" >&2; exit 2
-    fi
     if [[ -n "${NUM_EXPERTS}" ]]; then
         (( NUM_EXPERTS % EXPERT_PARALLEL == 0 )) || { echo "num-experts must be divisible by ep" >&2; exit 2; }
     fi
     # A cropped MoE model keeps every remaining layer MoE.
     if [[ -n "${NUM_LAYERS}" && -z "${MOE_LAYER_FREQ}" ]]; then
         MOE_LAYER_FREQ="$(ones_list "${NUM_LAYERS}")"
+    fi
+fi
+
+GRAPH_IMPL=none
+GRAPH_MODULES="[]"
+if [[ "${CUDA_GRAPH}" == on ]]; then
+    if [[ "${FSDP_LEVEL}" == ddp ]]; then
+        GRAPH_IMPL=transformer_engine
+        if [[ "${MODEL}" == 27b ]]; then
+            GRAPH_MODULES="[attn,mlp]"
+        elif [[ "${DTYPE}" == mxfp8 && "${DISPATCHER}" == alltoall ]]; then
+            # FP8 router padding makes all-to-all preprocess synchronize token counts to host.
+            GRAPH_MODULES="[attn,moe_router]"
+        else
+            GRAPH_MODULES="[attn,moe_router,moe_preprocess]"
+        fi
+    elif [[ "${MODEL}" == 27b ]]; then
+        GRAPH_IMPL=full_iteration
+    else
+        [[ "${FSDP_LEVEL}" == 3 ]] || { echo "MoE partial CUDA graphs require --fsdp 3" >&2; exit 2; }
+        [[ "${DTYPE}" == bf16 ]] || { echo "MoE partial CUDA graphs require --dtype bf16" >&2; exit 2; }
+        (( TENSOR_PARALLEL == 1 && CONTEXT_PARALLEL == 1 )) || {
+            echo "MoE partial CUDA graphs require --tp 1 and --cp 1" >&2; exit 2;
+        }
+        [[ "${SYMMETRIC}" == false ]] || { echo "MoE partial CUDA graphs require --symmetric to be off" >&2; exit 2; }
+        GRAPH_IMPL=local
+        GRAPH_MODULES="[attn]"
     fi
 fi
 # linear_attention_freq: N puts one gated attention layer after every N-1 GatedDeltaNet
@@ -339,6 +358,7 @@ TP_TAG=""
 (( TENSOR_PARALLEL > 1 )) && TP_TAG="-tp_${TENSOR_PARALLEL}"
 [[ "${TP_COMM_OVERLAP}" == true ]] && TP_TAG+="-tp-overlap"
 CG_TAG="${CUDA_GRAPH}"
+[[ "${GRAPH_IMPL}" == local ]] && CG_TAG+="-partial"
 [[ "${GRAPH_TRACE}" == graph ]] && CG_TAG+="-merge"
 CASE_NAME="model_${MODEL}-${DP_TAG}${OVERLAP_TAG}${DTYPE_TAG}-layers_${LAYERS_TAG}${ATTN_TAG}-mtp_${MTP_TAG}-experts_${EXPERTS_TAG}-cg_${CG_TAG}-mbs_${MICRO_BATCH_SIZE}-seq_${SEQ_LENGTH}${TP_TAG}-cp_${CONTEXT_PARALLEL}-ep_${EXPERT_PARALLEL}-disp_${DISPATCHER}-gbs_${GLOBAL_BATCH_SIZE}-gpus_${GPU_COUNT}-profile_${PROFILE}-date_${RUN_DATE}"
 RESULT_DIR="${RESULTS_ROOT}/${CASE_NAME}/node${NODE_RANK}"
@@ -428,8 +448,6 @@ if [[ "${FSDP_LEVEL}" == ddp && "${DDP_OVERLAP}" == false ]]; then
         "optimizer.overlap_param_gather_with_optimizer_step=false"
         "comm_overlap.overlap_param_gather_with_optimizer_step=false")
 fi
-GRAPH_IMPL=none
-GRAPH_MODULES="[]"
 if [[ "${SYMMETRIC}" == true ]]; then
     # nccl_ub allocates every Megatron-FSDP buffer created under its allocation context
     # (sharded weights, gradients, the max-pool double buffers that hold the all-gather
@@ -448,70 +466,39 @@ if [[ "${SYMMETRIC}" == true ]]; then
     )
     export NCCL_NVLS_ENABLE=1
 fi
-if [[ "${CUDA_GRAPH}" == on && "${FSDP_LEVEL}" == ddp ]]; then
-    # TE per-layer graphs: one make_graphed_callables() graph per layer and micro-batch
-    # for forward and one for backward. With parameter prefetch, Bridge replaces
-    # the forward pre-hook with per-layer manual hooks after capture.
-    # Dense layers are captured whole. MoE layers stop after the router
-    # and preprocess, so the dropless HybridEP / alltoall dispatch, routed experts and
-    # combine stay eager and keep the unfused TEGroupedMLP of the off mode.
-    GRAPH_IMPL=transformer_engine
-    if [[ "${MODEL}" == 27b ]]; then
-        GRAPH_MODULES="[attn,mlp]"
-    elif [[ "${DTYPE}" == mxfp8 && "${DISPATCHER}" == alltoall ]]; then
-        # moe_router_padding_for_fp8 makes the alltoall preprocess copy token counts
-        # to the host, which MCore refuses to graph.
-        GRAPH_MODULES="[attn,moe_router]"
-    else
-        GRAPH_MODULES="[attn,moe_router,moe_preprocess]"
-    fi
-    OVERRIDES+=(
-        "model.cuda_graph_impl=${GRAPH_IMPL}" "model.cuda_graph_scope=null" "model.cuda_graph_modules=${GRAPH_MODULES}"
-        "model.cuda_graph_warmup_steps=3" "model.use_te_rng_tracker=true" "rng.te_rng_tracker=true"
-    )
-elif [[ "${CUDA_GRAPH}" == on ]]; then
-    # One full-iteration graph of forward+backward (optimizer step stays eager), with
-    # the FSDP all-gather / reduce-scatter, TP / SP and CP collectives captured inside.
-    # Per-layer graphs (TE or local) are not an option: both refuse modules carrying
-    # Megatron-FSDP's forward / backward hooks. megatron_fsdp_cuda_graph_mode keeps
-    # gradient references alive for replay, and fsdp_all_gather_in_start_param_sync=false
-    # keeps the FSDP3 optimizer step from issuing an all-gather the graph would wait on
-    # (Megatron-LM sets both automatically, Bridge does not); FSDP1 / FSDP2 all-gather
-    # synchronously in the eager optimizer step. The recipe's max-pool double buffer
-    # keeps bucket addresses fixed. The graph cannot check NaN loss or gradients.
-    GRAPH_IMPL=full_iteration
-    OVERRIDES+=(
-        "model.cuda_graph_impl=${GRAPH_IMPL}" "model.cuda_graph_scope=null" "model.cuda_graph_modules=${GRAPH_MODULES}"
-        "model.cuda_graph_warmup_steps=3" "ddp.megatron_fsdp_cuda_graph_mode=true"
-        "ddp.fsdp_all_gather_in_start_param_sync=false"
-        "rerun_state_machine.check_for_nan_in_loss=false" "ddp.check_for_nan_in_grad=false"
-    )
-    # Dropless MoE copies token counts to the host and changes shapes every step,
-    # which a graph cannot capture. A per-rank token budget of 1.5x the balanced
-    # load fixes the HybridEP buffers (it needs the TE op-fuser grouped MLP), and
-    # paged stash keeps the routed-expert activations in fixed pages. An overflowing
-    # step is re-run eagerly by PagedStashRunner.
-    if [[ "${MODEL}" != 27b ]]; then
+OVERRIDES+=("model.cuda_graph_impl=${GRAPH_IMPL}" "model.cuda_graph_scope=null" "model.cuda_graph_modules=${GRAPH_MODULES}")
+case "${GRAPH_IMPL}" in
+    transformer_engine|local)
         OVERRIDES+=(
-            "model.moe_expert_rank_capacity_factor=1.5" "model.moe_paged_stash=true"
-            "model.use_transformer_engine_op_fuser=true"
+            "model.cuda_graph_warmup_steps=3" "model.use_te_rng_tracker=true" "rng.te_rng_tracker=true"
         )
-        # MCore only builds the fused SwiGLU grouped MLP (TE CuTe DSL kernel, sm100+)
-        # when this is set; otherwise TEGroupedMLP asserts "Fused GroupedMLP is not
-        # supported for this configuration".
-        export NVTE_CUTEDSL_FUSED_GROUPED_MLP=1
-    fi
-fi
+        if [[ "${GRAPH_IMPL}" == local ]]; then
+            # FSDP replays prefetch into fixed max-pool slots and attention consumes
+            # those weights. Dropless router, dispatch and experts stay eager.
+            OVERRIDES+=(
+                "model.gradient_accumulation_fusion=false"
+                "ddp.fsdp_double_buffer=true" "ddp.megatron_fsdp_max_pool_double_buffer=true"
+                "ddp.fsdp_all_gather_in_start_param_sync=true"
+            )
+        fi
+        ;;
+    full_iteration)
+        # Keep gradient references and dispatch FSDP3 parameter gathers inside the graph.
+        OVERRIDES+=(
+            "model.cuda_graph_warmup_steps=3" "ddp.megatron_fsdp_cuda_graph_mode=true"
+            "ddp.fsdp_all_gather_in_start_param_sync=false"
+            "rerun_state_machine.check_for_nan_in_loss=false" "ddp.check_for_nan_in_grad=false"
+        )
+        ;;
+esac
 if [[ "${CUDA_GRAPH}" == on ]]; then
-    # Keep NCCL graph registration off. The full-iteration graph holds NCCL
-    # collectives, where registering expandable segments (often inherited through
+    # Keep NCCL graph registration off. FSDP graphs hold NCCL collectives,
+    # where registering expandable segments (often inherited through
     # PYTORCH_CUDA_ALLOC_CONF) can hit illegal memory access, and TECudaGraphHelper
     # asserts it under expandable segments. This only stops NCCL from registering
     # buffers during capture; the --symmetric windows are registered explicitly after
     # the first step, before capture.
     export NCCL_GRAPH_REGISTER=0
-else
-    OVERRIDES+=("model.cuda_graph_impl=none" "model.cuda_graph_scope=null" "model.cuda_graph_modules=[]")
 fi
 [[ -n "${NUM_LAYERS}" ]] && OVERRIDES+=("model.num_layers=${NUM_LAYERS}")
 [[ -n "${NUM_EXPERTS}" ]] && OVERRIDES+=("model.num_moe_experts=${NUM_EXPERTS}")
