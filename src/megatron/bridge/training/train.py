@@ -48,7 +48,7 @@ from megatron.core.pipeline_parallel.utils import (
 )
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.rerun_state_machine import RerunDataIterator, get_rerun_state_machine
-from megatron.core.transformer import MegatronModule
+from megatron.core.transformer import MegatronModule, cuda_graphs
 from megatron.core.transformer.cuda_graphs import (
     TECudaGraphHelper,
     VisionTECudaGraphHelper,
@@ -101,7 +101,7 @@ from megatron.bridge.training.utils.train_utils import (
     training_log,
 )
 from megatron.bridge.utils.common_utils import get_world_size_safe, print_rank_0
-from megatron.bridge.utils.cuda_graph import is_full_iteration_cuda_graph
+from megatron.bridge.utils.cuda_graph import is_full_iteration_cuda_graph, uses_local_cuda_graph_manager
 
 
 # For Paged Stashing support
@@ -802,6 +802,7 @@ def train(
         if global_state._comet_logger:
             global_state._comet_logger.end()
         fault_tolerance.shutdown(global_state)
+        _delete_local_cuda_graphs(model, config)
         sys.exit(exit_code)
 
     # Close NVIDIA DLFw Inspect at clean finish
@@ -1655,6 +1656,25 @@ def _handle_mxfp8_param_buffer_copy(
             for optim_instance in optimizer.chained_optimizers:
                 if isinstance(optim_instance, DistributedOptimizer):
                     optim_instance._copy_main_params_to_param_buffer()
+
+
+def _delete_local_cuda_graphs(model: list[MegatronModule], config: ConfigContainer) -> None:
+    """Release native partial CUDA graphs after the last model use."""
+    if not uses_local_cuda_graph_manager(config.model):
+        return
+
+    # MCore drops its training capture record after capture, leaving the graphs on each manager.
+    for model_chunk in model:
+        for module in model_chunk.modules():
+            if isinstance(module, cuda_graphs.CudaGraphManager):
+                for runner in module.cudagraph_runners:
+                    runner.fwd_graph = None
+                    runner.bwd_graph = None
+                module.cudagraph_runners.clear()
+                module.custom_cudagraphs_lookup_table.clear()
+
+    # This also releases the FSDP prefetch graphs that captured NCCL all-gathers.
+    cuda_graphs.delete_cuda_graphs()
 
 
 def _delete_cuda_graphs(cuda_graph_helper: TECudaGraphHelper):

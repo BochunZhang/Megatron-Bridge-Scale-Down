@@ -26,7 +26,7 @@ from megatron.bridge.training.forward_step_func_types import ForwardStepCallable
 from megatron.bridge.training.initialize import destroy_global_state
 from megatron.bridge.training.setup import setup
 from megatron.bridge.training.state import GlobalState
-from megatron.bridge.training.train import _finish_train, train
+from megatron.bridge.training.train import _delete_local_cuda_graphs, _finish_train, train
 from megatron.bridge.training.utils.log_utils import barrier_and_log
 from megatron.bridge.utils.common_utils import print_rank_0
 from megatron.bridge.utils.decorators import experimental_fn
@@ -196,6 +196,8 @@ def _pretrain(
                 is_test=True,
             )
 
+        # Final evaluation can still replay FSDP prefetch graphs.
+        _delete_local_cuda_graphs(model, config)
         _finish_train(state, checkpoint_manager)
     except BaseException as error:
         if inprocess_call_wrapper is None:

@@ -21,8 +21,10 @@ from unittest.mock import Mock, patch
 import pytest
 from megatron.core.distributed.fsdp.mcore_fsdp_adapter import FullyShardedDataParallel as megatron_FSDP
 from megatron.core.optimizer.distrib_optimizer import DistributedOptimizer
+from megatron.core.transformer import cuda_graphs
 
 from megatron.bridge.training.train import (
+    _delete_local_cuda_graphs,
     _dummy_train_step,
     _handle_mxfp8_param_buffer_copy,
     _maybe_register_fsdp_buffers,
@@ -40,6 +42,27 @@ from megatron.bridge.training.utils.train_utils import maybe_inject_state
 
 
 pytestmark = pytest.mark.unit
+
+
+def test_delete_local_cuda_graphs_releases_layer_graphs_before_mcore_cleanup():
+    runner = SimpleNamespace(fwd_graph=object(), bwd_graph=object())
+    manager = Mock(spec=cuda_graphs.CudaGraphManager)
+    manager.cudagraph_runners = [runner]
+    manager.custom_cudagraphs_lookup_table = {"key": runner}
+    model_chunk = Mock()
+    model_chunk.modules.return_value = [model_chunk, manager]
+    config = SimpleNamespace(model=SimpleNamespace(cuda_graph_impl="local", cuda_graph_modules=["attn"]))
+
+    def check_layer_cleanup():
+        assert runner.fwd_graph is None
+        assert runner.bwd_graph is None
+        assert manager.cudagraph_runners == []
+        assert manager.custom_cudagraphs_lookup_table == {}
+
+    with patch.object(cuda_graphs, "delete_cuda_graphs", side_effect=check_layer_cleanup) as delete_graphs:
+        _delete_local_cuda_graphs([model_chunk], config)
+
+    delete_graphs.assert_called_once_with()
 
 
 class TestFSDPRegistration:
