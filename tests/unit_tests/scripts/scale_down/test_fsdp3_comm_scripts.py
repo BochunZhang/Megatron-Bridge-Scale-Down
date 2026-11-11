@@ -501,3 +501,42 @@ def test_mxfp8_tags_result_dirs_and_nsys_reports(tmp_path: Path):
             command = next(c for c in mxfp8 if f"model_{model}-fsdp_{fsdp}-mxfp8-layers_" in c)
             assert f"{report_tag}-fsdp_{fsdp}-mxfp8-experts_" in command
             assert "mixed_precision.fp8_recipe=mxfp8" in command
+
+
+def test_cpu_grad_accumulation_and_cpu_adamw_launch(tmp_path: Path):
+    (grad_command,) = _sweep(tmp_path, "--model", "27b", "--seq", "256", "--fsdp", "2", "--cpu-grad-accumulation")
+    grad_args = shlex.split(grad_command.removeprefix("command:"))
+    assert "ddp.fsdp_cpu_offload=[gradient]" in grad_args
+    assert "ddp.fsdp_cpu_grad_accumulation=true" in grad_args
+    assert "ddp.fsdp_cpu_optimizer=true" not in grad_args
+
+    (adam_command,) = _sweep(tmp_path, "--model", "27b", "--seq", "256", "--cpu-optimizer")
+    adam_args = shlex.split(adam_command.removeprefix("command:"))
+    assert "ddp.fsdp_cpu_offload=[optimizer,gradient]" in adam_args
+    assert "ddp.fsdp_cpu_grad_accumulation=true" in adam_args
+    assert "ddp.fsdp_cpu_optimizer=true" in adam_args
+    assert "ddp.data_parallel_sharding_strategy=optim_grads_params" in adam_args
+    assert "-cpu_grad_accum-cpu_adamw" in adam_command
+
+
+def test_nvme_offload_preserves_the_path_and_enables_nvtx(tmp_path: Path):
+    nvme_path = tmp_path / 'swap directory'
+    (command,) = _sweep(tmp_path, "--model", "27b", "--seq", "256", "--nvme-path", str(nvme_path))
+    args = shlex.split(command.removeprefix("command:"))
+    assert f'ddp.fsdp_nvme_path="{nvme_path}"' in args
+    assert "ddp.fsdp_cpu_offload=[optimizer,weight,gradient]" in args
+    assert "ddp.fsdp_cpu_grad_accumulation=true" in args
+    assert "ddp.fsdp_cpu_optimizer=true" in args
+    assert "profiling.nvtx_ranges=true" in args
+    assert "-cpu_adamw-nvme" in command
+
+
+def test_cpu_offload_rejects_incompatible_fsdp_and_graph_modes():
+    for options, expected in (
+        (("--fsdp", "1", "--cpu-grad-accumulation"), "requires eager FSDP2/3"),
+        (("--fsdp", "2", "--cpu-optimizer"), "require --fsdp 3 and BF16"),
+        (("--cuda-graph", "on", "--nvme-path", "/nvme"), "requires eager FSDP2/3"),
+    ):
+        result = _run(RUN_ONE, "--model", "27b", "--seq", "256", "--dry-run", *options)
+        assert result.returncode == 2
+        assert expected in result.stderr

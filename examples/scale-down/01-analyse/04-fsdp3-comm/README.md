@@ -113,6 +113,48 @@ bash $S --model 2.4t --experts 64 --seq 1024 --fsdp 3 --overlap --symmetric
 
 两个启动器都接受 `--offload`。它将所选模块传给 `ddp.fsdp_cpu_offload`，并将模块列表写入 `launch.json`。同一组模块采用固定顺序命名，例如 `...-offload_optimizer_weight_gradient/node0`。省略此选项可跑 baseline。运行环境需包含支持该字段的 Megatron-LM（`9b2c5ba3d` 或更新版本）。Offload 要求 Megatron-FSDP 并关闭 NCCL symmetric buffer。FSDP1 选择 `gradient` 时，启动器会开启梯度规约重叠。与 `--cuda-graph on` 同用时，需要 `--fsdp 3` 和支持该组合的 Megatron-LM 源码。
 
+### CPU 梯度累加、CPU AdamW 和 NVMe
+
+用本次修改的 Megatron-LM checkout 跑同一组 4 GPU、4 microbatch 的 mock-data 实验。以下命令从 Megatron-Bridge 根目录运行。
+
+```bash
+export MEGATRON_LM_DIR="$PWD/../megatron-lm"
+launcher=examples/scale-down/01-analyse/04-fsdp3-comm/benchmark_fsdp3.sh
+common=(--model 27b --fsdp 3 --num-layers 4 --seq 256 --num-microbatches 4 --profile nsys)
+
+# 已有路径：GPU 累加和 Adam 更新，CPU 保存 partial sum 和 optimizer 数据
+bash "$launcher" "${common[@]}" --offload optimizer,weight,gradient
+
+# 同一组卸载组件，改在 CPU 累加和更新
+bash "$launcher" "${common[@]}" --cpu-optimizer --offload weight
+
+# 同一组 CPU 运算，使用本机 NVMe 保存 shard
+bash "$launcher" "${common[@]}" --nvme-path /mnt/local-nvme/megatron-swap
+```
+
+单独使用 `--cpu-grad-accumulation` 可保留 GPU optimizer，用于比较梯度累加的位置。CPU 端按通信 dtype 的最大 shard 尺寸分配两个 pinned 槽位，D2H 完成后由 CPU worker 累加到 main grad，两个操作完成后才复用该槽位。梯度同步、unscale、范数和裁剪沿用 Megatron 的 GPU 路径。每步结束会回载梯度到 GPU，CPU AdamW 再按 bucket 收取裁剪后的 shard。CPU AdamW 和 NVMe 用 eager BF16 FSDP3，单独的 CPU 梯度累加也支持 eager FSDP2。
+
+NVMe 模式需要 Linux、已编译的 Megatron-LM `megatron_nvme_aio` 扩展及支持 direct I/O 的本地 NVMe 目录。每个 rank 在该目录内创建独立的临时 swap 子目录。计算权重、FP32 master、累加梯度和 Adam 一阶/二阶矩分别按 bucket 交换，Adam 的步数留在 CPU。读取权重时复用 FSDP 的 all-gather 预取顺序，梯度最终回载也提前提交下一 bucket 的磁盘读取。正常进程退出会清理临时目录。
+
+Nsight Systems 在 CPU 线程上显示 `fsdp.cpu_grad.d2h`、`fsdp.cpu_grad.wait_d2h`、`fsdp.cpu_grad.accumulate`、`fsdp.cpu_grad.finalize_h2d`、`fsdp.cpu_optimizer.gradient_d2h`、`fsdp.cpu_optimizer.adamw`、`fsdp.cpu_optimizer.publish` 和 `fsdp.nvme.read/write`。各模式的结果目录和报告名带有对应后缀。
+
+#### 编译 NVMe 扩展并查看 worker 时间线
+
+在 Linux GPU 容器内编译 Megatron-LM 自带的 `src/nvme/deepspeed`。扩展沿用 DeepSpeed 的 libaio 队列调度，编译依赖 C++17、`libaio-dev` 和 NVTX3 头文件。下面从 Megatron-Bridge 根目录执行，将扩展装到启动器使用的 Python 环境。若 NVTX3 头文件在 Nsight Systems 安装目录中，将 `NVTX_INCLUDE_DIR` 指向包含 `nvtx3/` 的 include 目录。
+
+```bash
+export MEGATRON_LM_DIR="$PWD/../megatron-lm"
+train_python="$(uv run --no-sync python -c 'import sys; print(sys.executable)')"
+uv pip install --python "$train_python" setuptools wheel
+uv pip install --python "$train_python" --no-build-isolation \
+  --no-deps --no-cache --reinstall "$MEGATRON_LM_DIR/src/nvme/deepspeed"
+
+MEGATRON_FSDP_TEST_NVME_PATH=/mnt/local-nvme/megatron-swap \
+  uv run --no-sync python "$MEGATRON_LM_DIR/src/nvme/deepspeed/verify_aio.py"
+```
+
+重跑上面的 `--nvme-path ... --profile nsys` 命令。在 Nsight Systems 中展开 `mfsdp-nvme-aio` 线程，`NVMe AIO read/write` 显示 worker 处理每个 shard 的区间和字节数，内层 `io_submit` 和 `io_getevents` 分别显示向内核提交和等待完成的时间。Python 线程上的 `fsdp.nvme.read/write` 同时包含 CPU staging 拷贝。SSD 控制器上的物理传输需要设备侧观测。
+
 ### DDP：逐层 backward 时间（27b / 397b / 2.4t）
 
 `--fsdp ddp` 将 Megatron-FSDP 换成 MCore `DistributedDataParallel`，用于对比 CUDA graph 开关下的逐层 backward 时间。Dense FSDP 使用 full-iteration graph，MoE FSDP3 使用原生 partial graph，DDP 使用 TE 按层 graph。

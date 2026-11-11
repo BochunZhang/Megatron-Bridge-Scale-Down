@@ -39,6 +39,9 @@ OVERLAP=false
 TP_COMM_OVERLAP=false
 SYMMETRIC=false
 OFFLOAD=""
+CPU_GRAD_ACCUMULATION=false
+CPU_OPTIMIZER=false
+NVME_PATH=""
 DDP_OVERLAP=false
 HYBRIDEP_NUM_SMS="${HYBRIDEP_NUM_SMS:-32}"
 GPU_COUNT="${GPU_COUNT:-4}"
@@ -131,6 +134,11 @@ Options:
   --node-rank N                  Node rank (default: NODE_RANK or 0)
   --master-addr HOST             Multi-node rendezvous address
   --master-port N                Multi-node rendezvous port (default: 29501)
+  --cpu-grad-accumulation        Stage reduced shards in pinned MaxPool double buffers and accumulate on CPU
+  --cpu-optimizer                Run AdamW on CPU; implies optimizer and gradient offload
+  --nvme-path DIR                Use the native NVMe AIO extension for weights, gradients and AdamW state;
+                                 implies --cpu-optimizer. DIR is local to each node.
+  MEGATRON_LM_DIR                Optional environment variable pointing to the MCore checkout
   --profile none|nsys            Profiling mode (default: none). nsys records the GPUs
                                  of node 0 into one report
   --nsys                         Alias for --profile nsys
@@ -184,6 +192,9 @@ while [[ $# -gt 0 ]]; do
         --ddp-overlap) DDP_OVERLAP=true; shift;;
         --overlap) OVERLAP=true; shift;;
         --symmetric) SYMMETRIC=true; shift;;
+        --cpu-grad-accumulation) CPU_GRAD_ACCUMULATION=true; shift;;
+        --cpu-optimizer) CPU_OPTIMIZER=true; shift;;
+        --nvme-path) need_value "$@"; NVME_PATH="$2"; [[ -n "${NVME_PATH}" ]] || { echo "--nvme-path requires a directory" >&2; exit 2; }; shift 2;;
         --offload) need_value "$@"; OFFLOAD="$2"; [[ -n "${OFFLOAD}" ]] || { echo "--offload requires a module list" >&2; exit 2; }; shift 2;;
         --gpu|--gpus) need_value "$@"; GPU_COUNT="$2"; shift 2;;
         --nproc-per-node) need_value "$@"; GPUS_PER_NODE="$2"; shift 2;;
@@ -258,6 +269,23 @@ case "${FSDP_LEVEL}" in
     *) echo "--fsdp must be ddp, 1, 2, or 3" >&2; exit 2;;
 esac
 [[ "${DDP_OVERLAP}" == false || "${FSDP_LEVEL}" == ddp ]] || { echo "--ddp-overlap requires --fsdp ddp" >&2; exit 2; }
+if [[ -n "${NVME_PATH}" ]]; then
+    CPU_OPTIMIZER=true
+    OFFLOAD="${OFFLOAD:+${OFFLOAD},}weight"
+fi
+if [[ "${CPU_OPTIMIZER}" == true ]]; then
+    [[ "${FSDP_LEVEL}" == 3 && "${DTYPE}" == bf16 ]] || {
+        echo "--cpu-optimizer and --nvme-path require --fsdp 3 and BF16" >&2; exit 2
+    }
+    CPU_GRAD_ACCUMULATION=true
+    OFFLOAD="${OFFLOAD:+${OFFLOAD},}optimizer"
+fi
+if [[ "${CPU_GRAD_ACCUMULATION}" == true ]]; then
+    [[ ( "${FSDP_LEVEL}" == 2 || "${FSDP_LEVEL}" == 3 ) && "${CUDA_GRAPH}" == off ]] || {
+        echo "--cpu-grad-accumulation requires eager FSDP2/3" >&2; exit 2
+    }
+    OFFLOAD="${OFFLOAD:+${OFFLOAD},}gradient"
+fi
 OFFLOAD_TAG=""
 OFFLOAD_JSON='[]'
 if [[ -n "${OFFLOAD}" ]]; then
@@ -286,6 +314,9 @@ if [[ -n "${OFFLOAD}" ]]; then
         GRAD_OVERLAP=true
     fi
 fi
+[[ "${CPU_GRAD_ACCUMULATION}" == true ]] && OFFLOAD_TAG+="-cpu_grad_accum"
+[[ "${CPU_OPTIMIZER}" == true ]] && OFFLOAD_TAG+="-cpu_adamw"
+[[ -n "${NVME_PATH}" ]] && OFFLOAD_TAG+="-nvme"
 # Only Megatron-FSDP builds its parameter all-gathers on the separate communicators.
 [[ "${OVERLAP}" == false || "${FSDP_LEVEL}" != ddp ]] || { echo "--overlap requires --fsdp 1, 2 or 3" >&2; exit 2; }
 # The max-pool double buffers are Megatron-FSDP's. A forced NCCL_ALGO keeps every
@@ -575,6 +606,19 @@ if [[ -n "${OFFLOAD}" ]]; then
         OVERRIDES+=("optimizer.use_precision_aware_optimizer=false" "optimizer.optimizer_cuda_graph=false")
     fi
 fi
+if [[ "${CPU_GRAD_ACCUMULATION}" == true ]]; then
+    OVERRIDES+=("ddp.fsdp_cpu_grad_accumulation=true")
+fi
+if [[ "${CPU_OPTIMIZER}" == true ]]; then
+    OVERRIDES+=("ddp.fsdp_cpu_optimizer=true" "ddp.megatron_fsdp_use_decoupled_grad=false"
+        "optimizer.decoupled_weight_decay=true")
+fi
+if [[ -n "${NVME_PATH}" ]]; then
+    # Quote the directory for OmegaConf, including spaces and override punctuation.
+    nvme_value="${NVME_PATH//\\/\\\\}"
+    nvme_value="${nvme_value//\"/\\\"}"
+    OVERRIDES+=("ddp.fsdp_nvme_path=\"${nvme_value}\"")
+fi
 [[ "${TP_COMM_OVERLAP}" == true ]] && OVERRIDES+=("comm_overlap.tp_comm_overlap=true")
 
 TRAIN_ARGS=("${REPO_ROOT}/scripts/training/run_recipe.py" --recipe "${RECIPE}" --mode pretrain --dataset mock --step-func llm_step "${OVERRIDES[@]}")
@@ -606,6 +650,13 @@ COMMAND+=(uv run --no-sync python -m torch.distributed.run "${DIST_ARGS[@]}" --n
 if (( ${#NUMA_WRAPPER[@]} > 0 )); then
     COMMAND+=("${NUMA_WRAPPER[@]}")
 fi
+if [[ -n "${MEGATRON_LM_DIR:-}" ]]; then
+    [[ -d "${MEGATRON_LM_DIR}/megatron/core" ]] || {
+        echo "MEGATRON_LM_DIR does not contain megatron/core" >&2; exit 2
+    }
+    MLM_SOURCE="$(cd "${MEGATRON_LM_DIR}" && pwd)"
+    COMMAND+=(env "PYTHONPATH=${MLM_SOURCE}${PYTHONPATH:+:${PYTHONPATH}}")
+fi
 COMMAND+=(uv run --no-sync python "${TRAIN_ARGS[@]}")
 
 INFO=(
@@ -615,6 +666,7 @@ INFO=(
     "tp=${TENSOR_PARALLEL}" "sp=${SEQUENCE_PARALLEL}" "cp=${CONTEXT_PARALLEL}" "dp=${DATA_PARALLEL}" "ep=${EXPERT_PARALLEL}"
     "dispatcher=${DISPATCHER}" "mbs=${MICRO_BATCH_SIZE}" "gbs=${GLOBAL_BATCH_SIZE}" "gpus=${GPU_COUNT}"
     "num_microbatches=${NUM_MICROBATCHES}" "numa=${NUMA_MODE}" "offload=${OFFLOAD:-none}"
+    "cpu_grad_accumulation=${CPU_GRAD_ACCUMULATION}" "cpu_optimizer=${CPU_OPTIMIZER}" "nvme=$([[ -n ${NVME_PATH} ]] && echo true || echo false)"
 )
 if [[ "${DRY_RUN}" == true ]]; then
     printf '%s\n' "${INFO[*]}" >&2
@@ -637,7 +689,7 @@ printf 'command:' >"${RESULT_DIR}/command.txt"
 printf ' %q' "${COMMAND[@]}" >>"${RESULT_DIR}/command.txt"
 printf '\n' >>"${RESULT_DIR}/command.txt"
 cat >"${RESULT_DIR}/launch.json" <<JSON
-{"model":"${MODEL_ID}","recipe":"${RECIPE}","run_name":"${RUN_NAME}","dtype":"${DTYPE}","fsdp":${FSDP_JSON},"fsdp_cpu_offload":${OFFLOAD_JSON},"data_parallel":"${DP_TAG}","create_all_gather_group":${OVERLAP},"nccl_ub":${SYMMETRIC},"num_layers":"${LAYERS_TAG}","attention":"${ATTENTION}","linear_attention_freq":"${LINEAR_ATTENTION_FREQ}","mtp_num_layers":${MTP_TAG},"num_moe_experts":"${EXPERTS_TAG}","force_balance":${FORCE_BALANCE},"cuda_graph":"${CUDA_GRAPH}","cuda_graph_impl":"${GRAPH_IMPL}","cuda_graph_modules":"${GRAPH_MODULES}","cuda_graph_trace":"${GRAPH_TRACE}","seq_length":${SEQ_LENGTH},"tensor_model_parallel_size":${TENSOR_PARALLEL},"sequence_parallel":${SEQUENCE_PARALLEL},"context_parallel_size":${CONTEXT_PARALLEL},"data_parallel_size":${DATA_PARALLEL},"expert_model_parallel_size":${EXPERT_PARALLEL},"dispatcher":"${DISPATCHER}","micro_batch_size":${MICRO_BATCH_SIZE},"global_batch_size":${GLOBAL_BATCH_SIZE},"num_microbatches":${NUM_MICROBATCHES},"gpu_count":${GPU_COUNT},"nnodes":${NNODES},"node_rank":${NODE_RANK},"numa_mode":"${NUMA_MODE}","pytorch_cuda_alloc_conf":"${PYTORCH_CUDA_ALLOC_CONF:-}","nccl_graph_register":"${NCCL_GRAPH_REGISTER:-}","nccl_nvls_enable":"${NCCL_NVLS_ENABLE:-}","nvte_cutedsl_fused_grouped_mlp":"${NVTE_CUTEDSL_FUSED_GROUPED_MLP:-}","run_date":"${RUN_DATE}"}
+{"model":"${MODEL_ID}","recipe":"${RECIPE}","run_name":"${RUN_NAME}","dtype":"${DTYPE}","fsdp":${FSDP_JSON},"fsdp_cpu_offload":${OFFLOAD_JSON},"fsdp_cpu_grad_accumulation":${CPU_GRAD_ACCUMULATION},"fsdp_cpu_optimizer":${CPU_OPTIMIZER},"fsdp_nvme":$([[ -n ${NVME_PATH} ]] && echo true || echo false),"data_parallel":"${DP_TAG}","create_all_gather_group":${OVERLAP},"nccl_ub":${SYMMETRIC},"num_layers":"${LAYERS_TAG}","attention":"${ATTENTION}","linear_attention_freq":"${LINEAR_ATTENTION_FREQ}","mtp_num_layers":${MTP_TAG},"num_moe_experts":"${EXPERTS_TAG}","force_balance":${FORCE_BALANCE},"cuda_graph":"${CUDA_GRAPH}","cuda_graph_impl":"${GRAPH_IMPL}","cuda_graph_modules":"${GRAPH_MODULES}","cuda_graph_trace":"${GRAPH_TRACE}","seq_length":${SEQ_LENGTH},"tensor_model_parallel_size":${TENSOR_PARALLEL},"sequence_parallel":${SEQUENCE_PARALLEL},"context_parallel_size":${CONTEXT_PARALLEL},"data_parallel_size":${DATA_PARALLEL},"expert_model_parallel_size":${EXPERT_PARALLEL},"dispatcher":"${DISPATCHER}","micro_batch_size":${MICRO_BATCH_SIZE},"global_batch_size":${GLOBAL_BATCH_SIZE},"num_microbatches":${NUM_MICROBATCHES},"gpu_count":${GPU_COUNT},"nnodes":${NNODES},"node_rank":${NODE_RANK},"numa_mode":"${NUMA_MODE}","pytorch_cuda_alloc_conf":"${PYTORCH_CUDA_ALLOC_CONF:-}","nccl_graph_register":"${NCCL_GRAPH_REGISTER:-}","nccl_nvls_enable":"${NCCL_NVLS_ENABLE:-}","nvte_cutedsl_fused_grouped_mlp":"${NVTE_CUTEDSL_FUSED_GROUPED_MLP:-}","run_date":"${RUN_DATE}"}
 JSON
 printf '%s\n' "${INFO[*]}" | tee "${RESULT_DIR}/run_info.txt"
 set +e

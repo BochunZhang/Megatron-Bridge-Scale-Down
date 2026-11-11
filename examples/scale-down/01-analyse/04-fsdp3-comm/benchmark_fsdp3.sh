@@ -48,6 +48,7 @@ OVERLAP=false
 TP_COMM_OVERLAP=false
 SYMMETRIC=false
 OFFLOAD=""
+OFFLOAD_ARGS=()
 DDP_OVERLAP=false
 MERGE_GRAPHS=false
 DRY_RUN=false
@@ -103,6 +104,9 @@ Options:
                                 only; 27b is unaffected); names get "-fb"
   --dtype bf16|mxfp8            Compute mode (default: bf16); --mxfp8 is an alias
   --offload MODULE[,MODULE...]  CPU offload for optimizer, weight, and/or gradient in each case
+  --cpu-grad-accumulation       Accumulate reduced gradient shards on CPU in each case
+  --cpu-optimizer               CPU AdamW and host gradient accumulation in each case
+  --nvme-path DIR               Native NVMe AIO offload in each case (requires FSDP3)
   --profile none|nsys           Profiling mode (default: nsys); --nsys is an alias
   --metric [HZ]                 Enable nsys GPU metrics on all GPUs on node 0
                                 (default frequency: 20000 Hz)
@@ -134,6 +138,8 @@ while [[ $# -gt 0 ]]; do
         --ddp-overlap) DDP_OVERLAP=true; shift;;
         --overlap) OVERLAP=true; shift;;
         --symmetric) SYMMETRIC=true; shift;;
+        --cpu-grad-accumulation|--cpu-optimizer) OFFLOAD_ARGS+=("$1"); shift;;
+        --nvme-path) need_value "$@"; OFFLOAD_ARGS+=("$1" "$2"); shift 2;;
         --offload) need_value "$@"; OFFLOAD="$2"; [[ -n "${OFFLOAD}" ]] || { echo "--offload requires a module list" >&2; exit 2; }; shift 2;;
         --tp) need_value "$@"; parse_csv "$2" TP_SIZES; shift 2;;
         --tp-comm-overlap) TP_COMM_OVERLAP=true; shift;;
@@ -184,6 +190,9 @@ done
 
 (( ${#MODELS[@]} > 0 )) || { echo "--model is required (27b, 397b, 2.4t)" >&2; usage >&2; exit 2; }
 for i in "${!MODELS[@]}"; do [[ "${MODELS[i]}" == 2p4t ]] && MODELS[i]=2.4t; done
+if [[ "${FSDP_LEVELS_EXPLICIT}" == false ]] && (( ${#OFFLOAD_ARGS[@]} )); then
+    FSDP_LEVELS=(3)
+fi
 is_positive() { [[ "$1" =~ ^[1-9][0-9]*$ ]]; }
 # A fixed GBS replaces the per-case derivation from the microbatch count. The empty
 # GBS list is never expanded: bash 3.2 treats that as unbound under set -u.
@@ -221,6 +230,7 @@ case_args() {
     [[ "${TP_COMM_OVERLAP}" == true && "${tp}" -gt 1 ]] && ARGS+=(--tp-comm-overlap)
     [[ "${SYMMETRIC}" == true && "${fsdp}" != ddp ]] && ARGS+=(--symmetric)
     [[ -n "${OFFLOAD}" ]] && ARGS+=(--offload "${OFFLOAD}")
+    if (( ${#OFFLOAD_ARGS[@]} )); then ARGS+=("${OFFLOAD_ARGS[@]}"); fi
     [[ "${DDP_OVERLAP}" == true && "${fsdp}" == ddp ]] && ARGS+=(--ddp-overlap)
     [[ -n "${METRIC_ARG}" ]] && ARGS+=("${METRIC_ARG}")
     [[ "${MERGE_GRAPHS}" == true ]] && ARGS+=(--merge)
