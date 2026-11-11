@@ -16,6 +16,7 @@ RECIPE=""
 SEQ_LENGTH=""
 DTYPE="${DTYPE:-bf16}"
 PROFILE="${PROFILE:-none}"
+METRIC_FREQUENCY=""
 TENSOR_PARALLEL="1"
 CONTEXT_PARALLEL="1"
 MICRO_BATCH_SIZE="1"
@@ -133,6 +134,8 @@ Options:
   --profile none|nsys            Profiling mode (default: none). nsys records the GPUs
                                  of node 0 into one report
   --nsys                         Alias for --profile nsys
+  --metric [HZ]                  Enable nsys GPU metrics on all GPUs on node 0
+                                 (default frequency: 20000 Hz)
   --merge                        With nsys and --cuda-graph on, draw each graph launch
                                  as one block (--cuda-graph-trace=graph) instead of
                                  its kernels; names get "-merge"
@@ -190,6 +193,20 @@ while [[ $# -gt 0 ]]; do
         --master-port) need_value "$@"; MASTER_PORT="$2"; shift 2;;
         --profile) need_value "$@"; PROFILE="$2"; shift 2;;
         --nsys) PROFILE=nsys; shift;;
+        --metric|--metric=*)
+            METRIC_FREQUENCY=20000
+            if [[ "$1" == --metric=* ]]; then
+                METRIC_FREQUENCY="${1#*=}"
+            elif (( $# > 1 )) && [[ "$2" != -* ]]; then
+                METRIC_FREQUENCY="$2"
+                shift
+            fi
+            if ! [[ "${METRIC_FREQUENCY}" =~ ^[1-9][0-9]{1,5}$ ]] || ! (( METRIC_FREQUENCY <= 200000 )); then
+                echo "--metric frequency must be an integer from 10 to 200000 Hz" >&2
+                exit 2
+            fi
+            shift
+            ;;
         --merge) MERGE_GRAPHS=true; shift;;
         --profile-start|--profile-step-start) need_value "$@"; PROFILE_START="$2"; shift 2;;
         --profile-end|--profile-step-end) need_value "$@"; PROFILE_END="$2"; shift 2;;
@@ -217,6 +234,7 @@ esac
 RECIPE="${RECIPE:-${DEFAULT_RECIPE}}"
 case "${DTYPE}" in bf16|mxfp8) ;; *) echo "--dtype must be bf16 or mxfp8" >&2; exit 2;; esac
 case "${PROFILE}" in none|nsys) ;; *) echo "--profile must be none or nsys" >&2; exit 2;; esac
+[[ -n "${METRIC_FREQUENCY}" ]] && PROFILE=nsys
 case "${DISPATCHER}" in hybridep|alltoall) ;; *) echo "--dispatcher must be hybridep or alltoall" >&2; exit 2;; esac
 case "${CUDA_GRAPH}" in off|on) ;; *) echo "--cuda-graph must be off or on" >&2; exit 2;; esac
 # nsys --cuda-graph-trace mode; only a profiled graph run has one. --merge without a
@@ -392,7 +410,8 @@ TP_TAG=""
 CG_TAG="${CUDA_GRAPH}"
 [[ "${GRAPH_IMPL}" == local ]] && CG_TAG+="-partial"
 [[ "${GRAPH_TRACE}" == graph ]] && CG_TAG+="-merge"
-CASE_NAME="model_${MODEL}-${DP_TAG}${OVERLAP_TAG}${DTYPE_TAG}-layers_${LAYERS_TAG}${ATTN_TAG}-mtp_${MTP_TAG}-experts_${EXPERTS_TAG}-cg_${CG_TAG}-mbs_${MICRO_BATCH_SIZE}-seq_${SEQ_LENGTH}${TP_TAG}-cp_${CONTEXT_PARALLEL}-ep_${EXPERT_PARALLEL}-disp_${DISPATCHER}-gbs_${GLOBAL_BATCH_SIZE}-gpus_${GPU_COUNT}-profile_${PROFILE}-date_${RUN_DATE}${OFFLOAD_TAG}"
+METRIC_TAG="${METRIC_FREQUENCY:+-metric_${METRIC_FREQUENCY}}"
+CASE_NAME="model_${MODEL}-${DP_TAG}${OVERLAP_TAG}${DTYPE_TAG}-layers_${LAYERS_TAG}${ATTN_TAG}-mtp_${MTP_TAG}-experts_${EXPERTS_TAG}-cg_${CG_TAG}-mbs_${MICRO_BATCH_SIZE}-seq_${SEQ_LENGTH}${TP_TAG}-cp_${CONTEXT_PARALLEL}-ep_${EXPERT_PARALLEL}-disp_${DISPATCHER}-gbs_${GLOBAL_BATCH_SIZE}-gpus_${GPU_COUNT}-profile_${PROFILE}-date_${RUN_DATE}${OFFLOAD_TAG}${METRIC_TAG}"
 RESULT_DIR="${RESULTS_ROOT}/${CASE_NAME}/node${NODE_RANK}"
 if [[ "${PRINT_RESULT_DIR}" == true ]]; then
     printf '%s\n' "${RESULT_DIR}"
@@ -400,7 +419,7 @@ if [[ "${PRINT_RESULT_DIR}" == true ]]; then
 fi
 # nsys report name, e.g. qwen35_27b-fsdp_3-mxfp8-experts_0-cg_off-tp_2-cp_1-ep_1-mbs_1-gbs_8-seq_4k.
 if (( SEQ_LENGTH % 1024 == 0 )); then SEQ_TAG="$((SEQ_LENGTH / 1024))k"; else SEQ_TAG="${SEQ_LENGTH}"; fi
-NSYS_NAME="${MODEL_TAG}-${DP_TAG}${OVERLAP_TAG}${DTYPE_TAG}${ATTN_TAG}-experts_${EXPERTS_TAG}-cg_${CG_TAG}${TP_TAG}-cp_${CONTEXT_PARALLEL}-ep_${EXPERT_PARALLEL}-mbs_${MICRO_BATCH_SIZE}-gbs_${GLOBAL_BATCH_SIZE}-seq_${SEQ_TAG}${OFFLOAD_TAG}"
+NSYS_NAME="${MODEL_TAG}-${DP_TAG}${OVERLAP_TAG}${DTYPE_TAG}${ATTN_TAG}-experts_${EXPERTS_TAG}-cg_${CG_TAG}${TP_TAG}-cp_${CONTEXT_PARALLEL}-ep_${EXPERT_PARALLEL}-mbs_${MICRO_BATCH_SIZE}-gbs_${GLOBAL_BATCH_SIZE}-seq_${SEQ_TAG}${OFFLOAD_TAG}${METRIC_TAG}"
 NUM_MICROBATCHES=$((GLOBAL_BATCH_SIZE / (MICRO_BATCH_SIZE * DATA_PARALLEL)))
 
 # torchrun creates LOCAL_RANK before this worker wrapper is invoked. Prefer a
@@ -573,6 +592,9 @@ if [[ "${PROFILE}" == nsys ]] && (( NODE_RANK == 0 )); then
     # ranks of the node share one timeline. Every rank of the node calls
     # cudaProfilerStart / Stop, bounding the capture to the profiled steps.
     COMMAND=(nsys profile --trace=cuda,nvtx --sample=none --cpuctxsw=none --capture-range=cudaProfilerApi --capture-range-end=stop --force-overwrite=true --output="${RESULT_DIR}/${NSYS_NAME}")
+    if [[ -n "${METRIC_FREQUENCY}" ]]; then
+        COMMAND+=(--gpu-metrics-devices=all --gpu-metrics-frequency="${METRIC_FREQUENCY}")
+    fi
     # nsys draws each graph launch as one opaque block by default (graph, kept by
     # --merge); node tracing records every kernel inside the graph (GEMMs, NCCL,
     # HybridEP) by name.

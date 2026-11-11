@@ -270,6 +270,28 @@ def test_nsys_traces_kernels_inside_cuda_graphs(tmp_path: Path):
     assert "--cuda-graph-trace" not in no_profile
 
 
+def test_nsys_gpu_metrics_is_opt_in_and_defaults_to_20_khz(tmp_path: Path):
+    common = ("--model", "27b", "--seq-length", "4096", "--results-root", str(tmp_path), "--dry-run")
+    (plain,) = _commands(_run(RUN_ONE, *common, "--nsys").stderr)
+    assert "--gpu-metrics-" not in plain
+
+    (metrics,) = _commands(_run(RUN_ONE, *common, "--metric").stderr)
+    assert metrics.startswith("command: nsys profile ")
+    assert "--gpu-metrics-devices=all --gpu-metrics-frequency=20000" in metrics
+    assert "-metric_20000/node0/" in metrics and "-metric_20000 " in metrics
+
+
+def test_sweep_forwards_gpu_metrics_frequency(tmp_path: Path):
+    common = ("--model", "27b", "--fsdp", "3", "--seq", "256")
+    (metrics,) = _sweep(tmp_path, *common, "--metric", "10000")
+    assert "--gpu-metrics-devices=all --gpu-metrics-frequency=10000" in metrics
+    assert "-metric_10000/node0/" in metrics
+
+    invalid = _run(BENCHMARK, *common, "--dry-run", "--metric=200001")
+    assert invalid.returncode == 2
+    assert "--metric frequency must be an integer from 10 to 200000 Hz" in invalid.stderr
+
+
 def test_merge_keeps_cuda_graph_launches_as_one_block(tmp_path: Path):
     commands = _sweep(tmp_path, "--model", "27b", "--fsdp", "3", "--seq", "256", "--cuda-graph", "off,on", "--merge")
     off = next(c for c in commands if "-cg_off-" in c)

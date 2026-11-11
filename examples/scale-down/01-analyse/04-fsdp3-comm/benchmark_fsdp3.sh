@@ -33,6 +33,7 @@ MTP_NUM_LAYERS="${MTP_NUM_LAYERS:-0}"
 DISPATCHER="${DISPATCHER:-hybridep}"
 DTYPE="${DTYPE:-bf16}"
 PROFILE="${PROFILE:-nsys}"
+METRIC_ARG=""
 TRAIN_ITERS="${TRAIN_ITERS:-10}"
 PROFILE_START="${PROFILE_START:-7}"
 PROFILE_END="${PROFILE_END:-8}"
@@ -103,6 +104,8 @@ Options:
   --dtype bf16|mxfp8            Compute mode (default: bf16); --mxfp8 is an alias
   --offload MODULE[,MODULE...]  CPU offload for optimizer, weight, and/or gradient in each case
   --profile none|nsys           Profiling mode (default: nsys); --nsys is an alias
+  --metric [HZ]                 Enable nsys GPU metrics on all GPUs on node 0
+                                (default frequency: 20000 Hz)
   --merge                       nsys draws each CUDA graph launch as one block
                                 instead of its kernels (cg=on cases get "-merge")
   --profile-start N             First profiled iteration (default: 7)
@@ -151,6 +154,15 @@ while [[ $# -gt 0 ]]; do
         --mxfp8) DTYPE=mxfp8; shift;;
         --profile) need_value "$@"; PROFILE="$2"; shift 2;;
         --nsys) PROFILE=nsys; shift;;
+        --metric)
+            METRIC_ARG="$1"
+            if (( $# > 1 )) && [[ "$2" != -* ]]; then
+                METRIC_ARG="--metric=$2"
+                shift
+            fi
+            shift
+            ;;
+        --metric=*) METRIC_ARG="$1"; shift;;
         --merge) MERGE_GRAPHS=true; shift;;
         --profile-start) need_value "$@"; PROFILE_START="$2"; shift 2;;
         --profile-end) need_value "$@"; PROFILE_END="$2"; shift 2;;
@@ -210,6 +222,7 @@ case_args() {
     [[ "${SYMMETRIC}" == true && "${fsdp}" != ddp ]] && ARGS+=(--symmetric)
     [[ -n "${OFFLOAD}" ]] && ARGS+=(--offload "${OFFLOAD}")
     [[ "${DDP_OVERLAP}" == true && "${fsdp}" == ddp ]] && ARGS+=(--ddp-overlap)
+    [[ -n "${METRIC_ARG}" ]] && ARGS+=("${METRIC_ARG}")
     [[ "${MERGE_GRAPHS}" == true ]] && ARGS+=(--merge)
     [[ "${RESUME}" == true ]] && ARGS+=(--resume)
     [[ "${DRY_RUN}" == true ]] && ARGS+=(--dry-run)

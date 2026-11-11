@@ -45,6 +45,7 @@ Qwen3.8-2.4T-A95B 的 HF 配置是纯文本的 `Qwen3_5MoeForCausalLM`（没有 
 | `--dtype` / `--mxfp8` | `bf16`、`mxfp8` | 默认 BF16 |
 | `--offload` | `optimizer`、`weight`、`gradient`，可逗号组合 | 每个 case 卸载指定模块，目录和 nsys 报告名追加 `-offload_<模块>` |
 | `--profile` / `--nsys` | `none`、`nsys` | sweep 默认 `nsys`，单 case 默认 `none` |
+| `--metric [HZ]` | 10–200000 Hz | 启用 nsys 并采集 node 0 上所有 GPU 的硬件指标。默认 20000 Hz，可用 `--metric 10000` 指定频率。结果目录和报告名追加 `-metric_<HZ>` |
 | `--merge` | — | nsys 不展开 CUDA graph，每次 graph launch 画成一个整体（`--cuda-graph-trace=graph`）；只对 nsys 且 `--cuda-graph on` 的 case 生效，在 graph 标记后追加 `-merge`。见「Nsys」 |
 
 DP = GPU 数 / (TP × CP)；MoE 的 EP=4 与 TP×DP×CP mesh 共用同一组 GPU，只要求 EP 整除 GPU 数（PP 固定为 1）。TP 组由连续 rank 组成，TP 必须整除每节点 GPU 数，保证 TP 通信不出节点；开启 SP 时每个 CP rank 的序列片段（seq / CP）还必须能被 TP 整除。
