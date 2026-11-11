@@ -43,6 +43,7 @@ Qwen3.8-2.4T-A95B 的 HF 配置是纯文本的 `Qwen3_5MoeForCausalLM`（没有 
 | `--dispatcher` | `hybridep`、`alltoall` | MoE dispatcher，默认 `hybridep` |
 | `--force-balance` | — | 见「强制均衡路由」 |
 | `--dtype` / `--mxfp8` | `bf16`、`mxfp8` | 默认 BF16 |
+| `--offload` | `optimizer`、`weight`、`gradient`，可逗号组合 | 每个 case 卸载指定模块，目录和 nsys 报告名追加 `-offload_<模块>` |
 | `--profile` / `--nsys` | `none`、`nsys` | sweep 默认 `nsys`，单 case 默认 `none` |
 | `--merge` | — | nsys 不展开 CUDA graph，每次 graph launch 画成一个整体（`--cuda-graph-trace=graph`）；只对 nsys 且 `--cuda-graph on` 的 case 生效，在 graph 标记后追加 `-merge`。见「Nsys」 |
 
@@ -95,6 +96,9 @@ bash $S --model 27b --fsdp 3 --seq 4096 --tp 1,2,4
 bash $S --model 397b --experts 64 --fsdp 3 --seq 16384 --cp 1,2,4
 # MBS / GBS
 bash $S --model 27b --fsdp 3 --seq 1024 --mbs 1,2 --gbs 16,32
+# FSDP3 CPU offload，四卡每步两个 microbatch
+bash $S --model 27b --fsdp 3 --seq 1024 --num-layers 4 --gbs 8 \
+  --profile none --offload optimizer,weight,gradient
 # 全 gated attention / 全 GatedDeltaNet
 bash $S --model 397b --experts 64 --seq 1024 --full
 bash $S --model 397b --experts 64 --seq 1024 --linear
@@ -105,6 +109,8 @@ bash $S --model 2.4t --experts 64 --seq 1024 --fsdp 3 --overlap --symmetric
 ```
 
 结果目录名中，非默认设置会追加标记，默认设置不加任何标记，因此以前的结果名仍可用 `--resume` 续跑：MXFP8 为 `-mxfp8`，强制均衡为 `-fb`，`--full` / `--linear` 为层数后的 `-attn_full` / `-attn_linear`，TP>1 为 CP 前的 `-tp_<N>`。例如 `model_27b-fsdp_3-mxfp8-layers_8-attn_full-mtp_0-experts_0-cg_off-mbs_1-seq_4096-tp_2-cp_1-...`。
+
+两个启动器都接受 `--offload`。它将所选模块传给 `ddp.fsdp_cpu_offload`，并将模块列表写入 `launch.json`。同一组模块采用固定顺序命名，例如 `...-offload_optimizer_weight_gradient/node0`。省略此选项可跑 baseline。运行环境需包含支持该字段的 Megatron-LM（`9b2c5ba3d` 或更新版本）。Offload 要求 Megatron-FSDP、`--cuda-graph off`，并关闭 NCCL symmetric buffer。FSDP1 选择 `gradient` 时，启动器会开启梯度规约重叠。
 
 ### DDP：逐层 backward 时间（27b / 397b / 2.4t）
 

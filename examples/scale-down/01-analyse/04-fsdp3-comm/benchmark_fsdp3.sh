@@ -46,6 +46,7 @@ FORCE_BALANCE=false
 OVERLAP=false
 TP_COMM_OVERLAP=false
 SYMMETRIC=false
+OFFLOAD=""
 DDP_OVERLAP=false
 MERGE_GRAPHS=false
 DRY_RUN=false
@@ -100,6 +101,7 @@ Options:
   --force-balance               Uniform random routing for MoE cases (benchmark
                                 only; 27b is unaffected); names get "-fb"
   --dtype bf16|mxfp8            Compute mode (default: bf16); --mxfp8 is an alias
+  --offload MODULE[,MODULE...]  CPU offload for optimizer, weight, and/or gradient in each case
   --profile none|nsys           Profiling mode (default: nsys); --nsys is an alias
   --merge                       nsys draws each CUDA graph launch as one block
                                 instead of its kernels (cg=on cases get "-merge")
@@ -129,6 +131,7 @@ while [[ $# -gt 0 ]]; do
         --ddp-overlap) DDP_OVERLAP=true; shift;;
         --overlap) OVERLAP=true; shift;;
         --symmetric) SYMMETRIC=true; shift;;
+        --offload) need_value "$@"; OFFLOAD="$2"; [[ -n "${OFFLOAD}" ]] || { echo "--offload requires a module list" >&2; exit 2; }; shift 2;;
         --tp) need_value "$@"; parse_csv "$2" TP_SIZES; shift 2;;
         --tp-comm-overlap) TP_COMM_OVERLAP=true; shift;;
         --cp) need_value "$@"; parse_csv "$2" CP_SIZES; shift 2;;
@@ -205,6 +208,7 @@ case_args() {
     [[ "${OVERLAP}" == true && "${fsdp}" != ddp ]] && ARGS+=(--overlap)
     [[ "${TP_COMM_OVERLAP}" == true && "${tp}" -gt 1 ]] && ARGS+=(--tp-comm-overlap)
     [[ "${SYMMETRIC}" == true && "${fsdp}" != ddp ]] && ARGS+=(--symmetric)
+    [[ -n "${OFFLOAD}" ]] && ARGS+=(--offload "${OFFLOAD}")
     [[ "${DDP_OVERLAP}" == true && "${fsdp}" == ddp ]] && ARGS+=(--ddp-overlap)
     [[ "${MERGE_GRAPHS}" == true ]] && ARGS+=(--merge)
     [[ "${RESUME}" == true ]] && ARGS+=(--resume)

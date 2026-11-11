@@ -3,6 +3,7 @@
 """Dry-run tests for 01-analyse/04-fsdp3-comm."""
 
 import os
+import shlex
 import subprocess
 from pathlib import Path
 
@@ -99,6 +100,48 @@ def test_run_one_rejects_unknown_fsdp_level():
     result = _run(RUN_ONE, "--model", "27b", "--seq-length", "256", "--fsdp", "4", "--dry-run")
     assert result.returncode == 2
     assert "--fsdp must be ddp, 1, 2, or 3" in result.stderr
+
+
+def test_offload_forwards_config_and_names_results(tmp_path: Path):
+    common = ("--model", "27b", "--fsdp", "3", "--seq", "1024")
+    (command,) = _sweep(
+        tmp_path, *common, "--offload", "gradient,optimizer,weight"
+    )
+    args = shlex.split(command)
+    suffix = "-offload_optimizer_weight_gradient"
+    assert "ddp.fsdp_cpu_offload=[optimizer,weight,gradient]" in args
+    assert "optimizer.use_precision_aware_optimizer=false" in args
+    assert any(arg.startswith("--output=") and arg.endswith(suffix) for arg in args)
+
+    result = _run(
+        RUN_ONE, *common, "--offload", "weight,gradient,optimizer",
+        "--profile", "nsys", "--run-date", RUN_DATE, "--results-root", str(tmp_path),
+        "--print-result-dir",
+    )
+    assert result.returncode == 0, result.stderr
+    assert Path(result.stdout.strip()).parent.name.endswith(f"-date_{RUN_DATE}{suffix}")
+
+
+def test_fsdp1_gradient_offload_enables_gradient_overlap(tmp_path: Path):
+    (command,) = _sweep(tmp_path, "--model", "27b", "--fsdp", "1", "--seq", "256", "--offload", "gradient")
+    args = shlex.split(command)
+    assert "ddp.fsdp_cpu_offload=[gradient]" in args
+    assert "ddp.overlap_grad_reduce=true" in args
+    assert "comm_overlap.overlap_grad_reduce=true" in args
+
+
+def test_offload_rejects_invalid_launches_before_the_sweep(tmp_path: Path):
+    common = ("--model", "27b", "--seq", "256", "--dry-run", "--output-dir", str(tmp_path))
+    for options in (
+        ("--offload", "weights"),
+        ("--offload", "weight,"),
+        ("--offload", "weight", "--fsdp", "3,ddp"),
+        ("--offload", "weight", "--cuda-graph", "off,on"),
+        ("--offload", "weight", "--symmetric"),
+    ):
+        result = _run(BENCHMARK, *common, *options)
+        assert result.returncode == 2 and "--offload" in result.stderr
+        assert not _commands(result.stderr)
 
 
 def test_tp_turns_on_sequence_parallel_and_shrinks_data_parallel(tmp_path: Path):

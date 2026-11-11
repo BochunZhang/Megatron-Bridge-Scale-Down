@@ -37,6 +37,7 @@ FSDP_LEVEL="${FSDP_LEVEL:-3}"
 OVERLAP=false
 TP_COMM_OVERLAP=false
 SYMMETRIC=false
+OFFLOAD=""
 DDP_OVERLAP=false
 HYBRIDEP_NUM_SMS="${HYBRIDEP_NUM_SMS:-32}"
 GPU_COUNT="${GPU_COUNT:-4}"
@@ -121,6 +122,7 @@ Options:
                                  not meaningful. Names get "-fb"
   --dtype|--precision bf16|mxfp8 Compute mode (default: bf16)
   --mxfp8                        Same as --dtype mxfp8
+  --offload MODULE[,MODULE...]   CPU offload for optimizer, weight, and/or gradient
   --gpu|--gpus N                 Global GPU count (default: 4)
   --nproc-per-node N             GPUs per node (default: 4)
   --nnodes N                     Number of nodes (default: gpu / nproc-per-node)
@@ -178,6 +180,7 @@ while [[ $# -gt 0 ]]; do
         --ddp-overlap) DDP_OVERLAP=true; shift;;
         --overlap) OVERLAP=true; shift;;
         --symmetric) SYMMETRIC=true; shift;;
+        --offload) need_value "$@"; OFFLOAD="$2"; [[ -n "${OFFLOAD}" ]] || { echo "--offload requires a module list" >&2; exit 2; }; shift 2;;
         --gpu|--gpus) need_value "$@"; GPU_COUNT="$2"; shift 2;;
         --nproc-per-node) need_value "$@"; GPUS_PER_NODE="$2"; shift 2;;
         --nnodes) need_value "$@"; NNODES="$2"; shift 2;;
@@ -236,6 +239,30 @@ case "${FSDP_LEVEL}" in
     *) echo "--fsdp must be ddp, 1, 2, or 3" >&2; exit 2;;
 esac
 [[ "${DDP_OVERLAP}" == false || "${FSDP_LEVEL}" == ddp ]] || { echo "--ddp-overlap requires --fsdp ddp" >&2; exit 2; }
+OFFLOAD_TAG=""
+OFFLOAD_JSON='[]'
+if [[ -n "${OFFLOAD}" ]]; then
+    [[ "${OFFLOAD}" =~ ^(optimizer|weight|gradient)(,(optimizer|weight|gradient))*$ ]] || {
+        echo "--offload expects a comma-separated list of optimizer, weight, and gradient" >&2
+        exit 2
+    }
+    [[ "${FSDP_LEVEL}" != ddp && "${CUDA_GRAPH}" == off && "${SYMMETRIC}" == false ]] || {
+        echo "--offload requires Megatron-FSDP, --cuda-graph off, and no --symmetric" >&2
+        exit 2
+    }
+    requested_offload=",${OFFLOAD},"
+    OFFLOAD=""
+    for component in optimizer weight gradient; do
+        if [[ "${requested_offload}" == *",${component},"* ]]; then
+            OFFLOAD="${OFFLOAD:+${OFFLOAD},}${component}"
+        fi
+    done
+    OFFLOAD_TAG="-offload_${OFFLOAD//,/_}"
+    OFFLOAD_JSON="[\"${OFFLOAD//,/\",\"}\"]"
+    if [[ "${FSDP_LEVEL}" == 1 && "${requested_offload}" == *,gradient,* ]]; then
+        GRAD_OVERLAP=true
+    fi
+fi
 # Only Megatron-FSDP builds its parameter all-gathers on the separate communicators.
 [[ "${OVERLAP}" == false || "${FSDP_LEVEL}" != ddp ]] || { echo "--overlap requires --fsdp 1, 2 or 3" >&2; exit 2; }
 # The max-pool double buffers are Megatron-FSDP's. A forced NCCL_ALGO keeps every
@@ -360,7 +387,7 @@ TP_TAG=""
 CG_TAG="${CUDA_GRAPH}"
 [[ "${GRAPH_IMPL}" == local ]] && CG_TAG+="-partial"
 [[ "${GRAPH_TRACE}" == graph ]] && CG_TAG+="-merge"
-CASE_NAME="model_${MODEL}-${DP_TAG}${OVERLAP_TAG}${DTYPE_TAG}-layers_${LAYERS_TAG}${ATTN_TAG}-mtp_${MTP_TAG}-experts_${EXPERTS_TAG}-cg_${CG_TAG}-mbs_${MICRO_BATCH_SIZE}-seq_${SEQ_LENGTH}${TP_TAG}-cp_${CONTEXT_PARALLEL}-ep_${EXPERT_PARALLEL}-disp_${DISPATCHER}-gbs_${GLOBAL_BATCH_SIZE}-gpus_${GPU_COUNT}-profile_${PROFILE}-date_${RUN_DATE}"
+CASE_NAME="model_${MODEL}-${DP_TAG}${OVERLAP_TAG}${DTYPE_TAG}-layers_${LAYERS_TAG}${ATTN_TAG}-mtp_${MTP_TAG}-experts_${EXPERTS_TAG}-cg_${CG_TAG}-mbs_${MICRO_BATCH_SIZE}-seq_${SEQ_LENGTH}${TP_TAG}-cp_${CONTEXT_PARALLEL}-ep_${EXPERT_PARALLEL}-disp_${DISPATCHER}-gbs_${GLOBAL_BATCH_SIZE}-gpus_${GPU_COUNT}-profile_${PROFILE}-date_${RUN_DATE}${OFFLOAD_TAG}"
 RESULT_DIR="${RESULTS_ROOT}/${CASE_NAME}/node${NODE_RANK}"
 if [[ "${PRINT_RESULT_DIR}" == true ]]; then
     printf '%s\n' "${RESULT_DIR}"
@@ -368,7 +395,7 @@ if [[ "${PRINT_RESULT_DIR}" == true ]]; then
 fi
 # nsys report name, e.g. qwen35_27b-fsdp_3-mxfp8-experts_0-cg_off-tp_2-cp_1-ep_1-mbs_1-gbs_8-seq_4k.
 if (( SEQ_LENGTH % 1024 == 0 )); then SEQ_TAG="$((SEQ_LENGTH / 1024))k"; else SEQ_TAG="${SEQ_LENGTH}"; fi
-NSYS_NAME="${MODEL_TAG}-${DP_TAG}${OVERLAP_TAG}${DTYPE_TAG}${ATTN_TAG}-experts_${EXPERTS_TAG}-cg_${CG_TAG}${TP_TAG}-cp_${CONTEXT_PARALLEL}-ep_${EXPERT_PARALLEL}-mbs_${MICRO_BATCH_SIZE}-gbs_${GLOBAL_BATCH_SIZE}-seq_${SEQ_TAG}"
+NSYS_NAME="${MODEL_TAG}-${DP_TAG}${OVERLAP_TAG}${DTYPE_TAG}${ATTN_TAG}-experts_${EXPERTS_TAG}-cg_${CG_TAG}${TP_TAG}-cp_${CONTEXT_PARALLEL}-ep_${EXPERT_PARALLEL}-mbs_${MICRO_BATCH_SIZE}-gbs_${GLOBAL_BATCH_SIZE}-seq_${SEQ_TAG}${OFFLOAD_TAG}"
 NUM_MICROBATCHES=$((GLOBAL_BATCH_SIZE / (MICRO_BATCH_SIZE * DATA_PARALLEL)))
 
 # torchrun creates LOCAL_RANK before this worker wrapper is invoked. Prefer a
@@ -518,6 +545,12 @@ fi
 if (( ${#EXTRA_OVERRIDES[@]} > 0 )); then
     OVERRIDES+=("${EXTRA_OVERRIDES[@]}")
 fi
+if [[ -n "${OFFLOAD}" ]]; then
+    OVERRIDES+=("ddp.fsdp_cpu_offload=[${OFFLOAD}]" "optimizer.optimizer_cpu_offload=false")
+    if [[ "${requested_offload}" == *,optimizer,* ]]; then
+        OVERRIDES+=("optimizer.use_precision_aware_optimizer=false" "optimizer.optimizer_cuda_graph=false")
+    fi
+fi
 [[ "${TP_COMM_OVERLAP}" == true ]] && OVERRIDES+=("comm_overlap.tp_comm_overlap=true")
 
 TRAIN_ARGS=("${REPO_ROOT}/scripts/training/run_recipe.py" --recipe "${RECIPE}" --mode pretrain --dataset mock --step-func llm_step "${OVERRIDES[@]}")
@@ -554,7 +587,7 @@ INFO=(
     "mtp=${MTP_TAG}" "experts=${EXPERTS_TAG}" "force_balance=${FORCE_BALANCE}" "cuda_graph=${CUDA_GRAPH}" "cuda_graph_trace=${GRAPH_TRACE}" "seq=${SEQ_LENGTH}"
     "tp=${TENSOR_PARALLEL}" "sp=${SEQUENCE_PARALLEL}" "cp=${CONTEXT_PARALLEL}" "dp=${DATA_PARALLEL}" "ep=${EXPERT_PARALLEL}"
     "dispatcher=${DISPATCHER}" "mbs=${MICRO_BATCH_SIZE}" "gbs=${GLOBAL_BATCH_SIZE}" "gpus=${GPU_COUNT}"
-    "num_microbatches=${NUM_MICROBATCHES}" "numa=${NUMA_MODE}"
+    "num_microbatches=${NUM_MICROBATCHES}" "numa=${NUMA_MODE}" "offload=${OFFLOAD:-none}"
 )
 if [[ "${DRY_RUN}" == true ]]; then
     printf '%s\n' "${INFO[*]}" >&2
@@ -577,7 +610,7 @@ printf 'command:' >"${RESULT_DIR}/command.txt"
 printf ' %q' "${COMMAND[@]}" >>"${RESULT_DIR}/command.txt"
 printf '\n' >>"${RESULT_DIR}/command.txt"
 cat >"${RESULT_DIR}/launch.json" <<JSON
-{"model":"${MODEL_ID}","recipe":"${RECIPE}","run_name":"${RUN_NAME}","dtype":"${DTYPE}","fsdp":${FSDP_JSON},"data_parallel":"${DP_TAG}","create_all_gather_group":${OVERLAP},"nccl_ub":${SYMMETRIC},"num_layers":"${LAYERS_TAG}","attention":"${ATTENTION}","linear_attention_freq":"${LINEAR_ATTENTION_FREQ}","mtp_num_layers":${MTP_TAG},"num_moe_experts":"${EXPERTS_TAG}","force_balance":${FORCE_BALANCE},"cuda_graph":"${CUDA_GRAPH}","cuda_graph_impl":"${GRAPH_IMPL}","cuda_graph_modules":"${GRAPH_MODULES}","cuda_graph_trace":"${GRAPH_TRACE}","seq_length":${SEQ_LENGTH},"tensor_model_parallel_size":${TENSOR_PARALLEL},"sequence_parallel":${SEQUENCE_PARALLEL},"context_parallel_size":${CONTEXT_PARALLEL},"data_parallel_size":${DATA_PARALLEL},"expert_model_parallel_size":${EXPERT_PARALLEL},"dispatcher":"${DISPATCHER}","micro_batch_size":${MICRO_BATCH_SIZE},"global_batch_size":${GLOBAL_BATCH_SIZE},"num_microbatches":${NUM_MICROBATCHES},"gpu_count":${GPU_COUNT},"nnodes":${NNODES},"node_rank":${NODE_RANK},"numa_mode":"${NUMA_MODE}","pytorch_cuda_alloc_conf":"${PYTORCH_CUDA_ALLOC_CONF:-}","nccl_graph_register":"${NCCL_GRAPH_REGISTER:-}","nccl_nvls_enable":"${NCCL_NVLS_ENABLE:-}","nvte_cutedsl_fused_grouped_mlp":"${NVTE_CUTEDSL_FUSED_GROUPED_MLP:-}","run_date":"${RUN_DATE}"}
+{"model":"${MODEL_ID}","recipe":"${RECIPE}","run_name":"${RUN_NAME}","dtype":"${DTYPE}","fsdp":${FSDP_JSON},"fsdp_cpu_offload":${OFFLOAD_JSON},"data_parallel":"${DP_TAG}","create_all_gather_group":${OVERLAP},"nccl_ub":${SYMMETRIC},"num_layers":"${LAYERS_TAG}","attention":"${ATTENTION}","linear_attention_freq":"${LINEAR_ATTENTION_FREQ}","mtp_num_layers":${MTP_TAG},"num_moe_experts":"${EXPERTS_TAG}","force_balance":${FORCE_BALANCE},"cuda_graph":"${CUDA_GRAPH}","cuda_graph_impl":"${GRAPH_IMPL}","cuda_graph_modules":"${GRAPH_MODULES}","cuda_graph_trace":"${GRAPH_TRACE}","seq_length":${SEQ_LENGTH},"tensor_model_parallel_size":${TENSOR_PARALLEL},"sequence_parallel":${SEQUENCE_PARALLEL},"context_parallel_size":${CONTEXT_PARALLEL},"data_parallel_size":${DATA_PARALLEL},"expert_model_parallel_size":${EXPERT_PARALLEL},"dispatcher":"${DISPATCHER}","micro_batch_size":${MICRO_BATCH_SIZE},"global_batch_size":${GLOBAL_BATCH_SIZE},"num_microbatches":${NUM_MICROBATCHES},"gpu_count":${GPU_COUNT},"nnodes":${NNODES},"node_rank":${NODE_RANK},"numa_mode":"${NUMA_MODE}","pytorch_cuda_alloc_conf":"${PYTORCH_CUDA_ALLOC_CONF:-}","nccl_graph_register":"${NCCL_GRAPH_REGISTER:-}","nccl_nvls_enable":"${NCCL_NVLS_ENABLE:-}","nvte_cutedsl_fused_grouped_mlp":"${NVTE_CUTEDSL_FUSED_GROUPED_MLP:-}","run_date":"${RUN_DATE}"}
 JSON
 printf '%s\n' "${INFO[*]}" | tee "${RESULT_DIR}/run_info.txt"
 set +e
