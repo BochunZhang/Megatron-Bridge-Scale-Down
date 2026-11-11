@@ -122,7 +122,8 @@ Options:
                                  not meaningful. Names get "-fb"
   --dtype|--precision bf16|mxfp8 Compute mode (default: bf16)
   --mxfp8                        Same as --dtype mxfp8
-  --offload MODULE[,MODULE...]   CPU offload for optimizer, weight, and/or gradient
+  --offload MODULE[,MODULE...]   CPU offload for optimizer, weight, and/or gradient.
+                                 CUDA graph testing is limited to dense FSDP3.
   --gpu|--gpus N                 Global GPU count (default: 4)
   --nproc-per-node N             GPUs per node (default: 4)
   --nnodes N                     Number of nodes (default: gpu / nproc-per-node)
@@ -246,8 +247,12 @@ if [[ -n "${OFFLOAD}" ]]; then
         echo "--offload expects a comma-separated list of optimizer, weight, and gradient" >&2
         exit 2
     }
-    [[ "${FSDP_LEVEL}" != ddp && "${CUDA_GRAPH}" == off && "${SYMMETRIC}" == false ]] || {
-        echo "--offload requires Megatron-FSDP, --cuda-graph off, and no --symmetric" >&2
+    [[ "${FSDP_LEVEL}" != ddp && "${SYMMETRIC}" == false ]] || {
+        echo "--offload requires Megatron-FSDP and no --symmetric" >&2
+        exit 2
+    }
+    [[ "${CUDA_GRAPH}" == off || ( "${MODEL}" == 27b && "${FSDP_LEVEL}" == 3 ) ]] || {
+        echo "--offload with --cuda-graph on requires dense FSDP3 (use --model 27b --fsdp 3)" >&2
         exit 2
     }
     requested_offload=",${OFFLOAD},"

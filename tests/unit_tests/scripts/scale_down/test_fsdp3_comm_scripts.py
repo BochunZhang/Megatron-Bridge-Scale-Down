@@ -130,13 +130,36 @@ def test_fsdp1_gradient_offload_enables_gradient_overlap(tmp_path: Path):
     assert "comm_overlap.overlap_grad_reduce=true" in args
 
 
+def test_dense_fsdp3_offload_allows_full_iteration_graph(tmp_path: Path):
+    (command,) = _sweep(
+        tmp_path,
+        "--model",
+        "27b",
+        "--fsdp",
+        "3",
+        "--seq",
+        "256",
+        "--offload",
+        "weight,gradient,optimizer",
+        "--cuda-graph",
+        "on",
+    )
+    args = shlex.split(command)
+    assert "ddp.fsdp_cpu_offload=[optimizer,weight,gradient]" in args
+    assert "model.cuda_graph_impl=full_iteration" in args
+    assert "ddp.megatron_fsdp_cuda_graph_mode=true" in args
+    assert "ddp.fsdp_all_gather_in_start_param_sync=false" in args
+    assert "optimizer.optimizer_cuda_graph=false" in args
+
+
 def test_offload_rejects_invalid_launches_before_the_sweep(tmp_path: Path):
     common = ("--model", "27b", "--seq", "256", "--dry-run", "--output-dir", str(tmp_path))
     for options in (
         ("--offload", "weights"),
         ("--offload", "weight,"),
         ("--offload", "weight", "--fsdp", "3,ddp"),
-        ("--offload", "weight", "--cuda-graph", "off,on"),
+        ("--offload", "weight", "--fsdp", "3,1", "--cuda-graph", "off,on"),
+        ("--offload", "weight", "--model", "397b", "--fsdp", "3", "--cuda-graph", "on"),
         ("--offload", "weight", "--symmetric"),
     ):
         result = _run(BENCHMARK, *common, *options)

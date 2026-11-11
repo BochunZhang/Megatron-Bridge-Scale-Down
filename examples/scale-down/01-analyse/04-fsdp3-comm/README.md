@@ -110,7 +110,7 @@ bash $S --model 2.4t --experts 64 --seq 1024 --fsdp 3 --overlap --symmetric
 
 结果目录名中，非默认设置会追加标记，默认设置不加任何标记，因此以前的结果名仍可用 `--resume` 续跑：MXFP8 为 `-mxfp8`，强制均衡为 `-fb`，`--full` / `--linear` 为层数后的 `-attn_full` / `-attn_linear`，TP>1 为 CP 前的 `-tp_<N>`。例如 `model_27b-fsdp_3-mxfp8-layers_8-attn_full-mtp_0-experts_0-cg_off-mbs_1-seq_4096-tp_2-cp_1-...`。
 
-两个启动器都接受 `--offload`。它将所选模块传给 `ddp.fsdp_cpu_offload`，并将模块列表写入 `launch.json`。同一组模块采用固定顺序命名，例如 `...-offload_optimizer_weight_gradient/node0`。省略此选项可跑 baseline。运行环境需包含支持该字段的 Megatron-LM（`9b2c5ba3d` 或更新版本）。Offload 要求 Megatron-FSDP、`--cuda-graph off`，并关闭 NCCL symmetric buffer。FSDP1 选择 `gradient` 时，启动器会开启梯度规约重叠。
+两个启动器都接受 `--offload`。它将所选模块传给 `ddp.fsdp_cpu_offload`，并将模块列表写入 `launch.json`。同一组模块采用固定顺序命名，例如 `...-offload_optimizer_weight_gradient/node0`。省略此选项可跑 baseline。运行环境需包含支持该字段的 Megatron-LM（`9b2c5ba3d` 或更新版本）。Offload 要求 Megatron-FSDP 并关闭 NCCL symmetric buffer。FSDP1 选择 `gradient` 时，启动器会开启梯度规约重叠。Dense `--model 27b --fsdp 3` 可以用 `--cuda-graph on` 实验 `full_iteration`，运行环境需使用支持该组合的 Megatron-LM 源码。
 
 ### DDP：逐层 backward 时间（27b / 397b / 2.4t）
 
