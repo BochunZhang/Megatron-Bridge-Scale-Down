@@ -32,6 +32,7 @@ ATTENTION=hybrid
 MTP_NUM_LAYERS=""
 DISPATCHER="${DISPATCHER:-hybridep}"
 CUDA_GRAPH="${CUDA_GRAPH:-off}"
+LOCAL_ATTENTION_GRAPH=false
 MERGE_GRAPHS=false
 FORCE_BALANCE=false
 FSDP_LEVEL="${FSDP_LEVEL:-3}"
@@ -52,6 +53,7 @@ MASTER_ADDR="${MASTER_ADDR:-${DLC_MASTER_ADDR:-}}"
 MASTER_PORT="${MASTER_PORT:-29501}"
 RUN_DATE="${RUN_DATE:-$(date +%y%m%d-%H%M%S)}"
 RUN_NAME=""
+STABLE_RESULT_DIR=false
 DRY_RUN=false
 PRINT_RESULT_DIR=false
 RESUME=false
@@ -136,6 +138,8 @@ Options:
   --master-port N                Multi-node rendezvous port (default: 29501)
   --cpu-grad-accumulation        Stage reduced shards in pinned MaxPool double buffers and accumulate on CPU
   --cpu-optimizer                Run AdamW on CPU; implies optimizer and gradient offload
+  --local-attention-graph        Use native attention-only graphs with --cuda-graph on,
+                                 BF16 FSDP3 and TP=CP=1 (including on dense models)
   --nvme-path DIR                Use the native NVMe AIO extension for weights, gradients and AdamW state;
                                  implies --cpu-optimizer. DIR is local to each node.
   MEGATRON_LM_DIR                Optional environment variable pointing to the MCore checkout
@@ -151,6 +155,8 @@ Options:
   --profile-end N                Stop iteration, exclusive (default: 8, i.e. one step)
   --run-date YYMMDD-HHMMSS       Shared matrix timestamp
   --run-name NAME                Optional human-readable case name
+  --stable-result-dir            Use --run-name as the case suffix instead of the timestamp;
+                                 require a nonempty node 0 report for successful nsys runs
   --results-root PATH            Result root
   --override KEY=VALUE           Additional run_recipe.py override (repeatable)
   --resume                       Skip a completed case; archive a failed or
@@ -196,6 +202,7 @@ while [[ $# -gt 0 ]]; do
         --cpu-optimizer) CPU_OPTIMIZER=true; shift;;
         --nvme-path) need_value "$@"; NVME_PATH="$2"; [[ -n "${NVME_PATH}" ]] || { echo "--nvme-path requires a directory" >&2; exit 2; }; shift 2;;
         --offload) need_value "$@"; OFFLOAD="$2"; [[ -n "${OFFLOAD}" ]] || { echo "--offload requires a module list" >&2; exit 2; }; shift 2;;
+        --local-attention-graph) LOCAL_ATTENTION_GRAPH=true; shift;;
         --gpu|--gpus) need_value "$@"; GPU_COUNT="$2"; shift 2;;
         --nproc-per-node) need_value "$@"; GPUS_PER_NODE="$2"; shift 2;;
         --nnodes) need_value "$@"; NNODES="$2"; shift 2;;
@@ -224,6 +231,7 @@ while [[ $# -gt 0 ]]; do
         --run-date) need_value "$@"; RUN_DATE="$2"; shift 2;;
         --run-name) need_value "$@"; RUN_NAME="$2"; shift 2;;
         --results-root) need_value "$@"; RESULTS_ROOT="$2"; shift 2;;
+        --stable-result-dir) STABLE_RESULT_DIR=true; shift;;
         --override) need_value "$@"; EXTRA_OVERRIDES+=("$2"); shift 2;;
         --resume) RESUME=true; shift;;
         --dry-run) DRY_RUN=true; shift;;
@@ -281,9 +289,6 @@ if [[ "${CPU_OPTIMIZER}" == true ]]; then
     OFFLOAD="${OFFLOAD:+${OFFLOAD},}optimizer"
 fi
 if [[ "${CPU_GRAD_ACCUMULATION}" == true ]]; then
-    [[ ( "${FSDP_LEVEL}" == 2 || "${FSDP_LEVEL}" == 3 ) && "${CUDA_GRAPH}" == off ]] || {
-        echo "--cpu-grad-accumulation requires eager FSDP2/3" >&2; exit 2
-    }
     OFFLOAD="${OFFLOAD:+${OFFLOAD},}gradient"
 fi
 OFFLOAD_TAG=""
@@ -383,6 +388,9 @@ fi
 
 GRAPH_IMPL=none
 GRAPH_MODULES="[]"
+if [[ "${LOCAL_ATTENTION_GRAPH}" == true && ( "${CUDA_GRAPH}" != on || "${FSDP_LEVEL}" != 3 ) ]]; then
+    echo "--local-attention-graph requires --cuda-graph on and --fsdp 3" >&2; exit 2
+fi
 if [[ "${CUDA_GRAPH}" == on ]]; then
     if [[ "${FSDP_LEVEL}" == ddp ]]; then
         GRAPH_IMPL=transformer_engine
@@ -394,17 +402,23 @@ if [[ "${CUDA_GRAPH}" == on ]]; then
         else
             GRAPH_MODULES="[attn,moe_router,moe_preprocess]"
         fi
-    elif [[ "${MODEL}" == 27b ]]; then
+    elif [[ "${MODEL}" == 27b && "${LOCAL_ATTENTION_GRAPH}" == false ]]; then
         GRAPH_IMPL=full_iteration
     else
-        [[ "${FSDP_LEVEL}" == 3 ]] || { echo "MoE partial CUDA graphs require --fsdp 3" >&2; exit 2; }
-        [[ "${DTYPE}" == bf16 ]] || { echo "MoE partial CUDA graphs require --dtype bf16" >&2; exit 2; }
+        [[ "${FSDP_LEVEL}" == 3 ]] || { echo "FSDP attention CUDA graphs require --fsdp 3" >&2; exit 2; }
+        [[ "${DTYPE}" == bf16 ]] || { echo "FSDP attention CUDA graphs require --dtype bf16" >&2; exit 2; }
         (( TENSOR_PARALLEL == 1 && CONTEXT_PARALLEL == 1 )) || {
-            echo "MoE partial CUDA graphs require --tp 1 and --cp 1" >&2; exit 2;
+            echo "FSDP attention CUDA graphs require --tp 1 and --cp 1" >&2; exit 2;
         }
-        [[ "${SYMMETRIC}" == false ]] || { echo "MoE partial CUDA graphs require --symmetric to be off" >&2; exit 2; }
+        [[ "${SYMMETRIC}" == false ]] || { echo "FSDP attention CUDA graphs require --symmetric to be off" >&2; exit 2; }
         GRAPH_IMPL=local
         GRAPH_MODULES="[attn]"
+    fi
+fi
+if [[ "${CPU_GRAD_ACCUMULATION}" == true ]]; then
+    if [[ ( "${FSDP_LEVEL}" != 2 && "${FSDP_LEVEL}" != 3 ) || ( "${GRAPH_IMPL}" != none && "${GRAPH_IMPL}" != local ) ]]; then
+        echo "--cpu-grad-accumulation requires eager FSDP2/3 or FSDP3 with local attention CUDA graphs" >&2
+        exit 2
     fi
 fi
 # linear_attention_freq: N puts one gated attention layer after every N-1 GatedDeltaNet
@@ -442,7 +456,12 @@ CG_TAG="${CUDA_GRAPH}"
 [[ "${GRAPH_IMPL}" == local ]] && CG_TAG+="-partial"
 [[ "${GRAPH_TRACE}" == graph ]] && CG_TAG+="-merge"
 METRIC_TAG="${METRIC_FREQUENCY:+-metric_${METRIC_FREQUENCY}}"
-CASE_NAME="model_${MODEL}-${DP_TAG}${OVERLAP_TAG}${DTYPE_TAG}-layers_${LAYERS_TAG}${ATTN_TAG}-mtp_${MTP_TAG}-experts_${EXPERTS_TAG}-cg_${CG_TAG}-mbs_${MICRO_BATCH_SIZE}-seq_${SEQ_LENGTH}${TP_TAG}-cp_${CONTEXT_PARALLEL}-ep_${EXPERT_PARALLEL}-disp_${DISPATCHER}-gbs_${GLOBAL_BATCH_SIZE}-gpus_${GPU_COUNT}-profile_${PROFILE}-date_${RUN_DATE}${OFFLOAD_TAG}${METRIC_TAG}"
+CASE_TAG="-date_${RUN_DATE}"
+if [[ "${STABLE_RESULT_DIR}" == true ]]; then
+    [[ "${RUN_NAME}" =~ ^[a-zA-Z0-9_-]+$ ]] || { echo "--stable-result-dir requires a filesystem-safe --run-name" >&2; exit 2; }
+    CASE_TAG="-${RUN_NAME}"
+fi
+CASE_NAME="model_${MODEL}-${DP_TAG}${OVERLAP_TAG}${DTYPE_TAG}-layers_${LAYERS_TAG}${ATTN_TAG}-mtp_${MTP_TAG}-experts_${EXPERTS_TAG}-cg_${CG_TAG}-mbs_${MICRO_BATCH_SIZE}-seq_${SEQ_LENGTH}${TP_TAG}-cp_${CONTEXT_PARALLEL}-ep_${EXPERT_PARALLEL}-disp_${DISPATCHER}-gbs_${GLOBAL_BATCH_SIZE}-gpus_${GPU_COUNT}-profile_${PROFILE}${CASE_TAG}${OFFLOAD_TAG}${METRIC_TAG}"
 RESULT_DIR="${RESULTS_ROOT}/${CASE_NAME}/node${NODE_RANK}"
 if [[ "${PRINT_RESULT_DIR}" == true ]]; then
     printf '%s\n' "${RESULT_DIR}"
@@ -451,6 +470,10 @@ fi
 # nsys report name, e.g. qwen35_27b-fsdp_3-mxfp8-experts_0-cg_off-tp_2-cp_1-ep_1-mbs_1-gbs_8-seq_4k.
 if (( SEQ_LENGTH % 1024 == 0 )); then SEQ_TAG="$((SEQ_LENGTH / 1024))k"; else SEQ_TAG="${SEQ_LENGTH}"; fi
 NSYS_NAME="${MODEL_TAG}-${DP_TAG}${OVERLAP_TAG}${DTYPE_TAG}${ATTN_TAG}-experts_${EXPERTS_TAG}-cg_${CG_TAG}${TP_TAG}-cp_${CONTEXT_PARALLEL}-ep_${EXPERT_PARALLEL}-mbs_${MICRO_BATCH_SIZE}-gbs_${GLOBAL_BATCH_SIZE}-seq_${SEQ_TAG}${OFFLOAD_TAG}${METRIC_TAG}"
+has_required_profile() {
+    [[ "${STABLE_RESULT_DIR}" == false || "${PROFILE}" != nsys || "${NODE_RANK}" != 0 ||
+        -s "${RESULT_DIR}/${NSYS_NAME}.nsys-rep" ]]
+}
 NUM_MICROBATCHES=$((GLOBAL_BATCH_SIZE / (MICRO_BATCH_SIZE * DATA_PARALLEL)))
 
 # torchrun creates LOCAL_RANK before this worker wrapper is invoked. Prefer a
@@ -560,6 +583,7 @@ case "${GRAPH_IMPL}" in
             OVERRIDES+=(
                 "model.gradient_accumulation_fusion=false"
                 "ddp.fsdp_double_buffer=true" "ddp.megatron_fsdp_max_pool_double_buffer=true"
+                "ddp.megatron_fsdp_cuda_graph_mode=false"
                 "ddp.fsdp_all_gather_in_start_param_sync=true"
             )
         fi
@@ -674,13 +698,13 @@ if [[ "${DRY_RUN}" == true ]]; then
     printf ' %q' "${COMMAND[@]}" >&2; printf '\n' >&2
     exit 0
 fi
-if [[ -e "${RESULT_DIR}/launch.json" ]]; then
+if [[ -e "${RESULT_DIR}/launch.json" || ( "${STABLE_RESULT_DIR}" == true && -d "${RESULT_DIR}" ) ]]; then
     [[ "${RESUME}" == true ]] || { echo "result already exists: ${RESULT_DIR} (use --resume)" >&2; exit 2; }
-    if grep -qx 'status=0' "${RESULT_DIR}/run_info.txt" 2>/dev/null; then
+    if grep -qx 'status=0' "${RESULT_DIR}/run_info.txt" 2>/dev/null && has_required_profile; then
         echo "skip completed case: ${RESULT_DIR}" >&2
         exit 0
     fi
-    ARCHIVE_DIR="${RESULT_DIR}.attempt-$(date +%y%m%d-%H%M%S)"
+    ARCHIVE_DIR="${RESULT_DIR}.attempt-$(date +%y%m%d-%H%M%S)-$$"
     mv "${RESULT_DIR}" "${ARCHIVE_DIR}"
     echo "archived incomplete or failed attempt: ${ARCHIVE_DIR}" >&2
 fi
@@ -694,7 +718,13 @@ JSON
 printf '%s\n' "${INFO[*]}" | tee "${RESULT_DIR}/run_info.txt"
 set +e
 "${COMMAND[@]}" 2>&1 | tee "${RESULT_DIR}/train.log"
-STATUS=${PIPESTATUS[0]}
+PIPE_STATUSES=("${PIPESTATUS[@]}")
 set -e
+STATUS=${PIPE_STATUSES[0]}
+if (( STATUS == 0 )); then STATUS=${PIPE_STATUSES[1]}; fi
+if (( STATUS == 0 )) && ! has_required_profile; then
+    echo "missing or empty nsys report: ${RESULT_DIR}/${NSYS_NAME}.nsys-rep" >&2
+    STATUS=1
+fi
 printf 'status=%s\n' "${STATUS}" >>"${RESULT_DIR}/run_info.txt"
 exit "${STATUS}"

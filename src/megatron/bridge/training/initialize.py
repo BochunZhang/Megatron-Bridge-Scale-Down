@@ -840,9 +840,17 @@ def _initialize_distributed(
         if dist_config.create_all_gather_group:
             # Megatron-FSDP all-gathers parameters on these groups so they do not queue
             # behind gradient reduce-scatters on the dp_cp / expt_dp communicators.
+            # Use the same stream priority for a split all-gather group as for its
+            # original group, which still handles reduce-scatter.
+            ag_comm_cfgs = {
+                name: {"is_high_priority_stream": True}
+                for name in (dist_config.high_priority_stream_groups or [])
+                if name in ("dp_cp", "ep_dp")
+            }
             dp_cp_ag, expt_dp_ag = parallel_state.create_all_gather_groups(
                 for_expert_parallelism=model_config.expert_model_parallel_size > 1,
                 timeout=datetime.timedelta(minutes=dist_config.distributed_timeout_minutes),
+                **({"nccl_comm_cfgs": ag_comm_cfgs} if ag_comm_cfgs else {}),
             )
             pg_collection.dp_cp_ag = dp_cp_ag
             pg_collection.expt_dp_ag = expt_dp_ag
