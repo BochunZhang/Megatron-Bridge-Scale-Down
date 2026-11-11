@@ -110,7 +110,7 @@ bash $S --model 2.4t --experts 64 --seq 1024 --fsdp 3 --overlap --symmetric
 
 结果目录名中，非默认设置会追加标记，默认设置不加任何标记，因此以前的结果名仍可用 `--resume` 续跑：MXFP8 为 `-mxfp8`，强制均衡为 `-fb`，`--full` / `--linear` 为层数后的 `-attn_full` / `-attn_linear`，TP>1 为 CP 前的 `-tp_<N>`。例如 `model_27b-fsdp_3-mxfp8-layers_8-attn_full-mtp_0-experts_0-cg_off-mbs_1-seq_4096-tp_2-cp_1-...`。
 
-两个启动器都接受 `--offload`。它将所选模块传给 `ddp.fsdp_cpu_offload`，并将模块列表写入 `launch.json`。同一组模块采用固定顺序命名，例如 `...-offload_optimizer_weight_gradient/node0`。省略此选项可跑 baseline。运行环境需包含支持该字段的 Megatron-LM（`9b2c5ba3d` 或更新版本）。Offload 要求 Megatron-FSDP 并关闭 NCCL symmetric buffer。FSDP1 选择 `gradient` 时，启动器会开启梯度规约重叠。Dense `--model 27b --fsdp 3` 可以用 `--cuda-graph on` 实验 `full_iteration`，运行环境需使用支持该组合的 Megatron-LM 源码。
+两个启动器都接受 `--offload`。它将所选模块传给 `ddp.fsdp_cpu_offload`，并将模块列表写入 `launch.json`。同一组模块采用固定顺序命名，例如 `...-offload_optimizer_weight_gradient/node0`。省略此选项可跑 baseline。运行环境需包含支持该字段的 Megatron-LM（`9b2c5ba3d` 或更新版本）。Offload 要求 Megatron-FSDP 并关闭 NCCL symmetric buffer。FSDP1 选择 `gradient` 时，启动器会开启梯度规约重叠。与 `--cuda-graph on` 同用时，需要 `--fsdp 3` 和支持该组合的 Megatron-LM 源码。
 
 ### DDP：逐层 backward 时间（27b / 397b / 2.4t）
 
@@ -185,7 +185,7 @@ bash examples/scale-down/01-analyse/04-fsdp3-comm/benchmark_fsdp3.sh --model 397
 
 使用 BF16、TP=CP=PP=1，关闭 `--symmetric`。启动器启用 max-pool double buffering，关闭 fused gradient accumulation，并保留 FSDP 预取与 NaN 检查。前 3 轮走 eager，第 4 轮开始 replay。结果名包含 `cg_on-partial`。
 
-预取图在原有 all-gather stream 上写入 max-pool 槽位，attention 图通过 FSDP 的完成事件等待后直接读取该槽位。梯度 reduce-scatter 和 dropless MoE 留在图外。省略 `--fsdp` 时，sweep 对 MoE 的 graph-on case 只跑 FSDP3，对 graph-off case 仍跑默认的 FSDP3、FSDP1。
+预取图在原有 all-gather stream 上写入 max-pool 槽位，attention 图通过 FSDP 的完成事件等待后直接读取该槽位。梯度 reduce-scatter 和 dropless MoE 留在图外。FSDP3 可以同时使用 `--offload`。选择 `weight` 时，参数 H2D 和 all-gather 走 eager，仍写入 attention 图使用的固定槽位。只选择 `gradient` 或 `optimizer` 时，参数预取图仍然启用。省略 `--fsdp` 时，sweep 对 MoE 的 graph-on case 只跑 FSDP3，对 graph-off case 仍跑默认的 FSDP3、FSDP1。
 
 运行环境必须能导入带原生 FSDP attention graph 支持的 Megatron-LM checkout。若当前环境指向其他版本，可在启动前将带改动的 checkout 放在 `PYTHONPATH` 首位。
 

@@ -159,7 +159,7 @@ def test_offload_rejects_invalid_launches_before_the_sweep(tmp_path: Path):
         ("--offload", "weight,"),
         ("--offload", "weight", "--fsdp", "3,ddp"),
         ("--offload", "weight", "--fsdp", "3,1", "--cuda-graph", "off,on"),
-        ("--offload", "weight", "--model", "397b", "--fsdp", "3", "--cuda-graph", "on"),
+        ("--offload", "weight", "--model", "397b", "--fsdp", "2", "--cuda-graph", "on"),
         ("--offload", "weight", "--symmetric"),
     ):
         result = _run(BENCHMARK, *common, *options)
@@ -331,6 +331,21 @@ def test_default_moe_sweep_keeps_fsdp1_for_graph_off_only(tmp_path: Path):
     assert len(commands) == 3
     assert sum("model_397b-fsdp_1-" in command and "-cg_off-" in command for command in commands) == 1
     assert sum("-cg_on-partial-" in command for command in commands) == 1
+
+
+def test_moe_fsdp3_offload_allows_attention_graph(tmp_path: Path):
+    (command,) = _sweep(
+        tmp_path,
+        "--model", "397b", "--fsdp", "3", "--seq", "1024", "--experts", "64",
+        "--offload", "weight,gradient,optimizer", "--cuda-graph", "on",
+    )
+    args = shlex.split(command)
+    assert "ddp.fsdp_cpu_offload=[optimizer,weight,gradient]" in args
+    assert "model.cuda_graph_impl=local" in args
+    assert "model.cuda_graph_modules=[attn]" in args
+    assert "ddp.fsdp_all_gather_in_start_param_sync=true" in args
+    assert "ddp.megatron_fsdp_cuda_graph_mode=true" not in args
+    assert "optimizer.optimizer_cuda_graph=false" in args
 
 
 def test_run_one_cuda_graph_disables_nccl_graph_register_with_expandable_segments(tmp_path: Path):

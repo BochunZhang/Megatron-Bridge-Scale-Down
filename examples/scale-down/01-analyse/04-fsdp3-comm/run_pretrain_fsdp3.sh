@@ -123,7 +123,7 @@ Options:
   --dtype|--precision bf16|mxfp8 Compute mode (default: bf16)
   --mxfp8                        Same as --dtype mxfp8
   --offload MODULE[,MODULE...]   CPU offload for optimizer, weight, and/or gradient.
-                                 CUDA graph testing is limited to dense FSDP3.
+                                 CUDA graph testing requires FSDP3.
   --gpu|--gpus N                 Global GPU count (default: 4)
   --nproc-per-node N             GPUs per node (default: 4)
   --nnodes N                     Number of nodes (default: gpu / nproc-per-node)
@@ -251,8 +251,8 @@ if [[ -n "${OFFLOAD}" ]]; then
         echo "--offload requires Megatron-FSDP and no --symmetric" >&2
         exit 2
     }
-    [[ "${CUDA_GRAPH}" == off || ( "${MODEL}" == 27b && "${FSDP_LEVEL}" == 3 ) ]] || {
-        echo "--offload with --cuda-graph on requires dense FSDP3 (use --model 27b --fsdp 3)" >&2
+    [[ "${CUDA_GRAPH}" == off || "${FSDP_LEVEL}" == 3 ]] || {
+        echo "--offload with --cuda-graph on requires --fsdp 3" >&2
         exit 2
     }
     requested_offload=",${OFFLOAD},"
@@ -505,8 +505,8 @@ case "${GRAPH_IMPL}" in
             "model.cuda_graph_warmup_steps=3" "model.use_te_rng_tracker=true" "rng.te_rng_tracker=true"
         )
         if [[ "${GRAPH_IMPL}" == local ]]; then
-            # FSDP replays prefetch into fixed max-pool slots and attention consumes
-            # those weights. Dropless router, dispatch and experts stay eager.
+            # FSDP prefetches into fixed max-pool slots and attention consumes those
+            # weights. Weight offload, router, dispatch and experts stay eager.
             OVERRIDES+=(
                 "model.gradient_accumulation_fusion=false"
                 "ddp.fsdp_double_buffer=true" "ddp.megatron_fsdp_max_pool_double_buffer=true"
