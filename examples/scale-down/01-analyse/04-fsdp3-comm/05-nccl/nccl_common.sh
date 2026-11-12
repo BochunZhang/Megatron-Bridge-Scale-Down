@@ -5,20 +5,27 @@
 # shellcheck source=../offload_study_common.sh
 source "$(dirname "${BASH_SOURCE[0]}")/../offload_study_common.sh" "$@"
 
-if [[ "${DRY_RUN}" == true ]]; then
-    NCCL_LIB="${NCCL_LIB:-/path/to/nccl-2.32.3-pause/build/lib/libnccl.so.2}"
-fi
-NCCL_PRELOAD=""
+NCCL_LIB="${NCCL_LIB:-${REPO_ROOT}/nccl/nccl-2.32.3-cta-with-pause/build/lib/libnccl.so.2}"
+[[ "${NCCL_LIB}" == /* ]] || NCCL_LIB="${PWD}/${NCCL_LIB}"
+NCCL_PRELOAD="${NCCL_LIB}"
+NCCL_CHECKED=false
+
+# Replace any NCCL selected by nccl_use and preserve other preloaded libraries.
+IFS=': ' read -r -a inherited_preloads <<< "${LD_PRELOAD:-}"
+for lib in ${inherited_preloads[@]+"${inherited_preloads[@]}"}; do
+    case "${lib##*/}" in
+        ''|libnccl.so|libnccl.so.*) ;;
+        *) NCCL_PRELOAD+=":${lib}" ;;
+    esac
+done
 
 prepare_case() {
-    if [[ -z "${NCCL_PRELOAD}" ]]; then
-        [[ -f "${NCCL_LIB}" && -r "${NCCL_LIB}" ]] || fail "Supply --nccl-lib FILE for the NCCL 2.32.3-pause build"
-        NCCL_LIB="$(cd "$(dirname "${NCCL_LIB}")" && pwd -P)/$(basename "${NCCL_LIB}")"
-        grep -aq 'NCCL version 2.32.3-pause+cuda' "${NCCL_LIB}" ||
-            fail "Expected the NCCL 2.32.3-pause build: ${NCCL_LIB}"
+    if [[ "${NCCL_CHECKED}" == false ]]; then
+        [[ -f "${NCCL_LIB}" && -r "${NCCL_LIB}" ]] || fail "NCCL library is missing or unreadable: ${NCCL_LIB}"
+        grep -aEq 'NCCL version 2\.32\.3-(cta-)?pause\+cuda' "${NCCL_LIB}" ||
+            fail "Expected an NCCL 2.32.3 build with the AG pause patch: ${NCCL_LIB}"
         grep -aq 'SYM_AG_STMC_PAUSE_CYCLES' "${NCCL_LIB}" ||
             fail "The NCCL build does not expose SYM_AG_STMC_PAUSE_CYCLES"
-        NCCL_PRELOAD="${NCCL_LIB}${LD_PRELOAD:+:${LD_PRELOAD}}"
 
         # A bundled NCCL in the PyTorch wheel can be loaded alongside LD_PRELOAD.
         (
@@ -37,6 +44,7 @@ if loaded != [expected]:
     sys.exit(f"Expected only {expected} for torch {torch.__version__}, but found {loaded}")
 PY
         )
+        NCCL_CHECKED=true
     fi
     LAUNCHER=(env "LD_PRELOAD=${NCCL_PRELOAD}" "${LAUNCHER[@]}")
 }
@@ -57,7 +65,7 @@ run_nccl_case() {
         )
     fi
     printf 'NCCL case %s:' "${name}" >&2
-    printf ' %q' "${launcher_env[@]}" "LD_PRELOAD=${NCCL_LIB}${LD_PRELOAD:+:${LD_PRELOAD}}" >&2
+    printf ' %q' "${launcher_env[@]}" "LD_PRELOAD=${NCCL_PRELOAD}" >&2
     printf '\n' >&2
     local LAUNCHER=("${launcher_env[@]}" "${BENCHMARK_DIR}/run_pretrain_fsdp3.sh")
     run_case 27b "${name}" 3 on 1 1 1 --override "dist.high_priority_stream_groups=${groups}" "$@"

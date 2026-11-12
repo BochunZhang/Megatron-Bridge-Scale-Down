@@ -42,7 +42,9 @@ while (( $# )); do
             printf 'Usage: %s [--model 27b|2.4t] [--output-dir DIR] [--dry-run]\n' "$0"
             case "${GROUP}" in
                 04-nvme) echo '  --nvme-path DIR    Directory on local NVMe (default: /tmp/megatron-fsdp3-nvme, or set NVME_PATH)';;
-                05-nccl) echo '  --nccl-lib FILE    NCCL 2.32.3-pause library (or set NCCL_LIB); 27b only';;
+                05-nccl)
+                    echo '  --nccl-lib FILE    Override the NCCL library (or set NCCL_LIB); 27b only'
+                    echo '                     Default: nccl/nccl-2.32.3-cta-with-pause/build/lib/libnccl.so.2';;
             esac
             exit 0;;
         *) fail "Unknown option: $1";;

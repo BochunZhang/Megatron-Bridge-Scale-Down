@@ -407,6 +407,17 @@ def test_baseline_saves_stable_case_paths_under_each_experiment(
 
 
 @pytest.mark.unit
+@pytest.mark.parametrize("script", ["01_priority.sh", "02_symmetric_multicast.sh", "03_ag_pause.sh"])
+def test_nccl_studies_default_to_the_cta_pause_build(script: str):
+    result = _run(EXAMPLE / "05-nccl" / script, "--dry-run", NCCL_LIB="", LD_PRELOAD="")
+    assert result.returncode == 0, result.stderr
+    case_lines = [line for line in result.stderr.splitlines() if line.startswith("NCCL case ")]
+    assert case_lines
+    library = REPO_ROOT / "nccl/nccl-2.32.3-cta-with-pause/build/lib/libnccl.so.2"
+    assert all(f"LD_PRELOAD={library}" in shlex.split(line) for line in case_lines)
+
+
+@pytest.mark.unit
 @pytest.mark.parametrize("script", sorted(EXAMPLE.glob("[0-9][0-9]-*/[0-9][0-9]_*.sh")), ids=lambda p: p.stem)
 def test_numbered_studies_skip_existing_case_directories(tmp_path: Path, script: Path):
     args = ("--model", "27b", "--output-dir", str(tmp_path))
