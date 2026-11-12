@@ -609,6 +609,36 @@ def test_nvme_offload_preserves_the_path_and_enables_nvtx(tmp_path: Path):
     assert "-cpu_adamw-nvme" in command
 
 
+def test_nvme_study_defaults_to_target_scratch_and_accepts_overrides(tmp_path: Path):
+    script = EXAMPLE / "04-nvme/01_dram_vs_nvme.sh"
+    common = ("--model", "27b", "--output-dir", str(tmp_path), "--dry-run")
+    for options, env_path, expected_path in (
+        ((), "", "/tmp/megatron-fsdp3-nvme"),
+        ((), "/scratch/env", "/scratch/env"),
+        (("--nvme-path", "/scratch/cli"), "/scratch/env", "/scratch/cli"),
+    ):
+        result = _run(script, *common, *options, NVME_PATH=env_path)
+        assert result.returncode == 0, result.stderr
+        dram, nvme = (shlex.split(command) for command in _commands(result.stderr))
+        assert not any(arg.startswith("ddp.fsdp_nvme_path=") for arg in dram)
+        assert f'ddp.fsdp_nvme_path="{expected_path}"' in nvme
+
+
+def test_nvme_study_rejects_non_nvme_default_before_launch(tmp_path: Path):
+    fake_df = tmp_path / "df"
+    fake_df.write_text("#!/bin/sh\nprintf '%s\\n' 'Filesystem 1024-blocks' 'overlay 1000'\n")
+    fake_df.chmod(0o755)
+    result = _run(
+        EXAMPLE / "04-nvme/01_dram_vs_nvme.sh",
+        "--model", "27b", "--output-dir", str(tmp_path),
+        PATH=f"{tmp_path}:{os.environ['PATH']}",
+        NVME_PATH="",
+    )
+    assert result.returncode == 2, result.stderr
+    assert "Default NVMe path /tmp/megatron-fsdp3-nvme is on overlay" in result.stderr
+    assert "case 04-nvme/" not in result.stderr
+
+
 def test_cpu_offload_rejects_incompatible_fsdp_and_graph_modes():
     for options, expected in (
         (("--fsdp", "1", "--cpu-grad-accumulation"), "requires eager FSDP2/3"),

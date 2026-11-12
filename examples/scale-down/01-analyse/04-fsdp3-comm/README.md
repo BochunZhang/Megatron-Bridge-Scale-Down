@@ -30,7 +30,7 @@ Qwen3.8-2.4T-A95B 的 HF 配置是纯文本的 `Qwen3_5MoeForCausalLM`（没有 
 | `01-baseline` | [01_cuda_graph.sh](01-baseline/01_cuda_graph.sh)、[02_mbs.sh](01-baseline/02_mbs.sh)、[03_fsdp3.sh](01-baseline/03_fsdp3.sh) | FSDP3 eager/graph、固定拓扑扫 MBS、FSDP1/FSDP3。27B 两边用 full-iteration graph，2.4T 两边用原生 MoE partial graph。 |
 | `02-comm-overlap` | [01_fsdp3_cp_overlap.sh](02-comm-overlap/01_fsdp3_cp_overlap.sh)、[02_ddp_cp_tp.sh](02-comm-overlap/02_ddp_cp_tp.sh) | FSDP3 在 CP=1/4 内分别比较 AG/RS 共用与独立 communicator。27B 用 full-iteration graph，2.4T 用 eager。DDP + graph 对比 CP4 与 TP4 的通信。 |
 | `03-cpu-offload` | [01_weight_offload.sh](03-cpu-offload/01_weight_offload.sh)、[02_cpu_grad_optimizer.sh](03-cpu-offload/02_cpu_grad_optimizer.sh) | 两个模型都在 CP=1 和 CP=4 测权重回载 × AG/RS overlap。固定 CP=1、卸载组件和各模型的 graph 范围，逐项把梯度累加和 AdamW 移到 CPU。 |
-| `04-nvme` | [01_dram_vs_nvme.sh](04-nvme/01_dram_vs_nvme.sh) | eager CPU 累加 + CPU AdamW，比较 DRAM 与 NVMe。传 `--nvme-path DIR` 或设置 `NVME_PATH`。 |
+| `04-nvme` | [01_dram_vs_nvme.sh](04-nvme/01_dram_vs_nvme.sh) | eager CPU 累加 + CPU AdamW，比较 DRAM 与 NVMe。默认用 `/tmp/megatron-fsdp3-nvme`，启动前检查默认目录所在设备。可用 `--nvme-path DIR` 或 `NVME_PATH` 指向节点的本地 NVMe 目录。 |
 | `05-nccl` | [01_priority.sh](05-nccl/01_priority.sh)、[02_symmetric_multicast.sh](05-nccl/02_symmetric_multicast.sh)、[03_ag_pause.sh](05-nccl/03_ag_pause.sh) | 27B graph 下的默认/高优先级、独立 AG communicator × symmetric multicast、AG pause 0/1536。三脚本共用同一份 NCCL 2.32.3-pause，传 `--nccl-lib FILE` 或设置 `NCCL_LIB`。 |
 
 从仓库根目录运行。默认结果目录为 `results/01-analyse/04-fsdp3-comm/<组名>/`。组内相同配置共用结果目录，重跑时跳过 `status=0` 且已有非空 `.nsys-rep` 的案例。可加 `--model 27b`、`--output-dir DIR` 或 `--dry-run`。
@@ -39,7 +39,8 @@ Qwen3.8-2.4T-A95B 的 HF 配置是纯文本的 `Qwen3_5MoeForCausalLM`（没有 
 study=examples/scale-down/01-analyse/04-fsdp3-comm
 bash "$study/01-baseline/01_cuda_graph.sh" --dry-run
 bash "$study/01-baseline/01_cuda_graph.sh"
-bash "$study/04-nvme/01_dram_vs_nvme.sh" --nvme-path "$(mktemp -d /tmp/megatron-nvme.XXXXXX)"
+bash "$study/04-nvme/01_dram_vs_nvme.sh"
+bash "$study/04-nvme/01_dram_vs_nvme.sh" --nvme-path /mnt/local-nvme/megatron-swap
 bash "$study/05-nccl/03_ag_pause.sh" --nccl-lib /path/to/nccl-2.32.3-pause/build/lib/libnccl.so.2
 ```
 

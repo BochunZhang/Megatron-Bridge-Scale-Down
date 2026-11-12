@@ -6,8 +6,16 @@
 source "$(dirname "${BASH_SOURCE[0]}")/../offload_study_common.sh" "$@"
 
 if [[ -z "${NVME_PATH}" ]]; then
-    [[ "${DRY_RUN}" == true ]] || fail "Supply --nvme-path DIR on local NVMe or set NVME_PATH"
-    NVME_PATH=/path/to/local-nvme
+    # The target nodes use /tmp for local NVMe scratch.
+    NVME_PATH=/tmp/megatron-fsdp3-nvme
+    if [[ "${DRY_RUN}" == false ]]; then
+        probe_path=/tmp
+        if [[ -e "${NVME_PATH}" || -L "${NVME_PATH}" ]]; then probe_path="${NVME_PATH}"; fi
+        mount_source="$(df -P "${probe_path}" | awk 'NR == 2 { print $1 }')" ||
+            fail "Cannot inspect the filesystem for ${NVME_PATH}. Set --nvme-path DIR or NVME_PATH."
+        [[ "${mount_source}" =~ ^/dev/nvme[0-9]+n[0-9]+(p[0-9]+)?$ ]] ||
+            fail "Default NVMe path ${NVME_PATH} is on ${mount_source:-an unknown device}. Set --nvme-path DIR or NVME_PATH to local NVMe scratch."
+    fi
 fi
 
 for model in "${MODELS[@]}"; do
