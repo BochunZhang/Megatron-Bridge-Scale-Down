@@ -409,13 +409,32 @@ def test_baseline_saves_stable_case_paths_under_each_experiment(
 
 @pytest.mark.unit
 @pytest.mark.parametrize("script", ["01_priority.sh", "02_symmetric_multicast.sh", "03_ag_pause.sh"])
-def test_nccl_studies_default_to_the_cta_pause_build(script: str):
-    result = _run(EXAMPLE / "05-nccl" / script, "--dry-run", NCCL_LIB="", LD_PRELOAD="")
+def test_nccl_studies_scope_multicast_and_pause_to_symmetric_fsdp_cases(script: str):
+    result = _run(
+        EXAMPLE / "05-nccl" / script,
+        "--dry-run",
+        NCCL_LIB="",
+        LD_PRELOAD="",
+        NCCL_ALGO="Ring",
+        NCCL_SYM_KERNEL="AllGather_STMC",
+        NCCL_SYM_AG_STMC_PAUSE_CYCLES="999",
+    )
     assert result.returncode == 0, result.stderr
     case_lines = [line for line in result.stderr.splitlines() if line.startswith("NCCL case ")]
     assert case_lines
-    library = REPO_ROOT / "nccl/nccl-2.32.3-cta-with-pause/build/lib/libnccl.so.2"
-    assert all(f"LD_PRELOAD={library}" in shlex.split(line) for line in case_lines)
+    library = REPO_ROOT / "nccl/nccl-2.32.3-fsdp-multicast/build/lib/libnccl.so.2"
+    pauses = []
+    for line in case_lines:
+        args = shlex.split(line)
+        assert f"LD_PRELOAD={library}" in args
+        assert "NCCL_SYM_KERNEL" in args
+        assert not any(arg.startswith("NCCL_SYM_KERNEL=") for arg in args)
+        assert "NCCL_ENQUEUE_REARCH_ENABLE=0" in args
+        assert "NCCL_SYM_AG_STMC_PAUSE_CYCLES=0" in args
+        assert f"MEGATRON_FSDP_MULTICAST={int('-symm-' in args[2])}" in args
+        pause_setting = next(arg for arg in args if arg.startswith("NCCL_FSDP_AG_STMC_PAUSE_CYCLES="))
+        pauses.append(int(pause_setting.split("=", 1)[1]))
+    assert pauses == ([1536, 3072, 4608] if script == "03_ag_pause.sh" else [0] * len(case_lines))
 
 
 @pytest.mark.unit

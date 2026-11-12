@@ -40,8 +40,10 @@
 # reset it with git -C <tree> checkout -- . and rerun.
 #
 # Usage:
-#   ./install/install-nccl-2.32.3-pause.sh [--dest DIR] [--cuda-home DIR] [--jobs N] [--check-only]
+#   ./install/install-nccl-2.32.3-pause.sh [--fsdp-multicast] [--dest DIR] [--cuda-home DIR] [--jobs N] [--check-only]
 #
+#   --fsdp-multicast  Add the CTA patch and FSDP-scoped kernel selection and pause.
+#                     Defaults to <megatron-bridge>/nccl/nccl-2.32.3-fsdp-multicast.
 #   --dest DIR      Source tree (default: <megatron-bridge>/nccl/nccl-2.32.3-pause)
 #   --cuda-home DIR CUDA toolkit, >= 12.8 for sm_100 (default: CUDA_HOME or /usr/local/cuda)
 #   --jobs N        make -j (default: every CPU in the affinity mask)
@@ -58,7 +60,8 @@ ST_PAUSE_ENV="NCCL_SYM_AG_ST_PAUSE_CYCLES"
 script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 repo_root="$(cd -- "${script_dir}/.." && pwd)"
 patch="${script_dir}/patches/nccl-2.32.3-pause.patch"
-dest="${repo_root}/nccl/nccl-2.32.3-pause"
+dest=""
+fsdp_multicast=false
 cuda_home="${CUDA_HOME:-/usr/local/cuda}"
 # GNU nproc returns OMP_NUM_THREADS when it is set, and training environments usually export
 # OMP_NUM_THREADS=1; drop it (and OMP_THREAD_LIMIT) so only the CPU affinity mask counts.
@@ -73,6 +76,7 @@ die() {
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --dest) dest="$2"; shift 2 ;;
+        --fsdp-multicast) fsdp_multicast=true; shift ;;
         --cuda-home) cuda_home="$2"; shift 2 ;;
         --jobs) jobs="$2"; shift 2 ;;
         --check-only) check_only=true; shift ;;
@@ -80,6 +84,13 @@ while [[ $# -gt 0 ]]; do
         *) die "unknown argument: $1" ;;
     esac
 done
+
+if $fsdp_multicast; then
+    NCCL_SUFFIX="-cta-pause-fsdp"
+    dest="${dest:-${repo_root}/nccl/nccl-2.32.3-fsdp-multicast}"
+else
+    dest="${dest:-${repo_root}/nccl/nccl-2.32.3-pause}"
+fi
 
 [[ -f "$patch" ]] || die "${patch} not found"
 (( jobs >= 1 )) || die "--jobs must be >= 1, got ${jobs}"
@@ -104,20 +115,35 @@ fi
 ################################################################################
 # 2. Patch
 
-if git -C "$dest" apply --reverse --check "$patch" 2>/dev/null; then
-    echo "=== ${patch##*/} is applied"
-elif $check_only; then
-    die "${dest} does not carry ${patch##*/}; run without --check-only"
+apply_patch_file() {
+    local file="$1"
+    shift
+    if git -C "$dest" apply "$@" --reverse --check "$file" 2>/dev/null; then
+        echo "=== ${file##*/} is applied"
+    elif $check_only; then
+        die "${dest} does not carry ${file##*/}; run without --check-only"
+    else
+        git -C "$dest" apply "$@" --check "$file" \
+            || die "${file##*/} does not apply to ${dest}; use a fresh --dest"
+        git -C "$dest" apply "$@" "$file"
+        echo "=== Applied ${file##*/}"
+    fi
+}
+
+if $fsdp_multicast; then
+    scoped_patch="${script_dir}/patches/nccl-2.32.3-fsdp-multicast.patch"
+    # The scoped patch changes overlapping hunks in the pause patch, including its version suffix.
+    if ! git -C "$dest" apply --reverse --check "$scoped_patch" 2>/dev/null; then
+        apply_patch_file "$patch"
+    fi
+    apply_patch_file "${script_dir}/patches/nccl-2.32.3-cta.patch" --exclude=makefiles/version.mk
+    apply_patch_file "$scoped_patch"
 else
-    # A tree patched for the old nccl-2.32.3-cta-with-pause build (cta + pause) does not take this patch.
-    git -C "$dest" apply --check "$patch" \
-        || die "${patch##*/} does not apply to ${dest}; reset it with git -C ${dest} checkout -- ."
-    git -C "$dest" apply "$patch"
-    echo "=== Applied ${patch##*/}"
+    apply_patch_file "$patch"
 fi
 git -C "$dest" diff --stat | sed 's/^/  /'
 # The CTA selection must stay NCCL's own: the cta patch's lsa.cc / gin.cc hunks would let minCTAs lift it.
-if git -C "$dest" diff --name-only | grep -q "^src/tuning/"; then
+if ! $fsdp_multicast && git -C "$dest" diff --name-only | grep -q "^src/tuning/"; then
     die "${dest} changes src/tuning (the cta patch?); reset it with git -C ${dest} checkout -- . and rerun"
 fi
 
@@ -143,6 +169,12 @@ echo "  [ok]   libnccl.so reads ${PAUSE_ENV}"
 grep -aq "$ST_PAUSE_ENV" "${build_dir}/lib/libnccl.so" \
     || die "${build_dir}/lib/libnccl.so does not read ${ST_PAUSE_ENV} (built from an older patch?); rebuild without --check-only"
 echo "  [ok]   libnccl.so reads ${ST_PAUSE_ENV}"
+if $fsdp_multicast; then
+    grep -aq 'ncclSetFsdpMulticast' "${build_dir}/lib/libnccl.so" \
+        || die "${build_dir}/lib/libnccl.so lacks FSDP-scoped kernel selection; rebuild without --check-only"
+    echo "=== nccl-2.32.3-fsdp-multicast: FSDP-scoped kernel selection and AG pause"
+    exit 0
+fi
 
 echo "=== nccl-2.32.3-pause: stock 2.32.3, plus ${PAUSE_ENV}=<cycles> slowing AllGather_STMC"
 echo "    and ${ST_PAUSE_ENV}=<cycles> slowing AllGather_ST"

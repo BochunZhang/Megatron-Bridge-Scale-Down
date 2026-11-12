@@ -31,7 +31,7 @@ Qwen3.8-2.4T-A95B 的 HF 配置是纯文本的 `Qwen3_5MoeForCausalLM`（没有 
 | `02-comm-overlap` | [01_fsdp3_cp_overlap.sh](02-comm-overlap/01_fsdp3_cp_overlap.sh)、[02_ddp_cp_tp.sh](02-comm-overlap/02_ddp_cp_tp.sh) | FSDP3 在 CP=1/4 内分别比较 AG/RS 共用与独立 communicator。27B 用 full-iteration graph，2.4T 用 eager。DDP + graph 对比 CP4 与 TP4 的通信。 |
 | `03-cpu-offload` | [01_weight_offload.sh](03-cpu-offload/01_weight_offload.sh)、[02_cpu_grad_optimizer.sh](03-cpu-offload/02_cpu_grad_optimizer.sh) | 两个模型都在 CP=1 和 CP=4 测权重回载 × AG/RS overlap。固定 CP=1、卸载组件和各模型的 graph 范围，逐项把梯度累加和 AdamW 移到 CPU。 |
 | `04-nvme` | [01_dram_vs_nvme.sh](04-nvme/01_dram_vs_nvme.sh) | eager CPU 累加 + CPU AdamW，比较 DRAM 与 NVMe。默认用 `/tmp/megatron-fsdp3-nvme`，启动前检查默认目录所在设备。可用 `--nvme-path DIR` 或 `NVME_PATH` 指向节点的本地 NVMe 目录。 |
-| `05-nccl` | [01_priority.sh](05-nccl/01_priority.sh)、[02_symmetric_multicast.sh](05-nccl/02_symmetric_multicast.sh)、[03_ag_pause.sh](05-nccl/03_ag_pause.sh) | 27B graph 下的默认/高优先级、独立 AG communicator × symmetric multicast、AG pause 1536/3072/4608 cycles。三脚本默认加载仓库内已编译的 `nccl/nccl-2.32.3-cta-with-pause/build/lib/libnccl.so.2`。可用 `--nccl-lib FILE` 或 `NCCL_LIB` 覆盖。 |
+| `05-nccl` | [01_priority.sh](05-nccl/01_priority.sh)、[02_symmetric_multicast.sh](05-nccl/02_symmetric_multicast.sh)、[03_ag_pause.sh](05-nccl/03_ag_pause.sh) | 27B graph 下的默认/高优先级、独立 AG communicator × symmetric multicast、AG pause 1536/3072/4608 cycles。三脚本默认加载 `nccl/nccl-2.32.3-fsdp-multicast/build/lib/libnccl.so.2`。可用 `--nccl-lib FILE` 或 `NCCL_LIB` 指定同一构建的其他位置。 |
 
 从仓库根目录运行。默认结果根目录为 `results/01-analyse/04-fsdp3-comm/`。所有编号脚本使用 `<组名>/<小项目>/model_<配置>/node0/`。小项目名取脚本名去掉 `.sh` 并将下划线换成连字符。编号实验省略时间戳，`01-baseline` 省略 `-baseline`，其余组在 case 目录名中保留用于区分实验变体的标签。
 
@@ -47,10 +47,13 @@ bash "$study/01-baseline/01_cuda_graph.sh" --dry-run
 bash "$study/01-baseline/01_cuda_graph.sh"
 bash "$study/04-nvme/01_dram_vs_nvme.sh"
 bash "$study/04-nvme/01_dram_vs_nvme.sh" --nvme-path /mnt/local-nvme/megatron-swap
-bash "$study/05-nccl/03_ag_pause.sh"
+bash install/install-nccl-2.32.3-pause.sh --fsdp-multicast
+MEGATRON_LM_DIR=/path/to/megatron-lm bash "$study/05-nccl/03_ag_pause.sh" --output-dir /path/to/new-results
 ```
 
-4 卡 TP=4 时 dense FSDP 分片组只有 1 个 rank，因此 TP4 使用 DDP 观测 TP 通信。NCCL 实验从 trace 核对实际运行的是 `AllGather_STMC` 与 `ReduceScatter_LDMC`。
+4 卡 TP=4 时 dense FSDP 分片组只有 1 个 rank，因此 TP4 使用 DDP 观测 TP 通信。
+
+`05-nccl` 需要包含 [FSDP multicast 调用标记](https://github.com/BochunZhang/Megatron-LM-Scale-Down/commit/d5549add2003bdef97e14c92b93541a3b7e6979e) 的 Megatron-LM checkout。`MEGATRON_LM_DIR` 指向该 checkout。首步完成 symmetric window 注册后，symmetric case 的 FSDP 参数 AG 固定为 `AllGather_STMC`，梯度 RS 固定为 `ReduceScatter_LDMC`。目标内核不可用时该轮报错。初始化、首步和 CP 等其他通信使用默认选核。Pause 只作用于已标记的 FSDP 参数 AG。用 Nsight Systems 在第 7 步的 FSDP NVTX 区间内核对 AG/RS 实际内核，复跑时使用新的结果根目录。
 
 ### 选项
 
@@ -338,7 +341,7 @@ FSDP RS L3 dense 119.6M
 | `ddp.fsdp_db_use_persist_buf_on_alloc_fail=true` | 不是 FSDP unit 的模块（embedding、LM head、final norm）在池内分配常驻 buffer；为 false 时它们走动态分配，不在池里，通信不走 symmetric |
 | `NCCL_NVLS_ENABLE=1` | `AllGather_STMC` / `ReduceScatter_LDMC` 依赖 multicast；`run_recipe.py` 只 `setdefault`，shell 里设成 0 时会退化为单播的 `AllGather_ST` / `ReduceScatter_LD`，所以启动器强制 export |
 
-以上 double buffer 选项与 recipe 当前值相同，显式写出是为了 `--recipe` 换成别的 recipe 时行为不变。`NCCL_ALGO` 会把集合通信钉在经典 ring / NVLS kernel 上，`--symmetric` 下启动器直接拒绝；`--fsdp ddp` 也拒绝（MCore DDP 不用 MaxPool）。
+以上 double buffer 选项与 recipe 当前值相同，显式写出是为了 `--recipe` 换成别的 recipe 时行为不变。`--symmetric` 要求 `NCCL_ALGO` 未设置，适用于 Megatron FSDP。`05-nccl` 通过 FSDP 调用标记固定内核。
 
 **注册的范围不只是 double buffer。** 注册以内存池为单位：`mem_alloc_context` 内分配的 buffer 都在池里，`manual_buffer_registration()` 在第 1 个 iteration 之后（`train.py` 的 `_maybe_register_fsdp_buffers`）把整个池在每个 FSDP communicator 上各注册一次——dense FSDP group、expert FSDP group，以及 `--overlap` 新建的两组 AG communicator。池里有：
 
