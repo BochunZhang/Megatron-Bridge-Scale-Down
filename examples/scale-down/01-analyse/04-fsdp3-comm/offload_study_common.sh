@@ -12,7 +12,6 @@ OUTPUT_DIR="${OUTPUT_DIR:-${REPO_ROOT}/results/01-analyse/04-fsdp3-comm}"
 MODELS=(27b 2.4t)
 if [[ "${GROUP}" == 05-nccl ]]; then MODELS=(27b); fi
 LAUNCHER=("${BENCHMARK_DIR}/run_pretrain_fsdp3.sh")
-MODE_ARGS=(--resume)
 DRY_RUN=false
 FAILED=0
 NVME_PATH="${NVME_PATH:-}"
@@ -38,7 +37,7 @@ while (( $# )); do
                     NCCL_LIB="$2";;
             esac
             shift 2;;
-        --dry-run) DRY_RUN=true; MODE_ARGS+=(--dry-run); shift;;
+        --dry-run) DRY_RUN=true; shift;;
         -h|--help)
             printf 'Usage: %s [--model 27b|2.4t] [--output-dir DIR] [--dry-run]\n' "$0"
             case "${GROUP}" in
@@ -51,6 +50,7 @@ while (( $# )); do
 done
 
 # run_case MODEL NAME FSDP GRAPH TP CP MBS [launcher flags...]
+# An empty NAME uses a subdirectory named after the calling script.
 run_case() {
     local model="$1" name="$2" fsdp="$3" graph="$4" tp="$5" cp="$6" mbs="$7"
     shift 7
@@ -60,13 +60,52 @@ run_case() {
     if [[ "${model}" == 2.4t ]]; then
         model_args=(--num-layers 4 --num-experts 64 --ep 4 --dispatcher hybridep)
     fi
-    local label="${GROUP}/${name} model=${model} fsdp=${fsdp} graph=${graph} tp=${tp} cp=${cp} mbs=${mbs} seq=${seq}"
+    local result_group="${GROUP}"
+    local result_args=(--stable-result-dir)
+    if [[ -n "${name}" ]]; then
+        result_args+=(--run-name "${name}")
+    else
+        local script_name="${BASH_SOURCE[1]##*/}"
+        script_name="${script_name%.sh}"
+        result_group+="/${script_name//_/-}"
+    fi
+    local args=("${model_args[@]}"
+        --model "${model}" --full --dtype bf16 --gpu 4 --nproc-per-node 4 --nnodes 1 --node-rank 0
+        --gbs 16 --mbs "${mbs}" --seq "${seq}" --tp "${tp}" --cp "${cp}" --fsdp "${fsdp}" --cuda-graph "${graph}"
+        --nsys --train-iters 10 --profile-start 7 --profile-end 8
+        --results-root "${OUTPUT_DIR}/${result_group}" "${result_args[@]}" "$@")
+    local label="${result_group}${name:+/${name}} model=${model} fsdp=${fsdp} graph=${graph} tp=${tp} cp=${cp} mbs=${mbs} seq=${seq}"
+    local case_dir=""
+    if [[ "${DRY_RUN}" == true ]]; then
+        args+=(--dry-run)
+    else
+        local node_dir
+        if ! node_dir=$("${LAUNCHER[@]}" "${args[@]}" --print-result-dir); then
+            printf 'failed to resolve result directory for %s\n' "${label}" >&2
+            FAILED=$(( FAILED + 1 ))
+            return 0
+        fi
+        case_dir="${node_dir%/*}"
+        if [[ -d "${case_dir}" ]]; then
+            printf 'skip existing case: %s\n' "${case_dir}" >&2
+            return 0
+        fi
+        if declare -F prepare_case >/dev/null; then
+            prepare_case "${name}"
+        fi
+        # Claim the case directory before launching so parallel invocations also skip it.
+        mkdir -p -- "${case_dir%/*}"
+        if ! mkdir -- "${case_dir}" 2>/dev/null; then
+            [[ -d "${case_dir}" ]] || fail "Cannot create case directory: ${case_dir}"
+            printf 'skip existing case: %s\n' "${case_dir}" >&2
+            return 0
+        fi
+    fi
     printf 'case %s\n' "${label}" >&2
-    if ! "${LAUNCHER[@]}" "${MODE_ARGS[@]}" "${model_args[@]}" \
-        --model "${model}" --full --dtype bf16 --gpu 4 --nproc-per-node 4 --nnodes 1 --node-rank 0 \
-        --gbs 16 --mbs "${mbs}" --seq "${seq}" --tp "${tp}" --cp "${cp}" --fsdp "${fsdp}" --cuda-graph "${graph}" \
-        --nsys --train-iters 10 --profile-start 7 --profile-end 8 \
-        --results-root "${OUTPUT_DIR}/${GROUP}" --stable-result-dir --run-name "${name}" "$@"; then
+    if ! "${LAUNCHER[@]}" "${args[@]}"; then
+        if [[ -n "${case_dir}" ]]; then
+            rmdir -- "${case_dir}" 2>/dev/null || true
+        fi
         printf 'failed %s\n' "${label}" >&2
         FAILED=$((FAILED + 1))
     fi

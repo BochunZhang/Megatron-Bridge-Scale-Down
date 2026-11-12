@@ -7,6 +7,8 @@ import shlex
 import subprocess
 from pathlib import Path
 
+import pytest
+
 
 REPO_ROOT = Path(__file__).resolve().parents[4]
 EXAMPLE = REPO_ROOT / "examples/scale-down/01-analyse/04-fsdp3-comm"
@@ -27,6 +29,10 @@ def _run(script: Path, *args: str, **env: str) -> subprocess.CompletedProcess:
 
 def _commands(stderr: str) -> list[str]:
     return [line for line in stderr.splitlines() if line.startswith("command:")]
+
+
+def _report_base(command: str) -> Path:
+    return next(Path(arg.removeprefix("--output=")) for arg in shlex.split(command) if arg.startswith("--output="))
 
 
 def _sweep(tmp_path: Path, *args: str) -> list[str]:
@@ -381,6 +387,70 @@ def test_moe_fsdp3_offload_allows_native_partial_graph(tmp_path: Path):
     assert "optimizer.optimizer_cuda_graph=false" in args
 
 
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    ("script", "result_group", "case_count"),
+    [("01_cuda_graph.sh", "01-cuda-graph", 2), ("02_mbs.sh", "02-mbs", 3), ("03_fsdp3.sh", "03-fsdp3", 2)],
+)
+def test_baseline_saves_stable_case_paths_under_each_experiment(
+    tmp_path: Path, script: str, result_group: str, case_count: int
+):
+    result = _run(EXAMPLE / "01-baseline" / script, "--model", "2.4t", "--dry-run", "--output-dir", str(tmp_path))
+    assert result.returncode == 0, result.stderr
+    commands = _commands(result.stderr)
+    assert len(commands) == case_count
+    for command in commands:
+        node_dir = _report_base(command).parent
+        assert node_dir.name == "node0"
+        assert node_dir.parent.parent == tmp_path / "01-baseline" / result_group
+        assert node_dir.parent.name.endswith("-profile_nsys")
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("script", sorted(EXAMPLE.glob("[0-9][0-9]-*/[0-9][0-9]_*.sh")), ids=lambda p: p.stem)
+def test_numbered_studies_skip_existing_case_directories(tmp_path: Path, script: Path):
+    args = ("--model", "27b", "--output-dir", str(tmp_path))
+    dry_run = _run(script, *args, "--dry-run", NVME_PATH="", NCCL_LIB="")
+    assert dry_run.returncode == 0, dry_run.stderr
+    case_dirs = [_report_base(command).parent.parent for command in _commands(dry_run.stderr)]
+    assert case_dirs
+    for case_dir in case_dirs:
+        case_dir.mkdir(parents=True)
+
+    result = _run(script, *args, NVME_PATH="", NCCL_LIB="")
+    assert result.returncode == 0, result.stderr
+    assert result.stderr.count("skip existing case:") == len(case_dirs)
+    assert all(not any(case_dir.iterdir()) for case_dir in case_dirs)
+
+
+@pytest.mark.unit
+def test_numbered_study_launches_missing_case_next_to_existing_one(tmp_path: Path):
+    script = EXAMPLE / "01-baseline/01_cuda_graph.sh"
+    args = ("--model", "27b", "--output-dir", str(tmp_path))
+    dry_run = _run(script, *args, "--dry-run")
+    assert dry_run.returncode == 0, dry_run.stderr
+    existing, missing = map(_report_base, _commands(dry_run.stderr))
+    existing.parent.parent.mkdir(parents=True)
+
+    fake_ip = tmp_path / "ip"
+    fake_ip.write_text("#!/bin/sh\nprintf '%s\\n' '2: eth0 inet 192.0.2.1/24'\n")
+    fake_ip.chmod(0o755)
+    fake_nsys = tmp_path / "nsys"
+    fake_nsys.write_text(
+        '#!/bin/sh\nfor arg; do\n  case "$arg" in\n'
+        '    --output=*) printf "report\\n" > "${arg#--output=}.nsys-rep"; exit 0;;\n'
+        "  esac\ndone\nexit 1\n"
+    )
+    fake_nsys.chmod(0o755)
+
+    result = _run(script, *args, PATH=f"{tmp_path}:{os.environ['PATH']}", GLOO_SOCKET_IFNAME="eth0")
+    assert result.returncode == 0, result.stderr
+    assert f"skip existing case: {existing.parent.parent}" in result.stderr
+    assert not existing.parent.exists()
+    assert (missing.parent / "run_info.txt").read_text().splitlines()[-1] == "status=0"
+    assert missing.with_suffix(".nsys-rep").stat().st_size > 0
+
+
 def test_weight_offload_study_uses_native_partial_graph_for_moe_cp4(tmp_path: Path):
     result = _run(
         EXAMPLE / "03-cpu-offload/01_weight_offload.sh",
@@ -624,19 +694,24 @@ def test_nvme_study_defaults_to_target_scratch_and_accepts_overrides(tmp_path: P
         assert f'ddp.fsdp_nvme_path="{expected_path}"' in nvme
 
 
-def test_nvme_study_rejects_non_nvme_default_before_launch(tmp_path: Path):
+def test_nvme_study_rejects_non_nvme_default_before_nvme_launch(tmp_path: Path):
+    script = EXAMPLE / "04-nvme/01_dram_vs_nvme.sh"
+    args = ("--model", "27b", "--output-dir", str(tmp_path))
+    dry_run = _run(script, *args, "--dry-run", NVME_PATH="")
+    assert dry_run.returncode == 0, dry_run.stderr
+    dram, nvme = map(_report_base, _commands(dry_run.stderr))
+    dram.parent.parent.mkdir(parents=True)
     fake_df = tmp_path / "df"
     fake_df.write_text("#!/bin/sh\nprintf '%s\\n' 'Filesystem 1024-blocks' 'overlay 1000'\n")
     fake_df.chmod(0o755)
     result = _run(
-        EXAMPLE / "04-nvme/01_dram_vs_nvme.sh",
-        "--model", "27b", "--output-dir", str(tmp_path),
+        script, *args,
         PATH=f"{tmp_path}:{os.environ['PATH']}",
         NVME_PATH="",
     )
     assert result.returncode == 2, result.stderr
     assert "Default NVMe path /tmp/megatron-fsdp3-nvme is on overlay" in result.stderr
-    assert "case 04-nvme/" not in result.stderr
+    assert not nvme.parent.parent.exists()
 
 
 def test_cpu_offload_rejects_incompatible_fsdp_and_graph_modes():

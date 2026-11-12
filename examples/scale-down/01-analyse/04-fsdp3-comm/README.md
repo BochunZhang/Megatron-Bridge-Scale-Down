@@ -33,7 +33,9 @@ Qwen3.8-2.4T-A95B 的 HF 配置是纯文本的 `Qwen3_5MoeForCausalLM`（没有 
 | `04-nvme` | [01_dram_vs_nvme.sh](04-nvme/01_dram_vs_nvme.sh) | eager CPU 累加 + CPU AdamW，比较 DRAM 与 NVMe。默认用 `/tmp/megatron-fsdp3-nvme`，启动前检查默认目录所在设备。可用 `--nvme-path DIR` 或 `NVME_PATH` 指向节点的本地 NVMe 目录。 |
 | `05-nccl` | [01_priority.sh](05-nccl/01_priority.sh)、[02_symmetric_multicast.sh](05-nccl/02_symmetric_multicast.sh)、[03_ag_pause.sh](05-nccl/03_ag_pause.sh) | 27B graph 下的默认/高优先级、独立 AG communicator × symmetric multicast、AG pause 0/1536。三脚本共用同一份 NCCL 2.32.3-pause，传 `--nccl-lib FILE` 或设置 `NCCL_LIB`。 |
 
-从仓库根目录运行。默认结果目录为 `results/01-analyse/04-fsdp3-comm/<组名>/`。组内相同配置共用结果目录，重跑时跳过 `status=0` 且已有非空 `.nsys-rep` 的案例。可加 `--model 27b`、`--output-dir DIR` 或 `--dry-run`。
+从仓库根目录运行。默认结果根目录为 `results/01-analyse/04-fsdp3-comm/`。在 `01-baseline/` 下，三个脚本分别写入 `01-cuda-graph/`、`02-mbs/` 和 `03-fsdp3/`。每个子目录下保存 `model_<配置>/node0/`，case 名省略 `-baseline` 和时间戳。其余组使用 `<组名>/model_<配置>-<case 名>/node0/`。
+
+编号脚本逐个检查 case 目录。目标 `model_…/` 已存在就跳过，包括空目录和上次失败的目录。缺少目录的 case 会继续运行。需要复跑时可指定新的 `--output-dir DIR`。可用 `--model 27b` 限定模型，或用 `--dry-run` 查看完整计划。
 
 ```bash
 study=examples/scale-down/01-analyse/04-fsdp3-comm

@@ -7,7 +7,7 @@ source "$(dirname "${BASH_SOURCE[0]}")/../offload_study_common.sh" "$@"
 
 for model in "${MODELS[@]}"; do
     for mbs in 1 2 4; do
-        run_case "${model}" baseline 3 on 1 1 "${mbs}"
+        run_case "${model}" "" 3 on 1 1 "${mbs}"
     done
 done
 

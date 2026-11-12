@@ -156,7 +156,7 @@ Options:
   --profile-end N                Stop iteration, exclusive (default: 8, i.e. one step)
   --run-date YYMMDD-HHMMSS       Shared matrix timestamp
   --run-name NAME                Optional human-readable case name
-  --stable-result-dir            Use --run-name as the case suffix instead of the timestamp;
+  --stable-result-dir            Omit the timestamp and append --run-name if provided;
                                  require a nonempty node 0 report for successful nsys runs
   --results-root PATH            Result root
   --override KEY=VALUE           Additional run_recipe.py override (repeatable)
@@ -465,8 +465,11 @@ CG_TAG="${CUDA_GRAPH}"
 METRIC_TAG="${METRIC_FREQUENCY:+-metric_${METRIC_FREQUENCY}}"
 CASE_TAG="-date_${RUN_DATE}"
 if [[ "${STABLE_RESULT_DIR}" == true ]]; then
-    [[ "${RUN_NAME}" =~ ^[a-zA-Z0-9_-]+$ ]] || { echo "--stable-result-dir requires a filesystem-safe --run-name" >&2; exit 2; }
-    CASE_TAG="-${RUN_NAME}"
+    [[ -z "${RUN_NAME}" || "${RUN_NAME}" =~ ^[a-zA-Z0-9_-]+$ ]] || {
+        echo "--run-name must be filesystem-safe with --stable-result-dir" >&2
+        exit 2
+    }
+    CASE_TAG="${RUN_NAME:+-${RUN_NAME}}"
 fi
 CASE_NAME="model_${MODEL}-${DP_TAG}${OVERLAP_TAG}${DTYPE_TAG}-layers_${LAYERS_TAG}${ATTN_TAG}-mtp_${MTP_TAG}-experts_${EXPERTS_TAG}-cg_${CG_TAG}-mbs_${MICRO_BATCH_SIZE}-seq_${SEQ_LENGTH}${TP_TAG}-cp_${CONTEXT_PARALLEL}-ep_${EXPERT_PARALLEL}-disp_${DISPATCHER}-gbs_${GLOBAL_BATCH_SIZE}-gpus_${GPU_COUNT}-profile_${PROFILE}${CASE_TAG}${OFFLOAD_TAG}${METRIC_TAG}"
 RESULT_DIR="${RESULTS_ROOT}/${CASE_NAME}/node${NODE_RANK}"

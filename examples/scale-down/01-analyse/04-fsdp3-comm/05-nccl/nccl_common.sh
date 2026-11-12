@@ -7,22 +7,23 @@ source "$(dirname "${BASH_SOURCE[0]}")/../offload_study_common.sh" "$@"
 
 if [[ "${DRY_RUN}" == true ]]; then
     NCCL_LIB="${NCCL_LIB:-/path/to/nccl-2.32.3-pause/build/lib/libnccl.so.2}"
-else
-    [[ -f "${NCCL_LIB}" && -r "${NCCL_LIB}" ]] || fail "Supply --nccl-lib FILE for the NCCL 2.32.3-pause build"
-    NCCL_LIB="$(cd "$(dirname "${NCCL_LIB}")" && pwd -P)/$(basename "${NCCL_LIB}")"
-    grep -aq 'NCCL version 2.32.3-pause+cuda' "${NCCL_LIB}" ||
-        fail "Expected the NCCL 2.32.3-pause build: ${NCCL_LIB}"
-    grep -aq 'SYM_AG_STMC_PAUSE_CYCLES' "${NCCL_LIB}" ||
-        fail "The NCCL build does not expose SYM_AG_STMC_PAUSE_CYCLES"
 fi
-NCCL_PRELOAD="${NCCL_LIB}${LD_PRELOAD:+:${LD_PRELOAD}}"
+NCCL_PRELOAD=""
 
-if [[ "${DRY_RUN}" == false ]]; then
-    # A bundled NCCL in the PyTorch wheel can be loaded alongside LD_PRELOAD.
-    # Verify the same environment that run_pretrain_fsdp3.sh uses for torchrun.
-    (
-        cd "${REPO_ROOT}"
-        LD_PRELOAD="${NCCL_PRELOAD}" uv run --no-sync python - "${NCCL_LIB}" <<'PY'
+prepare_case() {
+    if [[ -z "${NCCL_PRELOAD}" ]]; then
+        [[ -f "${NCCL_LIB}" && -r "${NCCL_LIB}" ]] || fail "Supply --nccl-lib FILE for the NCCL 2.32.3-pause build"
+        NCCL_LIB="$(cd "$(dirname "${NCCL_LIB}")" && pwd -P)/$(basename "${NCCL_LIB}")"
+        grep -aq 'NCCL version 2.32.3-pause+cuda' "${NCCL_LIB}" ||
+            fail "Expected the NCCL 2.32.3-pause build: ${NCCL_LIB}"
+        grep -aq 'SYM_AG_STMC_PAUSE_CYCLES' "${NCCL_LIB}" ||
+            fail "The NCCL build does not expose SYM_AG_STMC_PAUSE_CYCLES"
+        NCCL_PRELOAD="${NCCL_LIB}${LD_PRELOAD:+:${LD_PRELOAD}}"
+
+        # A bundled NCCL in the PyTorch wheel can be loaded alongside LD_PRELOAD.
+        (
+            cd "${REPO_ROOT}"
+            LD_PRELOAD="${NCCL_PRELOAD}" uv run --no-sync python - "${NCCL_LIB}" <<'PY'
 import os
 import sys
 
@@ -35,8 +36,10 @@ loaded = sorted({os.path.realpath(path) for path in libraries if os.path.basenam
 if loaded != [expected]:
     sys.exit(f"Expected only {expected} for torch {torch.__version__}, but found {loaded}")
 PY
-    )
-fi
+        )
+    fi
+    LAUNCHER=(env "LD_PRELOAD=${NCCL_PRELOAD}" "${LAUNCHER[@]}")
+}
 
 # run_nccl_case NAME PRIORITY PAUSE [launcher flags...]
 run_nccl_case() {
@@ -54,9 +57,8 @@ run_nccl_case() {
         )
     fi
     printf 'NCCL case %s:' "${name}" >&2
-    printf ' %q' "${launcher_env[@]}" "LD_PRELOAD=${NCCL_PRELOAD}" >&2
+    printf ' %q' "${launcher_env[@]}" "LD_PRELOAD=${NCCL_LIB}${LD_PRELOAD:+:${LD_PRELOAD}}" >&2
     printf '\n' >&2
-    if [[ "${DRY_RUN}" == false ]]; then launcher_env+=("LD_PRELOAD=${NCCL_PRELOAD}"); fi
     local LAUNCHER=("${launcher_env[@]}" "${BENCHMARK_DIR}/run_pretrain_fsdp3.sh")
     run_case 27b "${name}" 3 on 1 1 1 --override "dist.high_priority_stream_groups=${groups}" "$@"
 }
