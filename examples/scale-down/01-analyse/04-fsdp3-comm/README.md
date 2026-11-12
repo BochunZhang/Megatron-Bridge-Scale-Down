@@ -15,10 +15,35 @@ Qwen3.8-2.4T-A95B 的 HF 配置是纯文本的 `Qwen3_5MoeForCausalLM`（没有 
 
 ## 脚本
 
-目录只保留两个脚本：
+通用启动器和原综合测试：
 
 - `run_pretrain_fsdp3.sh`：启动一个 case，`--model` 选择模型与对应的 GB200 recipe（`--recipe` 可覆盖）；
 - `benchmark_fsdp3.sh`：对列表选项取笛卡尔积，逐个调用 `run_pretrain_fsdp3.sh`。启动第一个 case 前，所有 case 会先用 `run_pretrain_fsdp3.sh --print-result-dir` 做一遍和真实启动相同的校验；单个 case 失败（例如 OOM）只记录下来，sweep 继续。
+- `benchmark_fsdp3_suite.sh`：原 8 项综合矩阵，使用 GBS=8。
+
+### FSDP3 offload 专项实验
+
+以下五组在一台 4 卡 GB200 上运行。固定 BF16、full attention、GBS=16、27B 裁剪 8 层、2.4T 裁剪 4 层和 64 experts。默认 MBS=1，只有 `02_mbs.sh` 扫描 1、2、4。TP=CP=1 用 seq=4096，CP=4 或 TP=4 用 seq=16384。所有案例采集 Nsight Systems CUDA/NVTX trace，关闭 GPU metrics。
+
+| 组 | 脚本 | 对照 |
+| --- | --- | --- |
+| `01-baseline` | [01_cuda_graph.sh](01-baseline/01_cuda_graph.sh)、[02_mbs.sh](01-baseline/02_mbs.sh)、[03_fsdp3.sh](01-baseline/03_fsdp3.sh) | FSDP3 eager/graph、固定拓扑扫 MBS、FSDP1/FSDP3。2.4T 的 FSDP1/FSDP3 两边用 eager。 |
+| `02-comm-overlap` | [01_fsdp3_cp_overlap.sh](02-comm-overlap/01_fsdp3_cp_overlap.sh)、[02_ddp_cp_tp.sh](02-comm-overlap/02_ddp_cp_tp.sh) | FSDP3 在 CP=1/4 内分别比较 AG/RS 共用与独立 communicator。27B 用 full-iteration graph，2.4T 用 eager。DDP + graph 对比 CP4 与 TP4 的通信。 |
+| `03-cpu-offload` | [01_weight_offload.sh](03-cpu-offload/01_weight_offload.sh)、[02_cpu_grad_optimizer.sh](03-cpu-offload/02_cpu_grad_optimizer.sh) | 权重回载 × AG/RS overlap。两个模型测 CP=1，27B 加测 CP=4。固定卸载组件和 attention graph，逐项把梯度累加和 AdamW 移到 CPU。 |
+| `04-nvme` | [01_dram_vs_nvme.sh](04-nvme/01_dram_vs_nvme.sh) | eager CPU 累加 + CPU AdamW，比较 DRAM 与 NVMe。传 `--nvme-path DIR` 或设置 `NVME_PATH`。 |
+| `05-nccl` | [01_priority.sh](05-nccl/01_priority.sh)、[02_symmetric_multicast.sh](05-nccl/02_symmetric_multicast.sh)、[03_ag_pause.sh](05-nccl/03_ag_pause.sh) | 27B graph 下的默认/高优先级、独立 AG communicator × symmetric multicast、AG pause 0/1536。三脚本共用同一份 NCCL 2.32.3-pause，传 `--nccl-lib FILE` 或设置 `NCCL_LIB`。 |
+
+从仓库根目录运行。默认结果目录为 `results/01-analyse/04-fsdp3-comm/<组名>/`。组内相同配置共用结果目录，重跑时跳过 `status=0` 且已有非空 `.nsys-rep` 的案例。可加 `--model 27b`、`--output-dir DIR` 或 `--dry-run`。
+
+```bash
+study=examples/scale-down/01-analyse/04-fsdp3-comm
+bash "$study/01-baseline/01_cuda_graph.sh" --dry-run
+bash "$study/01-baseline/01_cuda_graph.sh"
+bash "$study/04-nvme/01_dram_vs_nvme.sh" --nvme-path "$(mktemp -d /tmp/megatron-nvme.XXXXXX)"
+bash "$study/05-nccl/03_ag_pause.sh" --nccl-lib /path/to/nccl-2.32.3-pause/build/lib/libnccl.so.2
+```
+
+4 卡 TP=4 时 dense FSDP 分片组只有 1 个 rank，因此 TP4 使用 DDP 观测 TP 通信。NCCL 实验从 trace 核对实际运行的是 `AllGather_STMC` 与 `ReduceScatter_LDMC`。
 
 ### 选项
 
