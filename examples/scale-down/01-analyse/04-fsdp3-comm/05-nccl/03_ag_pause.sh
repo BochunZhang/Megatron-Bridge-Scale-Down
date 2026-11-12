@@ -6,7 +6,7 @@
 source "$(dirname "${BASH_SOURCE[0]}")/nccl_common.sh" "$@"
 
 for pause in 1536 3072 4608; do
-    run_nccl_case "split-high-symm-pause${pause}" high "${pause}" --overlap --symmetric
+    run_nccl_case "split-high-symm-pause${pause}" high "${pause}" --overlap --separate-rs --symmetric
 done
 
 (( FAILED == 0 ))

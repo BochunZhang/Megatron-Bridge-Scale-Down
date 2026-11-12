@@ -45,6 +45,7 @@ MASTER_ADDR="${MASTER_ADDR:-${DLC_MASTER_ADDR:-}}"
 MASTER_PORT="${MASTER_PORT:-29501}"
 FORCE_BALANCE=false
 OVERLAP=false
+SEPARATE_RS=false
 TP_COMM_OVERLAP=false
 SYMMETRIC=false
 OFFLOAD=""
@@ -76,6 +77,7 @@ Options:
                                 communicators (create_all_gather_group), overlapping
                                 reduce-scatter in FSDP3; ddp cases are unaffected;
                                 names get "-overlap"
+  --separate-rs                 FSDP3 cases use a dedicated gradient reduce-scatter communicator.
   --symmetric                   FSDP cases register the FSDP buffers, including the
                                 max-pool double buffers, as NCCL symmetric windows
                                 (ddp.nccl_ub); ddp cases are unaffected; names get
@@ -136,6 +138,7 @@ while [[ $# -gt 0 ]]; do
         --fsdp) need_value "$@"; parse_csv "$2" FSDP_LEVELS; FSDP_LEVELS_EXPLICIT=true; shift 2;;
         --ddp-overlap) DDP_OVERLAP=true; shift;;
         --overlap) OVERLAP=true; shift;;
+        --separate-rs) SEPARATE_RS=true; shift;;
         --symmetric) SYMMETRIC=true; shift;;
         --cpu-grad-accumulation|--cpu-optimizer) OFFLOAD_ARGS+=("$1"); shift;;
         --nvme-path) need_value "$@"; OFFLOAD_ARGS+=("$1" "$2"); shift 2;;
@@ -226,6 +229,7 @@ case_args() {
         [[ "${FORCE_BALANCE}" == true ]] && ARGS+=(--force-balance)
     fi
     [[ "${OVERLAP}" == true && "${fsdp}" != ddp ]] && ARGS+=(--overlap)
+    [[ "${SEPARATE_RS}" == true && "${fsdp}" == 3 ]] && ARGS+=(--separate-rs)
     [[ "${TP_COMM_OVERLAP}" == true && "${tp}" -gt 1 ]] && ARGS+=(--tp-comm-overlap)
     [[ "${SYMMETRIC}" == true && "${fsdp}" != ddp ]] && ARGS+=(--symmetric)
     [[ -n "${OFFLOAD}" ]] && ARGS+=(--offload "${OFFLOAD}")

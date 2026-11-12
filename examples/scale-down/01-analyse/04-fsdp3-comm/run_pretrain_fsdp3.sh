@@ -37,6 +37,7 @@ MERGE_GRAPHS=false
 FORCE_BALANCE=false
 FSDP_LEVEL="${FSDP_LEVEL:-3}"
 OVERLAP=false
+SEPARATE_RS=false
 TP_COMM_OVERLAP=false
 SYMMETRIC=false
 OFFLOAD=""
@@ -88,6 +89,8 @@ Options:
                                  longer queue behind gradient reduce-scatters on one
                                  NCCL communicator; only FSDP3 overlaps the two. Names get
                                  "-overlap"
+  --separate-rs                  FSDP3 only: route gradient reduce-scatter through
+                                 a dedicated DP communicator. Names get "-separate-rs"
   --symmetric                    Megatron-FSDP only: allocate the FSDP buffers (sharded
                                  weights and gradients, max-pool double buffers holding
                                  the all-gather output and reduce-scatter input) from an
@@ -198,6 +201,7 @@ while [[ $# -gt 0 ]]; do
         --fsdp) need_value "$@"; FSDP_LEVEL="$2"; shift 2;;
         --ddp-overlap) DDP_OVERLAP=true; shift;;
         --overlap) OVERLAP=true; shift;;
+        --separate-rs) SEPARATE_RS=true; shift;;
         --symmetric) SYMMETRIC=true; shift;;
         --cpu-grad-accumulation) CPU_GRAD_ACCUMULATION=true; shift;;
         --cpu-optimizer) CPU_OPTIMIZER=true; shift;;
@@ -325,6 +329,7 @@ fi
 [[ -n "${NVME_PATH}" ]] && OFFLOAD_TAG+="-nvme"
 # Only Megatron-FSDP builds its parameter all-gathers on the separate communicators.
 [[ "${OVERLAP}" == false || "${FSDP_LEVEL}" != ddp ]] || { echo "--overlap requires --fsdp 1, 2 or 3" >&2; exit 2; }
+[[ "${SEPARATE_RS}" == false || "${FSDP_LEVEL}" == 3 ]] || { echo "--separate-rs requires --fsdp 3" >&2; exit 2; }
 # The max-pool double buffers are Megatron-FSDP's. A forced NCCL_ALGO keeps every
 # collective on the classic ring / NVLS kernels even on registered windows.
 [[ "${SYMMETRIC}" == false || "${FSDP_LEVEL}" != ddp ]] || { echo "--symmetric requires --fsdp 1, 2 or 3" >&2; exit 2; }
@@ -448,6 +453,7 @@ if [[ "${MODEL}" == 27b ]]; then EXPERTS_TAG=0; else EXPERTS_TAG="${NUM_EXPERTS:
 # "-attn_<full|linear>" after the layer count, and TP > 1 "-tp_<N>" before CP.
 OVERLAP_TAG=""
 [[ "${OVERLAP}" == true ]] && OVERLAP_TAG="-overlap"
+[[ "${SEPARATE_RS}" == true ]] && OVERLAP_TAG+="-separate-rs"
 [[ "${SYMMETRIC}" == true ]] && OVERLAP_TAG+="-symm"
 [[ "${FSDP_LEVEL}" == ddp && "${DDP_OVERLAP}" == false ]] && OVERLAP_TAG+="-sync-ag"
 DTYPE_TAG=""
@@ -532,7 +538,8 @@ OVERRIDES=(
     "model.cp_comm_type=p2p" "model.mtp_num_layers=0" "model.linear_attention_freq=${LINEAR_ATTENTION_FREQ}"
     "model.recompute_granularity=null" "model.recompute_method=null" "model.recompute_num_layers=null"
     "model.recompute_modules=[]" "model.fine_grained_activation_offloading=false" "model.offload_modules=[]"
-    "${DP_OVERRIDES[@]}" "dist.create_all_gather_group=${OVERLAP}" "ddp.use_distributed_optimizer=true"
+    "${DP_OVERRIDES[@]}" "dist.create_all_gather_group=${OVERLAP}"
+    "dist.create_reduce_scatter_group=${SEPARATE_RS}" "ddp.use_distributed_optimizer=true"
     "ddp.nccl_ub=${SYMMETRIC}"
     # grad_reduce_in_fp32 only reaches MCore DDP (fp32 gradient buffer and reduce-scatter).
     # Megatron-FSDP ignores it: its gradient buffer follows megatron_fsdp_main_grads_dtype,
@@ -695,7 +702,7 @@ COMMAND+=(uv run --no-sync python "${TRAIN_ARGS[@]}")
 
 INFO=(
     "model=${MODEL}" "recipe=${RECIPE}" "fsdp=${FSDP_LEVEL}" "overlap=${OVERLAP}" "symmetric=${SYMMETRIC}" "dtype=${DTYPE}" "layers=${LAYERS_TAG}" "attention=${ATTENTION}"
-    "ddp_overlap=${DDP_OVERLAP}"
+    "ddp_overlap=${DDP_OVERLAP}" "separate_rs=${SEPARATE_RS}"
     "mtp=${MTP_TAG}" "experts=${EXPERTS_TAG}" "force_balance=${FORCE_BALANCE}" "cuda_graph=${CUDA_GRAPH}" "cuda_graph_trace=${GRAPH_TRACE}" "seq=${SEQ_LENGTH}"
     "tp=${TENSOR_PARALLEL}" "sp=${SEQUENCE_PARALLEL}" "cp=${CONTEXT_PARALLEL}" "dp=${DATA_PARALLEL}" "ep=${EXPERT_PARALLEL}"
     "dispatcher=${DISPATCHER}" "mbs=${MICRO_BATCH_SIZE}" "gbs=${GLOBAL_BATCH_SIZE}" "gpus=${GPU_COUNT}"
@@ -731,7 +738,7 @@ printf 'command:' >"${RESULT_DIR}/command.txt"
 printf ' %q' "${COMMAND[@]}" >>"${RESULT_DIR}/command.txt"
 printf '\n' >>"${RESULT_DIR}/command.txt"
 cat >"${RESULT_DIR}/launch.json" <<JSON
-{"model":"${MODEL_ID}","recipe":"${RECIPE}","run_name":"${RUN_NAME}","dtype":"${DTYPE}","fsdp":${FSDP_JSON},"fsdp_cpu_offload":${OFFLOAD_JSON},"fsdp_cpu_grad_accumulation":${CPU_GRAD_ACCUMULATION},"fsdp_cpu_optimizer":${CPU_OPTIMIZER},"fsdp_nvme":$([[ -n ${NVME_PATH} ]] && echo true || echo false),"data_parallel":"${DP_TAG}","create_all_gather_group":${OVERLAP},"nccl_ub":${SYMMETRIC},"num_layers":"${LAYERS_TAG}","attention":"${ATTENTION}","linear_attention_freq":"${LINEAR_ATTENTION_FREQ}","mtp_num_layers":${MTP_TAG},"num_moe_experts":"${EXPERTS_TAG}","force_balance":${FORCE_BALANCE},"cuda_graph":"${CUDA_GRAPH}","cuda_graph_impl":"${GRAPH_IMPL}","cuda_graph_modules":"${GRAPH_MODULES}","cuda_graph_trace":"${GRAPH_TRACE}","seq_length":${SEQ_LENGTH},"tensor_model_parallel_size":${TENSOR_PARALLEL},"sequence_parallel":${SEQUENCE_PARALLEL},"context_parallel_size":${CONTEXT_PARALLEL},"data_parallel_size":${DATA_PARALLEL},"expert_model_parallel_size":${EXPERT_PARALLEL},"dispatcher":"${DISPATCHER}","micro_batch_size":${MICRO_BATCH_SIZE},"global_batch_size":${GLOBAL_BATCH_SIZE},"num_microbatches":${NUM_MICROBATCHES},"gpu_count":${GPU_COUNT},"nnodes":${NNODES},"node_rank":${NODE_RANK},"numa_mode":"${NUMA_MODE}","pytorch_cuda_alloc_conf":"${PYTORCH_CUDA_ALLOC_CONF:-}","nccl_graph_register":"${NCCL_GRAPH_REGISTER:-}","nccl_nvls_enable":"${NCCL_NVLS_ENABLE:-}","nvte_cutedsl_fused_grouped_mlp":"${NVTE_CUTEDSL_FUSED_GROUPED_MLP:-}","run_date":"${RUN_DATE}"}
+{"model":"${MODEL_ID}","recipe":"${RECIPE}","run_name":"${RUN_NAME}","dtype":"${DTYPE}","fsdp":${FSDP_JSON},"fsdp_cpu_offload":${OFFLOAD_JSON},"fsdp_cpu_grad_accumulation":${CPU_GRAD_ACCUMULATION},"fsdp_cpu_optimizer":${CPU_OPTIMIZER},"fsdp_nvme":$([[ -n ${NVME_PATH} ]] && echo true || echo false),"data_parallel":"${DP_TAG}","create_all_gather_group":${OVERLAP},"create_reduce_scatter_group":${SEPARATE_RS},"nccl_ub":${SYMMETRIC},"num_layers":"${LAYERS_TAG}","attention":"${ATTENTION}","linear_attention_freq":"${LINEAR_ATTENTION_FREQ}","mtp_num_layers":${MTP_TAG},"num_moe_experts":"${EXPERTS_TAG}","force_balance":${FORCE_BALANCE},"cuda_graph":"${CUDA_GRAPH}","cuda_graph_impl":"${GRAPH_IMPL}","cuda_graph_modules":"${GRAPH_MODULES}","cuda_graph_trace":"${GRAPH_TRACE}","seq_length":${SEQ_LENGTH},"tensor_model_parallel_size":${TENSOR_PARALLEL},"sequence_parallel":${SEQUENCE_PARALLEL},"context_parallel_size":${CONTEXT_PARALLEL},"data_parallel_size":${DATA_PARALLEL},"expert_model_parallel_size":${EXPERT_PARALLEL},"dispatcher":"${DISPATCHER}","micro_batch_size":${MICRO_BATCH_SIZE},"global_batch_size":${GLOBAL_BATCH_SIZE},"num_microbatches":${NUM_MICROBATCHES},"gpu_count":${GPU_COUNT},"nnodes":${NNODES},"node_rank":${NODE_RANK},"numa_mode":"${NUMA_MODE}","pytorch_cuda_alloc_conf":"${PYTORCH_CUDA_ALLOC_CONF:-}","nccl_graph_register":"${NCCL_GRAPH_REGISTER:-}","nccl_nvls_enable":"${NCCL_NVLS_ENABLE:-}","nvte_cutedsl_fused_grouped_mlp":"${NVTE_CUTEDSL_FUSED_GROUPED_MLP:-}","run_date":"${RUN_DATE}"}
 JSON
 printf '%s\n' "${INFO[*]}" | tee "${RESULT_DIR}/run_info.txt"
 set +e

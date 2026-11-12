@@ -537,3 +537,47 @@ class TestCreateAllGatherGroup:
         assert kwargs["timeout"].total_seconds() == 7 * 60
         assert pg_collection.dp_cp_ag == "dp_cp_ag"
         assert pg_collection.expt_dp_ag == ("expt_dp_ag" if ep_size > 1 else None)
+
+
+class TestCreateReduceScatterGroup:
+    @pytest.mark.unit
+    @pytest.mark.parametrize(
+        "enabled,ep_size,num_moe_experts", [(True, 4, 32), (True, 1, 32), (True, 1, None), (False, 4, 32)]
+    )
+    @patch("megatron.bridge.training.initialize.get_rank_safe", return_value=1)
+    @patch("megatron.bridge.training.initialize.parallel_state")
+    @patch("megatron.bridge.training.initialize.ProcessGroupCollection")
+    @patch("megatron.bridge.training.initialize.torch")
+    def test_reduce_scatter_groups_attached(
+        self, mock_torch, mock_pgc, mock_ps, _mock_rank, enabled, ep_size, num_moe_experts
+    ):
+        mock_torch.cuda.device_count.return_value = 1
+        mock_torch.distributed.is_initialized.return_value = True
+        mock_ps.model_parallel_is_initialized.return_value = True
+        expert_group = "expt_dp_rs" if num_moe_experts is not None else None
+        mock_ps.create_reduce_scatter_groups.return_value = ("dp_cp_rs", expert_group)
+        mock_pgc.use_mpu_process_groups.return_value = Mock(spec=[])
+        model_config = Mock(
+            expert_model_parallel_size=ep_size, expert_tensor_parallel_size=1, num_moe_experts=num_moe_experts
+        )
+        dist_config = DistributedInitConfig(
+            create_reduce_scatter_group=enabled,
+            distributed_timeout_minutes=7,
+            high_priority_stream_groups=["dp_cp", "ep_dp", "tp"],
+        )
+
+        pg_collection = _initialize_distributed(model_config, dist_config, 1, None, None)
+
+        if not enabled:
+            mock_ps.create_reduce_scatter_groups.assert_not_called()
+            assert not hasattr(pg_collection, "dp_cp_rs")
+            return
+        _, kwargs = mock_ps.create_reduce_scatter_groups.call_args
+        assert kwargs["for_expert_parallelism"] is (num_moe_experts is not None)
+        assert kwargs["timeout"].total_seconds() == 7 * 60
+        assert kwargs["nccl_comm_cfgs"] == {
+            "dp_cp": {"is_high_priority_stream": True},
+            "ep_dp": {"is_high_priority_stream": True},
+        }
+        assert pg_collection.dp_cp_rs == "dp_cp_rs"
+        assert pg_collection.expt_dp_rs == expert_group

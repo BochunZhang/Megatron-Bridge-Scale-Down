@@ -409,7 +409,7 @@ def test_baseline_saves_stable_case_paths_under_each_experiment(
 
 @pytest.mark.unit
 @pytest.mark.parametrize("script", ["01_priority.sh", "02_symmetric_multicast.sh", "03_ag_pause.sh"])
-def test_nccl_studies_scope_multicast_and_pause_to_symmetric_fsdp_cases(script: str):
+def test_nccl_studies_use_the_cta_pause_build_and_automatic_kernel_selection(script: str):
     result = _run(
         EXAMPLE / "05-nccl" / script,
         "--dry-run",
@@ -417,24 +417,21 @@ def test_nccl_studies_scope_multicast_and_pause_to_symmetric_fsdp_cases(script: 
         LD_PRELOAD="",
         NCCL_ALGO="Ring",
         NCCL_SYM_KERNEL="AllGather_STMC",
-        NCCL_SYM_AG_STMC_PAUSE_CYCLES="999",
     )
     assert result.returncode == 0, result.stderr
     case_lines = [line for line in result.stderr.splitlines() if line.startswith("NCCL case ")]
     assert case_lines
-    library = REPO_ROOT / "nccl/nccl-2.32.3-fsdp-multicast/build/lib/libnccl.so.2"
-    pauses = []
+    library = REPO_ROOT / "nccl/nccl-2.32.3-cta-with-pause/build/lib/libnccl.so.2"
     for line in case_lines:
         args = shlex.split(line)
         assert f"LD_PRELOAD={library}" in args
         assert "NCCL_SYM_KERNEL" in args
         assert not any(arg.startswith("NCCL_SYM_KERNEL=") for arg in args)
-        assert "NCCL_ENQUEUE_REARCH_ENABLE=0" in args
-        assert "NCCL_SYM_AG_STMC_PAUSE_CYCLES=0" in args
-        assert f"MEGATRON_FSDP_MULTICAST={int('-symm-' in args[2])}" in args
-        pause_setting = next(arg for arg in args if arg.startswith("NCCL_FSDP_AG_STMC_PAUSE_CYCLES="))
-        pauses.append(int(pause_setting.split("=", 1)[1]))
-    assert pauses == ([1536, 3072, 4608] if script == "03_ag_pause.sh" else [0] * len(case_lines))
+    for command in _commands(result.stderr):
+        args = shlex.split(command)
+        split_ag = "dist.create_all_gather_group=true" in args
+        assert f"dist.create_reduce_scatter_group={str(split_ag).lower()}" in args
+        assert ("-separate-rs-" in _report_base(command).name) == split_ag
 
 
 @pytest.mark.unit
@@ -683,6 +680,20 @@ def test_overlap_creates_all_gather_group_for_fsdp_cases_only(tmp_path: Path):
     result = _run(RUN_ONE, "--model", "27b", "--seq-length", "256", "--fsdp", "ddp", "--overlap", "--dry-run")
     assert result.returncode == 2
     assert "--overlap requires --fsdp 1, 2 or 3" in result.stderr
+
+
+def test_separate_rs_creates_a_group_for_fsdp3_cases_only(tmp_path: Path):
+    fsdp3, fsdp1, ddp = _sweep(tmp_path, "--model", "27b", "--fsdp", "3,1,ddp", "--seq", "256", "--separate-rs")
+    assert "dist.create_reduce_scatter_group=true" in fsdp3
+    assert "dist.create_all_gather_group=false" in fsdp3
+    assert "-separate-rs-" in _report_base(fsdp3).name
+    for command in (fsdp1, ddp):
+        assert "dist.create_reduce_scatter_group=false" in command
+        assert "-separate-rs-" not in _report_base(command).name
+
+    result = _run(RUN_ONE, "--model", "27b", "--seq-length", "256", "--fsdp", "1", "--separate-rs", "--dry-run")
+    assert result.returncode == 2
+    assert "--separate-rs requires --fsdp 3" in result.stderr
 
 
 def test_symmetric_registers_max_pool_double_buffers_for_fsdp_cases_only(tmp_path: Path):

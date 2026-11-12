@@ -837,27 +837,35 @@ def _initialize_distributed(
                 )
         # Return a ProcessGroupCollection using mpu process groups
         pg_collection = ProcessGroupCollection.use_mpu_process_groups()
-        if dist_config.create_all_gather_group:
-            # Megatron-FSDP all-gathers parameters on these groups so they do not queue
-            # behind gradient reduce-scatters on the dp_cp / expt_dp communicators.
-            # Use the same stream priority for a split all-gather group as for its
-            # original group, which still handles reduce-scatter.
-            ag_comm_cfgs = {
+        if dist_config.create_all_gather_group or dist_config.create_reduce_scatter_group:
+            # Inherit the stream priority of the corresponding DP group.
+            fsdp_comm_cfgs = {
                 name: {"is_high_priority_stream": True}
                 for name in (dist_config.high_priority_stream_groups or [])
                 if name in ("dp_cp", "ep_dp")
             }
-            dp_cp_ag, expt_dp_ag = parallel_state.create_all_gather_groups(
-                for_expert_parallelism=model_config.expert_model_parallel_size > 1,
-                timeout=datetime.timedelta(minutes=dist_config.distributed_timeout_minutes),
-                **({"nccl_comm_cfgs": ag_comm_cfgs} if ag_comm_cfgs else {}),
-            )
-            pg_collection.dp_cp_ag = dp_cp_ag
-            pg_collection.expt_dp_ag = expt_dp_ag
-            if get_rank_safe() == 0:
-                print(
-                    "> created all-gather process groups for AG/RS overlap"
-                    + (" (including expert data parallel)" if expt_dp_ag is not None else "")
+            timeout = datetime.timedelta(minutes=dist_config.distributed_timeout_minutes)
+            if dist_config.create_all_gather_group:
+                dp_cp_ag, expt_dp_ag = parallel_state.create_all_gather_groups(
+                    for_expert_parallelism=model_config.expert_model_parallel_size > 1,
+                    timeout=timeout,
+                    **({"nccl_comm_cfgs": fsdp_comm_cfgs} if fsdp_comm_cfgs else {}),
+                )
+                pg_collection.dp_cp_ag = dp_cp_ag
+                pg_collection.expt_dp_ag = expt_dp_ag
+                if get_rank_safe() == 0:
+                    print(
+                        "> created all-gather process groups for AG/RS overlap"
+                        + (" (including expert data parallel)" if expt_dp_ag is not None else "")
+                    )
+            if dist_config.create_reduce_scatter_group:
+                create_reduce_scatter_groups = getattr(parallel_state, "create_reduce_scatter_groups", None)
+                if create_reduce_scatter_groups is None:
+                    raise RuntimeError("create_reduce_scatter_group requires a Megatron Core build with RS groups.")
+                pg_collection.dp_cp_rs, pg_collection.expt_dp_rs = create_reduce_scatter_groups(
+                    for_expert_parallelism=getattr(model_config, "num_moe_experts", None) is not None,
+                    timeout=timeout,
+                    nccl_comm_cfgs=fsdp_comm_cfgs,
                 )
         return pg_collection
 

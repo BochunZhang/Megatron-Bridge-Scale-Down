@@ -166,6 +166,12 @@ class DistributedInitConfig(MTrainDistributedInitConfig):
     communicator and the two can overlap. Equivalent to Megatron-LM ``--create-all-gather-group``.
     Only Megatron-FSDP uses these groups; requires use_megatron_fsdp=True and use_decentralized_pg=False."""
 
+    create_reduce_scatter_group: bool = False
+    """Use separate data-parallel communicators for Megatron FSDP-3 gradient reduce-scatters.
+
+    Requires MPU process groups and one distributed optimizer instance with no outer DP sharding.
+    """
+
     eval_context_parallel_size: int | None = None
     """If set and different from model.context_parallel_size, validation runs with this CP
     degree instead of the training CP degree. Requires use_decentralized_pg=True. The caller
@@ -1369,6 +1375,15 @@ class ConfigContainer(Container):
                 raise ValueError("create_all_gather_group requires use_megatron_fsdp=True.")
             if self.dist.use_decentralized_pg:
                 raise ValueError("create_all_gather_group is not supported with use_decentralized_pg=True.")
+        if self.dist.create_reduce_scatter_group:
+            if not self.dist.use_megatron_fsdp or self.ddp.data_parallel_sharding_strategy != "optim_grads_params":
+                raise ValueError("create_reduce_scatter_group requires Megatron FSDP-3 (optim_grads_params).")
+            if self.dist.use_decentralized_pg:
+                raise ValueError("create_reduce_scatter_group is not supported with use_decentralized_pg=True.")
+            if self.ddp.num_distributed_optimizer_instances != 1 or self.ddp.outer_dp_sharding_strategy != "no_shard":
+                raise ValueError(
+                    "create_reduce_scatter_group requires one distributed optimizer instance and no outer DP sharding."
+                )
 
         # Validate reuse_grad_buf_for_mxfp8_param_ag when FSDP is not enabled
         is_fsdp = self.dist.use_megatron_fsdp or self.ddp.use_megatron_fsdp
