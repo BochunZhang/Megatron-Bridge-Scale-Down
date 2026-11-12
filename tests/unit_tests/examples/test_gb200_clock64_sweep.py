@@ -13,12 +13,11 @@ SCRIPT_DIR = Path(__file__).resolve().parents[3] / "examples/gb200/ncu-torch-all
 pytestmark = pytest.mark.unit
 
 
-@pytest.mark.parametrize("entry", ("sweep_symm_ag_clock64.sh", "sweep_symm_ag_rs_clock64.sh"))
-def test_clock64_sweep_uses_standalone_ag_in_all_three_tasks(entry: str, tmp_path: Path) -> None:
+def test_clock64_sweep_uses_standalone_ag_in_all_three_tasks(tmp_path: Path) -> None:
     result = subprocess.run(
         [
             "bash",
-            str(SCRIPT_DIR / entry),
+            str(SCRIPT_DIR / "sweep_symm_ag_clock64.sh"),
             "--dry-run",
             "--pause-cycles",
             "0,128",
@@ -52,6 +51,45 @@ def test_clock64_sweep_uses_standalone_ag_in_all_three_tasks(entry: str, tmp_pat
             assert command[command.index("--communicator") + 1] == "shmem"
             assert lib == "nccl-2.32.3-pause"
     assert not (tmp_path / "out").exists()
+
+
+def test_clock64_sweep_runs_both_patches_at_each_pause_with_ag_rs(tmp_path: Path) -> None:
+    output_dir = tmp_path / "out"
+    result = subprocess.run(
+        [
+            "bash",
+            str(SCRIPT_DIR / "sweep_symm_ag_rs_clock64.sh"),
+            "--dry-run",
+            "--pause-cycles",
+            "0,128",
+            "--output-dir",
+            str(output_dir),
+        ],
+        capture_output=True,
+        text=True,
+        check=True,
+        timeout=20,
+    )
+    commands = [
+        shlex.split(line)
+        for line in result.stdout.splitlines()
+        if line.startswith(("env ", "NCCL_SYM_AG_STMC_PAUSE_CYCLES="))
+    ]
+    assert len(commands) == 4
+    assert "ncu pause-only baseline" not in result.stdout
+    for index, command in enumerate(commands):
+        profile = ("store", "split")[index // 2]
+        pause = (0, 128)[index % 2]
+        assert "--ag-rs" in command
+        assert "--baseline-only" in command
+        assert command[command.index("--warmup") + 1] == "5"
+        assert command[command.index("--iters") + 1] == "1"
+        assert f"NCCL_SYM_AG_STMC_PAUSE_CYCLES={pause}" in command
+        assert f"NCCL_SYM_CLOCK64_CSV_PROFILE={profile}" in command
+        lib = Path(command[command.index("--nccl-lib") + 1]).parents[2].name
+        assert lib == f"nccl-2.32.3-pause-{profile}-clock64"
+        assert Path(command[command.index("--output-dir") + 1]) == output_dir / profile / f"pause-{pause}cyc"
+    assert not output_dir.exists()
 
 
 @pytest.mark.parametrize("index,kernel", ((0, "AllGather_STMC"), (1, "ReduceScatter_LDMC")))

@@ -265,6 +265,16 @@ bash examples/gb200/ncu-torch-all-gather/sweep_symm_ag_clock64.sh
 两个插桩任务走 `--baseline-only`，第三个复用已有的单跑 AG ncu sweep，默认使用 `application`
 replay 和 `shmem` communicator。可用 `--dry-run` 查看计划。
 
+并发采集 AG 和 RS 的两组 clock64 数据时，执行以下命令。sweep 会遍历默认的 12 个 AG pause 点，
+每点分别运行 `store` 和 `split` 版本，RS 按原速运行。每组默认 `--warmup 5 --iters 1`。
+首轮 warmup 串行运行 AG 和 RS 建立连接，后四轮并发，随后采集一次并发 AG + RS。
+用 `--pause-cycles 0,1536,6144` 可指定子集，用 `--venv DIR` 可指定已有的虚拟环境。
+每个 `baseline.log` 记录并发时长，汇总的 `clock64.csv` 用 `kernel` 列区分 AG 和 RS。
+
+```bash
+bash examples/gb200/ncu-torch-all-gather/sweep_symm_ag_rs_clock64.sh
+```
+
 | NCCL 构建 | AG 计时 | RS 计时 |
 | --- | --- | --- |
 | `2.32.3-pause-store-clock64` | 8 条 multicast store 的发射窗口 | 本地 store 的发射窗口 |
