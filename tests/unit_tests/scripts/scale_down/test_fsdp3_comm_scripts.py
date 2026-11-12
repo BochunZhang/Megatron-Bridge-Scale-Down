@@ -243,7 +243,7 @@ def test_run_one_print_result_dir_encodes_shape_and_cuda_graph(tmp_path: Path):
     )
     assert result.returncode == 0, result.stderr
     assert Path(result.stdout.strip()).parent.name.startswith(
-        "model_2.4t-fsdp_3-layers_4-mtp_1-experts_64-cg_on-partial-mbs_1-seq_4096-cp_1-ep_4-"
+        "model_2.4t-fsdp_3-layers_4-mtp_1-experts_64-cg_on-partial-moe-mbs_1-seq_4096-cp_1-ep_4-"
     )
 
 
@@ -329,9 +329,9 @@ def test_partial_cuda_graph_for_moe_fsdp(tmp_path: Path):
         )
         assert len(commands) == 3
         for command in commands:
-            assert "-cg_on-partial-" in command
+            assert "-cg_on-partial-moe-" in command
             assert "model.cuda_graph_impl=local" in command
-            assert r"model.cuda_graph_modules=\[attn\]" in command
+            assert "model.cuda_graph_modules=[attn,moe_router,moe_preprocess]" in shlex.split(command)
             assert "model.gradient_accumulation_fusion=false" in command
             assert "ddp.megatron_fsdp_max_pool_double_buffer=true" in command
             assert "ddp.fsdp_all_gather_in_start_param_sync=true" in command
@@ -348,14 +348,25 @@ def test_partial_cuda_graph_for_moe_fsdp(tmp_path: Path):
                 assert full_graph_only not in command
 
 
-def test_default_moe_sweep_keeps_fsdp1_for_graph_off_only(tmp_path: Path):
+def test_default_moe_sweep_uses_native_partial_graph_for_fsdp1_and_fsdp3(tmp_path: Path):
     commands = _sweep(tmp_path, "--model", "397b", "--experts", "64", "--seq", "1024", "--cuda-graph", "off,on")
-    assert len(commands) == 3
-    assert sum("model_397b-fsdp_1-" in command and "-cg_off-" in command for command in commands) == 1
-    assert sum("-cg_on-partial-" in command for command in commands) == 1
+    assert len(commands) == 4
+    fsdp1 = next(c for c in commands if "model_397b-fsdp_1-" in c and "-cg_on-partial-moe-" in c)
+    assert "model.cuda_graph_impl=local" in fsdp1
+    assert "model.cuda_graph_modules=[attn,moe_router,moe_preprocess]" in shlex.split(fsdp1)
+    assert "ddp.overlap_param_gather=false" in fsdp1
+    assert "ddp.megatron_fsdp_max_pool_double_buffer" not in fsdp1
+    assert sum("-cg_on-partial-moe-" in command for command in commands) == 2
 
 
-def test_moe_fsdp3_offload_allows_attention_graph(tmp_path: Path):
+def test_default_moe_sweep_keeps_graph_offload_on_fsdp3(tmp_path: Path):
+    (command,) = _sweep(
+        tmp_path, "--model", "397b", "--experts", "64", "--seq", "1024", "--cuda-graph", "on", "--offload", "weight"
+    )
+    assert "model_397b-fsdp_3-" in command
+
+
+def test_moe_fsdp3_offload_allows_native_partial_graph(tmp_path: Path):
     (command,) = _sweep(
         tmp_path,
         "--model", "397b", "--fsdp", "3", "--seq", "1024", "--experts", "64",
@@ -364,10 +375,48 @@ def test_moe_fsdp3_offload_allows_attention_graph(tmp_path: Path):
     args = shlex.split(command)
     assert "ddp.fsdp_cpu_offload=[optimizer,weight,gradient]" in args
     assert "model.cuda_graph_impl=local" in args
-    assert "model.cuda_graph_modules=[attn]" in args
+    assert "model.cuda_graph_modules=[attn,moe_router,moe_preprocess]" in args
     assert "ddp.fsdp_all_gather_in_start_param_sync=true" in args
     assert "ddp.megatron_fsdp_cuda_graph_mode=true" not in args
     assert "optimizer.optimizer_cuda_graph=false" in args
+
+
+def test_weight_offload_study_uses_native_partial_graph_for_moe_cp4(tmp_path: Path):
+    result = _run(
+        EXAMPLE / "03-cpu-offload/01_weight_offload.sh",
+        "--model",
+        "2.4t",
+        "--dry-run",
+        "--output-dir",
+        str(tmp_path),
+    )
+    assert result.returncode == 0, result.stderr
+    commands = [shlex.split(command) for command in _commands(result.stderr)]
+    assert len(commands) == 8
+    cp4_commands = [args for args in commands if "model.context_parallel_size=4" in args]
+    assert len(cp4_commands) == 4
+    for args in cp4_commands:
+        assert "model.cuda_graph_impl=local" in args
+        assert "model.cuda_graph_modules=[attn,moe_router,moe_preprocess]" in args
+    assert {
+        (
+            "dist.create_all_gather_group=true" in args,
+            "ddp.fsdp_cpu_offload=[weight]" in args,
+        )
+        for args in cp4_commands
+    } == {(False, False), (True, False), (False, True), (True, True)}
+
+
+def test_moe_attention_only_graph_has_distinct_results(tmp_path: Path):
+    result = _run(
+        RUN_ONE,
+        "--model", "2.4t", "--fsdp", "3", "--seq", "1024", "--cuda-graph", "on", "--local-attention-graph",
+        "--results-root", str(tmp_path), "--dry-run",
+    )
+    assert result.returncode == 0, result.stderr
+    (command,) = _commands(result.stderr)
+    assert "model.cuda_graph_modules=[attn]" in shlex.split(command)
+    assert "-cg_on-partial-mbs_" in command
 
 
 def test_run_one_cuda_graph_disables_nccl_graph_register_with_expandable_segments(tmp_path: Path):
@@ -387,11 +436,10 @@ def test_run_one_cuda_graph_disables_nccl_graph_register_with_expandable_segment
 def test_moe_partial_cuda_graph_rejects_unsupported_fsdp_configs(tmp_path: Path):
     common = ("--model", "2.4t", "--seq-length", "1024", "--cuda-graph", "on", "--dry-run")
     for args, message in (
-        (("--fsdp", "1"), "require --fsdp 3"),
-        (("--fsdp", "2"), "require --fsdp 3"),
+        (("--fsdp", "2"), "require --fsdp 1 or 3"),
+        (("--fsdp", "1", "--offload", "weight"), "offload with --cuda-graph on requires --fsdp 3"),
         (("--dtype", "mxfp8"), "require --dtype bf16"),
-        (("--tp", "2"), "require --tp 1 and --cp 1"),
-        (("--cp", "2"), "require --tp 1 and --cp 1"),
+        (("--tp", "2"), "require --tp 1"),
         (("--symmetric",), "require --symmetric to be off"),
     ):
         result = _run(RUN_ONE, *common, *args, NCCL_ALGO="")
@@ -399,10 +447,10 @@ def test_moe_partial_cuda_graph_rejects_unsupported_fsdp_configs(tmp_path: Path)
         assert message in result.stderr
     result = _run(
         BENCHMARK,
-        "--model", "397b", "--fsdp", "3,1", "--seq", "256", "--cuda-graph", "on",
+        "--model", "397b", "--fsdp", "3,2", "--seq", "256", "--cuda-graph", "on",
         "--output-dir", str(tmp_path), "--dry-run",
     )
-    assert result.returncode == 2 and "require --fsdp 3" in result.stderr
+    assert result.returncode == 2 and "require --fsdp 1 or 3" in result.stderr
 
 
 def test_ddp_replaces_megatron_fsdp_and_uses_te_per_layer_graphs(tmp_path: Path):
@@ -475,6 +523,36 @@ def test_overlap_creates_all_gather_group_for_fsdp_cases_only(tmp_path: Path):
     result = _run(RUN_ONE, "--model", "27b", "--seq-length", "256", "--fsdp", "ddp", "--overlap", "--dry-run")
     assert result.returncode == 2
     assert "--overlap requires --fsdp 1, 2 or 3" in result.stderr
+
+
+def test_symmetric_registers_max_pool_double_buffers_for_fsdp_cases_only(tmp_path: Path):
+    fsdp3, ddp = _sweep(
+        tmp_path, "--model", "2.4t", "--experts", "64", "--fsdp", "3,ddp", "--seq", "256", "--overlap", "--symmetric", "--nsys"
+    )
+    assert "model_2.4t-fsdp_3-overlap-symm-layers_4-" in fsdp3 and "/qwen38_2.4t-fsdp_3-overlap-symm-experts_64-" in fsdp3
+    for override in (
+        "ddp.nccl_ub=true",
+        "ddp.disable_symmetric_registration=false",
+        "ddp.fsdp_double_buffer=true",
+        "ddp.megatron_fsdp_max_pool_double_buffer=true",
+        "ddp.fsdp_db_use_persist_buf_on_alloc_fail=true",
+        "dist.create_all_gather_group=true",
+    ):
+        assert override in fsdp3
+    assert "model_2.4t-ddp-sync-ag-layers_4-" in ddp and "ddp.nccl_ub=false" in ddp
+    (default,) = _sweep(tmp_path, "--model", "27b", "--fsdp", "3", "--seq", "256")
+    assert "-symm-" not in default and "ddp.nccl_ub=false" in default
+    assert "ddp.disable_symmetric_registration" not in default
+
+    common = ("--model", "27b", "--seq-length", "256", "--symmetric", "--dry-run")
+    # The multicast symmetric kernels need NVLS even when the shell turned it off.
+    result = _run(RUN_ONE, *common, "--results-root", str(tmp_path), NCCL_NVLS_ENABLE="0")
+    assert result.returncode == 0, result.stderr
+    assert "NCCL_NVLS_ENABLE=1" in result.stderr.splitlines()
+    result = _run(RUN_ONE, *common, "--fsdp", "ddp")
+    assert result.returncode == 2 and "--symmetric requires --fsdp 1, 2 or 3" in result.stderr
+    result = _run(RUN_ONE, *common, NCCL_ALGO="Ring")
+    assert result.returncode == 2 and "--symmetric requires NCCL_ALGO to be unset" in result.stderr
 
 
 def test_force_balance_tags_moe_cases_and_skips_dense(tmp_path: Path):

@@ -86,9 +86,8 @@ Options:
                                 with TP > 1
   --cp N[,N...]                 Context parallel sizes (default: 1)
   --cuda-graph off|on[,...]     CUDA graph modes (default: off). on uses full-iteration
-                                for dense FSDP, native partial graphs for MoE FSDP3,
-                                and TE per-layer graphs for DDP. The default FSDP
-                                matrix skips FSDP1 for MoE graph-on cases.
+                                for dense FSDP, native partial graphs for MoE FSDP1/3,
+                                and TE per-layer graphs for DDP.
   --seq N[,N...]                Sequence lengths (default: 256,1024,4096)
   --mbs N[,N...]                Micro batch sizes (default: 1)
   --gbs N[,N...]                Fixed global batch sizes, multiples of MBS*DP;
@@ -259,7 +258,7 @@ for model in "${MODELS[@]}"; do
                             if [[ "${batch}" == gbs=* ]]; then gbs="${batch#gbs=}"; else gbs=$((${batch#nmb=} * mbs * dp)); fi
                             for cg in "${CUDA_GRAPHS[@]}"; do
                                 for fsdp in "${FSDP_LEVELS[@]}"; do
-                                    if [[ "${FSDP_LEVELS_EXPLICIT}" == false && "${model}" != 27b && "${cg}" == on && "${fsdp}" == 1 ]]; then
+                                    if [[ "${FSDP_LEVELS_EXPLICIT}" == false && -n "${OFFLOAD}" && "${model}" != 27b && "${cg}" == on && "${fsdp}" == 1 ]]; then
                                         continue
                                     fi
                                     case_args "${model}" "${experts}" "${seq}" "${tp}" "${cp}" "${mbs}" "${gbs}" "${cg}" "${fsdp}"

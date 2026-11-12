@@ -7,10 +7,12 @@ source "$(dirname "${BASH_SOURCE[0]}")/../offload_study_common.sh" "$@"
 
 # Match the offloaded components and graph scope while moving accumulation, then AdamW.
 for model in "${MODELS[@]}"; do
-    run_case "${model}" gpu-grad-gpu-adamw 3 on 1 1 1 --local-attention-graph --offload optimizer,weight,gradient
-    run_case "${model}" cpu-grad-gpu-adamw 3 on 1 1 1 --local-attention-graph --offload optimizer,weight,gradient \
+    graph_args=()
+    if [[ "${model}" == 27b ]]; then graph_args=(--local-attention-graph); fi
+    run_case "${model}" gpu-grad-gpu-adamw 3 on 1 1 1 ${graph_args[@]+"${graph_args[@]}"} --offload optimizer,weight,gradient
+    run_case "${model}" cpu-grad-gpu-adamw 3 on 1 1 1 ${graph_args[@]+"${graph_args[@]}"} --offload optimizer,weight,gradient \
         --cpu-grad-accumulation
-    run_case "${model}" cpu-grad-cpu-adamw 3 on 1 1 1 --local-attention-graph --offload weight --cpu-optimizer
+    run_case "${model}" cpu-grad-cpu-adamw 3 on 1 1 1 ${graph_args[@]+"${graph_args[@]}"} --offload weight --cpu-optimizer
 done
 
 (( FAILED == 0 ))

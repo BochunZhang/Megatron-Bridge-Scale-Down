@@ -102,8 +102,9 @@ Options:
                                  names get "-tp-overlap"
   --cp N                         Context parallel size (default: 1)
   --cuda-graph off|on            off: no CUDA graph (default). on with FSDP: dense uses
-                                 full_iteration; MoE uses native attention and prefetch
-                                 graphs with BF16 FSDP3, TP=CP=1 and no --symmetric.
+                                 full_iteration; MoE graphs attention, router and preprocess with
+                                 BF16 FSDP1 or FSDP3, TP=1 and no --symmetric.
+                                 FSDP3 also graphs eligible parameter prefetches.
                                  on with DDP: TE per-layer graphs, dense attn+mlp,
                                  MoE attn+moe_router+moe_preprocess where supported.
   --mbs|--micro-batch-size N     Micro batch size (default: 1)
@@ -139,7 +140,7 @@ Options:
   --cpu-grad-accumulation        Stage reduced shards in pinned MaxPool double buffers and accumulate on CPU
   --cpu-optimizer                Run AdamW on CPU; implies optimizer and gradient offload
   --local-attention-graph        Use native attention-only graphs with --cuda-graph on,
-                                 BF16 FSDP3 and TP=CP=1 (including on dense models)
+                                 BF16 FSDP1 or FSDP3 and TP=1 (including on dense models)
   --nvme-path DIR                Use the native NVMe AIO extension for weights, gradients and AdamW state;
                                  implies --cpu-optimizer. DIR is local to each node.
   MEGATRON_LM_DIR                Optional environment variable pointing to the MCore checkout
@@ -388,8 +389,8 @@ fi
 
 GRAPH_IMPL=none
 GRAPH_MODULES="[]"
-if [[ "${LOCAL_ATTENTION_GRAPH}" == true && ( "${CUDA_GRAPH}" != on || "${FSDP_LEVEL}" != 3 ) ]]; then
-    echo "--local-attention-graph requires --cuda-graph on and --fsdp 3" >&2; exit 2
+if [[ "${LOCAL_ATTENTION_GRAPH}" == true && ( "${CUDA_GRAPH}" != on || ( "${FSDP_LEVEL}" != 1 && "${FSDP_LEVEL}" != 3 ) ) ]]; then
+    echo "--local-attention-graph requires --cuda-graph on and --fsdp 1 or 3" >&2; exit 2
 fi
 if [[ "${CUDA_GRAPH}" == on ]]; then
     if [[ "${FSDP_LEVEL}" == ddp ]]; then
@@ -405,14 +406,19 @@ if [[ "${CUDA_GRAPH}" == on ]]; then
     elif [[ "${MODEL}" == 27b && "${LOCAL_ATTENTION_GRAPH}" == false ]]; then
         GRAPH_IMPL=full_iteration
     else
-        [[ "${FSDP_LEVEL}" == 3 ]] || { echo "FSDP attention CUDA graphs require --fsdp 3" >&2; exit 2; }
+        [[ "${FSDP_LEVEL}" == 1 || "${FSDP_LEVEL}" == 3 ]] || {
+            echo "FSDP attention CUDA graphs require --fsdp 1 or 3" >&2; exit 2;
+        }
         [[ "${DTYPE}" == bf16 ]] || { echo "FSDP attention CUDA graphs require --dtype bf16" >&2; exit 2; }
-        (( TENSOR_PARALLEL == 1 && CONTEXT_PARALLEL == 1 )) || {
-            echo "FSDP attention CUDA graphs require --tp 1 and --cp 1" >&2; exit 2;
+        (( TENSOR_PARALLEL == 1 )) || {
+            echo "FSDP attention CUDA graphs require --tp 1" >&2; exit 2;
         }
         [[ "${SYMMETRIC}" == false ]] || { echo "FSDP attention CUDA graphs require --symmetric to be off" >&2; exit 2; }
         GRAPH_IMPL=local
         GRAPH_MODULES="[attn]"
+        if [[ "${MODEL}" != 27b && "${LOCAL_ATTENTION_GRAPH}" == false ]]; then
+            GRAPH_MODULES="[attn,moe_router,moe_preprocess]"
+        fi
     fi
 fi
 if [[ "${CPU_GRAD_ACCUMULATION}" == true ]]; then
@@ -454,6 +460,7 @@ TP_TAG=""
 [[ "${TP_COMM_OVERLAP}" == true ]] && TP_TAG+="-tp-overlap"
 CG_TAG="${CUDA_GRAPH}"
 [[ "${GRAPH_IMPL}" == local ]] && CG_TAG+="-partial"
+[[ "${GRAPH_IMPL}" == local && "${GRAPH_MODULES}" == *moe_router* ]] && CG_TAG+="-moe"
 [[ "${GRAPH_TRACE}" == graph ]] && CG_TAG+="-merge"
 METRIC_TAG="${METRIC_FREQUENCY:+-metric_${METRIC_FREQUENCY}}"
 CASE_TAG="-date_${RUN_DATE}"
@@ -575,14 +582,17 @@ case "${GRAPH_IMPL}" in
             "model.cuda_graph_warmup_steps=3" "model.use_te_rng_tracker=true" "rng.te_rng_tracker=true"
         )
         if [[ "${GRAPH_IMPL}" == local ]]; then
-            # FSDP prefetches into fixed max-pool slots and attention consumes those
-            # weights. Weight offload, router, dispatch and experts stay eager.
             OVERRIDES+=(
                 "model.gradient_accumulation_fusion=false"
-                "ddp.fsdp_double_buffer=true" "ddp.megatron_fsdp_max_pool_double_buffer=true"
                 "ddp.megatron_fsdp_cuda_graph_mode=false"
-                "ddp.fsdp_all_gather_in_start_param_sync=true"
             )
+            if [[ "${FSDP_LEVEL}" == 3 ]]; then
+                # Prefetch into the fixed weight slots consumed by the attention graph.
+                OVERRIDES+=(
+                    "ddp.fsdp_double_buffer=true" "ddp.megatron_fsdp_max_pool_double_buffer=true"
+                    "ddp.fsdp_all_gather_in_start_param_sync=true"
+                )
+            fi
         fi
         ;;
     full_iteration)

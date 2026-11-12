@@ -131,8 +131,10 @@ def is_full_iteration_cuda_graph(config: Any) -> bool:
     ) or "full_iteration" in _member_names(getattr(config, "cuda_graph_scope", None))
 
 
-def validate_cuda_graph_configuration(config: Any, *, config_name: str = "model", fsdp3: bool | None = None) -> None:
-    """Validate CUDA graph scopes, using the resolved FSDP3 mode when available."""
+def validate_cuda_graph_configuration(
+    config: Any, *, config_name: str = "model", fsdp_strategy: str | None = None
+) -> None:
+    """Validate CUDA graph scopes using the resolved FSDP sharding strategy."""
     cuda_graph_impl = getattr(config, "cuda_graph_impl", "none")
     if cuda_graph_impl == "none":
         clear_cuda_graph_modules(config)
@@ -144,16 +146,29 @@ def validate_cuda_graph_configuration(config: Any, *, config_name: str = "model"
         cuda_graph_impl == "local" and not graph_modules and bool(inference_scopes & {"layer", "block"})
     )
     if cuda_graph_impl == "local" and not is_full_iteration_cuda_graph(config) and not is_local_inference_graph:
-        if graph_modules == ["attn"]:
+        modules = set(graph_modules)
+        if "attn" in modules and modules <= {"attn", "moe_router", "moe_preprocess"}:
             # The provider validates again after the container has resolved the FSDP strategy.
-            if fsdp3 is not None:
-                config._bridge_fsdp3_attention_graph = fsdp3
-            if getattr(config, "_bridge_fsdp3_attention_graph", False):
+            if fsdp_strategy is not None:
+                config._bridge_fsdp_attention_graph_strategy = fsdp_strategy
+            strategy = getattr(config, "_bridge_fsdp_attention_graph_strategy", None)
+            if strategy in ("optim", "optim_grads_params"):
                 from megatron.core.transformer import cuda_graphs
 
-                if not hasattr(cuda_graphs, "_configure_fsdp_attention_cuda_graphs"):
+                # Older scale-down checkouts implement only the sharded-weight path.
+                supported = getattr(cuda_graphs, "_FSDP_ATTENTION_GRAPH_SHARDING_STRATEGIES", ("optim_grads_params",))
+                supported_modules = _member_names(
+                    list(getattr(cuda_graphs, "_FSDP_MOE_PARTIAL_GRAPH_MODULES", ()))
+                )
+                if (
+                    not hasattr(cuda_graphs, "_configure_fsdp_attention_cuda_graphs")
+                    or strategy not in supported
+                    or not modules <= ({"attn"} | supported_modules)
+                ):
+                    fsdp_name = "FSDP1" if strategy == "optim" else "FSDP3"
                     raise ValueError(
-                        "Local FSDP3 attention CUDA graphs require a Megatron-LM checkout with that support."
+                        f"Local {fsdp_name} CUDA graphs with scopes {graph_modules} "
+                        "require a Megatron-LM checkout with that support."
                     )
                 return
         modules_msg = f" with scopes {graph_modules}" if graph_modules else ""

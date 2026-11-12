@@ -2004,10 +2004,17 @@ class TestConfigContainerValidation:
         finally:
             restore_get_world_size_safe(og_ws, cfg_mod)
 
-    def test_cuda_graph_local_attention_uses_native_fsdp3_support(self, monkeypatch):
+    @pytest.mark.parametrize("strategy", ["optim", "optim_grads_params"])
+    def test_cuda_graph_local_attention_uses_native_fsdp_support(self, strategy, monkeypatch):
         from megatron.core.transformer import cuda_graphs
 
         monkeypatch.setattr(cuda_graphs, "_configure_fsdp_attention_cuda_graphs", lambda *_: None, raising=False)
+        monkeypatch.setattr(
+            cuda_graphs,
+            "_FSDP_ATTENTION_GRAPH_SHARDING_STRATEGIES",
+            ("optim", "optim_grads_params"),
+            raising=False,
+        )
         gpt_model_cfg = create_test_gpt_config(cuda_graph_impl="local", use_te_rng_tracker=True)
         set_cuda_graph_modules(gpt_model_cfg, ["attn"])
         container, og_ws, cfg_mod = create_test_config_container(
@@ -2016,8 +2023,8 @@ class TestConfigContainerValidation:
             dist_config=create_test_distributed_init_config(use_megatron_fsdp=True),
             ddp_config=create_test_ddp_config(
                 use_megatron_fsdp=True,
-                data_parallel_sharding_strategy="optim_grads_params",
-                megatron_fsdp_max_pool_double_buffer=True,
+                data_parallel_sharding_strategy=strategy,
+                megatron_fsdp_max_pool_double_buffer=strategy == "optim_grads_params",
             ),
         )
 
@@ -2025,11 +2032,32 @@ class TestConfigContainerValidation:
             container.validate()
             assert cuda_graph_module_names(container.model) == ["attn"]
             validate_cuda_graph_configuration(container.model)  # GPT provider validation
+            monkeypatch.delattr(cuda_graphs, "_FSDP_ATTENTION_GRAPH_SHARDING_STRATEGIES")
+            if strategy == "optim":
+                with pytest.raises(ValueError, match="FSDP1.*require a Megatron-LM checkout"):
+                    validate_cuda_graph_configuration(container.model)
+            else:
+                validate_cuda_graph_configuration(container.model)
             monkeypatch.delattr(cuda_graphs, "_configure_fsdp_attention_cuda_graphs")
             with pytest.raises(ValueError, match="require a Megatron-LM checkout"):
                 validate_cuda_graph_configuration(container.model)
         finally:
             restore_get_world_size_safe(og_ws, cfg_mod)
+
+    def test_cuda_graph_local_moe_partial_requires_native_fsdp_scope_support(self, monkeypatch):
+        from megatron.core.transformer import cuda_graphs
+
+        model = create_test_gpt_config(cuda_graph_impl="local", use_te_rng_tracker=True)
+        modules = ["attn", "moe_router", "moe_preprocess"]
+        set_cuda_graph_modules(model, modules)
+        monkeypatch.setattr(cuda_graphs, "_configure_fsdp_attention_cuda_graphs", lambda *_: None, raising=False)
+        monkeypatch.setattr(cuda_graphs, "_FSDP_MOE_PARTIAL_GRAPH_MODULES", frozenset(modules), raising=False)
+
+        validate_cuda_graph_configuration(model, fsdp_strategy="optim_grads_params")
+        validate_cuda_graph_configuration(model)
+        monkeypatch.delattr(cuda_graphs, "_FSDP_MOE_PARTIAL_GRAPH_MODULES")
+        with pytest.raises(ValueError, match="FSDP3.*require a Megatron-LM checkout"):
+            validate_cuda_graph_configuration(model)
 
     def test_cuda_graph_local_deprecated_scope_raise_clear_error(self, monkeypatch):
         """Test post-construction cuda_graph_scope overrides fail clearly for local scoped graphs."""

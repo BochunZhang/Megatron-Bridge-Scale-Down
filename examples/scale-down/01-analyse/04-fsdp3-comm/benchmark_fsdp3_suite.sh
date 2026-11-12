@@ -32,7 +32,7 @@ and EP=4. Nsight Systems traces CUDA/NVTX at step 7 without GPU metric sampling.
 
 The MBS=4, TP=CP=1 points are invalid on 4 GPUs (MBS*DP=16). Where the
 comparison permits it, use CP=2 for the MBS=4 pair. Native attention-only
-FSDP3 graphs require TP=CP=1 and disallow symmetric registration. Item 03
+FSDP3 graphs require TP=1 and disallow symmetric registration. Item 03
 adds MoE eager topology controls; item 06 adds a matched MoE eager 2x2 sweep.
 Items 01/05/06 use full-iteration graphs on 27b and attention graphs on 2.4t.
 
@@ -131,7 +131,7 @@ for item in 01-cuda-graph 02-ddp-cp-tp 03-fsdp3-cp-tp 04-activation-offload \
             activation=moe_act
         fi
         if [[ "${model}" == 2.4t && "${index}" == 03 ]]; then
-            echo "03-fsdp3-cp-tp: 2.4t graphs support only TP=CP=1; running eager topology controls" >&2
+            echo "03-fsdp3-cp-tp: running 2.4t CP/TP topology controls in eager mode" >&2
         fi
         if [[ "${model}" == 2.4t && "${index}" == 06 ]]; then
             echo "06-overlap-symmetric: 2.4t graphs disallow symmetric registration; running the 2x2 in eager mode as well" >&2
@@ -177,7 +177,11 @@ for item in 01-cuda-graph 02-ddp-cp-tp 03-fsdp3-cp-tp 04-activation-offload \
                         overlap_sweep on "${fsdp_graph_cp}"
                         if [[ "${model}" == 2.4t ]]; then overlap_sweep off "${paired_cp}"; fi;;
                     07)
-                        run_case cpu-adamw 3 on 1 1 --local-attention-graph --offload weight --cpu-optimizer;;
+                        if [[ "${model}" == 27b ]]; then
+                            run_case cpu-adamw 3 on 1 1 --local-attention-graph --offload weight --cpu-optimizer
+                        else
+                            run_case cpu-adamw 3 on 1 1 --offload weight --cpu-optimizer
+                        fi;;
                     08)
                         run_case nvme 3 off 1 "${paired_cp}" --nvme-path "${NVME_PATH}";;
                 esac
