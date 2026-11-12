@@ -4,6 +4,7 @@
 
 # shellcheck source=../offload_study_common.sh
 source "$(dirname "${BASH_SOURCE[0]}")/../offload_study_common.sh" "$@"
+STUDY_SCRIPT="${BASH_SOURCE[1]##*/}"
 
 NCCL_LIB="${NCCL_LIB:-${REPO_ROOT}/nccl/nccl-2.32.3-cta-with-pause/build/lib/libnccl.so.2}"
 [[ "${NCCL_LIB}" == /* ]] || NCCL_LIB="${PWD}/${NCCL_LIB}"

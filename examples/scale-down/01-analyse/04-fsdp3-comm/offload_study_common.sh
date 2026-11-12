@@ -8,11 +8,13 @@ set -euo pipefail
 BENCHMARK_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${BENCHMARK_DIR}/../../../.." && pwd)"
 GROUP="$(basename "$(dirname "${BASH_SOURCE[1]}")")"
+STUDY_SCRIPT="${BASH_SOURCE[1]##*/}"
 OUTPUT_DIR="${OUTPUT_DIR:-${REPO_ROOT}/results/01-analyse/04-fsdp3-comm}"
 MODELS=(27b 2.4t)
 if [[ "${GROUP}" == 05-nccl ]]; then MODELS=(27b); fi
 LAUNCHER=("${BENCHMARK_DIR}/run_pretrain_fsdp3.sh")
 DRY_RUN=false
+PRINT_CASE_DIRS=false
 FAILED=0
 NVME_PATH="${NVME_PATH:-}"
 NCCL_LIB="${NCCL_LIB:-}"
@@ -38,8 +40,9 @@ while (( $# )); do
             esac
             shift 2;;
         --dry-run) DRY_RUN=true; shift;;
+        --print-case-dirs) PRINT_CASE_DIRS=true; shift;;
         -h|--help)
-            printf 'Usage: %s [--model 27b|2.4t] [--output-dir DIR] [--dry-run]\n' "$0"
+            printf 'Usage: %s [--model 27b|2.4t] [--output-dir DIR] [--dry-run | --print-case-dirs]\n' "$0"
             case "${GROUP}" in
                 04-nvme) echo '  --nvme-path DIR    Directory on local NVMe (default: /tmp/megatron-fsdp3-nvme, or set NVME_PATH)';;
                 05-nccl)
@@ -52,7 +55,7 @@ while (( $# )); do
 done
 
 # run_case MODEL NAME FSDP GRAPH TP CP MBS [launcher flags...]
-# An empty NAME uses a subdirectory named after the calling script.
+# An empty NAME omits the case suffix.
 run_case() {
     local model="$1" name="$2" fsdp="$3" graph="$4" tp="$5" cp="$6" mbs="$7"
     shift 7
@@ -62,14 +65,11 @@ run_case() {
     if [[ "${model}" == 2.4t ]]; then
         model_args=(--num-layers 4 --num-experts 64 --ep 4 --dispatcher hybridep)
     fi
-    local result_group="${GROUP}"
+    local script_name="${STUDY_SCRIPT%.sh}"
+    local result_group="${GROUP}/${script_name//_/-}"
     local result_args=(--stable-result-dir)
     if [[ -n "${name}" ]]; then
         result_args+=(--run-name "${name}")
-    else
-        local script_name="${BASH_SOURCE[1]##*/}"
-        script_name="${script_name%.sh}"
-        result_group+="/${script_name//_/-}"
     fi
     local args=("${model_args[@]}"
         --model "${model}" --full --dtype bf16 --gpu 4 --nproc-per-node 4 --nnodes 1 --node-rank 0
@@ -78,7 +78,7 @@ run_case() {
         --results-root "${OUTPUT_DIR}/${result_group}" "${result_args[@]}" "$@")
     local label="${result_group}${name:+/${name}} model=${model} fsdp=${fsdp} graph=${graph} tp=${tp} cp=${cp} mbs=${mbs} seq=${seq}"
     local case_dir=""
-    if [[ "${DRY_RUN}" == true ]]; then
+    if [[ "${DRY_RUN}" == true && "${PRINT_CASE_DIRS}" == false ]]; then
         args+=(--dry-run)
     else
         local node_dir
@@ -88,6 +88,10 @@ run_case() {
             return 0
         fi
         case_dir="${node_dir%/*}"
+        if [[ "${PRINT_CASE_DIRS}" == true ]]; then
+            printf '%s\n' "${case_dir}"
+            return 0
+        fi
         if [[ -d "${case_dir}" ]]; then
             printf 'skip existing case: %s\n' "${case_dir}" >&2
             return 0

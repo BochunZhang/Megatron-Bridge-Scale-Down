@@ -33,12 +33,16 @@ Qwen3.8-2.4T-A95B 的 HF 配置是纯文本的 `Qwen3_5MoeForCausalLM`（没有 
 | `04-nvme` | [01_dram_vs_nvme.sh](04-nvme/01_dram_vs_nvme.sh) | eager CPU 累加 + CPU AdamW，比较 DRAM 与 NVMe。默认用 `/tmp/megatron-fsdp3-nvme`，启动前检查默认目录所在设备。可用 `--nvme-path DIR` 或 `NVME_PATH` 指向节点的本地 NVMe 目录。 |
 | `05-nccl` | [01_priority.sh](05-nccl/01_priority.sh)、[02_symmetric_multicast.sh](05-nccl/02_symmetric_multicast.sh)、[03_ag_pause.sh](05-nccl/03_ag_pause.sh) | 27B graph 下的默认/高优先级、独立 AG communicator × symmetric multicast、AG pause 1536/3072/4608 cycles。三脚本默认加载仓库内已编译的 `nccl/nccl-2.32.3-cta-with-pause/build/lib/libnccl.so.2`。可用 `--nccl-lib FILE` 或 `NCCL_LIB` 覆盖。 |
 
-从仓库根目录运行。默认结果根目录为 `results/01-analyse/04-fsdp3-comm/`。在 `01-baseline/` 下，三个脚本分别写入 `01-cuda-graph/`、`02-mbs/` 和 `03-fsdp3/`。每个子目录下保存 `model_<配置>/node0/`，case 名省略 `-baseline` 和时间戳。其余组使用 `<组名>/model_<配置>-<case 名>/node0/`。
+从仓库根目录运行。默认结果根目录为 `results/01-analyse/04-fsdp3-comm/`。所有编号脚本使用 `<组名>/<小项目>/model_<配置>/node0/`。小项目名取脚本名去掉 `.sh` 并将下划线换成连字符。编号实验省略时间戳，`01-baseline` 省略 `-baseline`，其余组在 case 目录名中保留用于区分实验变体的标签。
 
-编号脚本逐个检查 case 目录。目标 `model_…/` 已存在就跳过，包括空目录和上次失败的目录。缺少目录的 case 会继续运行。需要复跑时可指定新的 `--output-dir DIR`。可用 `--model 27b` 限定模型，或用 `--dry-run` 查看完整计划。
+编号脚本只检查小项目下的目标 case 目录。目标 `model_…/` 已存在就跳过，包括空目录和上次失败的目录。缺少目录的 case 会继续运行。需要复跑时可指定新的 `--output-dir DIR`。可用 `--model 27b` 限定模型，或用 `--dry-run` 查看完整计划。
+
+用 `migrate_results.py` 迁移原先直接保存在组目录下的结果。脚本按当前测试矩阵匹配，完整迁移 case 目录及历史尝试。同一个旧 case 对应多个小项目时，每个目标都获得一份结果。若某个目标已有结果，该 case 的源目录与目标目录都保留，脚本报告冲突。未匹配的旧目录会列出来供检查。使用过自定义结果根目录时，给迁移脚本传同一个 `--output-dir DIR`。
 
 ```bash
 study=examples/scale-down/01-analyse/04-fsdp3-comm
+uv run --no-sync python "$study/migrate_results.py" --dry-run
+uv run --no-sync python "$study/migrate_results.py"
 bash "$study/01-baseline/01_cuda_graph.sh" --dry-run
 bash "$study/01-baseline/01_cuda_graph.sh"
 bash "$study/04-nvme/01_dram_vs_nvme.sh"

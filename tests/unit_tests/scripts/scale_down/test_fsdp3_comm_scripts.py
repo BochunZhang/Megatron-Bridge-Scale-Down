@@ -5,6 +5,7 @@
 import os
 import shlex
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -425,7 +426,12 @@ def test_numbered_studies_skip_existing_case_directories(tmp_path: Path, script:
     assert dry_run.returncode == 0, dry_run.stderr
     case_dirs = [_report_base(command).parent.parent for command in _commands(dry_run.stderr)]
     assert case_dirs
+    case_plan = _run(script, *args, "--print-case-dirs", NVME_PATH="", NCCL_LIB="")
+    assert case_plan.returncode == 0, case_plan.stderr
+    assert list(map(Path, case_plan.stdout.splitlines())) == case_dirs
     for case_dir in case_dirs:
+        assert case_dir.parent == tmp_path / script.parent.name / script.stem.replace("_", "-")
+        assert "-date_" not in case_dir.name
         case_dir.mkdir(parents=True)
 
     result = _run(script, *args, NVME_PATH="", NCCL_LIB="")
@@ -442,6 +448,8 @@ def test_numbered_study_launches_missing_case_next_to_existing_one(tmp_path: Pat
     assert dry_run.returncode == 0, dry_run.stderr
     existing, missing = map(_report_base, _commands(dry_run.stderr))
     existing.parent.parent.mkdir(parents=True)
+    legacy_case_dir = tmp_path / "01-baseline" / f"{missing.parent.parent.name}-baseline"
+    legacy_case_dir.mkdir()
 
     fake_ip = tmp_path / "ip"
     fake_ip.write_text("#!/bin/sh\nprintf '%s\\n' '2: eth0 inet 192.0.2.1/24'\n")
@@ -458,8 +466,60 @@ def test_numbered_study_launches_missing_case_next_to_existing_one(tmp_path: Pat
     assert result.returncode == 0, result.stderr
     assert f"skip existing case: {existing.parent.parent}" in result.stderr
     assert not existing.parent.exists()
+    assert not any(legacy_case_dir.iterdir())
     assert (missing.parent / "run_info.txt").read_text().splitlines()[-1] == "status=0"
     assert missing.with_suffix(".nsys-rep").stat().st_size > 0
+
+
+@pytest.mark.unit
+def test_migrate_legacy_results_preserves_shared_artifacts_and_conflicts(tmp_path: Path):
+    args = ("--output-dir", str(tmp_path))
+    baseline_plan = _run(EXAMPLE / "01-baseline/01_cuda_graph.sh", *args, "--model", "27b", "--print-case-dirs")
+    assert baseline_plan.returncode == 0, baseline_plan.stderr
+    baseline_target = next(Path(path) for path in baseline_plan.stdout.splitlines() if "-cg_on-" in path)
+    baseline_group = baseline_target.parent.parent
+    baseline_source = baseline_group / f"{baseline_target.name}-baseline"
+    baseline_targets = [
+        baseline_group / study / baseline_target.name for study in ("01-cuda-graph", "02-mbs", "03-fsdp3")
+    ]
+
+    nvme_plan = _run(EXAMPLE / "04-nvme/01_dram_vs_nvme.sh", *args, "--model", "27b", "--print-case-dirs")
+    assert nvme_plan.returncode == 0, nvme_plan.stderr
+    nvme_target = Path(nvme_plan.stdout.splitlines()[0])
+    nvme_source = nvme_target.parent.parent / nvme_target.name
+    for source in (baseline_source, nvme_source):
+        (source / "node0").mkdir(parents=True)
+        (source / "node0/train.log").write_text("legacy result\n")
+        (source / "node0.attempt-1").mkdir()
+
+    command = [sys.executable, str(EXAMPLE / "migrate_results.py"), *args]
+    preview = subprocess.run([*command, "--dry-run"], capture_output=True, text=True)
+    assert preview.returncode == 0, preview.stderr
+    assert preview.stderr.count("Dry run: Move ") == 2 and preview.stderr.count("Dry run: Copy ") == 2
+    assert baseline_source.is_dir() and nvme_source.is_dir()
+    assert not any(target.exists() for target in [*baseline_targets, nvme_target])
+
+    nvme_target.mkdir(parents=True)
+    conflict = nvme_target / "already-present"
+    conflict.write_text("keep\n")
+    migration = subprocess.run(command, capture_output=True, text=True)
+    assert migration.returncode == 1, migration.stderr
+    assert "Destination already exists" in migration.stderr
+    assert conflict.read_text() == "keep\n" and nvme_source.is_dir()
+    assert not baseline_source.exists()
+    for target in baseline_targets:
+        assert (target / "node0/train.log").read_text() == "legacy result\n"
+        assert (target / "node0.attempt-1").is_dir()
+
+    conflict.unlink()
+    nvme_target.rmdir()
+    migration = subprocess.run(command, capture_output=True, text=True)
+    assert migration.returncode == 0, migration.stderr
+    assert not nvme_source.exists()
+    assert (nvme_target / "node0/train.log").read_text() == "legacy result\n"
+    rerun = subprocess.run(command, capture_output=True, text=True)
+    assert rerun.returncode == 0, rerun.stderr
+    assert "No legacy result directories matched" in rerun.stderr
 
 
 def test_weight_offload_study_uses_native_partial_graph_for_moe_cp4(tmp_path: Path):
