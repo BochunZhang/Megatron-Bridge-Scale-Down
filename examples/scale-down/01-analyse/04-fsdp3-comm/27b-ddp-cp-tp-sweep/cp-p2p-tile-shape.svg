@@ -1,0 +1,122 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1280" height="912" viewBox="0 0 1280 912" role="img" aria-labelledby="title desc">
+  <title id="title">CP4 P2P 中有效 Q–K 对数相同，tile 形状不同</title>
+  <desc id="desc">以 CP rank 1 为例，它持有 Q1 和 Q6。从 rank 0 收到 KV0 和 KV7 时，两个 Q 块都只需要 KV0。从 rank 2 收到 KV2 和 KV5 时，只有 Q6 需要这两块 KV。两个远端 tile 均包含相同数量的有效 Q–K 对。下方是 27B GB200 trace 的 kernel 时间和前向 CUDA grid。</desc>
+  <metadata>27B BF16, 4×GB200, MBS 4, Seq 4096. 261109-27b-ddp-cp-cg, profiler step 8. 32 layer × microbatch groups. Each remote tile shape has 192 rank-round observations. Backward duration is the union of preprocess, dQ and dKV kernel intervals for the round.</metadata>
+  <defs>
+    <marker id="arrow" markerWidth="8" markerHeight="8" refX="6" refY="4" orient="auto">
+      <path d="M 0 0 L 8 4 L 0 8 Z" fill="#7c94a8"/>
+    </marker>
+    <pattern id="masked" width="8" height="8" patternUnits="userSpaceOnUse">
+      <rect width="8" height="8" fill="#edf2f6"/>
+      <path d="M -2 2 L 2 -2 M 0 8 L 8 0 M 6 10 L 10 6" stroke="#cfdae3" stroke-width="1"/>
+    </pattern>
+  </defs>
+  <style>
+    text {font-family: Arial, "Hiragino Sans GB", "PingFang SC", "Microsoft YaHei", sans-serif; fill: #142b42}
+    .subtitle {font-size: 15px; fill: #486176}
+    .small {font-size: 13px; fill: #486176}
+    .label {font-size: 14px; font-weight: 700}
+    .heading {font-size: 20px; font-weight: 700}
+    .white {fill: #ffffff}
+    .cool {fill: #256b98}
+    .warm {fill: #9d541a}
+    .rule {stroke: #d7e3ec}
+    .card {fill: #ffffff; stroke: #d4e1eb}
+  </style>
+
+  <rect width="1280" height="912" fill="#f3f7fb"/>
+  <rect width="1280" height="7" fill="#2b638e"/>
+  <text x="42" y="39" font-size="14" font-weight="700" fill="#245e88">27B / GB200 / CONTEXT PARALLEL</text>
+  <text x="40" y="79" font-size="31" font-weight="700">CP4 P2P · 相同的有效计算量，两种 attention 形状</text>
+  <text x="42" y="109" class="subtitle">MBS 4 · Seq 4096 · BF16 · 每个序列切成 8 个 chunk，每块 c = 512 token</text>
+
+  <rect x="32" y="132" width="1216" height="86" rx="11" class="card"/>
+  <text x="52" y="161" class="heading">Zigzag 切分</text>
+  <text x="52" y="191" class="subtitle">每卡拿一块靠前、一块靠后的 token。各 rank 的两块序号和都是 7。</text>
+  <g class="label" text-anchor="middle">
+    <rect x="676" y="151" width="126" height="46" rx="6" fill="#eaf1f7"/>
+    <rect x="815" y="151" width="126" height="46" rx="6" fill="#dcecf7"/>
+    <rect x="954" y="151" width="126" height="46" rx="6" fill="#eaf1f7"/>
+    <rect x="1093" y="151" width="126" height="46" rx="6" fill="#eaf1f7"/>
+    <text x="739" y="179">Rank 0 · (0, 7)</text>
+    <text x="878" y="179" class="cool">Rank 1 · (1, 6)</text>
+    <text x="1017" y="179">Rank 2 · (2, 5)</text>
+    <text x="1156" y="179">Rank 3 · (3, 4)</text>
+  </g>
+
+  <text x="42" y="253" class="heading">Rank 1 的两次远端 KV 交换</text>
+  <rect x="930" y="239" width="18" height="14" fill="url(#masked)" stroke="#cfdae3"/>
+  <text x="956" y="251" class="small">因果规则排除的整块 Q–K 对</text>
+
+  <rect x="32" y="268" width="598" height="273" rx="12" class="card"/>
+  <rect x="650" y="268" width="598" height="273" rx="12" class="card"/>
+
+  <text x="54" y="300" class="heading warm">收到 Rank 0 的 KV</text>
+  <text x="54" y="325" class="subtitle">Q₁ 和 Q₆ 都能看 KV₀，两者都看不到 KV₇。</text>
+  <text x="151" y="357" class="label" text-anchor="middle">KV₀</text>
+  <text x="213" y="357" class="label" text-anchor="middle">KV₇</text>
+  <text x="108" y="400" class="label" text-anchor="end">Q₁</text>
+  <text x="108" y="462" class="label" text-anchor="end">Q₆</text>
+  <rect x="120" y="365" width="62" height="124" fill="#e8a763"/>
+  <rect x="182" y="365" width="62" height="124" fill="url(#masked)"/>
+  <path d="M 120 365 H 244 V 489 H 120 Z M 182 365 V 489 M 120 427 H 244" fill="none" stroke="#8c9fad"/>
+  <path d="M 267 427 H 337" fill="none" stroke="#7c94a8" stroke-width="2" marker-end="url(#arrow)"/>
+  <text x="302" y="414" class="small" text-anchor="middle">裁切</text>
+  <rect x="361" y="365" width="62" height="124" rx="2" fill="#e8a763" stroke="#c37a31"/>
+  <line x1="361" x2="423" y1="427" y2="427" stroke="#c37a31"/>
+  <text x="451" y="406" font-size="24" font-weight="700" class="warm">2c × c</text>
+  <text x="451" y="432" class="label">1024 Q × 512 KV</text>
+  <text x="451" y="456" class="small">2c² 个有效 Q–K 对</text>
+  <text x="54" y="517" class="small">保留两块 Q，只取远端的第一块 KV。</text>
+
+  <text x="672" y="300" class="heading cool">收到 Rank 2 的 KV</text>
+  <text x="672" y="325" class="subtitle">Q₁ 看不到这两块，Q₆ 可以看 KV₂ 和 KV₅。</text>
+  <text x="769" y="357" class="label" text-anchor="middle">KV₂</text>
+  <text x="831" y="357" class="label" text-anchor="middle">KV₅</text>
+  <text x="726" y="400" class="label" text-anchor="end">Q₁</text>
+  <text x="726" y="462" class="label" text-anchor="end">Q₆</text>
+  <rect x="738" y="365" width="124" height="62" fill="url(#masked)"/>
+  <rect x="738" y="427" width="124" height="62" fill="#73afd5"/>
+  <path d="M 738 365 H 862 V 489 H 738 Z M 800 365 V 489 M 738 427 H 862" fill="none" stroke="#8c9fad"/>
+  <path d="M 885 427 H 955" fill="none" stroke="#7c94a8" stroke-width="2" marker-end="url(#arrow)"/>
+  <text x="920" y="414" class="small" text-anchor="middle">裁切</text>
+  <rect x="978" y="397" width="124" height="62" rx="2" fill="#73afd5" stroke="#3c80ae"/>
+  <line x1="1040" x2="1040" y1="397" y2="459" stroke="#3c80ae"/>
+  <text x="1120" y="406" font-size="24" font-weight="700" class="cool">c × 2c</text>
+  <text x="1120" y="432" class="label">512 Q × 1024 KV</text>
+  <text x="1120" y="456" class="small">2c² 个有效 Q–K 对</text>
+  <text x="672" y="517" class="small">保留两块 KV，只取本地的第二块 Q。</text>
+
+  <rect x="32" y="554" width="1216" height="60" rx="10" fill="#e8f0f7"/>
+  <text x="53" y="579" class="label">两个远端矩形都完整有效，kernel 内无需再做逐元素 causal masking。</text>
+  <text x="53" y="601" class="small">本地对角轮仍用 causal mask。每 rank 合计 3 × 2c² + (2c² + c) = 8c² + c 个有效 Q–K 对（每序列、每头）。</text>
+
+  <rect x="32" y="629" width="1216" height="250" rx="12" class="card"/>
+  <text x="54" y="661" class="heading">实测 kernel 时间与 CUDA grid</text>
+  <text x="54" y="687" class="small">同一条训练 trace，每种远端形状 192 次。耗时为中位数，反向取该轮三个 attention kernel 的区间并集。</text>
+  <g class="label">
+    <rect x="49" y="704" width="1182" height="33" rx="4" fill="#eaf1f7"/>
+    <text x="65" y="726">远端 tile</text>
+    <text x="248" y="726">前向 CUDA grid</text>
+    <text x="481" y="726">前向</text>
+    <text x="687" y="726">前向 · 无本卡 NCCL 重叠</text>
+    <text x="1104" y="726">反向</text>
+  </g>
+  <g font-size="15">
+    <text x="65" y="761" class="label cool">c × 2c</text>
+    <text x="248" y="761">4 × 24 × 4</text>
+    <text x="481" y="761">70.4 µs</text>
+    <text x="687" y="761">70.3 µs · 97 次</text>
+    <text x="1104" y="761">246.7 µs</text>
+    <line x1="49" y1="773" x2="1231" y2="773" class="rule"/>
+    <text x="65" y="796" class="label warm">2c × c</text>
+    <text x="248" y="796">8 × 24 × 4</text>
+    <text x="481" y="796">103.7 µs · +47%</text>
+    <text x="687" y="796">97.9 µs · 32 次 · +39%</text>
+    <text x="1104" y="796">279.6 µs · +13%</text>
+  </g>
+  <text x="53" y="832" class="small">Q 行数、KV 扫描长度和 CUDA grid 都变了。前向两组的 thread block 均为 384 线程。</text>
+  <text x="53" y="855" class="small">无本卡 NCCL 重叠的子集仍有耗时差。trace 能显示执行差异，具体 SM 利用率和访存瓶颈还需 kernel counters。</text>
+
+  <text x="43" y="900" class="small">数据  ·  261109-27b-ddp-cp-cg · MBS 4 / Seq 4K · Nsight Systems node trace · 第 8 步</text>
+</svg>

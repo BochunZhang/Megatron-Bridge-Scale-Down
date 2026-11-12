@@ -1,0 +1,92 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1400" height="880" viewBox="0 0 1400 880" role="img" aria-labelledby="title desc">
+<title id="title">CP4 反向的偏斜从哪里来</title><desc id="desc">比较每个形状的反向层起点、KV 就绪、首轮 P2P 起点和本地对齐后偏斜。</desc>
+<g font-family="Arial, Hiragino Sans GB, PingFang SC, Microsoft YaHei, sans-serif">
+<rect x="0.000" y="0.000" width="1400.000" height="880.000" rx="0" fill="#f3f7fb"/>
+<rect x="0.000" y="0.000" width="1400.000" height="7.000" rx="0" fill="#2b638e"/>
+<text x="44" y="40" font-size="14" fill="#245e88" font-weight="700" text-anchor="start">GB200  /  NSIGHT SYSTEMS  /  CUDA GRAPH REPLAY</text>
+<text x="43" y="81" font-size="31" fill="#112b43" font-weight="700" text-anchor="start">CP4 反向的偏斜从哪里来</text>
+<text x="45" y="113" font-size="15" fill="#495f72" font-weight="400" text-anchor="start">九组同步 AG trace  ·  每组 32 个 layer × microbatch  ·  四卡偏斜 = 最晚时间 − 最早时间</text>
+<rect x="34.000" y="139.000" width="1332.000" height="536.000" rx="12" fill="#ffffff" stroke="#d4e1eb"/>
+<text x="56" y="170" font-size="18" fill="#112b43" font-weight="700" text-anchor="start">第一轮 P2P 的偏斜在 KV staging 完成时已经出现</text>
+<rect x="57.000" y="190.000" width="15.000" height="8.000" rx="2" fill="#607791"/>
+<text x="78" y="199" font-size="13" fill="#495f72" font-weight="400" text-anchor="start">层起点</text>
+<rect x="275.000" y="190.000" width="15.000" height="8.000" rx="2" fill="#08949d"/>
+<text x="296" y="199" font-size="13" fill="#495f72" font-weight="400" text-anchor="start">KV staging 完成</text>
+<rect x="493.000" y="190.000" width="15.000" height="8.000" rx="2" fill="#df8a22"/>
+<text x="514" y="199" font-size="13" fill="#495f72" font-weight="400" text-anchor="start">首轮 P2P 起点</text>
+<rect x="711.000" y="190.000" width="15.000" height="8.000" rx="2" fill="#8a57a1"/>
+<text x="732" y="199" font-size="13" fill="#495f72" font-weight="400" text-anchor="start">各卡按层起点对齐后</text>
+<line x1="216.0" y1="221" x2="216.0" y2="640" stroke="#d4e1eb" stroke-width="1"/>
+<text x="216.0" y="660" font-size="12" fill="#63798c" font-weight="400" text-anchor="middle">0</text>
+<line x1="390.83333333333337" y1="221" x2="390.83333333333337" y2="640" stroke="#d4e1eb" stroke-width="1"/>
+<text x="390.83333333333337" y="660" font-size="12" fill="#63798c" font-weight="400" text-anchor="middle">1</text>
+<line x1="565.6666666666667" y1="221" x2="565.6666666666667" y2="640" stroke="#d4e1eb" stroke-width="1"/>
+<text x="565.6666666666667" y="660" font-size="12" fill="#63798c" font-weight="400" text-anchor="middle">2</text>
+<line x1="740.5" y1="221" x2="740.5" y2="640" stroke="#d4e1eb" stroke-width="1"/>
+<text x="740.5" y="660" font-size="12" fill="#63798c" font-weight="400" text-anchor="middle">3</text>
+<line x1="915.3333333333334" y1="221" x2="915.3333333333334" y2="640" stroke="#d4e1eb" stroke-width="1"/>
+<text x="915.3333333333334" y="660" font-size="12" fill="#63798c" font-weight="400" text-anchor="middle">4</text>
+<line x1="1090.1666666666665" y1="221" x2="1090.1666666666665" y2="640" stroke="#d4e1eb" stroke-width="1"/>
+<text x="1090.1666666666665" y="660" font-size="12" fill="#63798c" font-weight="400" text-anchor="middle">5</text>
+<line x1="1265.0" y1="221" x2="1265.0" y2="640" stroke="#d4e1eb" stroke-width="1"/>
+<text x="1265.0" y="660" font-size="12" fill="#63798c" font-weight="400" text-anchor="middle">6 ms</text>
+<text x="61" y="243" font-size="14" fill="#112b43" font-weight="700" text-anchor="start">MBS 1 × 4K</text>
+<rect x="216.000" y="221.000" width="33.744" height="6.000" rx="1" fill="#607791"><title>层起点 · 0.193 ms</title></rect>
+<rect x="216.000" y="230.000" width="32.365" height="6.000" rx="1" fill="#08949d"><title>KV staging 完成 · 0.185 ms</title></rect>
+<rect x="216.000" y="239.000" width="32.088" height="6.000" rx="1" fill="#df8a22"><title>首轮 P2P 起点 · 0.184 ms</title></rect>
+<text x="256.0879484166667" y="246" font-size="11" fill="#df8a22" font-weight="700" text-anchor="start">0.18</text>
+<rect x="216.000" y="248.000" width="7.410" height="6.000" rx="1" fill="#8a57a1"><title>各卡按层起点对齐后 · 0.042 ms</title></rect>
+<text x="61" y="289" font-size="14" fill="#112b43" font-weight="700" text-anchor="start">MBS 1 × 8K</text>
+<rect x="216.000" y="267.000" width="89.201" height="6.000" rx="1" fill="#607791"><title>层起点 · 0.510 ms</title></rect>
+<rect x="216.000" y="276.000" width="98.077" height="6.000" rx="1" fill="#08949d"><title>KV staging 完成 · 0.561 ms</title></rect>
+<rect x="216.000" y="285.000" width="97.859" height="6.000" rx="1" fill="#df8a22"><title>首轮 P2P 起点 · 0.560 ms</title></rect>
+<text x="321.85876233333335" y="292" font-size="11" fill="#df8a22" font-weight="700" text-anchor="start">0.56</text>
+<rect x="216.000" y="294.000" width="21.685" height="6.000" rx="1" fill="#8a57a1"><title>各卡按层起点对齐后 · 0.124 ms</title></rect>
+<text x="61" y="335" font-size="14" fill="#112b43" font-weight="700" text-anchor="start">MBS 1 × 16K</text>
+<rect x="216.000" y="313.000" width="231.011" height="6.000" rx="1" fill="#607791"><title>层起点 · 1.321 ms</title></rect>
+<rect x="216.000" y="322.000" width="236.489" height="6.000" rx="1" fill="#08949d"><title>KV staging 完成 · 1.353 ms</title></rect>
+<rect x="216.000" y="331.000" width="235.944" height="6.000" rx="1" fill="#df8a22"><title>首轮 P2P 起点 · 1.350 ms</title></rect>
+<text x="459.9439647500001" y="338" font-size="11" fill="#df8a22" font-weight="700" text-anchor="start">1.35</text>
+<rect x="216.000" y="340.000" width="43.994" height="6.000" rx="1" fill="#8a57a1"><title>各卡按层起点对齐后 · 0.252 ms</title></rect>
+<text x="61" y="381" font-size="14" fill="#112b43" font-weight="700" text-anchor="start">MBS 2 × 4K</text>
+<rect x="216.000" y="359.000" width="45.165" height="6.000" rx="1" fill="#607791"><title>层起点 · 0.258 ms</title></rect>
+<rect x="216.000" y="368.000" width="57.865" height="6.000" rx="1" fill="#08949d"><title>KV staging 完成 · 0.331 ms</title></rect>
+<rect x="216.000" y="377.000" width="57.667" height="6.000" rx="1" fill="#df8a22"><title>首轮 P2P 起点 · 0.330 ms</title></rect>
+<text x="281.66658958333335" y="384" font-size="11" fill="#df8a22" font-weight="700" text-anchor="start">0.33</text>
+<rect x="216.000" y="386.000" width="18.250" height="6.000" rx="1" fill="#8a57a1"><title>各卡按层起点对齐后 · 0.104 ms</title></rect>
+<text x="61" y="427" font-size="14" fill="#112b43" font-weight="700" text-anchor="start">MBS 2 × 8K</text>
+<rect x="216.000" y="405.000" width="160.997" height="6.000" rx="1" fill="#607791"><title>层起点 · 0.921 ms</title></rect>
+<rect x="216.000" y="414.000" width="159.483" height="6.000" rx="1" fill="#08949d"><title>KV staging 完成 · 0.912 ms</title></rect>
+<rect x="216.000" y="423.000" width="157.410" height="6.000" rx="1" fill="#df8a22"><title>首轮 P2P 起点 · 0.900 ms</title></rect>
+<text x="381.4101426666667" y="430" font-size="11" fill="#df8a22" font-weight="700" text-anchor="start">0.90</text>
+<rect x="216.000" y="432.000" width="36.709" height="6.000" rx="1" fill="#8a57a1"><title>各卡按层起点对齐后 · 0.210 ms</title></rect>
+<text x="61" y="473" font-size="14" fill="#112b43" font-weight="700" text-anchor="start">MBS 2 × 16K</text>
+<rect x="216.000" y="451.000" width="458.871" height="6.000" rx="1" fill="#607791"><title>层起点 · 2.625 ms</title></rect>
+<rect x="216.000" y="460.000" width="555.752" height="6.000" rx="1" fill="#08949d"><title>KV staging 完成 · 3.179 ms</title></rect>
+<rect x="216.000" y="469.000" width="554.532" height="6.000" rx="1" fill="#df8a22"><title>首轮 P2P 起点 · 3.172 ms</title></rect>
+<text x="778.5321706666667" y="476" font-size="11" fill="#df8a22" font-weight="700" text-anchor="start">3.17</text>
+<rect x="216.000" y="478.000" width="162.922" height="6.000" rx="1" fill="#8a57a1"><title>各卡按层起点对齐后 · 0.932 ms</title></rect>
+<text x="61" y="519" font-size="14" fill="#112b43" font-weight="700" text-anchor="start">MBS 4 × 4K</text>
+<rect x="216.000" y="497.000" width="123.475" height="6.000" rx="1" fill="#607791"><title>层起点 · 0.706 ms</title></rect>
+<rect x="216.000" y="506.000" width="150.617" height="6.000" rx="1" fill="#08949d"><title>KV staging 完成 · 0.861 ms</title></rect>
+<rect x="216.000" y="515.000" width="150.704" height="6.000" rx="1" fill="#df8a22"><title>首轮 P2P 起点 · 0.862 ms</title></rect>
+<text x="374.703536" y="522" font-size="11" fill="#df8a22" font-weight="700" text-anchor="start">0.86</text>
+<rect x="216.000" y="524.000" width="49.636" height="6.000" rx="1" fill="#8a57a1"><title>各卡按层起点对齐后 · 0.284 ms</title></rect>
+<text x="61" y="565" font-size="14" fill="#112b43" font-weight="700" text-anchor="start">MBS 4 × 8K</text>
+<rect x="216.000" y="543.000" width="323.853" height="6.000" rx="1" fill="#607791"><title>层起点 · 1.852 ms</title></rect>
+<rect x="216.000" y="552.000" width="430.093" height="6.000" rx="1" fill="#08949d"><title>KV staging 完成 · 2.460 ms</title></rect>
+<rect x="216.000" y="561.000" width="426.879" height="6.000" rx="1" fill="#df8a22"><title>首轮 P2P 起点 · 2.442 ms</title></rect>
+<text x="650.8790984166667" y="568" font-size="11" fill="#df8a22" font-weight="700" text-anchor="start">2.44</text>
+<rect x="216.000" y="570.000" width="139.332" height="6.000" rx="1" fill="#8a57a1"><title>各卡按层起点对齐后 · 0.797 ms</title></rect>
+<text x="61" y="611" font-size="14" fill="#112b43" font-weight="700" text-anchor="start">MBS 4 × 16K</text>
+<rect x="216.000" y="589.000" width="794.059" height="6.000" rx="1" fill="#607791"><title>层起点 · 4.542 ms</title></rect>
+<rect x="216.000" y="598.000" width="975.146" height="6.000" rx="1" fill="#08949d"><title>KV staging 完成 · 5.578 ms</title></rect>
+<rect x="216.000" y="607.000" width="976.100" height="6.000" rx="1" fill="#df8a22"><title>首轮 P2P 起点 · 5.583 ms</title></rect>
+<text x="1200.1002695000002" y="614" font-size="11" fill="#df8a22" font-weight="700" text-anchor="start">5.58</text>
+<rect x="216.000" y="616.000" width="275.755" height="6.000" rx="1" fill="#8a57a1"><title>各卡按层起点对齐后 · 1.577 ms</title></rect>
+<rect x="34.000" y="695.000" width="1332.000" height="151.000" rx="12" fill="#ffffff" stroke="#d4e1eb"/>
+<text x="55" y="728" font-size="18" fill="#112b43" font-weight="700" text-anchor="start">层间传播与因果 attention</text>
+<text x="56" y="757" font-size="15" fill="#495f72" font-weight="400" text-anchor="start">对同一 microbatch 的相邻反向层，四卡「上层结束 → 本层开始」间隔的偏差中位数仅 1–2 µs。</text>
+<text x="56" y="785" font-size="15" fill="#495f72" font-weight="400" text-anchor="start">各轮使用的 causal tile 和数据依赖随 rank、轮次而变。首轮到达差会让早到卡的 SendRecv kernel 区间包含等待。</text>
+<text x="56" y="813" font-size="15" fill="#495f72" font-weight="400" text-anchor="start">两套 CP4 × 9 组合都验证了每个 rank、每层前向 4 个 attention kernel / 6 个 SendRecv，反向 12 / 8。</text>
+</g></svg>

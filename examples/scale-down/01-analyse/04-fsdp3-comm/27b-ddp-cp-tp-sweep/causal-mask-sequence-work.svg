@@ -1,0 +1,235 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1280" height="912" viewBox="0 0 1280 912" role="img" aria-labelledby="title desc">
+<title id="title">Causal mask、序列长度与 attention 计算量</title>
+<desc id="desc">8 个 token 的 attention 矩阵呈下三角。第 t 个 Query 可见 t 个 Key。序列从 4 扩到 8 时，旧行保持原来的有效对数，新增 5、6、7、8 个有效对。CP4 将靠前和靠后的 token 配对以均分有效计算量。</desc>
+<defs>
+  <pattern id="masked" width="7" height="7" patternUnits="userSpaceOnUse">
+    <rect width="7" height="7" fill="#f1f4f7"/>
+    <path d="M -2 2 L 2 -2 M 0 7 L 7 0 M 5 9 L 9 5" stroke="#d5dfe8" stroke-width="0.8"/>
+  </pattern>
+</defs>
+<g font-family="Arial, Hiragino Sans GB, PingFang SC, Microsoft YaHei, sans-serif">
+<rect x="0" y="0" width="1280" height="912" rx="0" fill="#f3f7fb"/>
+<rect x="0" y="0" width="1280" height="7" rx="0" fill="#2b638e"/>
+<text x="42" y="39" fill="#245e88" font-size="14" font-weight="700" text-anchor="start">SELF-ATTENTION  /  CAUSAL MASK  /  CONTEXT PARALLEL</text>
+<text x="40" y="79" fill="#142b42" font-size="31" font-weight="700" text-anchor="start">Causal mask、序列长度与 attention 计算量</text>
+<text x="42" y="110" fill="#486176" font-size="15" font-weight="400" text-anchor="start">每个小格代表一对 Query 和 Key。以下按单条序列、单个 head 计数，token 位置从 1 起算。</text>
+<rect x="32" y="137" width="598" height="447" rx="12" fill="#ffffff" stroke="#d4e1eb"/>
+<rect x="650" y="137" width="598" height="447" rx="12" fill="#ffffff" stroke="#d4e1eb"/>
+<text x="54" y="171" fill="#142b42" font-size="20" font-weight="700" text-anchor="start">01   token 越靠后，可见的 Key 越多</text>
+<text x="55" y="199" fill="#486176" font-size="15" font-weight="400" text-anchor="start">第 t 个 Query 可见第 1 到第 t 个 Key，包含自己。</text>
+<text x="278" y="234" fill="#486176" font-size="14" font-weight="700" text-anchor="middle">Key 的位置 →</text>
+<text x="60" y="266" fill="#486176" font-size="13" font-weight="700" text-anchor="start">Query</text>
+<text x="60" y="285" fill="#486176" font-size="13" font-weight="700" text-anchor="start">位置 ↓</text>
+<rect x="137" y="267" width="34" height="34" rx="2" fill="#397cae"><title>Query 1 × Key 1 · 可见</title></rect>
+<rect x="172" y="267" width="34" height="34" rx="2" fill="url(#masked)"><title>Query 1 × Key 2 · 屏蔽</title></rect>
+<rect x="207" y="267" width="34" height="34" rx="2" fill="url(#masked)"><title>Query 1 × Key 3 · 屏蔽</title></rect>
+<rect x="242" y="267" width="34" height="34" rx="2" fill="url(#masked)"><title>Query 1 × Key 4 · 屏蔽</title></rect>
+<rect x="277" y="267" width="34" height="34" rx="2" fill="url(#masked)"><title>Query 1 × Key 5 · 屏蔽</title></rect>
+<rect x="312" y="267" width="34" height="34" rx="2" fill="url(#masked)"><title>Query 1 × Key 6 · 屏蔽</title></rect>
+<rect x="347" y="267" width="34" height="34" rx="2" fill="url(#masked)"><title>Query 1 × Key 7 · 屏蔽</title></rect>
+<rect x="382" y="267" width="34" height="34" rx="2" fill="url(#masked)"><title>Query 1 × Key 8 · 屏蔽</title></rect>
+<rect x="137" y="302" width="34" height="34" rx="2" fill="#83b7db"><title>Query 2 × Key 1 · 可见</title></rect>
+<rect x="172" y="302" width="34" height="34" rx="2" fill="#83b7db"><title>Query 2 × Key 2 · 可见</title></rect>
+<rect x="207" y="302" width="34" height="34" rx="2" fill="url(#masked)"><title>Query 2 × Key 3 · 屏蔽</title></rect>
+<rect x="242" y="302" width="34" height="34" rx="2" fill="url(#masked)"><title>Query 2 × Key 4 · 屏蔽</title></rect>
+<rect x="277" y="302" width="34" height="34" rx="2" fill="url(#masked)"><title>Query 2 × Key 5 · 屏蔽</title></rect>
+<rect x="312" y="302" width="34" height="34" rx="2" fill="url(#masked)"><title>Query 2 × Key 6 · 屏蔽</title></rect>
+<rect x="347" y="302" width="34" height="34" rx="2" fill="url(#masked)"><title>Query 2 × Key 7 · 屏蔽</title></rect>
+<rect x="382" y="302" width="34" height="34" rx="2" fill="url(#masked)"><title>Query 2 × Key 8 · 屏蔽</title></rect>
+<rect x="137" y="337" width="34" height="34" rx="2" fill="#83b7db"><title>Query 3 × Key 1 · 可见</title></rect>
+<rect x="172" y="337" width="34" height="34" rx="2" fill="#83b7db"><title>Query 3 × Key 2 · 可见</title></rect>
+<rect x="207" y="337" width="34" height="34" rx="2" fill="#83b7db"><title>Query 3 × Key 3 · 可见</title></rect>
+<rect x="242" y="337" width="34" height="34" rx="2" fill="url(#masked)"><title>Query 3 × Key 4 · 屏蔽</title></rect>
+<rect x="277" y="337" width="34" height="34" rx="2" fill="url(#masked)"><title>Query 3 × Key 5 · 屏蔽</title></rect>
+<rect x="312" y="337" width="34" height="34" rx="2" fill="url(#masked)"><title>Query 3 × Key 6 · 屏蔽</title></rect>
+<rect x="347" y="337" width="34" height="34" rx="2" fill="url(#masked)"><title>Query 3 × Key 7 · 屏蔽</title></rect>
+<rect x="382" y="337" width="34" height="34" rx="2" fill="url(#masked)"><title>Query 3 × Key 8 · 屏蔽</title></rect>
+<rect x="137" y="372" width="34" height="34" rx="2" fill="#83b7db"><title>Query 4 × Key 1 · 可见</title></rect>
+<rect x="172" y="372" width="34" height="34" rx="2" fill="#83b7db"><title>Query 4 × Key 2 · 可见</title></rect>
+<rect x="207" y="372" width="34" height="34" rx="2" fill="#83b7db"><title>Query 4 × Key 3 · 可见</title></rect>
+<rect x="242" y="372" width="34" height="34" rx="2" fill="#83b7db"><title>Query 4 × Key 4 · 可见</title></rect>
+<rect x="277" y="372" width="34" height="34" rx="2" fill="url(#masked)"><title>Query 4 × Key 5 · 屏蔽</title></rect>
+<rect x="312" y="372" width="34" height="34" rx="2" fill="url(#masked)"><title>Query 4 × Key 6 · 屏蔽</title></rect>
+<rect x="347" y="372" width="34" height="34" rx="2" fill="url(#masked)"><title>Query 4 × Key 7 · 屏蔽</title></rect>
+<rect x="382" y="372" width="34" height="34" rx="2" fill="url(#masked)"><title>Query 4 × Key 8 · 屏蔽</title></rect>
+<rect x="137" y="407" width="34" height="34" rx="2" fill="#83b7db"><title>Query 5 × Key 1 · 可见</title></rect>
+<rect x="172" y="407" width="34" height="34" rx="2" fill="#83b7db"><title>Query 5 × Key 2 · 可见</title></rect>
+<rect x="207" y="407" width="34" height="34" rx="2" fill="#83b7db"><title>Query 5 × Key 3 · 可见</title></rect>
+<rect x="242" y="407" width="34" height="34" rx="2" fill="#83b7db"><title>Query 5 × Key 4 · 可见</title></rect>
+<rect x="277" y="407" width="34" height="34" rx="2" fill="#83b7db"><title>Query 5 × Key 5 · 可见</title></rect>
+<rect x="312" y="407" width="34" height="34" rx="2" fill="url(#masked)"><title>Query 5 × Key 6 · 屏蔽</title></rect>
+<rect x="347" y="407" width="34" height="34" rx="2" fill="url(#masked)"><title>Query 5 × Key 7 · 屏蔽</title></rect>
+<rect x="382" y="407" width="34" height="34" rx="2" fill="url(#masked)"><title>Query 5 × Key 8 · 屏蔽</title></rect>
+<rect x="137" y="442" width="34" height="34" rx="2" fill="#83b7db"><title>Query 6 × Key 1 · 可见</title></rect>
+<rect x="172" y="442" width="34" height="34" rx="2" fill="#83b7db"><title>Query 6 × Key 2 · 可见</title></rect>
+<rect x="207" y="442" width="34" height="34" rx="2" fill="#83b7db"><title>Query 6 × Key 3 · 可见</title></rect>
+<rect x="242" y="442" width="34" height="34" rx="2" fill="#83b7db"><title>Query 6 × Key 4 · 可见</title></rect>
+<rect x="277" y="442" width="34" height="34" rx="2" fill="#83b7db"><title>Query 6 × Key 5 · 可见</title></rect>
+<rect x="312" y="442" width="34" height="34" rx="2" fill="#83b7db"><title>Query 6 × Key 6 · 可见</title></rect>
+<rect x="347" y="442" width="34" height="34" rx="2" fill="url(#masked)"><title>Query 6 × Key 7 · 屏蔽</title></rect>
+<rect x="382" y="442" width="34" height="34" rx="2" fill="url(#masked)"><title>Query 6 × Key 8 · 屏蔽</title></rect>
+<rect x="137" y="477" width="34" height="34" rx="2" fill="#83b7db"><title>Query 7 × Key 1 · 可见</title></rect>
+<rect x="172" y="477" width="34" height="34" rx="2" fill="#83b7db"><title>Query 7 × Key 2 · 可见</title></rect>
+<rect x="207" y="477" width="34" height="34" rx="2" fill="#83b7db"><title>Query 7 × Key 3 · 可见</title></rect>
+<rect x="242" y="477" width="34" height="34" rx="2" fill="#83b7db"><title>Query 7 × Key 4 · 可见</title></rect>
+<rect x="277" y="477" width="34" height="34" rx="2" fill="#83b7db"><title>Query 7 × Key 5 · 可见</title></rect>
+<rect x="312" y="477" width="34" height="34" rx="2" fill="#83b7db"><title>Query 7 × Key 6 · 可见</title></rect>
+<rect x="347" y="477" width="34" height="34" rx="2" fill="#83b7db"><title>Query 7 × Key 7 · 可见</title></rect>
+<rect x="382" y="477" width="34" height="34" rx="2" fill="url(#masked)"><title>Query 7 × Key 8 · 屏蔽</title></rect>
+<rect x="137" y="512" width="34" height="34" rx="2" fill="#397cae"><title>Query 8 × Key 1 · 可见</title></rect>
+<rect x="172" y="512" width="34" height="34" rx="2" fill="#397cae"><title>Query 8 × Key 2 · 可见</title></rect>
+<rect x="207" y="512" width="34" height="34" rx="2" fill="#397cae"><title>Query 8 × Key 3 · 可见</title></rect>
+<rect x="242" y="512" width="34" height="34" rx="2" fill="#397cae"><title>Query 8 × Key 4 · 可见</title></rect>
+<rect x="277" y="512" width="34" height="34" rx="2" fill="#397cae"><title>Query 8 × Key 5 · 可见</title></rect>
+<rect x="312" y="512" width="34" height="34" rx="2" fill="#397cae"><title>Query 8 × Key 6 · 可见</title></rect>
+<rect x="347" y="512" width="34" height="34" rx="2" fill="#397cae"><title>Query 8 × Key 7 · 可见</title></rect>
+<rect x="382" y="512" width="34" height="34" rx="2" fill="#397cae"><title>Query 8 × Key 8 · 可见</title></rect>
+<text x="154.5" y="258" fill="#486176" font-size="13" font-weight="700" text-anchor="middle">1</text>
+<text x="189.5" y="258" fill="#486176" font-size="13" font-weight="700" text-anchor="middle">2</text>
+<text x="224.5" y="258" fill="#486176" font-size="13" font-weight="700" text-anchor="middle">3</text>
+<text x="259.5" y="258" fill="#486176" font-size="13" font-weight="700" text-anchor="middle">4</text>
+<text x="294.5" y="258" fill="#486176" font-size="13" font-weight="700" text-anchor="middle">5</text>
+<text x="329.5" y="258" fill="#486176" font-size="13" font-weight="700" text-anchor="middle">6</text>
+<text x="364.5" y="258" fill="#486176" font-size="13" font-weight="700" text-anchor="middle">7</text>
+<text x="399.5" y="258" fill="#486176" font-size="13" font-weight="700" text-anchor="middle">8</text>
+<text x="123" y="289.5" fill="#486176" font-size="13" font-weight="700" text-anchor="end">1</text>
+<text x="441" y="289.5" fill="#397cae" font-size="14" font-weight="700" text-anchor="start">1 个</text>
+<text x="492" y="289.5" fill="#397cae" font-size="13" font-weight="700" text-anchor="start">只看自己</text>
+<text x="123" y="324.5" fill="#486176" font-size="13" font-weight="700" text-anchor="end">2</text>
+<text x="441" y="324.5" fill="#486176" font-size="14" font-weight="400" text-anchor="start">2 个</text>
+<text x="123" y="359.5" fill="#486176" font-size="13" font-weight="700" text-anchor="end">3</text>
+<text x="441" y="359.5" fill="#486176" font-size="14" font-weight="400" text-anchor="start">3 个</text>
+<text x="123" y="394.5" fill="#486176" font-size="13" font-weight="700" text-anchor="end">4</text>
+<text x="441" y="394.5" fill="#486176" font-size="14" font-weight="400" text-anchor="start">4 个</text>
+<text x="123" y="429.5" fill="#486176" font-size="13" font-weight="700" text-anchor="end">5</text>
+<text x="441" y="429.5" fill="#486176" font-size="14" font-weight="400" text-anchor="start">5 个</text>
+<text x="123" y="464.5" fill="#486176" font-size="13" font-weight="700" text-anchor="end">6</text>
+<text x="441" y="464.5" fill="#486176" font-size="14" font-weight="400" text-anchor="start">6 个</text>
+<text x="123" y="499.5" fill="#486176" font-size="13" font-weight="700" text-anchor="end">7</text>
+<text x="441" y="499.5" fill="#486176" font-size="14" font-weight="400" text-anchor="start">7 个</text>
+<text x="123" y="534.5" fill="#486176" font-size="13" font-weight="700" text-anchor="end">8</text>
+<text x="441" y="534.5" fill="#397cae" font-size="14" font-weight="700" text-anchor="start">8 个</text>
+<text x="492" y="534.5" fill="#397cae" font-size="13" font-weight="700" text-anchor="start">看完整前缀</text>
+<text x="439" y="257" fill="#142b42" font-size="13" font-weight="700" text-anchor="start">每行有效对数</text>
+<rect x="56" y="556" width="13" height="13" rx="2" fill="#83b7db"/>
+<text x="77" y="567" fill="#486176" font-size="13" font-weight="400" text-anchor="start">可见</text>
+<rect x="145" y="556" width="13" height="13" rx="2" fill="url(#masked)" stroke="#d4e1eb"/>
+<text x="167" y="567" fill="#486176" font-size="13" font-weight="400" text-anchor="start">被 mask 的未来 token</text>
+<text x="672" y="171" fill="#142b42" font-size="20" font-weight="700" text-anchor="start">02   序列加长，新增的行也更长</text>
+<text x="673" y="199" fill="#486176" font-size="15" font-weight="400" text-anchor="start">从 4 个 token 扩到 8 个时，原来 4 行各自的有效对数保持不变。</text>
+<text x="768" y="248" fill="#142b42" font-size="16" font-weight="700" text-anchor="middle">L = 4</text>
+<text x="1056" y="248" fill="#142b42" font-size="16" font-weight="700" text-anchor="middle">L = 8</text>
+<rect x="708" y="268" width="29" height="29" rx="2" fill="#83b7db"><title>Query 1 × Key 1 · 可见</title></rect>
+<rect x="738" y="268" width="29" height="29" rx="2" fill="url(#masked)"><title>Query 1 × Key 2 · 屏蔽</title></rect>
+<rect x="768" y="268" width="29" height="29" rx="2" fill="url(#masked)"><title>Query 1 × Key 3 · 屏蔽</title></rect>
+<rect x="798" y="268" width="29" height="29" rx="2" fill="url(#masked)"><title>Query 1 × Key 4 · 屏蔽</title></rect>
+<rect x="708" y="298" width="29" height="29" rx="2" fill="#83b7db"><title>Query 2 × Key 1 · 可见</title></rect>
+<rect x="738" y="298" width="29" height="29" rx="2" fill="#83b7db"><title>Query 2 × Key 2 · 可见</title></rect>
+<rect x="768" y="298" width="29" height="29" rx="2" fill="url(#masked)"><title>Query 2 × Key 3 · 屏蔽</title></rect>
+<rect x="798" y="298" width="29" height="29" rx="2" fill="url(#masked)"><title>Query 2 × Key 4 · 屏蔽</title></rect>
+<rect x="708" y="328" width="29" height="29" rx="2" fill="#83b7db"><title>Query 3 × Key 1 · 可见</title></rect>
+<rect x="738" y="328" width="29" height="29" rx="2" fill="#83b7db"><title>Query 3 × Key 2 · 可见</title></rect>
+<rect x="768" y="328" width="29" height="29" rx="2" fill="#83b7db"><title>Query 3 × Key 3 · 可见</title></rect>
+<rect x="798" y="328" width="29" height="29" rx="2" fill="url(#masked)"><title>Query 3 × Key 4 · 屏蔽</title></rect>
+<rect x="708" y="358" width="29" height="29" rx="2" fill="#83b7db"><title>Query 4 × Key 1 · 可见</title></rect>
+<rect x="738" y="358" width="29" height="29" rx="2" fill="#83b7db"><title>Query 4 × Key 2 · 可见</title></rect>
+<rect x="768" y="358" width="29" height="29" rx="2" fill="#83b7db"><title>Query 4 × Key 3 · 可见</title></rect>
+<rect x="798" y="358" width="29" height="29" rx="2" fill="#83b7db"><title>Query 4 × Key 4 · 可见</title></rect>
+<rect x="936" y="268" width="29" height="29" rx="2" fill="#83b7db"><title>Query 1 × Key 1 · 可见</title></rect>
+<rect x="966" y="268" width="29" height="29" rx="2" fill="url(#masked)"><title>Query 1 × Key 2 · 屏蔽</title></rect>
+<rect x="996" y="268" width="29" height="29" rx="2" fill="url(#masked)"><title>Query 1 × Key 3 · 屏蔽</title></rect>
+<rect x="1026" y="268" width="29" height="29" rx="2" fill="url(#masked)"><title>Query 1 × Key 4 · 屏蔽</title></rect>
+<rect x="1056" y="268" width="29" height="29" rx="2" fill="url(#masked)"><title>Query 1 × Key 5 · 屏蔽</title></rect>
+<rect x="1086" y="268" width="29" height="29" rx="2" fill="url(#masked)"><title>Query 1 × Key 6 · 屏蔽</title></rect>
+<rect x="1116" y="268" width="29" height="29" rx="2" fill="url(#masked)"><title>Query 1 × Key 7 · 屏蔽</title></rect>
+<rect x="1146" y="268" width="29" height="29" rx="2" fill="url(#masked)"><title>Query 1 × Key 8 · 屏蔽</title></rect>
+<rect x="936" y="298" width="29" height="29" rx="2" fill="#83b7db"><title>Query 2 × Key 1 · 可见</title></rect>
+<rect x="966" y="298" width="29" height="29" rx="2" fill="#83b7db"><title>Query 2 × Key 2 · 可见</title></rect>
+<rect x="996" y="298" width="29" height="29" rx="2" fill="url(#masked)"><title>Query 2 × Key 3 · 屏蔽</title></rect>
+<rect x="1026" y="298" width="29" height="29" rx="2" fill="url(#masked)"><title>Query 2 × Key 4 · 屏蔽</title></rect>
+<rect x="1056" y="298" width="29" height="29" rx="2" fill="url(#masked)"><title>Query 2 × Key 5 · 屏蔽</title></rect>
+<rect x="1086" y="298" width="29" height="29" rx="2" fill="url(#masked)"><title>Query 2 × Key 6 · 屏蔽</title></rect>
+<rect x="1116" y="298" width="29" height="29" rx="2" fill="url(#masked)"><title>Query 2 × Key 7 · 屏蔽</title></rect>
+<rect x="1146" y="298" width="29" height="29" rx="2" fill="url(#masked)"><title>Query 2 × Key 8 · 屏蔽</title></rect>
+<rect x="936" y="328" width="29" height="29" rx="2" fill="#83b7db"><title>Query 3 × Key 1 · 可见</title></rect>
+<rect x="966" y="328" width="29" height="29" rx="2" fill="#83b7db"><title>Query 3 × Key 2 · 可见</title></rect>
+<rect x="996" y="328" width="29" height="29" rx="2" fill="#83b7db"><title>Query 3 × Key 3 · 可见</title></rect>
+<rect x="1026" y="328" width="29" height="29" rx="2" fill="url(#masked)"><title>Query 3 × Key 4 · 屏蔽</title></rect>
+<rect x="1056" y="328" width="29" height="29" rx="2" fill="url(#masked)"><title>Query 3 × Key 5 · 屏蔽</title></rect>
+<rect x="1086" y="328" width="29" height="29" rx="2" fill="url(#masked)"><title>Query 3 × Key 6 · 屏蔽</title></rect>
+<rect x="1116" y="328" width="29" height="29" rx="2" fill="url(#masked)"><title>Query 3 × Key 7 · 屏蔽</title></rect>
+<rect x="1146" y="328" width="29" height="29" rx="2" fill="url(#masked)"><title>Query 3 × Key 8 · 屏蔽</title></rect>
+<rect x="936" y="358" width="29" height="29" rx="2" fill="#83b7db"><title>Query 4 × Key 1 · 可见</title></rect>
+<rect x="966" y="358" width="29" height="29" rx="2" fill="#83b7db"><title>Query 4 × Key 2 · 可见</title></rect>
+<rect x="996" y="358" width="29" height="29" rx="2" fill="#83b7db"><title>Query 4 × Key 3 · 可见</title></rect>
+<rect x="1026" y="358" width="29" height="29" rx="2" fill="#83b7db"><title>Query 4 × Key 4 · 可见</title></rect>
+<rect x="1056" y="358" width="29" height="29" rx="2" fill="url(#masked)"><title>Query 4 × Key 5 · 屏蔽</title></rect>
+<rect x="1086" y="358" width="29" height="29" rx="2" fill="url(#masked)"><title>Query 4 × Key 6 · 屏蔽</title></rect>
+<rect x="1116" y="358" width="29" height="29" rx="2" fill="url(#masked)"><title>Query 4 × Key 7 · 屏蔽</title></rect>
+<rect x="1146" y="358" width="29" height="29" rx="2" fill="url(#masked)"><title>Query 4 × Key 8 · 屏蔽</title></rect>
+<rect x="936" y="388" width="29" height="29" rx="2" fill="#50a787"><title>Query 5 × Key 1 · 可见</title></rect>
+<rect x="966" y="388" width="29" height="29" rx="2" fill="#50a787"><title>Query 5 × Key 2 · 可见</title></rect>
+<rect x="996" y="388" width="29" height="29" rx="2" fill="#50a787"><title>Query 5 × Key 3 · 可见</title></rect>
+<rect x="1026" y="388" width="29" height="29" rx="2" fill="#50a787"><title>Query 5 × Key 4 · 可见</title></rect>
+<rect x="1056" y="388" width="29" height="29" rx="2" fill="#50a787"><title>Query 5 × Key 5 · 可见</title></rect>
+<rect x="1086" y="388" width="29" height="29" rx="2" fill="url(#masked)"><title>Query 5 × Key 6 · 屏蔽</title></rect>
+<rect x="1116" y="388" width="29" height="29" rx="2" fill="url(#masked)"><title>Query 5 × Key 7 · 屏蔽</title></rect>
+<rect x="1146" y="388" width="29" height="29" rx="2" fill="url(#masked)"><title>Query 5 × Key 8 · 屏蔽</title></rect>
+<rect x="936" y="418" width="29" height="29" rx="2" fill="#50a787"><title>Query 6 × Key 1 · 可见</title></rect>
+<rect x="966" y="418" width="29" height="29" rx="2" fill="#50a787"><title>Query 6 × Key 2 · 可见</title></rect>
+<rect x="996" y="418" width="29" height="29" rx="2" fill="#50a787"><title>Query 6 × Key 3 · 可见</title></rect>
+<rect x="1026" y="418" width="29" height="29" rx="2" fill="#50a787"><title>Query 6 × Key 4 · 可见</title></rect>
+<rect x="1056" y="418" width="29" height="29" rx="2" fill="#50a787"><title>Query 6 × Key 5 · 可见</title></rect>
+<rect x="1086" y="418" width="29" height="29" rx="2" fill="#50a787"><title>Query 6 × Key 6 · 可见</title></rect>
+<rect x="1116" y="418" width="29" height="29" rx="2" fill="url(#masked)"><title>Query 6 × Key 7 · 屏蔽</title></rect>
+<rect x="1146" y="418" width="29" height="29" rx="2" fill="url(#masked)"><title>Query 6 × Key 8 · 屏蔽</title></rect>
+<rect x="936" y="448" width="29" height="29" rx="2" fill="#50a787"><title>Query 7 × Key 1 · 可见</title></rect>
+<rect x="966" y="448" width="29" height="29" rx="2" fill="#50a787"><title>Query 7 × Key 2 · 可见</title></rect>
+<rect x="996" y="448" width="29" height="29" rx="2" fill="#50a787"><title>Query 7 × Key 3 · 可见</title></rect>
+<rect x="1026" y="448" width="29" height="29" rx="2" fill="#50a787"><title>Query 7 × Key 4 · 可见</title></rect>
+<rect x="1056" y="448" width="29" height="29" rx="2" fill="#50a787"><title>Query 7 × Key 5 · 可见</title></rect>
+<rect x="1086" y="448" width="29" height="29" rx="2" fill="#50a787"><title>Query 7 × Key 6 · 可见</title></rect>
+<rect x="1116" y="448" width="29" height="29" rx="2" fill="#50a787"><title>Query 7 × Key 7 · 可见</title></rect>
+<rect x="1146" y="448" width="29" height="29" rx="2" fill="url(#masked)"><title>Query 7 × Key 8 · 屏蔽</title></rect>
+<rect x="936" y="478" width="29" height="29" rx="2" fill="#50a787"><title>Query 8 × Key 1 · 可见</title></rect>
+<rect x="966" y="478" width="29" height="29" rx="2" fill="#50a787"><title>Query 8 × Key 2 · 可见</title></rect>
+<rect x="996" y="478" width="29" height="29" rx="2" fill="#50a787"><title>Query 8 × Key 3 · 可见</title></rect>
+<rect x="1026" y="478" width="29" height="29" rx="2" fill="#50a787"><title>Query 8 × Key 4 · 可见</title></rect>
+<rect x="1056" y="478" width="29" height="29" rx="2" fill="#50a787"><title>Query 8 × Key 5 · 可见</title></rect>
+<rect x="1086" y="478" width="29" height="29" rx="2" fill="#50a787"><title>Query 8 × Key 6 · 可见</title></rect>
+<rect x="1116" y="478" width="29" height="29" rx="2" fill="#50a787"><title>Query 8 × Key 7 · 可见</title></rect>
+<rect x="1146" y="478" width="29" height="29" rx="2" fill="#50a787"><title>Query 8 × Key 8 · 可见</title></rect>
+<text x="882" y="333" fill="#397cae" font-size="32" font-weight="700" text-anchor="middle">→</text>
+<text x="768" y="415" fill="#397cae" font-size="19" font-weight="700" text-anchor="middle">10 对</text>
+<text x="768" y="438" fill="#486176" font-size="14" font-weight="400" text-anchor="middle">1 + 2 + 3 + 4</text>
+<text x="1056" y="531" fill="#142b42" font-size="17" font-weight="700" text-anchor="middle">36 对 = 原有 10 + 新增 26</text>
+<text x="1056" y="555" fill="#26775c" font-size="14" font-weight="700" text-anchor="middle">新增 5 + 6 + 7 + 8 对</text>
+<rect x="681" y="485" width="13" height="13" rx="2" fill="#83b7db"/>
+<text x="701" y="496" fill="#486176" font-size="13" font-weight="400" text-anchor="start">原有有效对</text>
+<rect x="681" y="511" width="13" height="13" rx="2" fill="#50a787"/>
+<text x="701" y="522" fill="#486176" font-size="13" font-weight="400" text-anchor="start">新增有效对</text>
+<rect x="32" y="601" width="1216" height="94" rx="11" fill="#e8f0f7"/>
+<text x="55" y="630" fill="#142b42" font-size="17" font-weight="700" text-anchor="start">整条序列的有效 Q–K 对数</text>
+<text x="55" y="663" fill="#142b42" font-size="18" font-weight="700" text-anchor="start">Causal mask    1 + 2 + … + L = L(L + 1)/2</text>
+<text x="553" y="663" fill="#486176" font-size="16" font-weight="700" text-anchor="start">无 mask    每行 L 个，共 L²</text>
+<text x="1222" y="629" fill="#397cae" font-size="16" font-weight="700" text-anchor="end">4K → 8K</text>
+<text x="1222" y="663" fill="#397cae" font-size="18" font-weight="700" text-anchor="end">8.39M → 33.56M  ·  约 4 倍</text>
+<rect x="32" y="712" width="1216" height="147" rx="12" fill="#ffffff" stroke="#d4e1eb"/>
+<text x="54" y="743" fill="#142b42" font-size="20" font-weight="700" text-anchor="start">03   CP4 用前后配对均分有效计算量</text>
+<text x="55" y="770" fill="#486176" font-size="15" font-weight="400" text-anchor="start">用上面的 8-token 示例，每个 rank 分到两个 Query，四卡各有 9 个有效 Q–K 对。</text>
+<rect x="54" y="786" width="276" height="47" rx="6" fill="#eef4f9"/>
+<text x="67" y="815" fill="#486176" font-size="14" font-weight="700" text-anchor="start">Rank 0</text>
+<text x="161" y="815" fill="#142b42" font-size="17" font-weight="700" text-anchor="start">1 + 8 = 9 对</text>
+<rect x="350" y="786" width="276" height="47" rx="6" fill="#eef4f9"/>
+<text x="363" y="815" fill="#486176" font-size="14" font-weight="700" text-anchor="start">Rank 1</text>
+<text x="457" y="815" fill="#142b42" font-size="17" font-weight="700" text-anchor="start">2 + 7 = 9 对</text>
+<rect x="646" y="786" width="276" height="47" rx="6" fill="#eef4f9"/>
+<text x="659" y="815" fill="#486176" font-size="14" font-weight="700" text-anchor="start">Rank 2</text>
+<text x="753" y="815" fill="#142b42" font-size="17" font-weight="700" text-anchor="start">3 + 6 = 9 对</text>
+<rect x="942" y="786" width="276" height="47" rx="6" fill="#eef4f9"/>
+<text x="955" y="815" fill="#486176" font-size="14" font-weight="700" text-anchor="start">Rank 3</text>
+<text x="1049" y="815" fill="#142b42" font-size="17" font-weight="700" text-anchor="start">4 + 5 = 9 对</text>
+<text x="54" y="849" fill="#486176" font-size="13" font-weight="400" text-anchor="start">实际 CP4 把 8 个等长 chunk 按同样的前后顺序配对。</text>
+<line x1="34" y1="877" x2="1246" y2="877" stroke="#d4e1eb"/>
+<text x="42" y="898" fill="#486176" font-size="13" font-weight="400" text-anchor="start">有效 Q–K 对数衡量 attention 的理论工作量。GPU kernel 的实际耗时还受 tile 形状和执行效率影响。</text>
+</g></svg>

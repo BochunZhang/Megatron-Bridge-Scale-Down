@@ -1,0 +1,1202 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1400" height="1455" viewBox="0 0 1400 1455" role="img" aria-labelledby="title desc">
+<title id="title">27B 单层四卡时间线  ·  MBS 4 × Seq 16K</title><desc id="desc">同一形状比较 CP4、TP4、DP4 + FSDP-3 以及可用的 DDP DP4。</desc>
+<metadata>{&quot;trace_sources&quot;: [&quot;results/01-analyse/04-fsdp3-comm/261109-27b-ddp-cp-cg/model_27b-ddp-sync-ag-layers_8-attn_full-mtp_0-experts_0-cg_on-mbs_4-seq_16384-cp_4-ep_1-disp_none-gbs_16-gpus_4-profile_nsys-date_261109-103504/node0/qwen35_27b-ddp-sync-ag-attn_full-experts_0-cg_on-cp_4-ep_1-mbs_4-gbs_16-seq_16k.nsys-rep&quot;, &quot;results/01-analyse/04-fsdp3-comm/261109-27b-ddp-tp-cg/model_27b-ddp-sync-ag-layers_8-attn_full-mtp_0-experts_0-cg_on-mbs_4-seq_16384-tp_4-cp_1-ep_1-disp_none-gbs_16-gpus_4-profile_nsys-date_261109-141638/node0/qwen35_27b-ddp-sync-ag-attn_full-experts_0-cg_on-tp_4-cp_1-ep_1-mbs_4-gbs_16-seq_16k.nsys-rep&quot;], &quot;sample&quot;: &quot;microbatch 1, layer 3 (zero-based)&quot;, &quot;fsdp_overlap_pair&quot;: &quot;AG(L2) with RS(L4) around bwd L3&quot;}</metadata>
+<g font-family="Arial, Hiragino Sans GB, PingFang SC, Microsoft YaHei, sans-serif">
+<rect x="0.000" y="0.000" width="1400.000" height="1455.000" rx="0" fill="#f3f7fb"/>
+<rect x="0.000" y="0.000" width="1400.000" height="7.000" rx="0" fill="#2b638e"/>
+<text x="44" y="40" font-size="14" fill="#245e88" font-weight="700" text-anchor="start">GB200  /  NSIGHT SYSTEMS  /  CUDA GRAPH REPLAY</text>
+<text x="43" y="81" font-size="31" fill="#112b43" font-weight="700" text-anchor="start">27B 单层四卡时间线  ·  MBS 4 × Seq 16K</text>
+<text x="45" y="113" font-size="15" fill="#495f72" font-weight="400" text-anchor="start">4 × GB200  ·  BF16  ·  8 层 full attention  ·  第 8 步 · MB1 / L3（从 0 起算）</text>
+<rect x="34.000" y="135.000" width="1332.000" height="216.000" rx="12" fill="#ffffff" stroke="#d4e1eb"/>
+<text x="54" y="159" font-size="14" fill="#112b43" font-weight="700" text-anchor="start">配置</text>
+<text x="340" y="159" font-size="14" fill="#112b43" font-weight="700" text-anchor="start">层前向 / 反向</text>
+<text x="560" y="159" font-size="14" fill="#112b43" font-weight="700" text-anchor="start">重叠情况</text>
+<text x="845" y="159" font-size="14" fill="#112b43" font-weight="700" text-anchor="start">前 AG / 反 AG / RS</text>
+<text x="1135" y="159" font-size="14" fill="#112b43" font-weight="700" text-anchor="start">末卡进入后</text>
+<line x1="52" y1="167" x2="1346" y2="167" stroke="#d4e1eb" stroke-width="1"/>
+<text x="54" y="185" font-size="14" fill="#a95817" font-weight="700" text-anchor="start">DDP · CP4</text>
+<text x="340" y="185" font-size="14" fill="#112b43" font-weight="400" text-anchor="start">14.29 / 35.17 ms</text>
+<text x="560" y="185" font-size="14" fill="#112b43" font-weight="400" text-anchor="start">38.61 / 83.64%</text>
+<line x1="52" y1="196" x2="1346" y2="196" stroke="#d4e1eb" stroke-width="1"/>
+<text x="54" y="214" font-size="14" fill="#356eb7" font-weight="700" text-anchor="start">DDP · TP4 + SP</text>
+<text x="340" y="214" font-size="14" fill="#112b43" font-weight="400" text-anchor="start">15.41 / 33.57 ms</text>
+<text x="560" y="214" font-size="14" fill="#112b43" font-weight="400" text-anchor="start">0.01 / 16.61%</text>
+<line x1="52" y1="225" x2="1346" y2="225" stroke="#d4e1eb" stroke-width="1"/>
+<text x="54" y="243" font-size="14" fill="#915e30" font-weight="700" text-anchor="start">DP4 + FSDP-3 · 同 communicator</text>
+<text x="340" y="243" font-size="14" fill="#63798c" font-weight="400" text-anchor="start">无 trace</text>
+<line x1="52" y1="254" x2="1346" y2="254" stroke="#d4e1eb" stroke-width="1"/>
+<text x="54" y="272" font-size="14" fill="#7a4592" font-weight="700" text-anchor="start">DP4 + FSDP-3 · 独立 AG communicator</text>
+<text x="340" y="272" font-size="14" fill="#63798c" font-weight="400" text-anchor="start">无 trace</text>
+<line x1="52" y1="283" x2="1346" y2="283" stroke="#d4e1eb" stroke-width="1"/>
+<text x="54" y="301" font-size="14" fill="#63798c" font-weight="700" text-anchor="start">DDP · 纯 DP4</text>
+<text x="340" y="301" font-size="14" fill="#63798c" font-weight="400" text-anchor="start">无 trace</text>
+<text x="55" y="337" font-size="13" fill="#495f72" font-weight="400" text-anchor="start">FSDP 列为 decoder bucket 单次驻留中位数。末卡进入后 = 四卡最后一个 kernel 开始到最晚结束。</text>
+<rect x="45.000" y="367.000" width="15.000" height="8.000" rx="2" fill="#3c70c6"/>
+<text x="66" y="376" font-size="13" fill="#495f72" font-weight="400" text-anchor="start">GEMM</text>
+<rect x="188.000" y="367.000" width="15.000" height="8.000" rx="2" fill="#08949d"/>
+<text x="209" y="376" font-size="13" fill="#495f72" font-weight="400" text-anchor="start">FlashAttention</text>
+<rect x="331.000" y="367.000" width="15.000" height="8.000" rx="2" fill="#9ab5d5"/>
+<text x="352" y="376" font-size="13" fill="#495f72" font-weight="400" text-anchor="start">其他计算</text>
+<rect x="474.000" y="367.000" width="15.000" height="8.000" rx="2" fill="#9da9b5"/>
+<text x="495" y="376" font-size="13" fill="#495f72" font-weight="400" text-anchor="start">D2D / memset</text>
+<rect x="617.000" y="367.000" width="15.000" height="8.000" rx="2" fill="#df8a22"/>
+<text x="638" y="376" font-size="13" fill="#495f72" font-weight="400" text-anchor="start">CP P2P</text>
+<rect x="760.000" y="367.000" width="15.000" height="8.000" rx="2" fill="#e0a12d"/>
+<text x="781" y="376" font-size="13" fill="#495f72" font-weight="400" text-anchor="start">AG</text>
+<rect x="903.000" y="367.000" width="15.000" height="8.000" rx="2" fill="#9856a8"/>
+<text x="924" y="376" font-size="13" fill="#495f72" font-weight="400" text-anchor="start">RS</text>
+<rect x="1046.000" y="367.000" width="15.000" height="8.000" rx="2" fill="#c85a7c"/>
+<text x="1067" y="376" font-size="13" fill="#495f72" font-weight="400" text-anchor="start">其他 NCCL</text>
+<rect x="1189.000" y="367.000" width="15.000" height="8.000" rx="2" fill="#2b9e65"/>
+<text x="1210" y="376" font-size="13" fill="#495f72" font-weight="400" text-anchor="start">四卡可用</text>
+<rect x="34.000" y="393.000" width="1332.000" height="143.000" rx="11" fill="#ffffff" stroke="#d4e1eb"/>
+<text x="53" y="416" font-size="15" fill="#a95817" font-weight="700" text-anchor="start">DDP · CP4</text>
+<text x="107" y="429" font-size="13" fill="#112b43" font-weight="700" text-anchor="start">前向  13.50 ms  ·  四卡累计可用 10.38 ms</text>
+<line x1="107.0" y1="435" x2="107.0" y2="517" stroke="#d4e1eb" stroke-width="1"/>
+<text x="107.0" y="532" font-size="11" fill="#63798c" font-weight="400" text-anchor="middle">0</text>
+<line x1="249.5" y1="435" x2="249.5" y2="517" stroke="#d4e1eb" stroke-width="1"/>
+<text x="249.5" y="532" font-size="11" fill="#63798c" font-weight="400" text-anchor="middle">5</text>
+<line x1="392.0" y1="435" x2="392.0" y2="517" stroke="#d4e1eb" stroke-width="1"/>
+<text x="392.0" y="532" font-size="11" fill="#63798c" font-weight="400" text-anchor="middle">10</text>
+<line x1="534.5" y1="435" x2="534.5" y2="517" stroke="#d4e1eb" stroke-width="1"/>
+<text x="534.5" y="532" font-size="11" fill="#63798c" font-weight="400" text-anchor="middle">15</text>
+<line x1="677.0" y1="435" x2="677.0" y2="517" stroke="#d4e1eb" stroke-width="1"/>
+<text x="677.0" y="532" font-size="11" fill="#63798c" font-weight="400" text-anchor="middle">20 ms</text>
+<text x="98" y="446" font-size="11" fill="#63798c" font-weight="400" text-anchor="end">GPU 0</text>
+<line x1="107" y1="448" x2="677" y2="448" stroke="#e9eff4" stroke-width="1"/>
+<rect x="113.779" y="436.000" width="1.584" height="6.000" rx="0" fill="#9da9b5"><title>GPU 0 · mem · 0.238–0.293 ms · 8</title></rect>
+<rect x="115.407" y="436.000" width="2.458" height="6.000" rx="0" fill="#9da9b5"><title>GPU 0 · mem · 0.295–0.381 ms · 8</title></rect>
+<rect x="117.915" y="436.000" width="0.074" height="6.000" rx="0" fill="#9da9b5"><title>GPU 0 · mem · 0.383–0.386 ms · 8</title></rect>
+<rect x="118.034" y="436.000" width="6.254" height="6.000" rx="0" fill="#9ab5d5"><title>GPU 0 · other · 0.387–0.607 ms · rmsnorm_fwd_general_kernel</title></rect>
+<rect x="165.988" y="436.000" width="6.782" height="6.000" rx="0" fill="#9ab5d5"><title>GPU 0 · other · 2.070–2.308 ms · elementwise_kernel</title></rect>
+<rect x="172.774" y="436.000" width="3.017" height="6.000" rx="0" fill="#9ab5d5"><title>GPU 0 · other · 2.308–2.414 ms · rmsnorm_fwd_general_kernel</title></rect>
+<rect x="175.800" y="436.000" width="1.228" height="6.000" rx="0" fill="#9ab5d5"><title>GPU 0 · other · 2.414–2.457 ms · elementwise_kernel</title></rect>
+<rect x="177.038" y="436.000" width="0.474" height="6.000" rx="0" fill="#9ab5d5"><title>GPU 0 · other · 2.457–2.474 ms · rmsnorm_fwd_general_kernel</title></rect>
+<rect x="177.522" y="436.000" width="6.856" height="6.000" rx="0" fill="#9ab5d5"><title>GPU 0 · other · 2.474–2.715 ms · elementwise_kernel</title></rect>
+<rect x="184.382" y="436.000" width="4.867" height="6.000" rx="0" fill="#9ab5d5"><title>GPU 0 · other · 2.715–2.886 ms · fused_rope_forward_kernel</title></rect>
+<rect x="189.259" y="436.000" width="1.121" height="6.000" rx="0" fill="#9ab5d5"><title>GPU 0 · other · 2.886–2.926 ms · fused_rope_forward_kernel</title></rect>
+<rect x="190.390" y="436.000" width="1.210" height="6.000" rx="0" fill="#9ab5d5"><title>GPU 0 · other · 2.926–2.968 ms · elementwise_kernel</title></rect>
+<rect x="191.610" y="436.000" width="7.375" height="6.000" rx="0" fill="#9ab5d5"><title>GPU 0 · other · 2.969–3.228 ms · elementwise_kernel</title></rect>
+<rect x="198.991" y="436.000" width="1.300" height="6.000" rx="0" fill="#9ab5d5"><title>GPU 0 · other · 3.228–3.273 ms · elementwise_kernel</title></rect>
+<rect x="200.300" y="436.000" width="1.311" height="6.000" rx="0" fill="#9ab5d5"><title>GPU 0 · other · 3.274–3.320 ms · elementwise_kernel</title></rect>
+<rect x="201.622" y="436.000" width="0.554" height="6.000" rx="0" fill="#9ab5d5"><title>GPU 0 · other · 3.320–3.339 ms · CatArrayBatchedCopy_vectorized</title></rect>
+<rect x="202.181" y="436.000" width="20.994" height="6.000" rx="0" fill="#08949d"><title>GPU 0 · FA · 3.340–4.076 ms · kernel_cutlass_kernel_flash_attncutesm100_hd256_2cta_fmha_forwardBlackwellFusedMultiHeadAttentionForward_object_at__TiledMMA_ThrLayoutVMNK21111000_PermutationMNK____MMAAtom_ThrID21_ShapeM_0</title></rect>
+<rect x="221.765" y="443.000" width="5.069" height="5.000" rx="0" fill="#df8a22"><title>GPU 0 · P2P · 4.027–4.205 ms · ncclDevKernel_SendRecv</title></rect>
+<rect x="221.871" y="443.000" width="5.171" height="5.000" rx="0" fill="#df8a22"><title>GPU 0 · P2P · 4.031–4.212 ms · ncclDevKernel_SendRecv</title></rect>
+<rect x="223.184" y="436.000" width="0.092" height="6.000" rx="0" fill="#9da9b5"><title>GPU 0 · mem · 4.077–4.080 ms · 8</title></rect>
+<rect x="223.293" y="436.000" width="2.268" height="6.000" rx="0" fill="#9da9b5"><title>GPU 0 · mem · 4.080–4.160 ms · 8</title></rect>
+<rect x="227.110" y="436.000" width="18.458" height="6.000" rx="0" fill="#08949d"><title>GPU 0 · FA · 4.214–4.862 ms · kernel_cutlass_kernel_flash_attncutesm100_hd256_2cta_fmha_forwardBlackwellFusedMultiHeadAttentionForward_object_at__TiledMMA_ThrLayoutVMNK21111000_PermutationMNK____MMAAtom_ThrID21_ShapeM_0</title></rect>
+<rect x="244.053" y="443.000" width="5.837" height="5.000" rx="0" fill="#df8a22"><title>GPU 0 · P2P · 4.809–5.014 ms · ncclDevKernel_SendRecv</title></rect>
+<rect x="244.202" y="443.000" width="5.896" height="5.000" rx="0" fill="#df8a22"><title>GPU 0 · P2P · 4.814–5.021 ms · ncclDevKernel_SendRecv</title></rect>
+<rect x="245.649" y="436.000" width="0.076" height="6.000" rx="0" fill="#9da9b5"><title>GPU 0 · mem · 4.865–4.868 ms · 8</title></rect>
+<rect x="245.745" y="436.000" width="0.133" height="6.000" rx="0" fill="#9ab5d5"><title>GPU 0 · other · 4.868–4.873 ms · triton_poi_fused_add_copy_exp_log1p_maximum_minimum_select_sub_0</title></rect>
+<rect x="245.902" y="436.000" width="3.349" height="6.000" rx="0" fill="#9ab5d5"><title>GPU 0 · other · 4.874–4.991 ms · triton_poi_fused__to_copy_addcmul_exp_mul_permute_select_sub_unsqueeze_view_0</title></rect>
+<rect x="249.260" y="436.000" width="1.806" height="6.000" rx="0" fill="#9ab5d5"><title>GPU 0 · other · 4.992–5.055 ms · triton_poi_fused__to_copy_addcmul_copy__exp_mul_permute_select_sub_unsqueeze_view_1</title></rect>
+<rect x="251.030" y="436.000" width="18.243" height="6.000" rx="0" fill="#08949d"><title>GPU 0 · FA · 5.054–5.694 ms · kernel_cutlass_kernel_flash_attncutesm100_hd256_2cta_fmha_forwardBlackwellFusedMultiHeadAttentionForward_object_at__TiledMMA_ThrLayoutVMNK21111000_PermutationMNK____MMAAtom_ThrID21_ShapeM_0</title></rect>
+<rect x="267.808" y="443.000" width="6.363" height="5.000" rx="0" fill="#df8a22"><title>GPU 0 · P2P · 5.642–5.866 ms · ncclDevKernel_SendRecv</title></rect>
+<rect x="267.934" y="443.000" width="6.102" height="5.000" rx="0" fill="#df8a22"><title>GPU 0 · P2P · 5.647–5.861 ms · ncclDevKernel_SendRecv</title></rect>
+<rect x="269.358" y="436.000" width="0.077" height="6.000" rx="0" fill="#9da9b5"><title>GPU 0 · mem · 5.697–5.699 ms · 8</title></rect>
+<rect x="269.452" y="436.000" width="0.068" height="6.000" rx="0" fill="#9ab5d5"><title>GPU 0 · other · 5.700–5.702 ms · triton_poi_fused_add_copy_exp_log1p_maximum_minimum_select_sub_0</title></rect>
+<rect x="269.535" y="436.000" width="3.506" height="6.000" rx="0" fill="#9ab5d5"><title>GPU 0 · other · 5.703–5.826 ms · triton_poi_fused__to_copy_addcmul_exp_mul_permute_select_sub_unsqueeze_view_0</title></rect>
+<rect x="273.047" y="436.000" width="1.759" height="6.000" rx="0" fill="#9ab5d5"><title>GPU 0 · other · 5.826–5.888 ms · triton_poi_fused__to_copy_addcmul_copy__exp_mul_permute_select_sub_unsqueeze_view_1</title></rect>
+<rect x="274.771" y="436.000" width="18.313" height="6.000" rx="0" fill="#08949d"><title>GPU 0 · FA · 5.887–6.529 ms · kernel_cutlass_kernel_flash_attncutesm100_hd256_2cta_fmha_forwardBlackwellFusedMultiHeadAttentionForward_object_at__TiledMMA_ThrLayoutVMNK21111000_PermutationMNK____MMAAtom_ThrID21_ShapeM_0</title></rect>
+<rect x="293.139" y="436.000" width="0.065" height="6.000" rx="0" fill="#9da9b5"><title>GPU 0 · mem · 6.531–6.533 ms · 8</title></rect>
+<rect x="293.214" y="436.000" width="0.060" height="6.000" rx="0" fill="#9ab5d5"><title>GPU 0 · other · 6.534–6.536 ms · triton_poi_fused_add_copy_exp_log1p_maximum_minimum_select_sub_0</title></rect>
+<rect x="293.284" y="436.000" width="2.826" height="6.000" rx="0" fill="#9ab5d5"><title>GPU 0 · other · 6.536–6.635 ms · triton_poi_fused__to_copy_addcmul_exp_mul_permute_select_sub_unsqueeze_view_0</title></rect>
+<rect x="296.115" y="436.000" width="1.707" height="6.000" rx="0" fill="#9ab5d5"><title>GPU 0 · other · 6.636–6.696 ms · triton_poi_fused__to_copy_addcmul_copy__exp_mul_permute_select_sub_unsqueeze_view_1</title></rect>
+<rect x="297.884" y="436.000" width="7.363" height="6.000" rx="0" fill="#9ab5d5"><title>GPU 0 · other · 6.698–6.956 ms · elementwise_kernel</title></rect>
+<rect x="305.259" y="436.000" width="2.534" height="6.000" rx="0" fill="#9ab5d5"><title>GPU 0 · other · 6.956–7.045 ms · triton_poi_fused__to_copy_mul_sigmoid_view_0</title></rect>
+<rect x="325.251" y="436.000" width="2.063" height="6.000" rx="0" fill="#9ab5d5"><title>GPU 0 · other · 7.658–7.730 ms · vectorized_elementwise_kernel</title></rect>
+<rect x="327.319" y="436.000" width="6.234" height="6.000" rx="0" fill="#9ab5d5"><title>GPU 0 · other · 7.730–7.949 ms · rmsnorm_fwd_general_kernel</title></rect>
+<rect x="432.631" y="436.000" width="8.691" height="6.000" rx="0" fill="#9ab5d5"><title>GPU 0 · other · 11.426–11.731 ms · triton_poi_fused_mul_silu_split_0</title></rect>
+<rect x="489.769" y="436.000" width="2.022" height="6.000" rx="0" fill="#9ab5d5"><title>GPU 0 · other · 13.430–13.501 ms · vectorized_elementwise_kernel</title></rect>
+<rect x="124.290" y="436.000" width="41.691" height="6.000" rx="0" fill="#3c70c6"><title>GPU 0 · GEMM · 0.607–2.070 ms · nvjet_sm100_tst_128x256_64x6_2x2_2cta_h_bz_TNT</title></rect>
+<rect x="307.787" y="436.000" width="17.459" height="6.000" rx="0" fill="#3c70c6"><title>GPU 0 · GEMM · 7.045–7.658 ms · nvjet_sm100_tst_128x256_64x6_2x2_2cta_h_bz_TNT</title></rect>
+<rect x="333.553" y="436.000" width="99.072" height="6.000" rx="0" fill="#3c70c6"><title>GPU 0 · GEMM · 7.949–11.425 ms · nvjet_sm100_tst_128x256_64x6_2x2_2cta_h_bz_TNT</title></rect>
+<rect x="441.314" y="436.000" width="48.449" height="6.000" rx="0" fill="#3c70c6"><title>GPU 0 · GEMM · 11.730–13.430 ms · nvjet_sm100_tst_256x256_64x4_2x2_2cta_h_bz_TNT</title></rect>
+<text x="98" y="463" font-size="11" fill="#63798c" font-weight="400" text-anchor="end">GPU 1</text>
+<line x1="107" y1="465" x2="677" y2="465" stroke="#e9eff4" stroke-width="1"/>
+<rect x="114.002" y="453.000" width="1.549" height="6.000" rx="0" fill="#9da9b5"><title>GPU 1 · mem · 0.246–0.300 ms · 8</title></rect>
+<rect x="115.632" y="453.000" width="2.378" height="6.000" rx="0" fill="#9da9b5"><title>GPU 1 · mem · 0.303–0.386 ms · 8</title></rect>
+<rect x="118.084" y="453.000" width="0.074" height="6.000" rx="0" fill="#9da9b5"><title>GPU 1 · mem · 0.389–0.392 ms · 8</title></rect>
+<rect x="118.207" y="453.000" width="5.627" height="6.000" rx="0" fill="#9ab5d5"><title>GPU 1 · other · 0.393–0.591 ms · rmsnorm_fwd_general_kernel</title></rect>
+<rect x="163.466" y="453.000" width="6.116" height="6.000" rx="0" fill="#9ab5d5"><title>GPU 1 · other · 1.981–2.196 ms · elementwise_kernel</title></rect>
+<rect x="169.586" y="453.000" width="2.582" height="6.000" rx="0" fill="#9ab5d5"><title>GPU 1 · other · 2.196–2.287 ms · rmsnorm_fwd_general_kernel</title></rect>
+<rect x="172.180" y="453.000" width="1.097" height="6.000" rx="0" fill="#9ab5d5"><title>GPU 1 · other · 2.287–2.326 ms · elementwise_kernel</title></rect>
+<rect x="173.286" y="453.000" width="0.363" height="6.000" rx="0" fill="#9ab5d5"><title>GPU 1 · other · 2.326–2.339 ms · rmsnorm_fwd_general_kernel</title></rect>
+<rect x="173.658" y="453.000" width="6.126" height="6.000" rx="0" fill="#9ab5d5"><title>GPU 1 · other · 2.339–2.554 ms · elementwise_kernel</title></rect>
+<rect x="179.788" y="453.000" width="4.332" height="6.000" rx="0" fill="#9ab5d5"><title>GPU 1 · other · 2.554–2.706 ms · fused_rope_forward_kernel</title></rect>
+<rect x="184.125" y="453.000" width="0.967" height="6.000" rx="0" fill="#9ab5d5"><title>GPU 1 · other · 2.706–2.740 ms · fused_rope_forward_kernel</title></rect>
+<rect x="185.096" y="453.000" width="1.083" height="6.000" rx="0" fill="#9ab5d5"><title>GPU 1 · other · 2.740–2.778 ms · elementwise_kernel</title></rect>
+<rect x="186.189" y="453.000" width="6.470" height="6.000" rx="0" fill="#9ab5d5"><title>GPU 1 · other · 2.779–3.006 ms · elementwise_kernel</title></rect>
+<rect x="192.662" y="453.000" width="1.145" height="6.000" rx="0" fill="#9ab5d5"><title>GPU 1 · other · 3.006–3.046 ms · elementwise_kernel</title></rect>
+<rect x="193.816" y="453.000" width="1.150" height="6.000" rx="0" fill="#9ab5d5"><title>GPU 1 · other · 3.046–3.087 ms · elementwise_kernel</title></rect>
+<rect x="194.976" y="453.000" width="0.552" height="6.000" rx="0" fill="#9ab5d5"><title>GPU 1 · other · 3.087–3.106 ms · CatArrayBatchedCopy_vectorized</title></rect>
+<rect x="195.529" y="453.000" width="17.862" height="6.000" rx="0" fill="#08949d"><title>GPU 1 · FA · 3.106–3.733 ms · kernel_cutlass_kernel_flash_attncutesm100_hd256_2cta_fmha_forwardBlackwellFusedMultiHeadAttentionForward_object_at__TiledMMA_ThrLayoutVMNK21111000_PermutationMNK____MMAAtom_ThrID21_ShapeM_0</title></rect>
+<rect x="212.153" y="460.000" width="4.410" height="5.000" rx="0" fill="#df8a22"><title>GPU 1 · P2P · 3.690–3.844 ms · ncclDevKernel_SendRecv</title></rect>
+<rect x="212.230" y="460.000" width="15.206" height="5.000" rx="0" fill="#df8a22"><title>GPU 1 · P2P · 3.692–4.226 ms · ncclDevKernel_SendRecv</title></rect>
+<rect x="213.402" y="453.000" width="0.076" height="6.000" rx="0" fill="#9da9b5"><title>GPU 1 · mem · 3.733–3.736 ms · 8</title></rect>
+<rect x="213.493" y="453.000" width="2.078" height="6.000" rx="0" fill="#9da9b5"><title>GPU 1 · mem · 3.737–3.810 ms · 8</title></rect>
+<rect x="227.540" y="453.000" width="17.280" height="6.000" rx="0" fill="#08949d"><title>GPU 1 · FA · 4.229–4.836 ms · kernel_cutlass_kernel_flash_attncutesm100_hd256_2cta_fmha_forwardBlackwellFusedMultiHeadAttentionForward_object_at__TiledMMA_ThrLayoutVMNK21111000_PermutationMNK____MMAAtom_ThrID21_ShapeM_0</title></rect>
+<rect x="244.096" y="460.000" width="5.538" height="5.000" rx="0" fill="#df8a22"><title>GPU 1 · P2P · 4.810–5.005 ms · ncclDevKernel_SendRecv</title></rect>
+<rect x="244.130" y="460.000" width="6.255" height="5.000" rx="0" fill="#df8a22"><title>GPU 1 · P2P · 4.812–5.031 ms · ncclDevKernel_SendRecv</title></rect>
+<rect x="244.896" y="453.000" width="0.064" height="6.000" rx="0" fill="#9da9b5"><title>GPU 1 · mem · 4.838–4.841 ms · 8</title></rect>
+<rect x="244.979" y="453.000" width="0.070" height="6.000" rx="0" fill="#9ab5d5"><title>GPU 1 · other · 4.841–4.844 ms · triton_poi_fused_add_copy__exp_log1p_maximum_minimum_sub_0</title></rect>
+<rect x="245.069" y="453.000" width="3.169" height="6.000" rx="0" fill="#9ab5d5"><title>GPU 1 · other · 4.845–4.956 ms · triton_poi_fused__to_copy_addcmul_exp_mul_permute_sub_unsqueeze_0</title></rect>
+<rect x="248.247" y="453.000" width="5.322" height="6.000" rx="0" fill="#9ab5d5"><title>GPU 1 · other · 4.956–5.143 ms · triton_poi_fused__to_copy_addcmul_copy__exp_mul_permute_sub_unsqueeze_1</title></rect>
+<rect x="253.529" y="453.000" width="18.372" height="6.000" rx="0" fill="#08949d"><title>GPU 1 · FA · 5.141–5.786 ms · kernel_cutlass_kernel_flash_attncutesm100_hd256_2cta_fmha_forwardBlackwellFusedMultiHeadAttentionForward_object_at__TiledMMA_ThrLayoutVMNK21111000_PermutationMNK____MMAAtom_ThrID21_ShapeM_0</title></rect>
+<rect x="270.410" y="460.000" width="5.979" height="5.000" rx="0" fill="#df8a22"><title>GPU 1 · P2P · 5.734–5.943 ms · ncclDevKernel_SendRecv</title></rect>
+<rect x="270.452" y="460.000" width="5.774" height="5.000" rx="0" fill="#df8a22"><title>GPU 1 · P2P · 5.735–5.938 ms · ncclDevKernel_SendRecv</title></rect>
+<rect x="272.003" y="453.000" width="0.112" height="6.000" rx="0" fill="#9da9b5"><title>GPU 1 · mem · 5.790–5.794 ms · 8</title></rect>
+<rect x="272.130" y="453.000" width="0.188" height="6.000" rx="0" fill="#9ab5d5"><title>GPU 1 · other · 5.794–5.801 ms · triton_poi_fused_add_copy_exp_log1p_maximum_minimum_select_sub_0</title></rect>
+<rect x="272.335" y="453.000" width="3.385" height="6.000" rx="0" fill="#9ab5d5"><title>GPU 1 · other · 5.801–5.920 ms · triton_poi_fused__to_copy_addcmul_exp_mul_permute_select_sub_unsqueeze_view_0</title></rect>
+<rect x="275.729" y="453.000" width="1.765" height="6.000" rx="0" fill="#9ab5d5"><title>GPU 1 · other · 5.920–5.982 ms · triton_poi_fused__to_copy_addcmul_copy__exp_mul_permute_select_sub_unsqueeze_view_1</title></rect>
+<rect x="277.458" y="453.000" width="18.122" height="6.000" rx="0" fill="#08949d"><title>GPU 1 · FA · 5.981–6.617 ms · kernel_cutlass_kernel_flash_attncutesm100_hd256_2cta_fmha_forwardBlackwellFusedMultiHeadAttentionForward_object_at__TiledMMA_ThrLayoutVMNK21111000_PermutationMNK____MMAAtom_ThrID21_ShapeM_0</title></rect>
+<rect x="295.640" y="453.000" width="0.065" height="6.000" rx="0" fill="#9da9b5"><title>GPU 1 · mem · 6.619–6.621 ms · 8</title></rect>
+<rect x="295.715" y="453.000" width="0.060" height="6.000" rx="0" fill="#9ab5d5"><title>GPU 1 · other · 6.622–6.624 ms · triton_poi_fused_add_copy_exp_log1p_maximum_minimum_select_sub_0</title></rect>
+<rect x="295.785" y="453.000" width="2.775" height="6.000" rx="0" fill="#9ab5d5"><title>GPU 1 · other · 6.624–6.721 ms · triton_poi_fused__to_copy_addcmul_exp_mul_permute_select_sub_unsqueeze_view_0</title></rect>
+<rect x="298.565" y="453.000" width="1.703" height="6.000" rx="0" fill="#9ab5d5"><title>GPU 1 · other · 6.722–6.781 ms · triton_poi_fused__to_copy_addcmul_copy__exp_mul_permute_select_sub_unsqueeze_view_1</title></rect>
+<rect x="300.335" y="453.000" width="7.302" height="6.000" rx="0" fill="#9ab5d5"><title>GPU 1 · other · 6.784–7.040 ms · elementwise_kernel</title></rect>
+<rect x="307.647" y="453.000" width="2.513" height="6.000" rx="0" fill="#9ab5d5"><title>GPU 1 · other · 7.040–7.128 ms · triton_poi_fused__to_copy_mul_sigmoid_view_0</title></rect>
+<rect x="327.425" y="453.000" width="2.076" height="6.000" rx="0" fill="#9ab5d5"><title>GPU 1 · other · 7.734–7.807 ms · vectorized_elementwise_kernel</title></rect>
+<rect x="329.506" y="453.000" width="6.241" height="6.000" rx="0" fill="#9ab5d5"><title>GPU 1 · other · 7.807–8.026 ms · rmsnorm_fwd_general_kernel</title></rect>
+<rect x="430.411" y="453.000" width="8.674" height="6.000" rx="0" fill="#9ab5d5"><title>GPU 1 · other · 11.348–11.652 ms · triton_poi_fused_mul_silu_split_0</title></rect>
+<rect x="485.885" y="453.000" width="2.037" height="6.000" rx="0" fill="#9ab5d5"><title>GPU 1 · other · 13.294–13.366 ms · vectorized_elementwise_kernel</title></rect>
+<rect x="123.835" y="453.000" width="39.626" height="6.000" rx="0" fill="#3c70c6"><title>GPU 1 · GEMM · 0.591–1.981 ms · nvjet_sm100_tst_128x256_64x6_2x2_2cta_h_bz_TNT</title></rect>
+<rect x="310.153" y="453.000" width="17.267" height="6.000" rx="0" fill="#3c70c6"><title>GPU 1 · GEMM · 7.128–7.734 ms · nvjet_sm100_tst_128x256_64x6_2x2_2cta_h_bz_TNT</title></rect>
+<rect x="335.746" y="453.000" width="94.661" height="6.000" rx="0" fill="#3c70c6"><title>GPU 1 · GEMM · 8.026–11.348 ms · nvjet_sm100_tst_128x256_64x6_2x2_2cta_h_bz_TNT</title></rect>
+<rect x="439.078" y="453.000" width="46.802" height="6.000" rx="0" fill="#3c70c6"><title>GPU 1 · GEMM · 11.652–13.294 ms · nvjet_sm100_tst_256x256_64x4_2x2_2cta_h_bz_TNT</title></rect>
+<text x="98" y="480" font-size="11" fill="#63798c" font-weight="400" text-anchor="end">GPU 2</text>
+<line x1="107" y1="482" x2="677" y2="482" stroke="#e9eff4" stroke-width="1"/>
+<rect x="108.722" y="470.000" width="1.573" height="6.000" rx="0" fill="#9da9b5"><title>GPU 2 · mem · 0.060–0.116 ms · 8</title></rect>
+<rect x="110.357" y="470.000" width="2.439" height="6.000" rx="0" fill="#9da9b5"><title>GPU 2 · mem · 0.118–0.203 ms · 8</title></rect>
+<rect x="112.860" y="470.000" width="0.072" height="6.000" rx="0" fill="#9da9b5"><title>GPU 2 · mem · 0.206–0.208 ms · 8</title></rect>
+<rect x="113.029" y="470.000" width="6.019" height="6.000" rx="0" fill="#9ab5d5"><title>GPU 2 · other · 0.212–0.423 ms · rmsnorm_fwd_general_kernel</title></rect>
+<rect x="157.836" y="470.000" width="6.469" height="6.000" rx="0" fill="#9ab5d5"><title>GPU 2 · other · 1.784–2.011 ms · elementwise_kernel</title></rect>
+<rect x="164.310" y="470.000" width="2.779" height="6.000" rx="0" fill="#9ab5d5"><title>GPU 2 · other · 2.011–2.108 ms · rmsnorm_fwd_general_kernel</title></rect>
+<rect x="167.099" y="470.000" width="1.162" height="6.000" rx="0" fill="#9ab5d5"><title>GPU 2 · other · 2.109–2.150 ms · elementwise_kernel</title></rect>
+<rect x="168.271" y="470.000" width="0.409" height="6.000" rx="0" fill="#9ab5d5"><title>GPU 2 · other · 2.150–2.164 ms · rmsnorm_fwd_general_kernel</title></rect>
+<rect x="168.690" y="470.000" width="6.530" height="6.000" rx="0" fill="#9ab5d5"><title>GPU 2 · other · 2.165–2.394 ms · elementwise_kernel</title></rect>
+<rect x="175.225" y="470.000" width="4.644" height="6.000" rx="0" fill="#9ab5d5"><title>GPU 2 · other · 2.394–2.557 ms · fused_rope_forward_kernel</title></rect>
+<rect x="179.874" y="470.000" width="1.053" height="6.000" rx="0" fill="#9ab5d5"><title>GPU 2 · other · 2.557–2.594 ms · fused_rope_forward_kernel</title></rect>
+<rect x="180.936" y="470.000" width="1.160" height="6.000" rx="0" fill="#9ab5d5"><title>GPU 2 · other · 2.594–2.635 ms · elementwise_kernel</title></rect>
+<rect x="182.105" y="470.000" width="6.993" height="6.000" rx="0" fill="#9ab5d5"><title>GPU 2 · other · 2.635–2.881 ms · elementwise_kernel</title></rect>
+<rect x="189.103" y="470.000" width="1.239" height="6.000" rx="0" fill="#9ab5d5"><title>GPU 2 · other · 2.881–2.924 ms · elementwise_kernel</title></rect>
+<rect x="190.352" y="470.000" width="1.233" height="6.000" rx="0" fill="#9ab5d5"><title>GPU 2 · other · 2.925–2.968 ms · elementwise_kernel</title></rect>
+<rect x="191.596" y="470.000" width="0.560" height="6.000" rx="0" fill="#9ab5d5"><title>GPU 2 · other · 2.968–2.988 ms · CatArrayBatchedCopy_vectorized</title></rect>
+<rect x="192.161" y="470.000" width="19.113" height="6.000" rx="0" fill="#08949d"><title>GPU 2 · FA · 2.988–3.659 ms · kernel_cutlass_kernel_flash_attncutesm100_hd256_2cta_fmha_forwardBlackwellFusedMultiHeadAttentionForward_object_at__TiledMMA_ThrLayoutVMNK21111000_PermutationMNK____MMAAtom_ThrID21_ShapeM_0</title></rect>
+<rect x="209.983" y="477.000" width="7.170" height="5.000" rx="0" fill="#df8a22"><title>GPU 2 · P2P · 3.613–3.865 ms · ncclDevKernel_SendRecv</title></rect>
+<rect x="210.093" y="477.000" width="4.711" height="5.000" rx="0" fill="#df8a22"><title>GPU 2 · P2P · 3.617–3.783 ms · ncclDevKernel_SendRecv</title></rect>
+<rect x="211.279" y="470.000" width="0.131" height="6.000" rx="0" fill="#9da9b5"><title>GPU 2 · mem · 3.659–3.664 ms · 8</title></rect>
+<rect x="211.425" y="470.000" width="2.190" height="6.000" rx="0" fill="#9da9b5"><title>GPU 2 · mem · 3.664–3.741 ms · 8</title></rect>
+<rect x="217.223" y="470.000" width="18.454" height="6.000" rx="0" fill="#08949d"><title>GPU 2 · FA · 3.867–4.515 ms · kernel_cutlass_kernel_flash_attncutesm100_hd256_2cta_fmha_forwardBlackwellFusedMultiHeadAttentionForward_object_at__TiledMMA_ThrLayoutVMNK21111000_PermutationMNK____MMAAtom_ThrID21_ShapeM_0</title></rect>
+<rect x="234.908" y="477.000" width="5.302" height="5.000" rx="0" fill="#df8a22"><title>GPU 2 · P2P · 4.488–4.674 ms · ncclDevKernel_SendRecv</title></rect>
+<rect x="235.003" y="477.000" width="15.058" height="5.000" rx="0" fill="#df8a22"><title>GPU 2 · P2P · 4.491–5.020 ms · ncclDevKernel_SendRecv</title></rect>
+<rect x="235.764" y="470.000" width="0.068" height="6.000" rx="0" fill="#9da9b5"><title>GPU 2 · mem · 4.518–4.520 ms · 8</title></rect>
+<rect x="235.846" y="470.000" width="0.070" height="6.000" rx="0" fill="#9ab5d5"><title>GPU 2 · other · 4.521–4.523 ms · triton_poi_fused_add_copy__exp_log1p_maximum_minimum_sub_0</title></rect>
+<rect x="235.943" y="470.000" width="2.907" height="6.000" rx="0" fill="#9ab5d5"><title>GPU 2 · other · 4.524–4.626 ms · triton_poi_fused__to_copy_addcmul_exp_mul_permute_sub_unsqueeze_0</title></rect>
+<rect x="238.860" y="470.000" width="1.955" height="6.000" rx="0" fill="#9ab5d5"><title>GPU 2 · other · 4.627–4.695 ms · triton_poi_fused__to_copy_addcmul_copy__exp_mul_permute_sub_unsqueeze_1</title></rect>
+<rect x="250.137" y="470.000" width="18.617" height="6.000" rx="0" fill="#08949d"><title>GPU 2 · FA · 5.022–5.676 ms · kernel_cutlass_kernel_flash_attncutesm100_hd256_2cta_fmha_forwardBlackwellFusedMultiHeadAttentionForward_object_at__TiledMMA_ThrLayoutVMNK21111000_PermutationMNK____MMAAtom_ThrID21_ShapeM_0</title></rect>
+<rect x="267.965" y="477.000" width="5.570" height="5.000" rx="0" fill="#df8a22"><title>GPU 2 · P2P · 5.648–5.843 ms · ncclDevKernel_SendRecv</title></rect>
+<rect x="268.030" y="477.000" width="8.741" height="5.000" rx="0" fill="#df8a22"><title>GPU 2 · P2P · 5.650–5.957 ms · ncclDevKernel_SendRecv</title></rect>
+<rect x="268.857" y="470.000" width="0.067" height="6.000" rx="0" fill="#9da9b5"><title>GPU 2 · mem · 5.679–5.682 ms · 8</title></rect>
+<rect x="268.937" y="470.000" width="0.077" height="6.000" rx="0" fill="#9ab5d5"><title>GPU 2 · other · 5.682–5.685 ms · triton_poi_fused_add_copy__exp_log1p_maximum_minimum_sub_0</title></rect>
+<rect x="269.034" y="470.000" width="3.030" height="6.000" rx="0" fill="#9ab5d5"><title>GPU 2 · other · 5.685–5.792 ms · triton_poi_fused__to_copy_addcmul_exp_mul_permute_sub_unsqueeze_0</title></rect>
+<rect x="272.071" y="470.000" width="2.233" height="6.000" rx="0" fill="#9ab5d5"><title>GPU 2 · other · 5.792–5.870 ms · triton_poi_fused__to_copy_addcmul_copy__exp_mul_permute_sub_unsqueeze_1</title></rect>
+<rect x="276.849" y="470.000" width="16.681" height="6.000" rx="0" fill="#08949d"><title>GPU 2 · FA · 5.960–6.545 ms · kernel_cutlass_kernel_flash_attncutesm100_hd256_2cta_fmha_forwardBlackwellFusedMultiHeadAttentionForward_object_at__TiledMMA_ThrLayoutVMNK21111000_PermutationMNK____MMAAtom_ThrID21_ShapeM_0</title></rect>
+<rect x="293.592" y="470.000" width="0.057" height="6.000" rx="0" fill="#9da9b5"><title>GPU 2 · mem · 6.547–6.549 ms · 8</title></rect>
+<rect x="293.658" y="470.000" width="0.062" height="6.000" rx="0" fill="#9ab5d5"><title>GPU 2 · other · 6.549–6.552 ms · triton_poi_fused_add_copy_exp_log1p_maximum_minimum_select_sub_0</title></rect>
+<rect x="293.729" y="470.000" width="2.679" height="6.000" rx="0" fill="#9ab5d5"><title>GPU 2 · other · 6.552–6.646 ms · triton_poi_fused__to_copy_addcmul_exp_mul_permute_select_sub_unsqueeze_view_0</title></rect>
+<rect x="296.412" y="470.000" width="1.684" height="6.000" rx="0" fill="#9ab5d5"><title>GPU 2 · other · 6.646–6.705 ms · triton_poi_fused__to_copy_addcmul_copy__exp_mul_permute_select_sub_unsqueeze_view_1</title></rect>
+<rect x="298.165" y="470.000" width="6.891" height="6.000" rx="0" fill="#9ab5d5"><title>GPU 2 · other · 6.708–6.949 ms · elementwise_kernel</title></rect>
+<rect x="305.069" y="470.000" width="2.445" height="6.000" rx="0" fill="#9ab5d5"><title>GPU 2 · other · 6.950–7.036 ms · triton_poi_fused__to_copy_mul_sigmoid_view_0</title></rect>
+<rect x="323.870" y="470.000" width="2.027" height="6.000" rx="0" fill="#9ab5d5"><title>GPU 2 · other · 7.609–7.681 ms · vectorized_elementwise_kernel</title></rect>
+<rect x="325.902" y="470.000" width="6.030" height="6.000" rx="0" fill="#9ab5d5"><title>GPU 2 · other · 7.681–7.892 ms · rmsnorm_fwd_general_kernel</title></rect>
+<rect x="425.708" y="470.000" width="8.773" height="6.000" rx="0" fill="#9ab5d5"><title>GPU 2 · other · 11.183–11.491 ms · triton_poi_fused_mul_silu_split_0</title></rect>
+<rect x="483.438" y="470.000" width="2.048" height="6.000" rx="0" fill="#9ab5d5"><title>GPU 2 · other · 13.208–13.280 ms · vectorized_elementwise_kernel</title></rect>
+<rect x="119.049" y="470.000" width="38.782" height="6.000" rx="0" fill="#3c70c6"><title>GPU 2 · GEMM · 0.423–1.784 ms · nvjet_sm100_tst_128x256_64x6_2x2_2cta_h_bz_TNT</title></rect>
+<rect x="307.506" y="470.000" width="16.359" height="6.000" rx="0" fill="#3c70c6"><title>GPU 2 · GEMM · 7.035–7.609 ms · nvjet_sm100_tst_128x256_64x6_2x2_2cta_h_bz_TNT</title></rect>
+<rect x="331.932" y="470.000" width="93.771" height="6.000" rx="0" fill="#3c70c6"><title>GPU 2 · GEMM · 7.892–11.183 ms · nvjet_sm100_tst_128x256_64x6_2x2_2cta_h_bz_TNT</title></rect>
+<rect x="434.472" y="470.000" width="48.961" height="6.000" rx="0" fill="#3c70c6"><title>GPU 2 · GEMM · 11.490–13.208 ms · nvjet_sm100_tst_256x256_64x4_2x2_2cta_h_bz_TNT</title></rect>
+<text x="98" y="497" font-size="11" fill="#63798c" font-weight="400" text-anchor="end">GPU 3</text>
+<line x1="107" y1="499" x2="677" y2="499" stroke="#e9eff4" stroke-width="1"/>
+<rect x="107.000" y="487.000" width="1.542" height="6.000" rx="0" fill="#9da9b5"><title>GPU 3 · mem · 0.000–0.054 ms · 8</title></rect>
+<rect x="108.635" y="487.000" width="2.395" height="6.000" rx="0" fill="#9da9b5"><title>GPU 3 · mem · 0.057–0.141 ms · 8</title></rect>
+<rect x="111.088" y="487.000" width="0.066" height="6.000" rx="0" fill="#9da9b5"><title>GPU 3 · mem · 0.143–0.146 ms · 8</title></rect>
+<rect x="111.203" y="487.000" width="5.695" height="6.000" rx="0" fill="#9ab5d5"><title>GPU 3 · other · 0.147–0.347 ms · rmsnorm_fwd_general_kernel</title></rect>
+<rect x="155.559" y="487.000" width="6.184" height="6.000" rx="0" fill="#9ab5d5"><title>GPU 3 · other · 1.704–1.921 ms · elementwise_kernel</title></rect>
+<rect x="161.748" y="487.000" width="2.664" height="6.000" rx="0" fill="#9ab5d5"><title>GPU 3 · other · 1.921–2.014 ms · rmsnorm_fwd_general_kernel</title></rect>
+<rect x="164.421" y="487.000" width="1.115" height="6.000" rx="0" fill="#9ab5d5"><title>GPU 3 · other · 2.015–2.054 ms · elementwise_kernel</title></rect>
+<rect x="165.546" y="487.000" width="0.380" height="6.000" rx="0" fill="#9ab5d5"><title>GPU 3 · other · 2.054–2.068 ms · rmsnorm_fwd_general_kernel</title></rect>
+<rect x="165.936" y="487.000" width="6.240" height="6.000" rx="0" fill="#9ab5d5"><title>GPU 3 · other · 2.068–2.287 ms · elementwise_kernel</title></rect>
+<rect x="172.181" y="487.000" width="4.416" height="6.000" rx="0" fill="#9ab5d5"><title>GPU 3 · other · 2.287–2.442 ms · fused_rope_forward_kernel</title></rect>
+<rect x="176.602" y="487.000" width="0.981" height="6.000" rx="0" fill="#9ab5d5"><title>GPU 3 · other · 2.442–2.477 ms · fused_rope_forward_kernel</title></rect>
+<rect x="177.592" y="487.000" width="1.110" height="6.000" rx="0" fill="#9ab5d5"><title>GPU 3 · other · 2.477–2.516 ms · elementwise_kernel</title></rect>
+<rect x="178.711" y="487.000" width="6.603" height="6.000" rx="0" fill="#9ab5d5"><title>GPU 3 · other · 2.516–2.748 ms · elementwise_kernel</title></rect>
+<rect x="185.319" y="487.000" width="1.169" height="6.000" rx="0" fill="#9ab5d5"><title>GPU 3 · other · 2.748–2.789 ms · elementwise_kernel</title></rect>
+<rect x="186.498" y="487.000" width="1.176" height="6.000" rx="0" fill="#9ab5d5"><title>GPU 3 · other · 2.789–2.831 ms · elementwise_kernel</title></rect>
+<rect x="187.684" y="487.000" width="0.538" height="6.000" rx="0" fill="#9ab5d5"><title>GPU 3 · other · 2.831–2.850 ms · CatArrayBatchedCopy_vectorized</title></rect>
+<rect x="188.233" y="487.000" width="17.840" height="6.000" rx="0" fill="#08949d"><title>GPU 3 · FA · 2.850–3.476 ms · kernel_cutlass_kernel_flash_attncutesm100_hd256_2cta_fmha_forwardBlackwellFusedMultiHeadAttentionForward_object_at__TiledMMA_ThrLayoutVMNK21111000_PermutationMNK____MMAAtom_ThrID21_ShapeM_0</title></rect>
+<rect x="204.875" y="494.000" width="4.410" height="5.000" rx="0" fill="#df8a22"><title>GPU 3 · P2P · 3.434–3.589 ms · ncclDevKernel_SendRecv</title></rect>
+<rect x="204.952" y="494.000" width="10.291" height="5.000" rx="0" fill="#df8a22"><title>GPU 3 · P2P · 3.437–3.798 ms · ncclDevKernel_SendRecv</title></rect>
+<rect x="206.078" y="487.000" width="0.077" height="6.000" rx="0" fill="#9da9b5"><title>GPU 3 · mem · 3.476–3.479 ms · 8</title></rect>
+<rect x="206.168" y="487.000" width="2.108" height="6.000" rx="0" fill="#9da9b5"><title>GPU 3 · mem · 3.480–3.554 ms · 8</title></rect>
+<rect x="215.328" y="487.000" width="17.066" height="6.000" rx="0" fill="#08949d"><title>GPU 3 · FA · 3.801–4.400 ms · kernel_cutlass_kernel_flash_attncutesm100_hd256_2cta_fmha_forwardBlackwellFusedMultiHeadAttentionForward_object_at__TiledMMA_ThrLayoutVMNK21111000_PermutationMNK____MMAAtom_ThrID21_ShapeM_0</title></rect>
+<rect x="231.662" y="494.000" width="8.924" height="5.000" rx="0" fill="#df8a22"><title>GPU 3 · P2P · 4.374–4.687 ms · ncclDevKernel_SendRecv</title></rect>
+<rect x="231.759" y="494.000" width="5.643" height="5.000" rx="0" fill="#df8a22"><title>GPU 3 · P2P · 4.378–4.576 ms · ncclDevKernel_SendRecv</title></rect>
+<rect x="232.470" y="487.000" width="0.113" height="6.000" rx="0" fill="#9da9b5"><title>GPU 3 · mem · 4.402–4.406 ms · 8</title></rect>
+<rect x="232.602" y="487.000" width="0.068" height="6.000" rx="0" fill="#9ab5d5"><title>GPU 3 · other · 4.407–4.409 ms · triton_poi_fused_add_copy__exp_log1p_maximum_minimum_sub_0</title></rect>
+<rect x="232.687" y="487.000" width="2.781" height="6.000" rx="0" fill="#9ab5d5"><title>GPU 3 · other · 4.410–4.508 ms · triton_poi_fused__to_copy_addcmul_exp_mul_permute_sub_unsqueeze_0</title></rect>
+<rect x="235.476" y="487.000" width="2.192" height="6.000" rx="0" fill="#9ab5d5"><title>GPU 3 · other · 4.508–4.585 ms · triton_poi_fused__to_copy_addcmul_copy__exp_mul_permute_sub_unsqueeze_1</title></rect>
+<rect x="240.641" y="487.000" width="17.328" height="6.000" rx="0" fill="#08949d"><title>GPU 3 · FA · 4.689–5.297 ms · kernel_cutlass_kernel_flash_attncutesm100_hd256_2cta_fmha_forwardBlackwellFusedMultiHeadAttentionForward_object_at__TiledMMA_ThrLayoutVMNK21111000_PermutationMNK____MMAAtom_ThrID21_ShapeM_0</title></rect>
+<rect x="257.202" y="494.000" width="5.322" height="5.000" rx="0" fill="#df8a22"><title>GPU 3 · P2P · 5.270–5.457 ms · ncclDevKernel_SendRecv</title></rect>
+<rect x="257.262" y="494.000" width="16.641" height="5.000" rx="0" fill="#df8a22"><title>GPU 3 · P2P · 5.272–5.856 ms · ncclDevKernel_SendRecv</title></rect>
+<rect x="258.058" y="487.000" width="0.062" height="6.000" rx="0" fill="#9da9b5"><title>GPU 3 · mem · 5.300–5.302 ms · 8</title></rect>
+<rect x="258.134" y="487.000" width="0.071" height="6.000" rx="0" fill="#9ab5d5"><title>GPU 3 · other · 5.303–5.305 ms · triton_poi_fused_add_copy__exp_log1p_maximum_minimum_sub_0</title></rect>
+<rect x="258.218" y="487.000" width="2.801" height="6.000" rx="0" fill="#9ab5d5"><title>GPU 3 · other · 5.306–5.404 ms · triton_poi_fused__to_copy_addcmul_exp_mul_permute_sub_unsqueeze_0</title></rect>
+<rect x="261.024" y="487.000" width="1.924" height="6.000" rx="0" fill="#9ab5d5"><title>GPU 3 · other · 5.404–5.472 ms · triton_poi_fused__to_copy_addcmul_copy__exp_mul_permute_sub_unsqueeze_1</title></rect>
+<rect x="273.983" y="487.000" width="17.406" height="6.000" rx="0" fill="#08949d"><title>GPU 3 · FA · 5.859–6.470 ms · kernel_cutlass_kernel_flash_attncutesm100_hd256_2cta_fmha_forwardBlackwellFusedMultiHeadAttentionForward_object_at__TiledMMA_ThrLayoutVMNK21111000_PermutationMNK____MMAAtom_ThrID21_ShapeM_0</title></rect>
+<rect x="291.444" y="487.000" width="0.058" height="6.000" rx="0" fill="#9da9b5"><title>GPU 3 · mem · 6.472–6.474 ms · 8</title></rect>
+<rect x="291.511" y="487.000" width="0.065" height="6.000" rx="0" fill="#9ab5d5"><title>GPU 3 · other · 6.474–6.476 ms · triton_poi_fused_add_copy__exp_log1p_maximum_minimum_sub_0</title></rect>
+<rect x="291.592" y="487.000" width="2.523" height="6.000" rx="0" fill="#9ab5d5"><title>GPU 3 · other · 6.477–6.565 ms · triton_poi_fused__to_copy_addcmul_exp_mul_permute_sub_unsqueeze_0</title></rect>
+<rect x="294.119" y="487.000" width="1.759" height="6.000" rx="0" fill="#9ab5d5"><title>GPU 3 · other · 6.566–6.627 ms · triton_poi_fused__to_copy_addcmul_copy__exp_mul_permute_sub_unsqueeze_1</title></rect>
+<rect x="295.930" y="487.000" width="6.610" height="6.000" rx="0" fill="#9ab5d5"><title>GPU 3 · other · 6.629–6.861 ms · elementwise_kernel</title></rect>
+<rect x="302.552" y="487.000" width="2.406" height="6.000" rx="0" fill="#9ab5d5"><title>GPU 3 · other · 6.861–6.946 ms · triton_poi_fused__to_copy_mul_sigmoid_view_0</title></rect>
+<rect x="321.030" y="487.000" width="2.009" height="6.000" rx="0" fill="#9ab5d5"><title>GPU 3 · other · 7.510–7.580 ms · vectorized_elementwise_kernel</title></rect>
+<rect x="323.044" y="487.000" width="5.758" height="6.000" rx="0" fill="#9ab5d5"><title>GPU 3 · other · 7.580–7.783 ms · rmsnorm_fwd_general_kernel</title></rect>
+<rect x="422.070" y="487.000" width="7.524" height="6.000" rx="0" fill="#9ab5d5"><title>GPU 3 · other · 11.055–11.319 ms · triton_poi_fused_mul_silu_split_0</title></rect>
+<rect x="474.409" y="487.000" width="1.962" height="6.000" rx="0" fill="#9ab5d5"><title>GPU 3 · other · 12.892–12.960 ms · vectorized_elementwise_kernel</title></rect>
+<rect x="116.906" y="487.000" width="38.648" height="6.000" rx="0" fill="#3c70c6"><title>GPU 3 · GEMM · 0.348–1.704 ms · nvjet_sm100_tst_128x256_64x6_2x2_2cta_h_bz_TNT</title></rect>
+<rect x="304.958" y="487.000" width="16.067" height="6.000" rx="0" fill="#3c70c6"><title>GPU 3 · GEMM · 6.946–7.510 ms · nvjet_sm100_tst_128x256_64x6_2x2_2cta_h_bz_TNT</title></rect>
+<rect x="328.802" y="487.000" width="93.262" height="6.000" rx="0" fill="#3c70c6"><title>GPU 3 · GEMM · 7.783–11.055 ms · nvjet_sm100_tst_128x256_64x6_2x2_2cta_h_bz_TNT</title></rect>
+<rect x="429.586" y="487.000" width="44.818" height="6.000" rx="0" fill="#3c70c6"><title>GPU 3 · GEMM · 11.319–12.891 ms · nvjet_sm100_tst_256x256_64x4_2x2_2cta_h_bz_TNT</title></rect>
+<text x="98" y="514" font-size="11" fill="#16764f" font-weight="700" text-anchor="end">可用</text>
+<rect x="107.000" y="508.000" width="570.000" height="7.000" rx="1" fill="#e7f2eb"/>
+<rect x="118.207" y="508.000" width="0.841" height="7.000" rx="0" fill="#2b9e65"><title>四卡可用 · 0.393–0.423 ms</title></rect>
+<rect x="119.049" y="508.000" width="4.785" height="7.000" rx="0" fill="#2b9e65"><title>四卡可用 · 0.423–0.591 ms</title></rect>
+<rect x="123.835" y="508.000" width="0.453" height="7.000" rx="0" fill="#2b9e65"><title>四卡可用 · 0.591–0.607 ms</title></rect>
+<rect x="124.290" y="508.000" width="31.264" height="7.000" rx="0" fill="#2b9e65"><title>四卡可用 · 0.607–1.704 ms</title></rect>
+<rect x="155.559" y="508.000" width="2.271" height="7.000" rx="0" fill="#2b9e65"><title>四卡可用 · 1.704–1.784 ms</title></rect>
+<rect x="157.836" y="508.000" width="3.907" height="7.000" rx="0" fill="#2b9e65"><title>四卡可用 · 1.784–1.921 ms</title></rect>
+<rect x="161.748" y="508.000" width="1.713" height="7.000" rx="0" fill="#2b9e65"><title>四卡可用 · 1.921–1.981 ms</title></rect>
+<rect x="163.466" y="508.000" width="0.839" height="7.000" rx="0" fill="#2b9e65"><title>四卡可用 · 1.981–2.011 ms</title></rect>
+<rect x="164.310" y="508.000" width="0.103" height="7.000" rx="0" fill="#2b9e65"><title>四卡可用 · 2.011–2.014 ms</title></rect>
+<rect x="164.421" y="508.000" width="1.115" height="7.000" rx="0" fill="#2b9e65"><title>四卡可用 · 2.015–2.054 ms</title></rect>
+<rect x="165.546" y="508.000" width="0.380" height="7.000" rx="0" fill="#2b9e65"><title>四卡可用 · 2.054–2.068 ms</title></rect>
+<rect x="165.936" y="508.000" width="0.045" height="7.000" rx="0" fill="#2b9e65"><title>四卡可用 · 2.068–2.070 ms</title></rect>
+<rect x="165.988" y="508.000" width="1.101" height="7.000" rx="0" fill="#2b9e65"><title>四卡可用 · 2.070–2.108 ms</title></rect>
+<rect x="167.099" y="508.000" width="1.162" height="7.000" rx="0" fill="#2b9e65"><title>四卡可用 · 2.109–2.150 ms</title></rect>
+<rect x="168.271" y="508.000" width="0.409" height="7.000" rx="0" fill="#2b9e65"><title>四卡可用 · 2.150–2.164 ms</title></rect>
+<rect x="168.690" y="508.000" width="0.892" height="7.000" rx="0" fill="#2b9e65"><title>四卡可用 · 2.165–2.196 ms</title></rect>
+<rect x="169.586" y="508.000" width="2.582" height="7.000" rx="0" fill="#2b9e65"><title>四卡可用 · 2.196–2.287 ms</title></rect>
+<rect x="172.181" y="508.000" width="0.589" height="7.000" rx="0" fill="#2b9e65"><title>四卡可用 · 2.287–2.308 ms</title></rect>
+<rect x="172.774" y="508.000" width="0.503" height="7.000" rx="0" fill="#2b9e65"><title>四卡可用 · 2.308–2.326 ms</title></rect>
+<rect x="173.286" y="508.000" width="0.363" height="7.000" rx="0" fill="#2b9e65"><title>四卡可用 · 2.326–2.339 ms</title></rect>
+<rect x="173.658" y="508.000" width="1.562" height="7.000" rx="0" fill="#2b9e65"><title>四卡可用 · 2.339–2.394 ms</title></rect>
+<rect x="175.225" y="508.000" width="0.566" height="7.000" rx="0" fill="#2b9e65"><title>四卡可用 · 2.394–2.414 ms</title></rect>
+<rect x="175.800" y="508.000" width="0.796" height="7.000" rx="0" fill="#2b9e65"><title>四卡可用 · 2.414–2.442 ms</title></rect>
+<rect x="176.602" y="508.000" width="0.426" height="7.000" rx="0" fill="#2b9e65"><title>四卡可用 · 2.442–2.457 ms</title></rect>
+<rect x="177.038" y="508.000" width="0.474" height="7.000" rx="0" fill="#2b9e65"><title>四卡可用 · 2.457–2.474 ms</title></rect>
+<rect x="177.522" y="508.000" width="0.061" height="7.000" rx="0" fill="#2b9e65"><title>四卡可用 · 2.474–2.477 ms</title></rect>
+<rect x="177.592" y="508.000" width="1.110" height="7.000" rx="0" fill="#2b9e65"><title>四卡可用 · 2.477–2.516 ms</title></rect>
+<rect x="178.711" y="508.000" width="1.072" height="7.000" rx="0" fill="#2b9e65"><title>四卡可用 · 2.516–2.554 ms</title></rect>
+<rect x="179.788" y="508.000" width="0.081" height="7.000" rx="0" fill="#2b9e65"><title>四卡可用 · 2.554–2.557 ms</title></rect>
+<rect x="179.874" y="508.000" width="1.053" height="7.000" rx="0" fill="#2b9e65"><title>四卡可用 · 2.557–2.594 ms</title></rect>
+<rect x="180.936" y="508.000" width="1.160" height="7.000" rx="0" fill="#2b9e65"><title>四卡可用 · 2.594–2.635 ms</title></rect>
+<rect x="182.105" y="508.000" width="2.015" height="7.000" rx="0" fill="#2b9e65"><title>四卡可用 · 2.635–2.706 ms</title></rect>
+<rect x="184.125" y="508.000" width="0.253" height="7.000" rx="0" fill="#2b9e65"><title>四卡可用 · 2.706–2.715 ms</title></rect>
+<rect x="184.382" y="508.000" width="0.709" height="7.000" rx="0" fill="#2b9e65"><title>四卡可用 · 2.715–2.740 ms</title></rect>
+<rect x="185.096" y="508.000" width="0.218" height="7.000" rx="0" fill="#2b9e65"><title>四卡可用 · 2.740–2.748 ms</title></rect>
+<rect x="185.319" y="508.000" width="0.860" height="7.000" rx="0" fill="#2b9e65"><title>四卡可用 · 2.748–2.778 ms</title></rect>
+<rect x="186.189" y="508.000" width="0.300" height="7.000" rx="0" fill="#2b9e65"><title>四卡可用 · 2.779–2.789 ms</title></rect>
+<rect x="186.498" y="508.000" width="1.176" height="7.000" rx="0" fill="#2b9e65"><title>四卡可用 · 2.789–2.831 ms</title></rect>
+<rect x="187.684" y="508.000" width="0.538" height="7.000" rx="0" fill="#2b9e65"><title>四卡可用 · 2.831–2.850 ms</title></rect>
+<rect x="188.233" y="508.000" width="0.866" height="7.000" rx="0" fill="#2b9e65"><title>四卡可用 · 2.850–2.881 ms</title></rect>
+<rect x="189.103" y="508.000" width="0.146" height="7.000" rx="0" fill="#2b9e65"><title>四卡可用 · 2.881–2.886 ms</title></rect>
+<rect x="189.259" y="508.000" width="1.083" height="7.000" rx="0" fill="#2b9e65"><title>四卡可用 · 2.886–2.924 ms</title></rect>
+<rect x="190.352" y="508.000" width="0.028" height="7.000" rx="0" fill="#2b9e65"><title>四卡可用 · 2.925–2.926 ms</title></rect>
+<rect x="190.390" y="508.000" width="1.195" height="7.000" rx="0" fill="#2b9e65"><title>四卡可用 · 2.926–2.968 ms</title></rect>
+<rect x="191.596" y="508.000" width="0.005" height="7.000" rx="0" fill="#2b9e65"><title>四卡可用 · 2.968–2.968 ms</title></rect>
+<rect x="191.610" y="508.000" width="0.545" height="7.000" rx="0" fill="#2b9e65"><title>四卡可用 · 2.969–2.988 ms</title></rect>
+<rect x="192.161" y="508.000" width="0.497" height="7.000" rx="0" fill="#2b9e65"><title>四卡可用 · 2.988–3.006 ms</title></rect>
+<rect x="192.662" y="508.000" width="1.145" height="7.000" rx="0" fill="#2b9e65"><title>四卡可用 · 3.006–3.046 ms</title></rect>
+<rect x="193.816" y="508.000" width="1.150" height="7.000" rx="0" fill="#2b9e65"><title>四卡可用 · 3.046–3.087 ms</title></rect>
+<rect x="194.976" y="508.000" width="0.552" height="7.000" rx="0" fill="#2b9e65"><title>四卡可用 · 3.087–3.106 ms</title></rect>
+<rect x="195.529" y="508.000" width="3.457" height="7.000" rx="0" fill="#2b9e65"><title>四卡可用 · 3.106–3.228 ms</title></rect>
+<rect x="198.991" y="508.000" width="1.300" height="7.000" rx="0" fill="#2b9e65"><title>四卡可用 · 3.228–3.273 ms</title></rect>
+<rect x="200.300" y="508.000" width="1.311" height="7.000" rx="0" fill="#2b9e65"><title>四卡可用 · 3.274–3.320 ms</title></rect>
+<rect x="201.622" y="508.000" width="0.554" height="7.000" rx="0" fill="#2b9e65"><title>四卡可用 · 3.320–3.339 ms</title></rect>
+<rect x="202.181" y="508.000" width="2.693" height="7.000" rx="0" fill="#2b9e65"><title>四卡可用 · 3.340–3.434 ms</title></rect>
+<rect x="227.540" y="508.000" width="4.122" height="7.000" rx="0" fill="#2b9e65"><title>四卡可用 · 4.229–4.374 ms</title></rect>
+<rect x="250.385" y="508.000" width="6.817" height="7.000" rx="0" fill="#2b9e65"><title>四卡可用 · 5.031–5.270 ms</title></rect>
+<rect x="276.849" y="508.000" width="14.540" height="7.000" rx="0" fill="#2b9e65"><title>四卡可用 · 5.960–6.470 ms</title></rect>
+<rect x="291.511" y="508.000" width="0.065" height="7.000" rx="0" fill="#2b9e65"><title>四卡可用 · 6.474–6.476 ms</title></rect>
+<rect x="291.592" y="508.000" width="1.493" height="7.000" rx="0" fill="#2b9e65"><title>四卡可用 · 6.477–6.529 ms</title></rect>
+<rect x="293.214" y="508.000" width="0.060" height="7.000" rx="0" fill="#2b9e65"><title>四卡可用 · 6.534–6.536 ms</title></rect>
+<rect x="293.284" y="508.000" width="0.246" height="7.000" rx="0" fill="#2b9e65"><title>四卡可用 · 6.536–6.545 ms</title></rect>
+<rect x="293.658" y="508.000" width="0.062" height="7.000" rx="0" fill="#2b9e65"><title>四卡可用 · 6.549–6.552 ms</title></rect>
+<rect x="293.729" y="508.000" width="0.385" height="7.000" rx="0" fill="#2b9e65"><title>四卡可用 · 6.552–6.565 ms</title></rect>
+<rect x="294.119" y="508.000" width="1.461" height="7.000" rx="0" fill="#2b9e65"><title>四卡可用 · 6.566–6.617 ms</title></rect>
+<rect x="295.715" y="508.000" width="0.060" height="7.000" rx="0" fill="#2b9e65"><title>四卡可用 · 6.622–6.624 ms</title></rect>
+<rect x="295.785" y="508.000" width="0.093" height="7.000" rx="0" fill="#2b9e65"><title>四卡可用 · 6.624–6.627 ms</title></rect>
+<rect x="295.930" y="508.000" width="0.180" height="7.000" rx="0" fill="#2b9e65"><title>四卡可用 · 6.629–6.635 ms</title></rect>
+<rect x="296.115" y="508.000" width="0.293" height="7.000" rx="0" fill="#2b9e65"><title>四卡可用 · 6.636–6.646 ms</title></rect>
+<rect x="296.412" y="508.000" width="1.410" height="7.000" rx="0" fill="#2b9e65"><title>四卡可用 · 6.646–6.696 ms</title></rect>
+<rect x="297.884" y="508.000" width="0.212" height="7.000" rx="0" fill="#2b9e65"><title>四卡可用 · 6.698–6.705 ms</title></rect>
+<rect x="298.165" y="508.000" width="0.396" height="7.000" rx="0" fill="#2b9e65"><title>四卡可用 · 6.708–6.721 ms</title></rect>
+<rect x="298.565" y="508.000" width="1.703" height="7.000" rx="0" fill="#2b9e65"><title>四卡可用 · 6.722–6.781 ms</title></rect>
+<rect x="300.335" y="508.000" width="2.205" height="7.000" rx="0" fill="#2b9e65"><title>四卡可用 · 6.784–6.861 ms</title></rect>
+<rect x="302.552" y="508.000" width="2.406" height="7.000" rx="0" fill="#2b9e65"><title>四卡可用 · 6.861–6.946 ms</title></rect>
+<rect x="304.958" y="508.000" width="0.098" height="7.000" rx="0" fill="#2b9e65"><title>四卡可用 · 6.946–6.949 ms</title></rect>
+<rect x="305.069" y="508.000" width="0.179" height="7.000" rx="0" fill="#2b9e65"><title>四卡可用 · 6.950–6.956 ms</title></rect>
+<rect x="305.259" y="508.000" width="2.378" height="7.000" rx="0" fill="#2b9e65"><title>四卡可用 · 6.956–7.040 ms</title></rect>
+<rect x="307.647" y="508.000" width="13.378" height="7.000" rx="0" fill="#2b9e65"><title>四卡可用 · 7.040–7.510 ms</title></rect>
+<rect x="321.030" y="508.000" width="2.009" height="7.000" rx="0" fill="#2b9e65"><title>四卡可用 · 7.510–7.580 ms</title></rect>
+<rect x="323.044" y="508.000" width="0.821" height="7.000" rx="0" fill="#2b9e65"><title>四卡可用 · 7.580–7.609 ms</title></rect>
+<rect x="323.870" y="508.000" width="1.375" height="7.000" rx="0" fill="#2b9e65"><title>四卡可用 · 7.609–7.658 ms</title></rect>
+<rect x="325.251" y="508.000" width="0.646" height="7.000" rx="0" fill="#2b9e65"><title>四卡可用 · 7.658–7.681 ms</title></rect>
+<rect x="325.902" y="508.000" width="1.412" height="7.000" rx="0" fill="#2b9e65"><title>四卡可用 · 7.681–7.730 ms</title></rect>
+<rect x="327.319" y="508.000" width="0.101" height="7.000" rx="0" fill="#2b9e65"><title>四卡可用 · 7.730–7.734 ms</title></rect>
+<rect x="327.425" y="508.000" width="1.377" height="7.000" rx="0" fill="#2b9e65"><title>四卡可用 · 7.734–7.783 ms</title></rect>
+<rect x="328.802" y="508.000" width="0.699" height="7.000" rx="0" fill="#2b9e65"><title>四卡可用 · 7.783–7.807 ms</title></rect>
+<rect x="329.506" y="508.000" width="4.048" height="7.000" rx="0" fill="#2b9e65"><title>四卡可用 · 7.807–7.949 ms</title></rect>
+<rect x="333.553" y="508.000" width="88.511" height="7.000" rx="0" fill="#2b9e65"><title>四卡可用 · 7.949–11.055 ms</title></rect>
+<rect x="422.070" y="508.000" width="3.633" height="7.000" rx="0" fill="#2b9e65"><title>四卡可用 · 11.055–11.183 ms</title></rect>
+<rect x="425.708" y="508.000" width="4.699" height="7.000" rx="0" fill="#2b9e65"><title>四卡可用 · 11.183–11.348 ms</title></rect>
+<rect x="430.411" y="508.000" width="2.214" height="7.000" rx="0" fill="#2b9e65"><title>四卡可用 · 11.348–11.425 ms</title></rect>
+<rect x="432.631" y="508.000" width="41.774" height="7.000" rx="0" fill="#2b9e65"><title>四卡可用 · 11.426–12.891 ms</title></rect>
+<rect x="474.409" y="508.000" width="1.962" height="7.000" rx="0" fill="#2b9e65"><title>四卡可用 · 12.892–12.960 ms</title></rect>
+<text x="747" y="429" font-size="13" fill="#112b43" font-weight="700" text-anchor="start">反向  34.15 ms  ·  四卡累计可用 13.58 ms</text>
+<line x1="747.0" y1="435" x2="747.0" y2="517" stroke="#d4e1eb" stroke-width="1"/>
+<text x="747.0" y="532" font-size="11" fill="#63798c" font-weight="400" text-anchor="middle">0</text>
+<line x1="889.5" y1="435" x2="889.5" y2="517" stroke="#d4e1eb" stroke-width="1"/>
+<text x="889.5" y="532" font-size="11" fill="#63798c" font-weight="400" text-anchor="middle">10</text>
+<line x1="1032.0" y1="435" x2="1032.0" y2="517" stroke="#d4e1eb" stroke-width="1"/>
+<text x="1032.0" y="532" font-size="11" fill="#63798c" font-weight="400" text-anchor="middle">20</text>
+<line x1="1174.5" y1="435" x2="1174.5" y2="517" stroke="#d4e1eb" stroke-width="1"/>
+<text x="1174.5" y="532" font-size="11" fill="#63798c" font-weight="400" text-anchor="middle">30</text>
+<line x1="1317.0" y1="435" x2="1317.0" y2="517" stroke="#d4e1eb" stroke-width="1"/>
+<text x="1317.0" y="532" font-size="11" fill="#63798c" font-weight="400" text-anchor="middle">40 ms</text>
+<text x="738" y="446" font-size="11" fill="#63798c" font-weight="400" text-anchor="end">GPU 0</text>
+<line x1="747" y1="448" x2="1317" y2="448" stroke="#e9eff4" stroke-width="1"/>
+<rect x="805.752" y="436.000" width="0.828" height="6.000" rx="0" fill="#9da9b5"><title>GPU 0 · mem · 4.123–4.181 ms · 8</title></rect>
+<rect x="856.684" y="436.000" width="16.423" height="6.000" rx="0" fill="#9ab5d5"><title>GPU 0 · other · 7.697–8.850 ms · triton_poi_fused_add_cat_mul_rsub_sigmoid_silu_split_0</title></rect>
+<rect x="975.918" y="436.000" width="0.021" height="6.000" rx="0" fill="#9da9b5"><title>GPU 0 · mem · 16.064–16.066 ms · memset</title></rect>
+<rect x="976.008" y="436.000" width="6.448" height="6.000" rx="0" fill="#9ab5d5"><title>GPU 0 · other · 16.071–16.523 ms · rmsnorm_bwd_general_kernel</title></rect>
+<rect x="982.466" y="436.000" width="0.108" height="6.000" rx="0" fill="#9ab5d5"><title>GPU 0 · other · 16.524–16.531 ms · rmsnorm_bwd_finalize_general_kernel</title></rect>
+<rect x="982.579" y="436.000" width="1.075" height="6.000" rx="0" fill="#9ab5d5"><title>GPU 0 · other · 16.532–16.607 ms · vectorized_elementwise_kernel</title></rect>
+<rect x="1003.113" y="436.000" width="1.957" height="6.000" rx="0" fill="#9ab5d5"><title>GPU 0 · other · 17.973–18.110 ms · triton_poi_fused__to_copy_mul_sigmoid_sigmoid_backward_view_0</title></rect>
+<rect x="1005.072" y="436.000" width="0.050" height="6.000" rx="0" fill="#9ab5d5"><title>GPU 0 · other · 18.110–18.114 ms · elementwise_kernel</title></rect>
+<rect x="1005.125" y="436.000" width="0.348" height="6.000" rx="0" fill="#9da9b5"><title>GPU 0 · mem · 18.114–18.138 ms · 8</title></rect>
+<rect x="1005.476" y="436.000" width="0.626" height="6.000" rx="0" fill="#08949d"><title>GPU 0 · FA · 18.139–18.183 ms · kernel_cutlass_kernel_flash_attncuteflash_bwd_preprocessFlashAttentionBackwardPreprocess_object_at__tensorptrbf16gmemalign16oi64div81i64div8i64div8_tensorptrbf16gmemalign16oi64div81i64div_0</title></rect>
+<rect x="1006.049" y="443.000" width="2.399" height="5.000" rx="0" fill="#df8a22"><title>GPU 0 · P2P · 18.179–18.347 ms · ncclDevKernel_SendRecv</title></rect>
+<rect x="1006.059" y="443.000" width="2.336" height="5.000" rx="0" fill="#df8a22"><title>GPU 0 · P2P · 18.180–18.344 ms · ncclDevKernel_SendRecv</title></rect>
+<rect x="1006.107" y="436.000" width="14.417" height="6.000" rx="0" fill="#08949d"><title>GPU 0 · FA · 18.183–19.195 ms · kernel_cutlass_kernel_flash_attncutesm100_hd256_2cta_fmha_backward_dqkernelBlackwellFusedMultiHeadAttentionBackwardDQKernel_object_at__TiledMMA_ThrLayoutVMNK21111000_PermutationMNK____MMA_0</title></rect>
+<rect x="1020.532" y="436.000" width="19.670" height="6.000" rx="0" fill="#08949d"><title>GPU 0 · FA · 19.195–20.576 ms · kernel_cutlass_dkdv_bwd_flash_attncutesm100_hd256_2cta_fmha_backward_dkdvkernelBlackwellFusedMultiHeadAttentionBackwardDKDVKernel_object_at__TiledMMA_ThrLayoutVMNK21111000_PermutationMNK__1</title></rect>
+<rect x="1040.207" y="436.000" width="1.776" height="6.000" rx="0" fill="#9ab5d5"><title>GPU 0 · other · 20.576–20.701 ms · elementwise_kernel</title></rect>
+<rect x="1042.037" y="436.000" width="0.179" height="6.000" rx="0" fill="#9da9b5"><title>GPU 0 · mem · 20.704–20.717 ms · 8</title></rect>
+<rect x="1042.221" y="436.000" width="0.177" height="6.000" rx="0" fill="#9da9b5"><title>GPU 0 · mem · 20.717–20.730 ms · 8</title></rect>
+<rect x="1042.431" y="436.000" width="0.628" height="6.000" rx="0" fill="#08949d"><title>GPU 0 · FA · 20.732–20.776 ms · kernel_cutlass_kernel_flash_attncuteflash_bwd_preprocessFlashAttentionBackwardPreprocess_object_at__tensorptrbf16gmemalign16oi64div81i64div8i64div8_tensorptrbf16gmemalign16oi64div81i64div_0</title></rect>
+<rect x="1043.016" y="443.000" width="4.527" height="5.000" rx="0" fill="#df8a22"><title>GPU 0 · P2P · 20.773–21.091 ms · ncclDevKernel_SendRecv</title></rect>
+<rect x="1043.024" y="443.000" width="4.379" height="5.000" rx="0" fill="#df8a22"><title>GPU 0 · P2P · 20.774–21.081 ms · ncclDevKernel_SendRecv</title></rect>
+<rect x="1043.065" y="436.000" width="14.065" height="6.000" rx="0" fill="#08949d"><title>GPU 0 · FA · 20.776–21.763 ms · kernel_cutlass_kernel_flash_attncutesm100_hd256_2cta_fmha_backward_dqkernelBlackwellFusedMultiHeadAttentionBackwardDQKernel_object_at__TiledMMA_ThrLayoutVMNK21111000_PermutationMNK____MMA_0</title></rect>
+<rect x="1057.133" y="436.000" width="18.383" height="6.000" rx="0" fill="#08949d"><title>GPU 0 · FA · 21.764–23.054 ms · kernel_cutlass_dkdv_bwd_flash_attncutesm100_hd256_2cta_fmha_backward_dkdvkernelBlackwellFusedMultiHeadAttentionBackwardDKDVKernel_object_at__TiledMMA_ThrLayoutVMNK21111000_PermutationMNK__1</title></rect>
+<rect x="1075.518" y="436.000" width="1.931" height="6.000" rx="0" fill="#9ab5d5"><title>GPU 0 · other · 23.054–23.189 ms · elementwise_kernel</title></rect>
+<rect x="1077.484" y="436.000" width="0.235" height="6.000" rx="0" fill="#9ab5d5"><title>GPU 0 · other · 23.192–23.208 ms · vectorized_elementwise_kernel</title></rect>
+<rect x="1077.723" y="436.000" width="0.234" height="6.000" rx="0" fill="#9ab5d5"><title>GPU 0 · other · 23.209–23.225 ms · vectorized_elementwise_kernel</title></rect>
+<rect x="1077.988" y="436.000" width="0.612" height="6.000" rx="0" fill="#08949d"><title>GPU 0 · FA · 23.227–23.270 ms · kernel_cutlass_kernel_flash_attncuteflash_bwd_preprocessFlashAttentionBackwardPreprocess_object_at__tensorptrbf16gmemalign16oi64div81i64div8i64div8_tensorptrbf16gmemalign16oi64div81i64div_0</title></rect>
+<rect x="1078.553" y="443.000" width="4.349" height="5.000" rx="0" fill="#df8a22"><title>GPU 0 · P2P · 23.267–23.572 ms · ncclDevKernel_SendRecv</title></rect>
+<rect x="1078.565" y="443.000" width="4.221" height="5.000" rx="0" fill="#df8a22"><title>GPU 0 · P2P · 23.268–23.564 ms · ncclDevKernel_SendRecv</title></rect>
+<rect x="1078.606" y="436.000" width="13.702" height="6.000" rx="0" fill="#08949d"><title>GPU 0 · FA · 23.271–24.232 ms · kernel_cutlass_kernel_flash_attncutesm100_hd256_2cta_fmha_backward_dqkernelBlackwellFusedMultiHeadAttentionBackwardDQKernel_object_at__TiledMMA_ThrLayoutVMNK21111000_PermutationMNK____MMA_0</title></rect>
+<rect x="1092.310" y="436.000" width="18.308" height="6.000" rx="0" fill="#08949d"><title>GPU 0 · FA · 24.232–25.517 ms · kernel_cutlass_dkdv_bwd_flash_attncutesm100_hd256_2cta_fmha_backward_dkdvkernelBlackwellFusedMultiHeadAttentionBackwardDKDVKernel_object_at__TiledMMA_ThrLayoutVMNK21111000_PermutationMNK__1</title></rect>
+<rect x="1110.626" y="436.000" width="1.953" height="6.000" rx="0" fill="#9ab5d5"><title>GPU 0 · other · 25.518–25.655 ms · elementwise_kernel</title></rect>
+<rect x="1112.616" y="436.000" width="0.234" height="6.000" rx="0" fill="#9ab5d5"><title>GPU 0 · other · 25.657–25.674 ms · vectorized_elementwise_kernel</title></rect>
+<rect x="1112.855" y="436.000" width="0.234" height="6.000" rx="0" fill="#9ab5d5"><title>GPU 0 · other · 25.674–25.690 ms · vectorized_elementwise_kernel</title></rect>
+<rect x="1113.127" y="436.000" width="1.054" height="6.000" rx="0" fill="#08949d"><title>GPU 0 · FA · 25.693–25.767 ms · kernel_cutlass_kernel_flash_attncuteflash_bwd_preprocessFlashAttentionBackwardPreprocess_object_at__tensorptrbf16gmemalign16oi64div81i64div8i64div8_tensorptrbf16gmemalign16oi64div81i64div_0</title></rect>
+<rect x="1114.140" y="443.000" width="2.097" height="5.000" rx="0" fill="#df8a22"><title>GPU 0 · P2P · 25.764–25.911 ms · ncclDevKernel_SendRecv</title></rect>
+<rect x="1114.153" y="443.000" width="2.150" height="5.000" rx="0" fill="#df8a22"><title>GPU 0 · P2P · 25.765–25.916 ms · ncclDevKernel_SendRecv</title></rect>
+<rect x="1114.186" y="436.000" width="15.272" height="6.000" rx="0" fill="#08949d"><title>GPU 0 · FA · 25.767–26.839 ms · kernel_cutlass_kernel_flash_attncutesm100_hd256_2cta_fmha_backward_dqkernelBlackwellFusedMultiHeadAttentionBackwardDQKernel_object_at__TiledMMA_ThrLayoutVMNK21111000_PermutationMNK____MMA_0</title></rect>
+<rect x="1129.461" y="436.000" width="22.337" height="6.000" rx="0" fill="#08949d"><title>GPU 0 · FA · 26.839–28.407 ms · kernel_cutlass_dkdv_bwd_flash_attncutesm100_hd256_2cta_fmha_backward_dkdvkernelBlackwellFusedMultiHeadAttentionBackwardDKDVKernel_object_at__TiledMMA_ThrLayoutVMNK21111000_PermutationMNK__1</title></rect>
+<rect x="1151.804" y="436.000" width="1.700" height="6.000" rx="0" fill="#9ab5d5"><title>GPU 0 · other · 28.407–28.527 ms · elementwise_kernel</title></rect>
+<rect x="1153.506" y="436.000" width="2.039" height="6.000" rx="0" fill="#9ab5d5"><title>GPU 0 · other · 28.527–28.670 ms · elementwise_kernel</title></rect>
+<rect x="1155.582" y="436.000" width="0.369" height="6.000" rx="0" fill="#9ab5d5"><title>GPU 0 · other · 28.672–28.698 ms · elementwise_kernel</title></rect>
+<rect x="1155.956" y="436.000" width="0.321" height="6.000" rx="0" fill="#9ab5d5"><title>GPU 0 · other · 28.699–28.721 ms · elementwise_kernel</title></rect>
+<rect x="1156.282" y="436.000" width="0.363" height="6.000" rx="0" fill="#9ab5d5"><title>GPU 0 · other · 28.722–28.747 ms · elementwise_kernel</title></rect>
+<rect x="1156.650" y="436.000" width="0.321" height="6.000" rx="0" fill="#9ab5d5"><title>GPU 0 · other · 28.747–28.770 ms · elementwise_kernel</title></rect>
+<rect x="1156.977" y="436.000" width="0.560" height="6.000" rx="0" fill="#9ab5d5"><title>GPU 0 · other · 28.770–28.810 ms · fused_rope_backward_kernel</title></rect>
+<rect x="1157.542" y="436.000" width="2.421" height="6.000" rx="0" fill="#9ab5d5"><title>GPU 0 · other · 28.810–28.980 ms · fused_rope_backward_kernel</title></rect>
+<rect x="1159.966" y="436.000" width="0.708" height="6.000" rx="0" fill="#9ab5d5"><title>GPU 0 · other · 28.980–29.030 ms · rmsnorm_bwd_general_kernel</title></rect>
+<rect x="1160.677" y="436.000" width="0.210" height="6.000" rx="0" fill="#9ab5d5"><title>GPU 0 · other · 29.030–29.045 ms · rmsnorm_bwd_finalize_general_kernel</title></rect>
+<rect x="1160.892" y="436.000" width="3.664" height="6.000" rx="0" fill="#9ab5d5"><title>GPU 0 · other · 29.045–29.302 ms · rmsnorm_bwd_general_kernel</title></rect>
+<rect x="1164.559" y="436.000" width="0.202" height="6.000" rx="0" fill="#9ab5d5"><title>GPU 0 · other · 29.302–29.317 ms · rmsnorm_bwd_finalize_general_kernel</title></rect>
+<rect x="1164.766" y="436.000" width="17.505" height="6.000" rx="0" fill="#9ab5d5"><title>GPU 0 · other · 29.317–30.545 ms · CatArrayBatchedCopy</title></rect>
+<rect x="1222.155" y="436.000" width="0.026" height="6.000" rx="0" fill="#9da9b5"><title>GPU 0 · mem · 33.344–33.346 ms · memset</title></rect>
+<rect x="1222.212" y="436.000" width="6.330" height="6.000" rx="0" fill="#9ab5d5"><title>GPU 0 · other · 33.348–33.792 ms · rmsnorm_bwd_general_kernel</title></rect>
+<rect x="1228.549" y="436.000" width="0.102" height="6.000" rx="0" fill="#9ab5d5"><title>GPU 0 · other · 33.793–33.800 ms · rmsnorm_bwd_finalize_general_kernel</title></rect>
+<rect x="1228.656" y="436.000" width="1.039" height="6.000" rx="0" fill="#9ab5d5"><title>GPU 0 · other · 33.800–33.873 ms · vectorized_elementwise_kernel</title></rect>
+<rect x="1229.767" y="436.000" width="0.325" height="6.000" rx="0" fill="#9da9b5"><title>GPU 0 · mem · 33.878–33.901 ms · 8</title></rect>
+<rect x="1230.122" y="436.000" width="0.032" height="6.000" rx="0" fill="#9da9b5"><title>GPU 0 · mem · 33.903–33.906 ms · 8</title></rect>
+<rect x="1230.176" y="436.000" width="0.697" height="6.000" rx="0" fill="#9da9b5"><title>GPU 0 · mem · 33.907–33.956 ms · 8</title></rect>
+<rect x="1230.910" y="436.000" width="0.029" height="6.000" rx="0" fill="#9da9b5"><title>GPU 0 · mem · 33.959–33.961 ms · 8</title></rect>
+<rect x="1230.963" y="436.000" width="0.024" height="6.000" rx="0" fill="#9da9b5"><title>GPU 0 · mem · 33.962–33.964 ms · 8</title></rect>
+<rect x="1231.017" y="436.000" width="0.032" height="6.000" rx="0" fill="#9da9b5"><title>GPU 0 · mem · 33.966–33.968 ms · 8</title></rect>
+<rect x="1231.075" y="436.000" width="1.665" height="6.000" rx="0" fill="#9da9b5"><title>GPU 0 · mem · 33.970–34.087 ms · 8</title></rect>
+<rect x="1232.775" y="436.000" width="0.835" height="6.000" rx="0" fill="#9da9b5"><title>GPU 0 · mem · 34.089–34.148 ms · 8</title></rect>
+<rect x="806.653" y="436.000" width="25.146" height="6.000" rx="0" fill="#3c70c6"><title>GPU 0 · GEMM · 4.186–5.951 ms · nvjet_sm100_tst_128x256_64x6_2x2_2cta_h_bz_NNT</title></rect>
+<rect x="831.752" y="436.000" width="24.929" height="6.000" rx="0" fill="#3c70c6"><title>GPU 0 · GEMM · 5.948–7.697 ms · nvjet_sm100_tss_256x256_64x4_2x1_2cta_v_badd_NTT</title></rect>
+<rect x="873.102" y="436.000" width="50.955" height="6.000" rx="0" fill="#3c70c6"><title>GPU 0 · GEMM · 8.849–12.425 ms · nvjet_sm100_tst_256x256_64x4_2x2_2cta_h_bz_NNT</title></rect>
+<rect x="923.975" y="436.000" width="51.887" height="6.000" rx="0" fill="#3c70c6"><title>GPU 0 · GEMM · 12.419–16.060 ms · nvjet_sm100_tss_256x256_64x4_2x2_2cta_h_badd_NTT</title></rect>
+<rect x="983.650" y="436.000" width="9.053" height="6.000" rx="0" fill="#3c70c6"><title>GPU 0 · GEMM · 16.607–17.242 ms · nvjet_sm100_tst_128x256_64x6_2x2_2cta_h_bz_NNT</title></rect>
+<rect x="992.651" y="436.000" width="10.459" height="6.000" rx="0" fill="#3c70c6"><title>GPU 0 · GEMM · 17.239–17.973 ms · nvjet_sm100_tss_320x192_64x3_2x2_2cta_h_badd_NTT</title></rect>
+<rect x="1182.267" y="436.000" width="19.845" height="6.000" rx="0" fill="#3c70c6"><title>GPU 0 · GEMM · 30.545–31.938 ms · nvjet_sm100_tst_256x256_64x4_2x2_2cta_h_bz_NNT</title></rect>
+<rect x="1202.040" y="436.000" width="20.062" height="6.000" rx="0" fill="#3c70c6"><title>GPU 0 · GEMM · 31.933–33.340 ms · nvjet_sm100_tss_256x256_64x4_2x2_2cta_h_badd_NTT</title></rect>
+<text x="738" y="463" font-size="11" fill="#63798c" font-weight="400" text-anchor="end">GPU 1</text>
+<line x1="747" y1="465" x2="1317" y2="465" stroke="#e9eff4" stroke-width="1"/>
+<rect x="769.895" y="453.000" width="0.808" height="6.000" rx="0" fill="#9da9b5"><title>GPU 1 · mem · 1.607–1.663 ms · 8</title></rect>
+<rect x="817.894" y="453.000" width="15.570" height="6.000" rx="0" fill="#9ab5d5"><title>GPU 1 · other · 4.975–6.068 ms · triton_poi_fused_add_cat_mul_rsub_sigmoid_silu_split_0</title></rect>
+<rect x="930.408" y="453.000" width="0.021" height="6.000" rx="0" fill="#9da9b5"><title>GPU 1 · mem · 12.871–12.872 ms · memset</title></rect>
+<rect x="930.502" y="453.000" width="6.412" height="6.000" rx="0" fill="#9ab5d5"><title>GPU 1 · other · 12.877–13.327 ms · rmsnorm_bwd_general_kernel</title></rect>
+<rect x="936.924" y="453.000" width="0.110" height="6.000" rx="0" fill="#9ab5d5"><title>GPU 1 · other · 13.328–13.336 ms · rmsnorm_bwd_finalize_general_kernel</title></rect>
+<rect x="937.039" y="453.000" width="1.064" height="6.000" rx="0" fill="#9ab5d5"><title>GPU 1 · other · 13.336–13.411 ms · vectorized_elementwise_kernel</title></rect>
+<rect x="956.676" y="453.000" width="1.964" height="6.000" rx="0" fill="#9ab5d5"><title>GPU 1 · other · 14.714–14.852 ms · triton_poi_fused__to_copy_mul_sigmoid_sigmoid_backward_view_0</title></rect>
+<rect x="958.643" y="453.000" width="0.048" height="6.000" rx="0" fill="#9ab5d5"><title>GPU 1 · other · 14.852–14.856 ms · elementwise_kernel</title></rect>
+<rect x="958.696" y="453.000" width="0.344" height="6.000" rx="0" fill="#9da9b5"><title>GPU 1 · mem · 14.856–14.880 ms · 8</title></rect>
+<rect x="959.043" y="453.000" width="0.620" height="6.000" rx="0" fill="#08949d"><title>GPU 1 · FA · 14.880–14.924 ms · kernel_cutlass_kernel_flash_attncuteflash_bwd_preprocessFlashAttentionBackwardPreprocess_object_at__tensorptrbf16gmemalign16oi64div81i64div8i64div8_tensorptrbf16gmemalign16oi64div81i64div_0</title></rect>
+<rect x="959.604" y="460.000" width="2.268" height="5.000" rx="0" fill="#df8a22"><title>GPU 1 · P2P · 14.920–15.079 ms · ncclDevKernel_SendRecv</title></rect>
+<rect x="959.612" y="460.000" width="2.312" height="5.000" rx="0" fill="#df8a22"><title>GPU 1 · P2P · 14.920–15.082 ms · ncclDevKernel_SendRecv</title></rect>
+<rect x="959.662" y="453.000" width="13.710" height="6.000" rx="0" fill="#08949d"><title>GPU 1 · FA · 14.924–15.886 ms · kernel_cutlass_kernel_flash_attncutesm100_hd256_2cta_fmha_backward_dqkernelBlackwellFusedMultiHeadAttentionBackwardDQKernel_object_at__TiledMMA_ThrLayoutVMNK21111000_PermutationMNK____MMA_0</title></rect>
+<rect x="973.375" y="453.000" width="19.199" height="6.000" rx="0" fill="#08949d"><title>GPU 1 · FA · 15.886–17.233 ms · kernel_cutlass_dkdv_bwd_flash_attncutesm100_hd256_2cta_fmha_backward_dkdvkernelBlackwellFusedMultiHeadAttentionBackwardDKDVKernel_object_at__TiledMMA_ThrLayoutVMNK21111000_PermutationMNK__1</title></rect>
+<rect x="992.574" y="453.000" width="1.739" height="6.000" rx="0" fill="#9ab5d5"><title>GPU 1 · other · 17.233–17.355 ms · elementwise_kernel</title></rect>
+<rect x="994.365" y="453.000" width="0.182" height="6.000" rx="0" fill="#9da9b5"><title>GPU 1 · mem · 17.359–17.372 ms · 8</title></rect>
+<rect x="994.551" y="453.000" width="0.174" height="6.000" rx="0" fill="#9da9b5"><title>GPU 1 · mem · 17.372–17.384 ms · 8</title></rect>
+<rect x="994.763" y="453.000" width="0.623" height="6.000" rx="0" fill="#08949d"><title>GPU 1 · FA · 17.387–17.431 ms · kernel_cutlass_kernel_flash_attncuteflash_bwd_preprocessFlashAttentionBackwardPreprocess_object_at__tensorptrbf16gmemalign16oi64div81i64div8i64div8_tensorptrbf16gmemalign16oi64div81i64div_0</title></rect>
+<rect x="995.333" y="460.000" width="4.170" height="5.000" rx="0" fill="#df8a22"><title>GPU 1 · P2P · 17.427–17.719 ms · ncclDevKernel_SendRecv</title></rect>
+<rect x="995.346" y="460.000" width="50.205" height="5.000" rx="0" fill="#df8a22"><title>GPU 1 · P2P · 17.428–20.951 ms · ncclDevKernel_SendRecv</title></rect>
+<rect x="995.391" y="453.000" width="15.021" height="6.000" rx="0" fill="#08949d"><title>GPU 1 · FA · 17.431–18.485 ms · kernel_cutlass_kernel_flash_attncutesm100_hd256_2cta_fmha_backward_dqkernelBlackwellFusedMultiHeadAttentionBackwardDQKernel_object_at__TiledMMA_ThrLayoutVMNK21111000_PermutationMNK____MMA_0</title></rect>
+<rect x="1010.417" y="453.000" width="20.319" height="6.000" rx="0" fill="#08949d"><title>GPU 1 · FA · 18.485–19.911 ms · kernel_cutlass_dkdv_bwd_flash_attncutesm100_hd256_2cta_fmha_backward_dkdvkernelBlackwellFusedMultiHeadAttentionBackwardDKDVKernel_object_at__TiledMMA_ThrLayoutVMNK21111000_PermutationMNK__1</title></rect>
+<rect x="1030.741" y="453.000" width="2.215" height="6.000" rx="0" fill="#9ab5d5"><title>GPU 1 · other · 19.912–20.067 ms · elementwise_kernel</title></rect>
+<rect x="1045.595" y="453.000" width="0.227" height="6.000" rx="0" fill="#9ab5d5"><title>GPU 1 · other · 20.954–20.970 ms · vectorized_elementwise_kernel</title></rect>
+<rect x="1045.827" y="453.000" width="0.216" height="6.000" rx="0" fill="#9ab5d5"><title>GPU 1 · other · 20.970–20.985 ms · vectorized_elementwise_kernel</title></rect>
+<rect x="1046.077" y="453.000" width="1.076" height="6.000" rx="0" fill="#08949d"><title>GPU 1 · FA · 20.988–21.063 ms · kernel_cutlass_kernel_flash_attncuteflash_bwd_preprocessFlashAttentionBackwardPreprocess_object_at__tensorptrbf16gmemalign16oi64div81i64div8i64div8_tensorptrbf16gmemalign16oi64div81i64div_0</title></rect>
+<rect x="1047.115" y="460.000" width="4.394" height="5.000" rx="0" fill="#df8a22"><title>GPU 1 · P2P · 21.061–21.369 ms · ncclDevKernel_SendRecv</title></rect>
+<rect x="1047.122" y="460.000" width="34.002" height="5.000" rx="0" fill="#df8a22"><title>GPU 1 · P2P · 21.061–23.447 ms · ncclDevKernel_SendRecv</title></rect>
+<rect x="1047.158" y="453.000" width="16.412" height="6.000" rx="0" fill="#08949d"><title>GPU 1 · FA · 21.064–22.215 ms · kernel_cutlass_kernel_flash_attncutesm100_hd256_2cta_fmha_backward_dqkernelBlackwellFusedMultiHeadAttentionBackwardDQKernel_object_at__TiledMMA_ThrLayoutVMNK21111000_PermutationMNK____MMA_0</title></rect>
+<rect x="1063.575" y="453.000" width="21.304" height="6.000" rx="0" fill="#08949d"><title>GPU 1 · FA · 22.216–23.711 ms · kernel_cutlass_dkdv_bwd_flash_attncutesm100_hd256_2cta_fmha_backward_dkdvkernelBlackwellFusedMultiHeadAttentionBackwardDKDVKernel_object_at__TiledMMA_ThrLayoutVMNK21111000_PermutationMNK__1</title></rect>
+<rect x="1084.881" y="453.000" width="1.683" height="6.000" rx="0" fill="#9ab5d5"><title>GPU 1 · other · 23.711–23.829 ms · elementwise_kernel</title></rect>
+<rect x="1086.566" y="453.000" width="1.951" height="6.000" rx="0" fill="#9ab5d5"><title>GPU 1 · other · 23.829–23.966 ms · elementwise_kernel</title></rect>
+<rect x="1088.548" y="453.000" width="0.367" height="6.000" rx="0" fill="#9ab5d5"><title>GPU 1 · other · 23.968–23.994 ms · elementwise_kernel</title></rect>
+<rect x="1088.920" y="453.000" width="0.357" height="6.000" rx="0" fill="#9ab5d5"><title>GPU 1 · other · 23.994–24.019 ms · elementwise_kernel</title></rect>
+<rect x="1089.309" y="453.000" width="1.075" height="6.000" rx="0" fill="#08949d"><title>GPU 1 · FA · 24.022–24.097 ms · kernel_cutlass_kernel_flash_attncuteflash_bwd_preprocessFlashAttentionBackwardPreprocess_object_at__tensorptrbf16gmemalign16oi64div81i64div8i64div8_tensorptrbf16gmemalign16oi64div81i64div_0</title></rect>
+<rect x="1090.340" y="460.000" width="2.232" height="5.000" rx="0" fill="#df8a22"><title>GPU 1 · P2P · 24.094–24.251 ms · ncclDevKernel_SendRecv</title></rect>
+<rect x="1090.354" y="460.000" width="2.145" height="5.000" rx="0" fill="#df8a22"><title>GPU 1 · P2P · 24.095–24.246 ms · ncclDevKernel_SendRecv</title></rect>
+<rect x="1090.389" y="453.000" width="15.255" height="6.000" rx="0" fill="#08949d"><title>GPU 1 · FA · 24.097–25.168 ms · kernel_cutlass_kernel_flash_attncutesm100_hd256_2cta_fmha_backward_dqkernelBlackwellFusedMultiHeadAttentionBackwardDQKernel_object_at__TiledMMA_ThrLayoutVMNK21111000_PermutationMNK____MMA_0</title></rect>
+<rect x="1105.647" y="453.000" width="22.543" height="6.000" rx="0" fill="#08949d"><title>GPU 1 · FA · 25.168–26.750 ms · kernel_cutlass_dkdv_bwd_flash_attncutesm100_hd256_2cta_fmha_backward_dkdvkernelBlackwellFusedMultiHeadAttentionBackwardDKDVKernel_object_at__TiledMMA_ThrLayoutVMNK21111000_PermutationMNK__1</title></rect>
+<rect x="1128.192" y="453.000" width="1.214" height="6.000" rx="0" fill="#9ab5d5"><title>GPU 1 · other · 26.750–26.835 ms · vectorized_elementwise_kernel</title></rect>
+<rect x="1129.446" y="453.000" width="0.240" height="6.000" rx="0" fill="#9ab5d5"><title>GPU 1 · other · 26.838–26.855 ms · vectorized_elementwise_kernel</title></rect>
+<rect x="1129.690" y="453.000" width="0.230" height="6.000" rx="0" fill="#9ab5d5"><title>GPU 1 · other · 26.855–26.872 ms · vectorized_elementwise_kernel</title></rect>
+<rect x="1129.926" y="453.000" width="0.570" height="6.000" rx="0" fill="#9ab5d5"><title>GPU 1 · other · 26.872–26.912 ms · fused_rope_backward_kernel</title></rect>
+<rect x="1130.499" y="453.000" width="2.429" height="6.000" rx="0" fill="#9ab5d5"><title>GPU 1 · other · 26.912–27.083 ms · fused_rope_backward_kernel</title></rect>
+<rect x="1132.930" y="453.000" width="0.732" height="6.000" rx="0" fill="#9ab5d5"><title>GPU 1 · other · 27.083–27.134 ms · rmsnorm_bwd_general_kernel</title></rect>
+<rect x="1133.665" y="453.000" width="0.209" height="6.000" rx="0" fill="#9ab5d5"><title>GPU 1 · other · 27.134–27.149 ms · rmsnorm_bwd_finalize_general_kernel</title></rect>
+<rect x="1133.882" y="453.000" width="3.779" height="6.000" rx="0" fill="#9ab5d5"><title>GPU 1 · other · 27.150–27.415 ms · rmsnorm_bwd_general_kernel</title></rect>
+<rect x="1137.663" y="453.000" width="0.194" height="6.000" rx="0" fill="#9ab5d5"><title>GPU 1 · other · 27.415–27.429 ms · rmsnorm_bwd_finalize_general_kernel</title></rect>
+<rect x="1137.862" y="453.000" width="17.996" height="6.000" rx="0" fill="#9ab5d5"><title>GPU 1 · other · 27.429–28.692 ms · CatArrayBatchedCopy</title></rect>
+<rect x="1196.529" y="453.000" width="0.024" height="6.000" rx="0" fill="#9da9b5"><title>GPU 1 · mem · 31.546–31.548 ms · memset</title></rect>
+<rect x="1196.587" y="453.000" width="6.339" height="6.000" rx="0" fill="#9ab5d5"><title>GPU 1 · other · 31.550–31.995 ms · rmsnorm_bwd_general_kernel</title></rect>
+<rect x="1202.934" y="453.000" width="0.105" height="6.000" rx="0" fill="#9ab5d5"><title>GPU 1 · other · 31.995–32.003 ms · rmsnorm_bwd_finalize_general_kernel</title></rect>
+<rect x="1203.044" y="453.000" width="1.047" height="6.000" rx="0" fill="#9ab5d5"><title>GPU 1 · other · 32.003–32.077 ms · vectorized_elementwise_kernel</title></rect>
+<rect x="1204.170" y="453.000" width="0.330" height="6.000" rx="0" fill="#9da9b5"><title>GPU 1 · mem · 32.082–32.105 ms · 8</title></rect>
+<rect x="1204.548" y="453.000" width="0.033" height="6.000" rx="0" fill="#9da9b5"><title>GPU 1 · mem · 32.109–32.111 ms · 8</title></rect>
+<rect x="1204.606" y="453.000" width="0.708" height="6.000" rx="0" fill="#9da9b5"><title>GPU 1 · mem · 32.113–32.162 ms · 8</title></rect>
+<rect x="1205.340" y="453.000" width="0.030" height="6.000" rx="0" fill="#9da9b5"><title>GPU 1 · mem · 32.164–32.166 ms · 8</title></rect>
+<rect x="1205.394" y="453.000" width="0.024" height="6.000" rx="0" fill="#9da9b5"><title>GPU 1 · mem · 32.168–32.170 ms · 8</title></rect>
+<rect x="1205.452" y="453.000" width="0.028" height="6.000" rx="0" fill="#9da9b5"><title>GPU 1 · mem · 32.172–32.174 ms · 8</title></rect>
+<rect x="1205.507" y="453.000" width="1.664" height="6.000" rx="0" fill="#9da9b5"><title>GPU 1 · mem · 32.176–32.293 ms · 8</title></rect>
+<rect x="1207.203" y="453.000" width="0.841" height="6.000" rx="0" fill="#9da9b5"><title>GPU 1 · mem · 32.295–32.354 ms · 8</title></rect>
+<rect x="770.757" y="453.000" width="23.788" height="6.000" rx="0" fill="#3c70c6"><title>GPU 1 · GEMM · 1.667–3.336 ms · nvjet_sm100_tst_128x256_64x6_2x2_2cta_h_bz_NNT</title></rect>
+<rect x="794.502" y="453.000" width="23.380" height="6.000" rx="0" fill="#3c70c6"><title>GPU 1 · GEMM · 3.333–4.974 ms · nvjet_sm100_tss_256x256_64x4_2x1_2cta_v_badd_NTT</title></rect>
+<rect x="833.457" y="453.000" width="47.933" height="6.000" rx="0" fill="#3c70c6"><title>GPU 1 · GEMM · 6.067–9.431 ms · nvjet_sm100_tst_256x256_64x4_2x2_2cta_h_bz_NNT</title></rect>
+<rect x="881.315" y="453.000" width="49.045" height="6.000" rx="0" fill="#3c70c6"><title>GPU 1 · GEMM · 9.426–12.867 ms · nvjet_sm100_tss_256x256_64x4_2x2_2cta_h_badd_NTT</title></rect>
+<rect x="938.102" y="453.000" width="8.746" height="6.000" rx="0" fill="#3c70c6"><title>GPU 1 · GEMM · 13.411–14.024 ms · nvjet_sm100_tst_128x256_64x6_2x2_2cta_h_bz_NNT</title></rect>
+<rect x="946.802" y="453.000" width="9.871" height="6.000" rx="0" fill="#3c70c6"><title>GPU 1 · GEMM · 14.021–14.714 ms · nvjet_sm100_tss_320x192_64x3_2x2_2cta_h_badd_NTT</title></rect>
+<rect x="1155.852" y="453.000" width="20.247" height="6.000" rx="0" fill="#3c70c6"><title>GPU 1 · GEMM · 28.691–30.112 ms · nvjet_sm100_tst_256x256_64x4_2x2_2cta_h_bz_NNT</title></rect>
+<rect x="1176.020" y="453.000" width="20.476" height="6.000" rx="0" fill="#3c70c6"><title>GPU 1 · GEMM · 30.107–31.544 ms · nvjet_sm100_tss_256x256_64x4_2x2_2cta_h_badd_NTT</title></rect>
+<text x="738" y="480" font-size="11" fill="#63798c" font-weight="400" text-anchor="end">GPU 2</text>
+<line x1="747" y1="482" x2="1317" y2="482" stroke="#e9eff4" stroke-width="1"/>
+<rect x="747.000" y="470.000" width="0.749" height="6.000" rx="0" fill="#9da9b5"><title>GPU 2 · mem · 0.000–0.053 ms · 8</title></rect>
+<rect x="792.247" y="470.000" width="12.102" height="6.000" rx="0" fill="#9ab5d5"><title>GPU 2 · other · 3.175–4.024 ms · triton_poi_fused_add_cat_mul_rsub_sigmoid_silu_split_0</title></rect>
+<rect x="895.441" y="470.000" width="0.021" height="6.000" rx="0" fill="#9da9b5"><title>GPU 2 · mem · 10.417–10.418 ms · memset</title></rect>
+<rect x="895.535" y="470.000" width="6.078" height="6.000" rx="0" fill="#9ab5d5"><title>GPU 2 · other · 10.423–10.850 ms · rmsnorm_bwd_general_kernel</title></rect>
+<rect x="901.622" y="470.000" width="0.103" height="6.000" rx="0" fill="#9ab5d5"><title>GPU 2 · other · 10.851–10.858 ms · rmsnorm_bwd_finalize_general_kernel</title></rect>
+<rect x="901.730" y="470.000" width="1.053" height="6.000" rx="0" fill="#9ab5d5"><title>GPU 2 · other · 10.858–10.932 ms · vectorized_elementwise_kernel</title></rect>
+<rect x="920.052" y="470.000" width="1.969" height="6.000" rx="0" fill="#9ab5d5"><title>GPU 2 · other · 12.144–12.282 ms · triton_poi_fused__to_copy_mul_sigmoid_sigmoid_backward_view_0</title></rect>
+<rect x="922.024" y="470.000" width="0.047" height="6.000" rx="0" fill="#9ab5d5"><title>GPU 2 · other · 12.282–12.286 ms · elementwise_kernel</title></rect>
+<rect x="922.076" y="470.000" width="0.339" height="6.000" rx="0" fill="#9da9b5"><title>GPU 2 · mem · 12.286–12.310 ms · 8</title></rect>
+<rect x="922.416" y="470.000" width="0.627" height="6.000" rx="0" fill="#08949d"><title>GPU 2 · FA · 12.310–12.354 ms · kernel_cutlass_kernel_flash_attncuteflash_bwd_preprocessFlashAttentionBackwardPreprocess_object_at__tensorptrbf16gmemalign16oi64div81i64div8i64div8_tensorptrbf16gmemalign16oi64div81i64div_0</title></rect>
+<rect x="922.995" y="477.000" width="58.256" height="5.000" rx="0" fill="#df8a22"><title>GPU 2 · P2P · 12.351–16.439 ms · ncclDevKernel_SendRecv</title></rect>
+<rect x="923.006" y="477.000" width="2.088" height="5.000" rx="0" fill="#df8a22"><title>GPU 2 · P2P · 12.351–12.498 ms · ncclDevKernel_SendRecv</title></rect>
+<rect x="923.049" y="470.000" width="13.384" height="6.000" rx="0" fill="#08949d"><title>GPU 2 · FA · 12.354–13.294 ms · kernel_cutlass_kernel_flash_attncutesm100_hd256_2cta_fmha_backward_dqkernelBlackwellFusedMultiHeadAttentionBackwardDQKernel_object_at__TiledMMA_ThrLayoutVMNK21111000_PermutationMNK____MMA_0</title></rect>
+<rect x="936.439" y="470.000" width="19.008" height="6.000" rx="0" fill="#08949d"><title>GPU 2 · FA · 13.294–14.628 ms · kernel_cutlass_dkdv_bwd_flash_attncutesm100_hd256_2cta_fmha_backward_dkdvkernelBlackwellFusedMultiHeadAttentionBackwardDKDVKernel_object_at__TiledMMA_ThrLayoutVMNK21111000_PermutationMNK__1</title></rect>
+<rect x="955.450" y="470.000" width="1.816" height="6.000" rx="0" fill="#9ab5d5"><title>GPU 2 · other · 14.628–14.755 ms · elementwise_kernel</title></rect>
+<rect x="981.313" y="470.000" width="0.187" height="6.000" rx="0" fill="#9da9b5"><title>GPU 2 · mem · 16.443–16.456 ms · 8</title></rect>
+<rect x="981.502" y="470.000" width="0.184" height="6.000" rx="0" fill="#9da9b5"><title>GPU 2 · mem · 16.456–16.469 ms · 8</title></rect>
+<rect x="981.723" y="470.000" width="1.074" height="6.000" rx="0" fill="#08949d"><title>GPU 2 · FA · 16.472–16.547 ms · kernel_cutlass_kernel_flash_attncuteflash_bwd_preprocessFlashAttentionBackwardPreprocess_object_at__tensorptrbf16gmemalign16oi64div81i64div8i64div8_tensorptrbf16gmemalign16oi64div81i64div_0</title></rect>
+<rect x="982.757" y="477.000" width="15.014" height="5.000" rx="0" fill="#df8a22"><title>GPU 2 · P2P · 16.544–17.598 ms · ncclDevKernel_SendRecv</title></rect>
+<rect x="982.765" y="477.000" width="38.169" height="5.000" rx="0" fill="#df8a22"><title>GPU 2 · P2P · 16.545–19.223 ms · ncclDevKernel_SendRecv</title></rect>
+<rect x="982.802" y="470.000" width="16.386" height="6.000" rx="0" fill="#08949d"><title>GPU 2 · FA · 16.547–17.697 ms · kernel_cutlass_kernel_flash_attncutesm100_hd256_2cta_fmha_backward_dqkernelBlackwellFusedMultiHeadAttentionBackwardDQKernel_object_at__TiledMMA_ThrLayoutVMNK21111000_PermutationMNK____MMA_0</title></rect>
+<rect x="999.192" y="470.000" width="22.043" height="6.000" rx="0" fill="#08949d"><title>GPU 2 · FA · 17.698–19.245 ms · kernel_cutlass_dkdv_bwd_flash_attncutesm100_hd256_2cta_fmha_backward_dkdvkernelBlackwellFusedMultiHeadAttentionBackwardDKDVKernel_object_at__TiledMMA_ThrLayoutVMNK21111000_PermutationMNK__1</title></rect>
+<rect x="1021.234" y="470.000" width="1.818" height="6.000" rx="0" fill="#9ab5d5"><title>GPU 2 · other · 19.244–19.372 ms · elementwise_kernel</title></rect>
+<rect x="1023.054" y="470.000" width="2.026" height="6.000" rx="0" fill="#9ab5d5"><title>GPU 2 · other · 19.372–19.514 ms · elementwise_kernel</title></rect>
+<rect x="1025.115" y="470.000" width="0.391" height="6.000" rx="0" fill="#9ab5d5"><title>GPU 2 · other · 19.517–19.544 ms · elementwise_kernel</title></rect>
+<rect x="1025.509" y="470.000" width="0.395" height="6.000" rx="0" fill="#9ab5d5"><title>GPU 2 · other · 19.544–19.572 ms · elementwise_kernel</title></rect>
+<rect x="1025.938" y="470.000" width="1.089" height="6.000" rx="0" fill="#08949d"><title>GPU 2 · FA · 19.575–19.651 ms · kernel_cutlass_kernel_flash_attncuteflash_bwd_preprocessFlashAttentionBackwardPreprocess_object_at__tensorptrbf16gmemalign16oi64div81i64div8i64div8_tensorptrbf16gmemalign16oi64div81i64div_0</title></rect>
+<rect x="1026.981" y="477.000" width="22.831" height="5.000" rx="0" fill="#df8a22"><title>GPU 2 · P2P · 19.648–21.250 ms · ncclDevKernel_SendRecv</title></rect>
+<rect x="1026.994" y="477.000" width="32.574" height="5.000" rx="0" fill="#df8a22"><title>GPU 2 · P2P · 19.649–21.935 ms · ncclDevKernel_SendRecv</title></rect>
+<rect x="1027.033" y="470.000" width="19.152" height="6.000" rx="0" fill="#08949d"><title>GPU 2 · FA · 19.651–20.995 ms · kernel_cutlass_kernel_flash_attncutesm100_hd256_2cta_fmha_backward_dqkernelBlackwellFusedMultiHeadAttentionBackwardDQKernel_object_at__TiledMMA_ThrLayoutVMNK21111000_PermutationMNK____MMA_0</title></rect>
+<rect x="1046.190" y="470.000" width="22.929" height="6.000" rx="0" fill="#08949d"><title>GPU 2 · FA · 20.996–22.605 ms · kernel_cutlass_dkdv_bwd_flash_attncutesm100_hd256_2cta_fmha_backward_dkdvkernelBlackwellFusedMultiHeadAttentionBackwardDKDVKernel_object_at__TiledMMA_ThrLayoutVMNK21111000_PermutationMNK__1</title></rect>
+<rect x="1069.121" y="470.000" width="1.231" height="6.000" rx="0" fill="#9ab5d5"><title>GPU 2 · other · 22.605–22.691 ms · vectorized_elementwise_kernel</title></rect>
+<rect x="1070.384" y="470.000" width="0.397" height="6.000" rx="0" fill="#9ab5d5"><title>GPU 2 · other · 22.694–22.722 ms · elementwise_kernel</title></rect>
+<rect x="1070.786" y="470.000" width="0.387" height="6.000" rx="0" fill="#9ab5d5"><title>GPU 2 · other · 22.722–22.749 ms · elementwise_kernel</title></rect>
+<rect x="1071.212" y="470.000" width="1.093" height="6.000" rx="0" fill="#08949d"><title>GPU 2 · FA · 22.752–22.828 ms · kernel_cutlass_kernel_flash_attncuteflash_bwd_preprocessFlashAttentionBackwardPreprocess_object_at__tensorptrbf16gmemalign16oi64div81i64div8i64div8_tensorptrbf16gmemalign16oi64div81i64div_0</title></rect>
+<rect x="1072.262" y="477.000" width="22.309" height="5.000" rx="0" fill="#df8a22"><title>GPU 2 · P2P · 22.825–24.391 ms · ncclDevKernel_SendRecv</title></rect>
+<rect x="1072.272" y="477.000" width="2.358" height="5.000" rx="0" fill="#df8a22"><title>GPU 2 · P2P · 22.826–22.992 ms · ncclDevKernel_SendRecv</title></rect>
+<rect x="1072.310" y="470.000" width="18.085" height="6.000" rx="0" fill="#08949d"><title>GPU 2 · FA · 22.829–24.098 ms · kernel_cutlass_kernel_flash_attncutesm100_hd256_2cta_fmha_backward_dqkernelBlackwellFusedMultiHeadAttentionBackwardDQKernel_object_at__TiledMMA_ThrLayoutVMNK21111000_PermutationMNK____MMA_0</title></rect>
+<rect x="1090.403" y="470.000" width="24.431" height="6.000" rx="0" fill="#08949d"><title>GPU 2 · FA · 24.098–25.813 ms · kernel_cutlass_dkdv_bwd_flash_attncutesm100_hd256_2cta_fmha_backward_dkdvkernelBlackwellFusedMultiHeadAttentionBackwardDKDVKernel_object_at__TiledMMA_ThrLayoutVMNK21111000_PermutationMNK__1</title></rect>
+<rect x="1114.837" y="470.000" width="1.228" height="6.000" rx="0" fill="#9ab5d5"><title>GPU 2 · other · 25.813–25.899 ms · vectorized_elementwise_kernel</title></rect>
+<rect x="1116.099" y="470.000" width="0.243" height="6.000" rx="0" fill="#9ab5d5"><title>GPU 2 · other · 25.902–25.919 ms · vectorized_elementwise_kernel</title></rect>
+<rect x="1116.347" y="470.000" width="0.242" height="6.000" rx="0" fill="#9ab5d5"><title>GPU 2 · other · 25.919–25.936 ms · vectorized_elementwise_kernel</title></rect>
+<rect x="1116.594" y="470.000" width="0.597" height="6.000" rx="0" fill="#9ab5d5"><title>GPU 2 · other · 25.936–25.978 ms · fused_rope_backward_kernel</title></rect>
+<rect x="1117.196" y="470.000" width="2.555" height="6.000" rx="0" fill="#9ab5d5"><title>GPU 2 · other · 25.979–26.158 ms · fused_rope_backward_kernel</title></rect>
+<rect x="1119.754" y="470.000" width="0.739" height="6.000" rx="0" fill="#9ab5d5"><title>GPU 2 · other · 26.158–26.210 ms · rmsnorm_bwd_general_kernel</title></rect>
+<rect x="1120.496" y="470.000" width="0.218" height="6.000" rx="0" fill="#9ab5d5"><title>GPU 2 · other · 26.210–26.226 ms · rmsnorm_bwd_finalize_general_kernel</title></rect>
+<rect x="1120.723" y="470.000" width="3.840" height="6.000" rx="0" fill="#9ab5d5"><title>GPU 2 · other · 26.226–26.496 ms · rmsnorm_bwd_general_kernel</title></rect>
+<rect x="1124.566" y="470.000" width="0.208" height="6.000" rx="0" fill="#9ab5d5"><title>GPU 2 · other · 26.496–26.510 ms · rmsnorm_bwd_finalize_general_kernel</title></rect>
+<rect x="1124.780" y="470.000" width="19.004" height="6.000" rx="0" fill="#9ab5d5"><title>GPU 2 · other · 26.511–27.844 ms · CatArrayBatchedCopy</title></rect>
+<rect x="1186.849" y="470.000" width="0.031" height="6.000" rx="0" fill="#9da9b5"><title>GPU 2 · mem · 30.867–30.869 ms · memset</title></rect>
+<rect x="1186.915" y="470.000" width="6.592" height="6.000" rx="0" fill="#9ab5d5"><title>GPU 2 · other · 30.871–31.334 ms · rmsnorm_bwd_general_kernel</title></rect>
+<rect x="1193.514" y="470.000" width="0.110" height="6.000" rx="0" fill="#9ab5d5"><title>GPU 2 · other · 31.334–31.342 ms · rmsnorm_bwd_finalize_general_kernel</title></rect>
+<rect x="1193.629" y="470.000" width="1.068" height="6.000" rx="0" fill="#9ab5d5"><title>GPU 2 · other · 31.342–31.417 ms · vectorized_elementwise_kernel</title></rect>
+<rect x="1194.759" y="470.000" width="0.344" height="6.000" rx="0" fill="#9da9b5"><title>GPU 2 · mem · 31.422–31.446 ms · 8</title></rect>
+<rect x="1195.131" y="470.000" width="0.032" height="6.000" rx="0" fill="#9da9b5"><title>GPU 2 · mem · 31.448–31.450 ms · 8</title></rect>
+<rect x="1195.186" y="470.000" width="0.720" height="6.000" rx="0" fill="#9da9b5"><title>GPU 2 · mem · 31.452–31.502 ms · 8</title></rect>
+<rect x="1195.952" y="470.000" width="0.033" height="6.000" rx="0" fill="#9da9b5"><title>GPU 2 · mem · 31.505–31.508 ms · 8</title></rect>
+<rect x="1196.003" y="470.000" width="0.032" height="6.000" rx="0" fill="#9da9b5"><title>GPU 2 · mem · 31.509–31.511 ms · 8</title></rect>
+<rect x="1196.061" y="470.000" width="0.036" height="6.000" rx="0" fill="#9da9b5"><title>GPU 2 · mem · 31.513–31.516 ms · 8</title></rect>
+<rect x="1196.124" y="470.000" width="1.702" height="6.000" rx="0" fill="#9da9b5"><title>GPU 2 · mem · 31.517–31.637 ms · 8</title></rect>
+<rect x="1197.880" y="470.000" width="0.868" height="6.000" rx="0" fill="#9da9b5"><title>GPU 2 · mem · 31.641–31.702 ms · 8</title></rect>
+<rect x="747.798" y="470.000" width="22.170" height="6.000" rx="0" fill="#3c70c6"><title>GPU 2 · GEMM · 0.056–1.612 ms · nvjet_sm100_tst_128x256_64x6_2x2_2cta_h_bz_NNT</title></rect>
+<rect x="769.923" y="470.000" width="22.318" height="6.000" rx="0" fill="#3c70c6"><title>GPU 2 · GEMM · 1.609–3.175 ms · nvjet_sm100_tss_256x256_64x4_2x1_2cta_v_badd_NTT</title></rect>
+<rect x="804.345" y="470.000" width="45.699" height="6.000" rx="0" fill="#3c70c6"><title>GPU 2 · GEMM · 4.024–7.231 ms · nvjet_sm100_tst_256x256_64x4_2x2_2cta_h_bz_NNT</title></rect>
+<rect x="849.975" y="470.000" width="45.436" height="6.000" rx="0" fill="#3c70c6"><title>GPU 2 · GEMM · 7.226–10.415 ms · nvjet_sm100_tss_256x256_64x4_2x2_2cta_h_badd_NTT</title></rect>
+<rect x="902.780" y="470.000" width="8.207" height="6.000" rx="0" fill="#3c70c6"><title>GPU 2 · GEMM · 10.932–11.508 ms · nvjet_sm100_tst_128x256_64x6_2x2_2cta_h_bz_NNT</title></rect>
+<rect x="910.938" y="470.000" width="9.112" height="6.000" rx="0" fill="#3c70c6"><title>GPU 2 · GEMM · 11.504–12.144 ms · nvjet_sm100_tss_320x192_64x3_2x2_2cta_h_badd_NTT</title></rect>
+<rect x="1143.777" y="470.000" width="21.331" height="6.000" rx="0" fill="#3c70c6"><title>GPU 2 · GEMM · 27.844–29.341 ms · nvjet_sm100_tst_256x256_64x4_2x2_2cta_h_bz_NNT</title></rect>
+<rect x="1165.028" y="470.000" width="21.775" height="6.000" rx="0" fill="#3c70c6"><title>GPU 2 · GEMM · 29.335–30.863 ms · nvjet_sm100_tss_256x256_64x4_2x2_2cta_h_badd_NTT</title></rect>
+<text x="738" y="497" font-size="11" fill="#63798c" font-weight="400" text-anchor="end">GPU 3</text>
+<line x1="747" y1="499" x2="1317" y2="499" stroke="#e9eff4" stroke-width="1"/>
+<rect x="794.371" y="487.000" width="0.789" height="6.000" rx="0" fill="#9da9b5"><title>GPU 3 · mem · 3.324–3.380 ms · 8</title></rect>
+<rect x="841.588" y="487.000" width="15.352" height="6.000" rx="0" fill="#9ab5d5"><title>GPU 3 · other · 6.638–7.715 ms · triton_poi_fused_add_cat_mul_rsub_sigmoid_silu_split_0</title></rect>
+<rect x="951.311" y="487.000" width="0.020" height="6.000" rx="0" fill="#9da9b5"><title>GPU 3 · mem · 14.338–14.339 ms · memset</title></rect>
+<rect x="951.389" y="487.000" width="5.951" height="6.000" rx="0" fill="#9ab5d5"><title>GPU 3 · other · 14.343–14.761 ms · rmsnorm_bwd_general_kernel</title></rect>
+<rect x="957.348" y="487.000" width="0.096" height="6.000" rx="0" fill="#9ab5d5"><title>GPU 3 · other · 14.761–14.768 ms · rmsnorm_bwd_finalize_general_kernel</title></rect>
+<rect x="957.448" y="487.000" width="1.038" height="6.000" rx="0" fill="#9ab5d5"><title>GPU 3 · other · 14.768–14.841 ms · vectorized_elementwise_kernel</title></rect>
+<rect x="975.578" y="487.000" width="1.959" height="6.000" rx="0" fill="#9ab5d5"><title>GPU 3 · other · 16.041–16.178 ms · triton_poi_fused__to_copy_mul_sigmoid_sigmoid_backward_view_0</title></rect>
+<rect x="977.539" y="487.000" width="0.341" height="6.000" rx="0" fill="#9da9b5"><title>GPU 3 · mem · 16.178–16.202 ms · 8</title></rect>
+<rect x="977.885" y="487.000" width="1.063" height="6.000" rx="0" fill="#08949d"><title>GPU 3 · FA · 16.202–16.277 ms · kernel_cutlass_kernel_flash_attncuteflash_bwd_preprocessFlashAttentionBackwardPreprocess_object_at__tensorptrbf16gmemalign16oi64div81i64div8i64div8_tensorptrbf16gmemalign16oi64div81i64div_0</title></rect>
+<rect x="978.913" y="494.000" width="29.769" height="5.000" rx="0" fill="#df8a22"><title>GPU 3 · P2P · 16.275–18.364 ms · ncclDevKernel_SendRecv</title></rect>
+<rect x="978.917" y="494.000" width="2.020" height="5.000" rx="0" fill="#df8a22"><title>GPU 3 · P2P · 16.275–16.417 ms · ncclDevKernel_SendRecv</title></rect>
+<rect x="978.953" y="487.000" width="14.595" height="6.000" rx="0" fill="#08949d"><title>GPU 3 · FA · 16.277–17.302 ms · kernel_cutlass_kernel_flash_attncutesm100_hd256_2cta_fmha_backward_dqkernelBlackwellFusedMultiHeadAttentionBackwardDQKernel_object_at__TiledMMA_ThrLayoutVMNK21111000_PermutationMNK____MMA_0</title></rect>
+<rect x="993.557" y="487.000" width="20.194" height="6.000" rx="0" fill="#08949d"><title>GPU 3 · FA · 17.302–18.719 ms · kernel_cutlass_dkdv_bwd_flash_attncutesm100_hd256_2cta_fmha_backward_dkdvkernelBlackwellFusedMultiHeadAttentionBackwardDKDVKernel_object_at__TiledMMA_ThrLayoutVMNK21111000_PermutationMNK__1</title></rect>
+<rect x="1013.754" y="487.000" width="0.847" height="6.000" rx="0" fill="#9da9b5"><title>GPU 3 · mem · 18.720–18.779 ms · 8</title></rect>
+<rect x="1014.646" y="487.000" width="0.325" height="6.000" rx="0" fill="#9ab5d5"><title>GPU 3 · other · 18.782–18.805 ms · elementwise_kernel</title></rect>
+<rect x="1014.976" y="487.000" width="0.311" height="6.000" rx="0" fill="#9ab5d5"><title>GPU 3 · other · 18.805–18.827 ms · elementwise_kernel</title></rect>
+<rect x="1015.316" y="487.000" width="1.061" height="6.000" rx="0" fill="#08949d"><title>GPU 3 · FA · 18.829–18.904 ms · kernel_cutlass_kernel_flash_attncuteflash_bwd_preprocessFlashAttentionBackwardPreprocess_object_at__tensorptrbf16gmemalign16oi64div81i64div8i64div8_tensorptrbf16gmemalign16oi64div81i64div_0</title></rect>
+<rect x="1016.333" y="494.000" width="31.425" height="5.000" rx="0" fill="#df8a22"><title>GPU 3 · P2P · 18.901–21.106 ms · ncclDevKernel_SendRecv</title></rect>
+<rect x="1016.343" y="494.000" width="4.117" height="5.000" rx="0" fill="#df8a22"><title>GPU 3 · P2P · 18.901–19.190 ms · ncclDevKernel_SendRecv</title></rect>
+<rect x="1016.381" y="487.000" width="15.095" height="6.000" rx="0" fill="#08949d"><title>GPU 3 · FA · 18.904–19.963 ms · kernel_cutlass_kernel_flash_attncutesm100_hd256_2cta_fmha_backward_dqkernelBlackwellFusedMultiHeadAttentionBackwardDQKernel_object_at__TiledMMA_ThrLayoutVMNK21111000_PermutationMNK____MMA_0</title></rect>
+<rect x="1031.484" y="487.000" width="20.541" height="6.000" rx="0" fill="#08949d"><title>GPU 3 · FA · 19.964–21.405 ms · kernel_cutlass_dkdv_bwd_flash_attncutesm100_hd256_2cta_fmha_backward_dkdvkernelBlackwellFusedMultiHeadAttentionBackwardDKDVKernel_object_at__TiledMMA_ThrLayoutVMNK21111000_PermutationMNK__1</title></rect>
+<rect x="1052.028" y="487.000" width="1.163" height="6.000" rx="0" fill="#9ab5d5"><title>GPU 3 · other · 21.405–21.487 ms · vectorized_elementwise_kernel</title></rect>
+<rect x="1053.225" y="487.000" width="0.352" height="6.000" rx="0" fill="#9ab5d5"><title>GPU 3 · other · 21.489–21.514 ms · elementwise_kernel</title></rect>
+<rect x="1053.582" y="487.000" width="0.347" height="6.000" rx="0" fill="#9ab5d5"><title>GPU 3 · other · 21.515–21.539 ms · elementwise_kernel</title></rect>
+<rect x="1053.958" y="487.000" width="1.028" height="6.000" rx="0" fill="#08949d"><title>GPU 3 · FA · 21.541–21.613 ms · kernel_cutlass_kernel_flash_attncuteflash_bwd_preprocessFlashAttentionBackwardPreprocess_object_at__tensorptrbf16gmemalign16oi64div81i64div8i64div8_tensorptrbf16gmemalign16oi64div81i64div_0</title></rect>
+<rect x="1054.942" y="494.000" width="28.182" height="5.000" rx="0" fill="#df8a22"><title>GPU 3 · P2P · 21.610–23.588 ms · ncclDevKernel_SendRecv</title></rect>
+<rect x="1054.953" y="494.000" width="3.671" height="5.000" rx="0" fill="#df8a22"><title>GPU 3 · P2P · 21.611–21.868 ms · ncclDevKernel_SendRecv</title></rect>
+<rect x="1054.990" y="487.000" width="14.278" height="6.000" rx="0" fill="#08949d"><title>GPU 3 · FA · 21.613–22.615 ms · kernel_cutlass_kernel_flash_attncutesm100_hd256_2cta_fmha_backward_dqkernelBlackwellFusedMultiHeadAttentionBackwardDQKernel_object_at__TiledMMA_ThrLayoutVMNK21111000_PermutationMNK____MMA_0</title></rect>
+<rect x="1069.276" y="487.000" width="19.846" height="6.000" rx="0" fill="#08949d"><title>GPU 3 · FA · 22.616–24.009 ms · kernel_cutlass_dkdv_bwd_flash_attncutesm100_hd256_2cta_fmha_backward_dkdvkernelBlackwellFusedMultiHeadAttentionBackwardDKDVKernel_object_at__TiledMMA_ThrLayoutVMNK21111000_PermutationMNK__1</title></rect>
+<rect x="1089.124" y="487.000" width="1.158" height="6.000" rx="0" fill="#9ab5d5"><title>GPU 3 · other · 24.009–24.090 ms · vectorized_elementwise_kernel</title></rect>
+<rect x="1090.312" y="487.000" width="0.352" height="6.000" rx="0" fill="#9ab5d5"><title>GPU 3 · other · 24.092–24.117 ms · elementwise_kernel</title></rect>
+<rect x="1090.671" y="487.000" width="0.355" height="6.000" rx="0" fill="#9ab5d5"><title>GPU 3 · other · 24.117–24.142 ms · elementwise_kernel</title></rect>
+<rect x="1091.055" y="487.000" width="1.021" height="6.000" rx="0" fill="#08949d"><title>GPU 3 · FA · 24.144–24.216 ms · kernel_cutlass_kernel_flash_attncuteflash_bwd_preprocessFlashAttentionBackwardPreprocess_object_at__tensorptrbf16gmemalign16oi64div81i64div8i64div8_tensorptrbf16gmemalign16oi64div81i64div_0</title></rect>
+<rect x="1092.039" y="494.000" width="1.875" height="5.000" rx="0" fill="#df8a22"><title>GPU 3 · P2P · 24.213–24.345 ms · ncclDevKernel_SendRecv</title></rect>
+<rect x="1092.046" y="494.000" width="24.480" height="5.000" rx="0" fill="#df8a22"><title>GPU 3 · P2P · 24.214–25.932 ms · ncclDevKernel_SendRecv</title></rect>
+<rect x="1092.080" y="487.000" width="15.007" height="6.000" rx="0" fill="#08949d"><title>GPU 3 · FA · 24.216–25.269 ms · kernel_cutlass_kernel_flash_attncutesm100_hd256_2cta_fmha_backward_dqkernelBlackwellFusedMultiHeadAttentionBackwardDQKernel_object_at__TiledMMA_ThrLayoutVMNK21111000_PermutationMNK____MMA_0</title></rect>
+<rect x="1107.092" y="487.000" width="21.045" height="6.000" rx="0" fill="#08949d"><title>GPU 3 · FA · 25.270–26.747 ms · kernel_cutlass_dkdv_bwd_flash_attncutesm100_hd256_2cta_fmha_backward_dkdvkernelBlackwellFusedMultiHeadAttentionBackwardDKDVKernel_object_at__TiledMMA_ThrLayoutVMNK21111000_PermutationMNK__1</title></rect>
+<rect x="1128.140" y="487.000" width="1.174" height="6.000" rx="0" fill="#9ab5d5"><title>GPU 3 · other · 26.747–26.829 ms · vectorized_elementwise_kernel</title></rect>
+<rect x="1129.346" y="487.000" width="0.229" height="6.000" rx="0" fill="#9ab5d5"><title>GPU 3 · other · 26.831–26.847 ms · vectorized_elementwise_kernel</title></rect>
+<rect x="1129.580" y="487.000" width="0.226" height="6.000" rx="0" fill="#9ab5d5"><title>GPU 3 · other · 26.848–26.864 ms · vectorized_elementwise_kernel</title></rect>
+<rect x="1129.810" y="487.000" width="0.511" height="6.000" rx="0" fill="#9ab5d5"><title>GPU 3 · other · 26.864–26.900 ms · fused_rope_backward_kernel</title></rect>
+<rect x="1130.331" y="487.000" width="2.273" height="6.000" rx="0" fill="#9ab5d5"><title>GPU 3 · other · 26.900–27.060 ms · fused_rope_backward_kernel</title></rect>
+<rect x="1132.606" y="487.000" width="0.694" height="6.000" rx="0" fill="#9ab5d5"><title>GPU 3 · other · 27.060–27.109 ms · rmsnorm_bwd_general_kernel</title></rect>
+<rect x="1133.307" y="487.000" width="0.201" height="6.000" rx="0" fill="#9ab5d5"><title>GPU 3 · other · 27.109–27.123 ms · rmsnorm_bwd_finalize_general_kernel</title></rect>
+<rect x="1133.513" y="487.000" width="3.493" height="6.000" rx="0" fill="#9ab5d5"><title>GPU 3 · other · 27.124–27.369 ms · rmsnorm_bwd_general_kernel</title></rect>
+<rect x="1137.008" y="487.000" width="0.187" height="6.000" rx="0" fill="#9ab5d5"><title>GPU 3 · other · 27.369–27.382 ms · rmsnorm_bwd_finalize_general_kernel</title></rect>
+<rect x="1137.201" y="487.000" width="15.986" height="6.000" rx="0" fill="#9ab5d5"><title>GPU 3 · other · 27.383–28.504 ms · CatArrayBatchedCopy</title></rect>
+<rect x="1189.421" y="487.000" width="0.026" height="6.000" rx="0" fill="#9da9b5"><title>GPU 3 · mem · 31.047–31.049 ms · memset</title></rect>
+<rect x="1189.485" y="487.000" width="5.836" height="6.000" rx="0" fill="#9ab5d5"><title>GPU 3 · other · 31.052–31.461 ms · rmsnorm_bwd_general_kernel</title></rect>
+<rect x="1195.330" y="487.000" width="0.099" height="6.000" rx="0" fill="#9ab5d5"><title>GPU 3 · other · 31.462–31.469 ms · rmsnorm_bwd_finalize_general_kernel</title></rect>
+<rect x="1195.434" y="487.000" width="1.019" height="6.000" rx="0" fill="#9ab5d5"><title>GPU 3 · other · 31.469–31.541 ms · vectorized_elementwise_kernel</title></rect>
+<rect x="1196.512" y="487.000" width="0.300" height="6.000" rx="0" fill="#9da9b5"><title>GPU 3 · mem · 31.545–31.566 ms · 8</title></rect>
+<rect x="1196.865" y="487.000" width="0.035" height="6.000" rx="0" fill="#9da9b5"><title>GPU 3 · mem · 31.569–31.572 ms · 8</title></rect>
+<rect x="1196.940" y="487.000" width="0.675" height="6.000" rx="0" fill="#9da9b5"><title>GPU 3 · mem · 31.575–31.622 ms · 8</title></rect>
+<rect x="1197.659" y="487.000" width="0.039" height="6.000" rx="0" fill="#9da9b5"><title>GPU 3 · mem · 31.625–31.628 ms · 8</title></rect>
+<rect x="1197.743" y="487.000" width="0.032" height="6.000" rx="0" fill="#9da9b5"><title>GPU 3 · mem · 31.631–31.633 ms · 8</title></rect>
+<rect x="1197.800" y="487.000" width="0.029" height="6.000" rx="0" fill="#9da9b5"><title>GPU 3 · mem · 31.635–31.637 ms · 8</title></rect>
+<rect x="1197.863" y="487.000" width="1.592" height="6.000" rx="0" fill="#9da9b5"><title>GPU 3 · mem · 31.640–31.751 ms · 8</title></rect>
+<rect x="1199.503" y="487.000" width="0.810" height="6.000" rx="0" fill="#9da9b5"><title>GPU 3 · mem · 31.755–31.811 ms · 8</title></rect>
+<rect x="795.208" y="487.000" width="23.250" height="6.000" rx="0" fill="#3c70c6"><title>GPU 3 · GEMM · 3.383–5.015 ms · nvjet_sm100_tst_128x256_64x6_2x2_2cta_h_bz_NNT</title></rect>
+<rect x="818.416" y="487.000" width="23.165" height="6.000" rx="0" fill="#3c70c6"><title>GPU 3 · GEMM · 5.012–6.637 ms · nvjet_sm100_tss_256x256_64x4_2x1_2cta_v_badd_NTT</title></rect>
+<rect x="856.936" y="487.000" width="46.489" height="6.000" rx="0" fill="#3c70c6"><title>GPU 3 · GEMM · 7.715–10.977 ms · nvjet_sm100_tst_256x256_64x4_2x2_2cta_h_bz_NNT</title></rect>
+<rect x="903.347" y="487.000" width="47.916" height="6.000" rx="0" fill="#3c70c6"><title>GPU 3 · GEMM · 10.972–14.334 ms · nvjet_sm100_tss_256x256_64x4_2x2_2cta_h_badd_NTT</title></rect>
+<rect x="958.486" y="487.000" width="8.190" height="6.000" rx="0" fill="#3c70c6"><title>GPU 3 · GEMM · 14.841–15.416 ms · nvjet_sm100_tst_128x256_64x6_2x2_2cta_h_bz_NNT</title></rect>
+<rect x="966.632" y="487.000" width="8.944" height="6.000" rx="0" fill="#3c70c6"><title>GPU 3 · GEMM · 15.413–16.040 ms · nvjet_sm100_tss_320x192_64x3_2x2_2cta_h_badd_NTT</title></rect>
+<rect x="1153.182" y="487.000" width="17.965" height="6.000" rx="0" fill="#3c70c6"><title>GPU 3 · GEMM · 28.504–29.765 ms · nvjet_sm100_tst_256x256_64x4_2x2_2cta_h_bz_NNT</title></rect>
+<rect x="1171.076" y="487.000" width="18.302" height="6.000" rx="0" fill="#3c70c6"><title>GPU 3 · GEMM · 29.760–31.044 ms · nvjet_sm100_tss_256x256_64x4_2x2_2cta_h_badd_NTT</title></rect>
+<text x="738" y="514" font-size="11" fill="#16764f" font-weight="700" text-anchor="end">可用</text>
+<rect x="747.000" y="508.000" width="570.000" height="7.000" rx="1" fill="#e7f2eb"/>
+<rect x="806.653" y="508.000" width="11.230" height="7.000" rx="0" fill="#2b9e65"><title>四卡可用 · 4.186–4.974 ms</title></rect>
+<rect x="817.894" y="508.000" width="23.687" height="7.000" rx="0" fill="#2b9e65"><title>四卡可用 · 4.975–6.637 ms</title></rect>
+<rect x="841.588" y="508.000" width="15.093" height="7.000" rx="0" fill="#2b9e65"><title>四卡可用 · 6.638–7.697 ms</title></rect>
+<rect x="856.684" y="508.000" width="38.727" height="7.000" rx="0" fill="#2b9e65"><title>四卡可用 · 7.697–10.415 ms</title></rect>
+<rect x="895.535" y="508.000" width="6.078" height="7.000" rx="0" fill="#2b9e65"><title>四卡可用 · 10.423–10.850 ms</title></rect>
+<rect x="901.622" y="508.000" width="0.103" height="7.000" rx="0" fill="#2b9e65"><title>四卡可用 · 10.851–10.858 ms</title></rect>
+<rect x="901.730" y="508.000" width="18.320" height="7.000" rx="0" fill="#2b9e65"><title>四卡可用 · 10.858–12.144 ms</title></rect>
+<rect x="920.052" y="508.000" width="1.969" height="7.000" rx="0" fill="#2b9e65"><title>四卡可用 · 12.144–12.282 ms</title></rect>
+<rect x="922.024" y="508.000" width="0.047" height="7.000" rx="0" fill="#2b9e65"><title>四卡可用 · 12.282–12.286 ms</title></rect>
+<rect x="922.416" y="508.000" width="0.579" height="7.000" rx="0" fill="#2b9e65"><title>四卡可用 · 12.310–12.351 ms</title></rect>
+<rect x="1116.526" y="508.000" width="0.062" height="7.000" rx="0" fill="#2b9e65"><title>四卡可用 · 25.932–25.936 ms</title></rect>
+<rect x="1116.594" y="508.000" width="0.597" height="7.000" rx="0" fill="#2b9e65"><title>四卡可用 · 25.936–25.978 ms</title></rect>
+<rect x="1117.196" y="508.000" width="2.555" height="7.000" rx="0" fill="#2b9e65"><title>四卡可用 · 25.979–26.158 ms</title></rect>
+<rect x="1119.754" y="508.000" width="0.739" height="7.000" rx="0" fill="#2b9e65"><title>四卡可用 · 26.158–26.210 ms</title></rect>
+<rect x="1120.496" y="508.000" width="0.218" height="7.000" rx="0" fill="#2b9e65"><title>四卡可用 · 26.210–26.226 ms</title></rect>
+<rect x="1120.723" y="508.000" width="3.840" height="7.000" rx="0" fill="#2b9e65"><title>四卡可用 · 26.226–26.496 ms</title></rect>
+<rect x="1124.566" y="508.000" width="0.208" height="7.000" rx="0" fill="#2b9e65"><title>四卡可用 · 26.496–26.510 ms</title></rect>
+<rect x="1124.780" y="508.000" width="3.358" height="7.000" rx="0" fill="#2b9e65"><title>四卡可用 · 26.511–26.747 ms</title></rect>
+<rect x="1128.140" y="508.000" width="0.049" height="7.000" rx="0" fill="#2b9e65"><title>四卡可用 · 26.747–26.750 ms</title></rect>
+<rect x="1128.192" y="508.000" width="1.122" height="7.000" rx="0" fill="#2b9e65"><title>四卡可用 · 26.750–26.829 ms</title></rect>
+<rect x="1129.346" y="508.000" width="0.060" height="7.000" rx="0" fill="#2b9e65"><title>四卡可用 · 26.831–26.835 ms</title></rect>
+<rect x="1129.446" y="508.000" width="0.012" height="7.000" rx="0" fill="#2b9e65"><title>四卡可用 · 26.838–26.839 ms</title></rect>
+<rect x="1129.461" y="508.000" width="0.114" height="7.000" rx="0" fill="#2b9e65"><title>四卡可用 · 26.839–26.847 ms</title></rect>
+<rect x="1129.580" y="508.000" width="0.106" height="7.000" rx="0" fill="#2b9e65"><title>四卡可用 · 26.848–26.855 ms</title></rect>
+<rect x="1129.690" y="508.000" width="0.115" height="7.000" rx="0" fill="#2b9e65"><title>四卡可用 · 26.855–26.864 ms</title></rect>
+<rect x="1129.810" y="508.000" width="0.110" height="7.000" rx="0" fill="#2b9e65"><title>四卡可用 · 26.864–26.872 ms</title></rect>
+<rect x="1129.926" y="508.000" width="0.396" height="7.000" rx="0" fill="#2b9e65"><title>四卡可用 · 26.872–26.900 ms</title></rect>
+<rect x="1130.331" y="508.000" width="0.165" height="7.000" rx="0" fill="#2b9e65"><title>四卡可用 · 26.900–26.912 ms</title></rect>
+<rect x="1130.499" y="508.000" width="2.105" height="7.000" rx="0" fill="#2b9e65"><title>四卡可用 · 26.912–27.060 ms</title></rect>
+<rect x="1132.606" y="508.000" width="0.321" height="7.000" rx="0" fill="#2b9e65"><title>四卡可用 · 27.060–27.083 ms</title></rect>
+<rect x="1132.930" y="508.000" width="0.371" height="7.000" rx="0" fill="#2b9e65"><title>四卡可用 · 27.083–27.109 ms</title></rect>
+<rect x="1133.307" y="508.000" width="0.201" height="7.000" rx="0" fill="#2b9e65"><title>四卡可用 · 27.109–27.123 ms</title></rect>
+<rect x="1133.513" y="508.000" width="0.149" height="7.000" rx="0" fill="#2b9e65"><title>四卡可用 · 27.124–27.134 ms</title></rect>
+<rect x="1133.665" y="508.000" width="0.209" height="7.000" rx="0" fill="#2b9e65"><title>四卡可用 · 27.134–27.149 ms</title></rect>
+<rect x="1133.882" y="508.000" width="3.124" height="7.000" rx="0" fill="#2b9e65"><title>四卡可用 · 27.150–27.369 ms</title></rect>
+<rect x="1137.008" y="508.000" width="0.187" height="7.000" rx="0" fill="#2b9e65"><title>四卡可用 · 27.369–27.382 ms</title></rect>
+<rect x="1137.201" y="508.000" width="0.460" height="7.000" rx="0" fill="#2b9e65"><title>四卡可用 · 27.383–27.415 ms</title></rect>
+<rect x="1137.663" y="508.000" width="0.194" height="7.000" rx="0" fill="#2b9e65"><title>四卡可用 · 27.415–27.429 ms</title></rect>
+<rect x="1137.862" y="508.000" width="13.936" height="7.000" rx="0" fill="#2b9e65"><title>四卡可用 · 27.429–28.407 ms</title></rect>
+<rect x="1151.804" y="508.000" width="1.700" height="7.000" rx="0" fill="#2b9e65"><title>四卡可用 · 28.407–28.527 ms</title></rect>
+<rect x="1153.506" y="508.000" width="2.039" height="7.000" rx="0" fill="#2b9e65"><title>四卡可用 · 28.527–28.670 ms</title></rect>
+<rect x="1155.582" y="508.000" width="0.369" height="7.000" rx="0" fill="#2b9e65"><title>四卡可用 · 28.672–28.698 ms</title></rect>
+<rect x="1155.956" y="508.000" width="0.321" height="7.000" rx="0" fill="#2b9e65"><title>四卡可用 · 28.699–28.721 ms</title></rect>
+<rect x="1156.282" y="508.000" width="0.363" height="7.000" rx="0" fill="#2b9e65"><title>四卡可用 · 28.722–28.747 ms</title></rect>
+<rect x="1156.650" y="508.000" width="0.321" height="7.000" rx="0" fill="#2b9e65"><title>四卡可用 · 28.747–28.770 ms</title></rect>
+<rect x="1156.977" y="508.000" width="0.560" height="7.000" rx="0" fill="#2b9e65"><title>四卡可用 · 28.770–28.810 ms</title></rect>
+<rect x="1157.542" y="508.000" width="2.421" height="7.000" rx="0" fill="#2b9e65"><title>四卡可用 · 28.810–28.980 ms</title></rect>
+<rect x="1159.966" y="508.000" width="0.708" height="7.000" rx="0" fill="#2b9e65"><title>四卡可用 · 28.980–29.030 ms</title></rect>
+<rect x="1160.677" y="508.000" width="0.210" height="7.000" rx="0" fill="#2b9e65"><title>四卡可用 · 29.030–29.045 ms</title></rect>
+<rect x="1160.892" y="508.000" width="3.664" height="7.000" rx="0" fill="#2b9e65"><title>四卡可用 · 29.045–29.302 ms</title></rect>
+<rect x="1164.559" y="508.000" width="0.202" height="7.000" rx="0" fill="#2b9e65"><title>四卡可用 · 29.302–29.317 ms</title></rect>
+<rect x="1164.766" y="508.000" width="22.036" height="7.000" rx="0" fill="#2b9e65"><title>四卡可用 · 29.317–30.863 ms</title></rect>
+<rect x="1186.915" y="508.000" width="2.463" height="7.000" rx="0" fill="#2b9e65"><title>四卡可用 · 30.871–31.044 ms</title></rect>
+<rect x="1189.485" y="508.000" width="4.022" height="7.000" rx="0" fill="#2b9e65"><title>四卡可用 · 31.052–31.334 ms</title></rect>
+<rect x="1193.514" y="508.000" width="0.110" height="7.000" rx="0" fill="#2b9e65"><title>四卡可用 · 31.334–31.342 ms</title></rect>
+<rect x="1193.629" y="508.000" width="1.068" height="7.000" rx="0" fill="#2b9e65"><title>四卡可用 · 31.342–31.417 ms</title></rect>
+<text x="1345" y="429" font-size="12" fill="#217c80" font-weight="700" text-anchor="end">浅青线 · 无 NCCL 最长 8.23 ms</text>
+<line x1="805.7517525" y1="505" x2="922.99548" y2="505" stroke="#58a7a9" stroke-width="2"/>
+<line x1="1116.526212" y1="505" x2="1198.748256" y2="505" stroke="#58a7a9" stroke-width="2"/>
+<rect x="34.000" y="547.000" width="1332.000" height="143.000" rx="11" fill="#ffffff" stroke="#d4e1eb"/>
+<text x="53" y="570" font-size="15" fill="#356eb7" font-weight="700" text-anchor="start">DDP · TP4 + SP</text>
+<text x="107" y="583" font-size="13" fill="#112b43" font-weight="700" text-anchor="start">前向  15.15 ms  ·  四卡累计可用 10.78 ms</text>
+<line x1="107.0" y1="589" x2="107.0" y2="671" stroke="#d4e1eb" stroke-width="1"/>
+<text x="107.0" y="686" font-size="11" fill="#63798c" font-weight="400" text-anchor="middle">0</text>
+<line x1="249.5" y1="589" x2="249.5" y2="671" stroke="#d4e1eb" stroke-width="1"/>
+<text x="249.5" y="686" font-size="11" fill="#63798c" font-weight="400" text-anchor="middle">5</text>
+<line x1="392.0" y1="589" x2="392.0" y2="671" stroke="#d4e1eb" stroke-width="1"/>
+<text x="392.0" y="686" font-size="11" fill="#63798c" font-weight="400" text-anchor="middle">10</text>
+<line x1="534.5" y1="589" x2="534.5" y2="671" stroke="#d4e1eb" stroke-width="1"/>
+<text x="534.5" y="686" font-size="11" fill="#63798c" font-weight="400" text-anchor="middle">15</text>
+<line x1="677.0" y1="589" x2="677.0" y2="671" stroke="#d4e1eb" stroke-width="1"/>
+<text x="677.0" y="686" font-size="11" fill="#63798c" font-weight="400" text-anchor="middle">20 ms</text>
+<text x="98" y="600" font-size="11" fill="#63798c" font-weight="400" text-anchor="end">GPU 0</text>
+<line x1="107" y1="602" x2="677" y2="602" stroke="#e9eff4" stroke-width="1"/>
+<rect x="107.783" y="590.000" width="1.552" height="6.000" rx="0" fill="#9da9b5"><title>GPU 0 · mem · 0.027–0.082 ms · 8</title></rect>
+<rect x="109.417" y="590.000" width="9.451" height="6.000" rx="0" fill="#9da9b5"><title>GPU 0 · mem · 0.085–0.416 ms · 8</title></rect>
+<rect x="118.914" y="590.000" width="0.117" height="6.000" rx="0" fill="#9da9b5"><title>GPU 0 · mem · 0.418–0.422 ms · 8</title></rect>
+<rect x="119.101" y="590.000" width="5.869" height="6.000" rx="0" fill="#9ab5d5"><title>GPU 0 · other · 0.425–0.631 ms · rmsnorm_fwd_general_kernel</title></rect>
+<rect x="125.075" y="597.000" width="25.820" height="5.000" rx="0" fill="#e0a12d"><title>GPU 0 · AG · 0.634–1.540 ms · ncclDevKernel_AllGather_RING</title></rect>
+<rect x="191.081" y="590.000" width="6.306" height="6.000" rx="0" fill="#9ab5d5"><title>GPU 0 · other · 2.950–3.171 ms · elementwise_kernel</title></rect>
+<rect x="197.392" y="590.000" width="2.747" height="6.000" rx="0" fill="#9ab5d5"><title>GPU 0 · other · 3.172–3.268 ms · rmsnorm_fwd_general_kernel</title></rect>
+<rect x="200.144" y="590.000" width="1.144" height="6.000" rx="0" fill="#9ab5d5"><title>GPU 0 · other · 3.268–3.308 ms · elementwise_kernel</title></rect>
+<rect x="201.293" y="590.000" width="0.401" height="6.000" rx="0" fill="#9ab5d5"><title>GPU 0 · other · 3.309–3.323 ms · rmsnorm_fwd_general_kernel</title></rect>
+<rect x="201.703" y="590.000" width="5.290" height="6.000" rx="0" fill="#9ab5d5"><title>GPU 0 · other · 3.323–3.509 ms · fused_rope_forward_kernel</title></rect>
+<rect x="206.997" y="590.000" width="2.084" height="6.000" rx="0" fill="#9ab5d5"><title>GPU 0 · other · 3.509–3.582 ms · fused_rope_forward_kernel</title></rect>
+<rect x="209.086" y="590.000" width="1.125" height="6.000" rx="0" fill="#9ab5d5"><title>GPU 0 · other · 3.582–3.621 ms · elementwise_kernel</title></rect>
+<rect x="210.225" y="590.000" width="6.806" height="6.000" rx="0" fill="#9ab5d5"><title>GPU 0 · other · 3.622–3.861 ms · elementwise_kernel</title></rect>
+<rect x="217.036" y="590.000" width="1.213" height="6.000" rx="0" fill="#9ab5d5"><title>GPU 0 · other · 3.861–3.903 ms · elementwise_kernel</title></rect>
+<rect x="218.258" y="590.000" width="1.205" height="6.000" rx="0" fill="#9ab5d5"><title>GPU 0 · other · 3.904–3.946 ms · elementwise_kernel</title></rect>
+<rect x="219.473" y="590.000" width="57.247" height="6.000" rx="0" fill="#08949d"><title>GPU 0 · FA · 3.946–5.955 ms · kernel_cutlass_kernel_flash_attncutesm100_hd256_2cta_fmha_forwardBlackwellFusedMultiHeadAttentionForward_object_at__TiledMMA_ThrLayoutVMNK21111000_PermutationMNK____MMAAtom_ThrID21_ShapeM_0</title></rect>
+<rect x="276.732" y="590.000" width="6.804" height="6.000" rx="0" fill="#9ab5d5"><title>GPU 0 · other · 5.955–6.194 ms · elementwise_kernel</title></rect>
+<rect x="283.540" y="590.000" width="2.479" height="6.000" rx="0" fill="#9ab5d5"><title>GPU 0 · other · 6.194–6.281 ms · triton_poi_fused__to_copy_clone_mul_sigmoid_view_0</title></rect>
+<rect x="302.005" y="597.000" width="25.099" height="5.000" rx="0" fill="#9856a8"><title>GPU 0 · RS · 6.842–7.723 ms · ncclDevKernel_ReduceScatter_bf16_RING</title></rect>
+<rect x="327.118" y="590.000" width="2.083" height="6.000" rx="0" fill="#9ab5d5"><title>GPU 0 · other · 7.723–7.797 ms · vectorized_elementwise_kernel</title></rect>
+<rect x="329.205" y="590.000" width="5.869" height="6.000" rx="0" fill="#9ab5d5"><title>GPU 0 · other · 7.797–8.003 ms · rmsnorm_fwd_general_kernel</title></rect>
+<rect x="335.178" y="597.000" width="26.166" height="5.000" rx="0" fill="#e0a12d"><title>GPU 0 · AG · 8.006–8.924 ms · ncclDevKernel_AllGather_RING</title></rect>
+<rect x="456.723" y="590.000" width="7.832" height="6.000" rx="0" fill="#9ab5d5"><title>GPU 0 · other · 12.271–12.546 ms · triton_poi_fused_mul_silu_split_0</title></rect>
+<rect x="511.190" y="597.000" width="25.396" height="5.000" rx="0" fill="#9856a8"><title>GPU 0 · RS · 14.182–15.073 ms · ncclDevKernel_ReduceScatter_bf16_RING</title></rect>
+<rect x="536.599" y="590.000" width="2.079" height="6.000" rx="0" fill="#9ab5d5"><title>GPU 0 · other · 15.074–15.147 ms · vectorized_elementwise_kernel</title></rect>
+<rect x="150.887" y="590.000" width="40.189" height="6.000" rx="0" fill="#3c70c6"><title>GPU 0 · GEMM · 1.540–2.950 ms · nvjet_sm100_tst_128x256_64x6_2x2_2cta_h_bz_TNT</title></rect>
+<rect x="286.011" y="590.000" width="15.904" height="6.000" rx="0" fill="#3c70c6"><title>GPU 0 · GEMM · 6.281–6.839 ms · nvjet_sm100_tst_128x256_64x6_2x1_2cta_v_bz_TNT</title></rect>
+<rect x="361.337" y="590.000" width="95.387" height="6.000" rx="0" fill="#3c70c6"><title>GPU 0 · GEMM · 8.924–12.271 ms · nvjet_sm100_tst_128x256_64x6_2x2_2cta_h_bz_TNT</title></rect>
+<rect x="464.555" y="590.000" width="46.505" height="6.000" rx="0" fill="#3c70c6"><title>GPU 0 · GEMM · 12.546–14.178 ms · nvjet_sm100_tst_128x256_64x6_2x1_2cta_v_bz_TNT</title></rect>
+<text x="98" y="617" font-size="11" fill="#63798c" font-weight="400" text-anchor="end">GPU 1</text>
+<line x1="107" y1="619" x2="677" y2="619" stroke="#e9eff4" stroke-width="1"/>
+<rect x="107.302" y="607.000" width="1.551" height="6.000" rx="0" fill="#9da9b5"><title>GPU 1 · mem · 0.011–0.065 ms · 8</title></rect>
+<rect x="108.937" y="607.000" width="9.399" height="6.000" rx="0" fill="#9da9b5"><title>GPU 1 · mem · 0.068–0.398 ms · 8</title></rect>
+<rect x="118.391" y="607.000" width="0.091" height="6.000" rx="0" fill="#9da9b5"><title>GPU 1 · mem · 0.400–0.403 ms · 8</title></rect>
+<rect x="118.571" y="607.000" width="5.757" height="6.000" rx="0" fill="#9ab5d5"><title>GPU 1 · other · 0.406–0.608 ms · rmsnorm_fwd_general_kernel</title></rect>
+<rect x="124.428" y="614.000" width="26.097" height="5.000" rx="0" fill="#e0a12d"><title>GPU 1 · AG · 0.612–1.527 ms · ncclDevKernel_AllGather_RING</title></rect>
+<rect x="189.582" y="607.000" width="6.220" height="6.000" rx="0" fill="#9ab5d5"><title>GPU 1 · other · 2.898–3.116 ms · elementwise_kernel</title></rect>
+<rect x="195.806" y="607.000" width="2.704" height="6.000" rx="0" fill="#9ab5d5"><title>GPU 1 · other · 3.116–3.211 ms · rmsnorm_fwd_general_kernel</title></rect>
+<rect x="198.515" y="607.000" width="1.120" height="6.000" rx="0" fill="#9ab5d5"><title>GPU 1 · other · 3.211–3.250 ms · elementwise_kernel</title></rect>
+<rect x="199.640" y="607.000" width="0.386" height="6.000" rx="0" fill="#9ab5d5"><title>GPU 1 · other · 3.251–3.264 ms · rmsnorm_fwd_general_kernel</title></rect>
+<rect x="200.034" y="607.000" width="5.196" height="6.000" rx="0" fill="#9ab5d5"><title>GPU 1 · other · 3.264–3.447 ms · fused_rope_forward_kernel</title></rect>
+<rect x="205.236" y="607.000" width="1.999" height="6.000" rx="0" fill="#9ab5d5"><title>GPU 1 · other · 3.447–3.517 ms · fused_rope_forward_kernel</title></rect>
+<rect x="207.244" y="607.000" width="1.110" height="6.000" rx="0" fill="#9ab5d5"><title>GPU 1 · other · 3.517–3.556 ms · elementwise_kernel</title></rect>
+<rect x="208.367" y="607.000" width="6.662" height="6.000" rx="0" fill="#9ab5d5"><title>GPU 1 · other · 3.557–3.791 ms · elementwise_kernel</title></rect>
+<rect x="215.034" y="607.000" width="1.176" height="6.000" rx="0" fill="#9ab5d5"><title>GPU 1 · other · 3.791–3.832 ms · elementwise_kernel</title></rect>
+<rect x="216.220" y="607.000" width="1.190" height="6.000" rx="0" fill="#9ab5d5"><title>GPU 1 · other · 3.832–3.874 ms · elementwise_kernel</title></rect>
+<rect x="217.420" y="607.000" width="56.648" height="6.000" rx="0" fill="#08949d"><title>GPU 1 · FA · 3.874–5.862 ms · kernel_cutlass_kernel_flash_attncutesm100_hd256_2cta_fmha_forwardBlackwellFusedMultiHeadAttentionForward_object_at__TiledMMA_ThrLayoutVMNK21111000_PermutationMNK____MMAAtom_ThrID21_ShapeM_0</title></rect>
+<rect x="274.084" y="607.000" width="7.021" height="6.000" rx="0" fill="#9ab5d5"><title>GPU 1 · other · 5.863–6.109 ms · elementwise_kernel</title></rect>
+<rect x="281.109" y="607.000" width="2.535" height="6.000" rx="0" fill="#9ab5d5"><title>GPU 1 · other · 6.109–6.198 ms · triton_poi_fused__to_copy_clone_mul_sigmoid_view_0</title></rect>
+<rect x="299.724" y="614.000" width="27.204" height="5.000" rx="0" fill="#9856a8"><title>GPU 1 · RS · 6.762–7.717 ms · ncclDevKernel_ReduceScatter_bf16_RING</title></rect>
+<rect x="326.944" y="607.000" width="2.115" height="6.000" rx="0" fill="#9ab5d5"><title>GPU 1 · other · 7.717–7.792 ms · vectorized_elementwise_kernel</title></rect>
+<rect x="329.063" y="607.000" width="5.953" height="6.000" rx="0" fill="#9ab5d5"><title>GPU 1 · other · 7.792–8.001 ms · rmsnorm_fwd_general_kernel</title></rect>
+<rect x="335.117" y="614.000" width="26.381" height="5.000" rx="0" fill="#e0a12d"><title>GPU 1 · AG · 8.004–8.930 ms · ncclDevKernel_AllGather_RING</title></rect>
+<rect x="456.015" y="607.000" width="8.218" height="6.000" rx="0" fill="#9ab5d5"><title>GPU 1 · other · 12.246–12.534 ms · triton_poi_fused_mul_silu_split_0</title></rect>
+<rect x="510.248" y="614.000" width="25.992" height="5.000" rx="0" fill="#9856a8"><title>GPU 1 · RS · 14.149–15.061 ms · ncclDevKernel_ReduceScatter_bf16_RING</title></rect>
+<rect x="536.254" y="607.000" width="2.116" height="6.000" rx="0" fill="#9ab5d5"><title>GPU 1 · other · 15.062–15.136 ms · vectorized_elementwise_kernel</title></rect>
+<rect x="150.513" y="607.000" width="39.064" height="6.000" rx="0" fill="#3c70c6"><title>GPU 1 · GEMM · 1.527–2.897 ms · nvjet_sm100_tst_128x256_64x6_2x2_2cta_h_bz_TNT</title></rect>
+<rect x="283.638" y="607.000" width="15.990" height="6.000" rx="0" fill="#3c70c6"><title>GPU 1 · GEMM · 6.198–6.759 ms · nvjet_sm100_tst_128x256_64x6_2x1_2cta_v_bz_TNT</title></rect>
+<rect x="361.490" y="607.000" width="94.519" height="6.000" rx="0" fill="#3c70c6"><title>GPU 1 · GEMM · 8.929–12.246 ms · nvjet_sm100_tst_128x256_64x6_2x2_2cta_h_bz_TNT</title></rect>
+<rect x="464.225" y="607.000" width="45.900" height="6.000" rx="0" fill="#3c70c6"><title>GPU 1 · GEMM · 12.534–14.145 ms · nvjet_sm100_tst_128x256_64x6_2x1_2cta_v_bz_TNT</title></rect>
+<text x="98" y="634" font-size="11" fill="#63798c" font-weight="400" text-anchor="end">GPU 2</text>
+<line x1="107" y1="636" x2="677" y2="636" stroke="#e9eff4" stroke-width="1"/>
+<rect x="107.000" y="624.000" width="1.555" height="6.000" rx="0" fill="#9da9b5"><title>GPU 2 · mem · 0.000–0.055 ms · 8</title></rect>
+<rect x="108.646" y="624.000" width="9.452" height="6.000" rx="0" fill="#9da9b5"><title>GPU 2 · mem · 0.058–0.389 ms · 8</title></rect>
+<rect x="118.149" y="624.000" width="0.104" height="6.000" rx="0" fill="#9da9b5"><title>GPU 2 · mem · 0.391–0.395 ms · 8</title></rect>
+<rect x="118.328" y="624.000" width="5.844" height="6.000" rx="0" fill="#9ab5d5"><title>GPU 2 · other · 0.397–0.603 ms · rmsnorm_fwd_general_kernel</title></rect>
+<rect x="124.246" y="631.000" width="26.171" height="5.000" rx="0" fill="#e0a12d"><title>GPU 2 · AG · 0.605–1.523 ms · ncclDevKernel_AllGather_RING</title></rect>
+<rect x="190.265" y="624.000" width="6.317" height="6.000" rx="0" fill="#9ab5d5"><title>GPU 2 · other · 2.922–3.143 ms · elementwise_kernel</title></rect>
+<rect x="196.587" y="624.000" width="2.711" height="6.000" rx="0" fill="#9ab5d5"><title>GPU 2 · other · 3.143–3.239 ms · rmsnorm_fwd_general_kernel</title></rect>
+<rect x="199.302" y="624.000" width="1.134" height="6.000" rx="0" fill="#9ab5d5"><title>GPU 2 · other · 3.239–3.278 ms · elementwise_kernel</title></rect>
+<rect x="200.440" y="624.000" width="0.393" height="6.000" rx="0" fill="#9ab5d5"><title>GPU 2 · other · 3.279–3.292 ms · rmsnorm_fwd_general_kernel</title></rect>
+<rect x="200.842" y="624.000" width="5.275" height="6.000" rx="0" fill="#9ab5d5"><title>GPU 2 · other · 3.293–3.478 ms · fused_rope_forward_kernel</title></rect>
+<rect x="206.129" y="624.000" width="2.047" height="6.000" rx="0" fill="#9ab5d5"><title>GPU 2 · other · 3.478–3.550 ms · fused_rope_forward_kernel</title></rect>
+<rect x="208.186" y="624.000" width="1.126" height="6.000" rx="0" fill="#9ab5d5"><title>GPU 2 · other · 3.550–3.590 ms · elementwise_kernel</title></rect>
+<rect x="209.326" y="624.000" width="6.758" height="6.000" rx="0" fill="#9ab5d5"><title>GPU 2 · other · 3.590–3.828 ms · elementwise_kernel</title></rect>
+<rect x="216.089" y="624.000" width="1.200" height="6.000" rx="0" fill="#9ab5d5"><title>GPU 2 · other · 3.828–3.870 ms · elementwise_kernel</title></rect>
+<rect x="217.298" y="624.000" width="1.208" height="6.000" rx="0" fill="#9ab5d5"><title>GPU 2 · other · 3.870–3.913 ms · elementwise_kernel</title></rect>
+<rect x="218.517" y="624.000" width="57.710" height="6.000" rx="0" fill="#08949d"><title>GPU 2 · FA · 3.913–5.938 ms · kernel_cutlass_kernel_flash_attncutesm100_hd256_2cta_fmha_forwardBlackwellFusedMultiHeadAttentionForward_object_at__TiledMMA_ThrLayoutVMNK21111000_PermutationMNK____MMAAtom_ThrID21_ShapeM_0</title></rect>
+<rect x="276.238" y="624.000" width="6.708" height="6.000" rx="0" fill="#9ab5d5"><title>GPU 2 · other · 5.938–6.174 ms · elementwise_kernel</title></rect>
+<rect x="282.950" y="624.000" width="2.457" height="6.000" rx="0" fill="#9ab5d5"><title>GPU 2 · other · 6.174–6.260 ms · triton_poi_fused__to_copy_clone_mul_sigmoid_view_0</title></rect>
+<rect x="301.462" y="631.000" width="25.597" height="5.000" rx="0" fill="#9856a8"><title>GPU 2 · RS · 6.823–7.721 ms · ncclDevKernel_ReduceScatter_bf16_RING</title></rect>
+<rect x="327.073" y="624.000" width="2.092" height="6.000" rx="0" fill="#9ab5d5"><title>GPU 2 · other · 7.722–7.795 ms · vectorized_elementwise_kernel</title></rect>
+<rect x="329.170" y="624.000" width="5.791" height="6.000" rx="0" fill="#9ab5d5"><title>GPU 2 · other · 7.795–7.999 ms · rmsnorm_fwd_general_kernel</title></rect>
+<rect x="335.047" y="631.000" width="26.090" height="5.000" rx="0" fill="#e0a12d"><title>GPU 2 · AG · 8.002–8.917 ms · ncclDevKernel_AllGather_RING</title></rect>
+<rect x="453.959" y="624.000" width="7.695" height="6.000" rx="0" fill="#9ab5d5"><title>GPU 2 · other · 12.174–12.444 ms · triton_poi_fused_mul_silu_split_0</title></rect>
+<rect x="506.853" y="631.000" width="29.022" height="5.000" rx="0" fill="#9856a8"><title>GPU 2 · RS · 14.030–15.048 ms · ncclDevKernel_ReduceScatter_bf16_RING</title></rect>
+<rect x="535.887" y="624.000" width="2.117" height="6.000" rx="0" fill="#9ab5d5"><title>GPU 2 · other · 15.049–15.123 ms · vectorized_elementwise_kernel</title></rect>
+<rect x="150.409" y="624.000" width="39.851" height="6.000" rx="0" fill="#3c70c6"><title>GPU 2 · GEMM · 1.523–2.921 ms · nvjet_sm100_tst_128x256_64x6_2x2_2cta_h_bz_TNT</title></rect>
+<rect x="285.401" y="624.000" width="15.977" height="6.000" rx="0" fill="#3c70c6"><title>GPU 2 · GEMM · 6.260–6.820 ms · nvjet_sm100_tst_128x256_64x6_2x1_2cta_v_bz_TNT</title></rect>
+<rect x="361.129" y="624.000" width="92.825" height="6.000" rx="0" fill="#3c70c6"><title>GPU 2 · GEMM · 8.917–12.174 ms · nvjet_sm100_tst_128x256_64x6_2x2_2cta_h_bz_TNT</title></rect>
+<rect x="461.640" y="624.000" width="45.121" height="6.000" rx="0" fill="#3c70c6"><title>GPU 2 · GEMM · 12.444–14.027 ms · nvjet_sm100_tst_128x256_64x6_2x1_2cta_v_bz_TNT</title></rect>
+<text x="98" y="651" font-size="11" fill="#63798c" font-weight="400" text-anchor="end">GPU 3</text>
+<line x1="107" y1="653" x2="677" y2="653" stroke="#e9eff4" stroke-width="1"/>
+<rect x="107.368" y="641.000" width="1.562" height="6.000" rx="0" fill="#9da9b5"><title>GPU 3 · mem · 0.013–0.068 ms · 8</title></rect>
+<rect x="109.003" y="641.000" width="9.517" height="6.000" rx="0" fill="#9da9b5"><title>GPU 3 · mem · 0.070–0.404 ms · 8</title></rect>
+<rect x="118.557" y="641.000" width="0.093" height="6.000" rx="0" fill="#9da9b5"><title>GPU 3 · mem · 0.406–0.409 ms · 8</title></rect>
+<rect x="118.746" y="641.000" width="5.947" height="6.000" rx="0" fill="#9ab5d5"><title>GPU 3 · other · 0.412–0.621 ms · rmsnorm_fwd_general_kernel</title></rect>
+<rect x="124.776" y="648.000" width="26.226" height="5.000" rx="0" fill="#e0a12d"><title>GPU 3 · AG · 0.624–1.544 ms · ncclDevKernel_AllGather_RING</title></rect>
+<rect x="190.685" y="641.000" width="6.380" height="6.000" rx="0" fill="#9ab5d5"><title>GPU 3 · other · 2.936–3.160 ms · elementwise_kernel</title></rect>
+<rect x="197.070" y="641.000" width="2.789" height="6.000" rx="0" fill="#9ab5d5"><title>GPU 3 · other · 3.160–3.258 ms · rmsnorm_fwd_general_kernel</title></rect>
+<rect x="199.863" y="641.000" width="1.156" height="6.000" rx="0" fill="#9ab5d5"><title>GPU 3 · other · 3.258–3.299 ms · elementwise_kernel</title></rect>
+<rect x="201.027" y="641.000" width="0.408" height="6.000" rx="0" fill="#9ab5d5"><title>GPU 3 · other · 3.299–3.314 ms · rmsnorm_fwd_general_kernel</title></rect>
+<rect x="201.449" y="641.000" width="5.389" height="6.000" rx="0" fill="#9ab5d5"><title>GPU 3 · other · 3.314–3.503 ms · fused_rope_forward_kernel</title></rect>
+<rect x="206.842" y="641.000" width="2.125" height="6.000" rx="0" fill="#9ab5d5"><title>GPU 3 · other · 3.503–3.578 ms · fused_rope_forward_kernel</title></rect>
+<rect x="208.976" y="641.000" width="1.141" height="6.000" rx="0" fill="#9ab5d5"><title>GPU 3 · other · 3.578–3.618 ms · elementwise_kernel</title></rect>
+<rect x="210.131" y="641.000" width="6.905" height="6.000" rx="0" fill="#9ab5d5"><title>GPU 3 · other · 3.619–3.861 ms · elementwise_kernel</title></rect>
+<rect x="217.040" y="641.000" width="1.228" height="6.000" rx="0" fill="#9ab5d5"><title>GPU 3 · other · 3.861–3.904 ms · elementwise_kernel</title></rect>
+<rect x="218.277" y="641.000" width="1.236" height="6.000" rx="0" fill="#9ab5d5"><title>GPU 3 · other · 3.904–3.948 ms · elementwise_kernel</title></rect>
+<rect x="219.518" y="641.000" width="56.992" height="6.000" rx="0" fill="#08949d"><title>GPU 3 · FA · 3.948–5.948 ms · kernel_cutlass_kernel_flash_attncutesm100_hd256_2cta_fmha_forwardBlackwellFusedMultiHeadAttentionForward_object_at__TiledMMA_ThrLayoutVMNK21111000_PermutationMNK____MMAAtom_ThrID21_ShapeM_0</title></rect>
+<rect x="276.523" y="641.000" width="6.893" height="6.000" rx="0" fill="#9ab5d5"><title>GPU 3 · other · 5.948–6.190 ms · elementwise_kernel</title></rect>
+<rect x="283.421" y="641.000" width="2.505" height="6.000" rx="0" fill="#9ab5d5"><title>GPU 3 · other · 6.190–6.278 ms · triton_poi_fused__to_copy_clone_mul_sigmoid_view_0</title></rect>
+<rect x="302.115" y="648.000" width="25.425" height="5.000" rx="0" fill="#9856a8"><title>GPU 3 · RS · 6.846–7.738 ms · ncclDevKernel_ReduceScatter_bf16_RING</title></rect>
+<rect x="327.555" y="641.000" width="2.076" height="6.000" rx="0" fill="#9ab5d5"><title>GPU 3 · other · 7.739–7.812 ms · vectorized_elementwise_kernel</title></rect>
+<rect x="329.637" y="641.000" width="5.860" height="6.000" rx="0" fill="#9ab5d5"><title>GPU 3 · other · 7.812–8.017 ms · rmsnorm_fwd_general_kernel</title></rect>
+<rect x="335.580" y="648.000" width="26.129" height="5.000" rx="0" fill="#e0a12d"><title>GPU 3 · AG · 8.020–8.937 ms · ncclDevKernel_AllGather_RING</title></rect>
+<rect x="455.220" y="641.000" width="7.806" height="6.000" rx="0" fill="#9ab5d5"><title>GPU 3 · other · 12.218–12.492 ms · triton_poi_fused_mul_silu_split_0</title></rect>
+<rect x="508.730" y="648.000" width="27.341" height="5.000" rx="0" fill="#9856a8"><title>GPU 3 · RS · 14.096–15.055 ms · ncclDevKernel_ReduceScatter_bf16_RING</title></rect>
+<rect x="536.083" y="641.000" width="2.094" height="6.000" rx="0" fill="#9ab5d5"><title>GPU 3 · other · 15.056–15.129 ms · vectorized_elementwise_kernel</title></rect>
+<rect x="150.991" y="641.000" width="39.689" height="6.000" rx="0" fill="#3c70c6"><title>GPU 3 · GEMM · 1.544–2.936 ms · nvjet_sm100_tst_128x256_64x6_2x2_2cta_h_bz_TNT</title></rect>
+<rect x="285.927" y="641.000" width="16.087" height="6.000" rx="0" fill="#3c70c6"><title>GPU 3 · GEMM · 6.278–6.843 ms · nvjet_sm100_tst_128x256_64x6_2x1_2cta_v_bz_TNT</title></rect>
+<rect x="361.700" y="641.000" width="93.522" height="6.000" rx="0" fill="#3c70c6"><title>GPU 3 · GEMM · 8.937–12.218 ms · nvjet_sm100_tst_128x256_64x6_2x2_2cta_h_bz_TNT</title></rect>
+<rect x="463.018" y="641.000" width="45.614" height="6.000" rx="0" fill="#3c70c6"><title>GPU 3 · GEMM · 12.492–14.092 ms · nvjet_sm100_tst_128x256_64x6_2x1_2cta_v_bz_TNT</title></rect>
+<text x="98" y="668" font-size="11" fill="#16764f" font-weight="700" text-anchor="end">可用</text>
+<rect x="107.000" y="662.000" width="570.000" height="7.000" rx="1" fill="#e7f2eb"/>
+<rect x="119.101" y="662.000" width="5.071" height="7.000" rx="0" fill="#2b9e65"><title>四卡可用 · 0.425–0.603 ms</title></rect>
+<rect x="151.002" y="662.000" width="38.574" height="7.000" rx="0" fill="#2b9e65"><title>四卡可用 · 1.544–2.897 ms</title></rect>
+<rect x="189.582" y="662.000" width="0.678" height="7.000" rx="0" fill="#2b9e65"><title>四卡可用 · 2.898–2.921 ms</title></rect>
+<rect x="190.265" y="662.000" width="0.416" height="7.000" rx="0" fill="#2b9e65"><title>四卡可用 · 2.922–2.936 ms</title></rect>
+<rect x="190.685" y="662.000" width="0.391" height="7.000" rx="0" fill="#2b9e65"><title>四卡可用 · 2.936–2.950 ms</title></rect>
+<rect x="191.081" y="662.000" width="4.721" height="7.000" rx="0" fill="#2b9e65"><title>四卡可用 · 2.950–3.116 ms</title></rect>
+<rect x="195.806" y="662.000" width="0.776" height="7.000" rx="0" fill="#2b9e65"><title>四卡可用 · 3.116–3.143 ms</title></rect>
+<rect x="196.587" y="662.000" width="0.479" height="7.000" rx="0" fill="#2b9e65"><title>四卡可用 · 3.143–3.160 ms</title></rect>
+<rect x="197.070" y="662.000" width="0.317" height="7.000" rx="0" fill="#2b9e65"><title>四卡可用 · 3.160–3.171 ms</title></rect>
+<rect x="197.392" y="662.000" width="1.118" height="7.000" rx="0" fill="#2b9e65"><title>四卡可用 · 3.172–3.211 ms</title></rect>
+<rect x="198.515" y="662.000" width="0.783" height="7.000" rx="0" fill="#2b9e65"><title>四卡可用 · 3.211–3.239 ms</title></rect>
+<rect x="199.302" y="662.000" width="0.333" height="7.000" rx="0" fill="#2b9e65"><title>四卡可用 · 3.239–3.250 ms</title></rect>
+<rect x="199.640" y="662.000" width="0.219" height="7.000" rx="0" fill="#2b9e65"><title>四卡可用 · 3.251–3.258 ms</title></rect>
+<rect x="199.863" y="662.000" width="0.162" height="7.000" rx="0" fill="#2b9e65"><title>四卡可用 · 3.258–3.264 ms</title></rect>
+<rect x="200.034" y="662.000" width="0.105" height="7.000" rx="0" fill="#2b9e65"><title>四卡可用 · 3.264–3.268 ms</title></rect>
+<rect x="200.144" y="662.000" width="0.292" height="7.000" rx="0" fill="#2b9e65"><title>四卡可用 · 3.268–3.278 ms</title></rect>
+<rect x="200.440" y="662.000" width="0.393" height="7.000" rx="0" fill="#2b9e65"><title>四卡可用 · 3.279–3.292 ms</title></rect>
+<rect x="200.842" y="662.000" width="0.177" height="7.000" rx="0" fill="#2b9e65"><title>四卡可用 · 3.293–3.299 ms</title></rect>
+<rect x="201.027" y="662.000" width="0.260" height="7.000" rx="0" fill="#2b9e65"><title>四卡可用 · 3.299–3.308 ms</title></rect>
+<rect x="201.293" y="662.000" width="0.142" height="7.000" rx="0" fill="#2b9e65"><title>四卡可用 · 3.309–3.314 ms</title></rect>
+<rect x="201.449" y="662.000" width="0.245" height="7.000" rx="0" fill="#2b9e65"><title>四卡可用 · 3.314–3.323 ms</title></rect>
+<rect x="201.703" y="662.000" width="3.527" height="7.000" rx="0" fill="#2b9e65"><title>四卡可用 · 3.323–3.447 ms</title></rect>
+<rect x="205.236" y="662.000" width="0.882" height="7.000" rx="0" fill="#2b9e65"><title>四卡可用 · 3.447–3.478 ms</title></rect>
+<rect x="206.129" y="662.000" width="0.709" height="7.000" rx="0" fill="#2b9e65"><title>四卡可用 · 3.478–3.503 ms</title></rect>
+<rect x="206.842" y="662.000" width="0.151" height="7.000" rx="0" fill="#2b9e65"><title>四卡可用 · 3.503–3.509 ms</title></rect>
+<rect x="206.997" y="662.000" width="0.237" height="7.000" rx="0" fill="#2b9e65"><title>四卡可用 · 3.509–3.517 ms</title></rect>
+<rect x="207.244" y="662.000" width="0.933" height="7.000" rx="0" fill="#2b9e65"><title>四卡可用 · 3.517–3.550 ms</title></rect>
+<rect x="208.186" y="662.000" width="0.167" height="7.000" rx="0" fill="#2b9e65"><title>四卡可用 · 3.550–3.556 ms</title></rect>
+<rect x="208.367" y="662.000" width="0.600" height="7.000" rx="0" fill="#2b9e65"><title>四卡可用 · 3.557–3.578 ms</title></rect>
+<rect x="208.976" y="662.000" width="0.105" height="7.000" rx="0" fill="#2b9e65"><title>四卡可用 · 3.578–3.582 ms</title></rect>
+<rect x="209.086" y="662.000" width="0.227" height="7.000" rx="0" fill="#2b9e65"><title>四卡可用 · 3.582–3.590 ms</title></rect>
+<rect x="209.326" y="662.000" width="0.791" height="7.000" rx="0" fill="#2b9e65"><title>四卡可用 · 3.590–3.618 ms</title></rect>
+<rect x="210.131" y="662.000" width="0.080" height="7.000" rx="0" fill="#2b9e65"><title>四卡可用 · 3.619–3.621 ms</title></rect>
+<rect x="210.225" y="662.000" width="4.805" height="7.000" rx="0" fill="#2b9e65"><title>四卡可用 · 3.622–3.791 ms</title></rect>
+<rect x="215.034" y="662.000" width="1.050" height="7.000" rx="0" fill="#2b9e65"><title>四卡可用 · 3.791–3.828 ms</title></rect>
+<rect x="216.089" y="662.000" width="0.122" height="7.000" rx="0" fill="#2b9e65"><title>四卡可用 · 3.828–3.832 ms</title></rect>
+<rect x="216.220" y="662.000" width="0.811" height="7.000" rx="0" fill="#2b9e65"><title>四卡可用 · 3.832–3.861 ms</title></rect>
+<rect x="217.040" y="662.000" width="0.249" height="7.000" rx="0" fill="#2b9e65"><title>四卡可用 · 3.861–3.870 ms</title></rect>
+<rect x="217.298" y="662.000" width="0.112" height="7.000" rx="0" fill="#2b9e65"><title>四卡可用 · 3.870–3.874 ms</title></rect>
+<rect x="217.420" y="662.000" width="0.829" height="7.000" rx="0" fill="#2b9e65"><title>四卡可用 · 3.874–3.903 ms</title></rect>
+<rect x="218.258" y="662.000" width="0.010" height="7.000" rx="0" fill="#2b9e65"><title>四卡可用 · 3.904–3.904 ms</title></rect>
+<rect x="218.277" y="662.000" width="0.230" height="7.000" rx="0" fill="#2b9e65"><title>四卡可用 · 3.904–3.913 ms</title></rect>
+<rect x="218.517" y="662.000" width="0.946" height="7.000" rx="0" fill="#2b9e65"><title>四卡可用 · 3.913–3.946 ms</title></rect>
+<rect x="219.473" y="662.000" width="0.040" height="7.000" rx="0" fill="#2b9e65"><title>四卡可用 · 3.946–3.948 ms</title></rect>
+<rect x="219.518" y="662.000" width="54.550" height="7.000" rx="0" fill="#2b9e65"><title>四卡可用 · 3.948–5.862 ms</title></rect>
+<rect x="274.084" y="662.000" width="2.142" height="7.000" rx="0" fill="#2b9e65"><title>四卡可用 · 5.863–5.938 ms</title></rect>
+<rect x="276.238" y="662.000" width="0.272" height="7.000" rx="0" fill="#2b9e65"><title>四卡可用 · 5.938–5.948 ms</title></rect>
+<rect x="276.523" y="662.000" width="0.196" height="7.000" rx="0" fill="#2b9e65"><title>四卡可用 · 5.948–5.955 ms</title></rect>
+<rect x="276.732" y="662.000" width="4.373" height="7.000" rx="0" fill="#2b9e65"><title>四卡可用 · 5.955–6.109 ms</title></rect>
+<rect x="281.109" y="662.000" width="1.836" height="7.000" rx="0" fill="#2b9e65"><title>四卡可用 · 6.109–6.174 ms</title></rect>
+<rect x="282.950" y="662.000" width="0.466" height="7.000" rx="0" fill="#2b9e65"><title>四卡可用 · 6.174–6.190 ms</title></rect>
+<rect x="283.421" y="662.000" width="0.114" height="7.000" rx="0" fill="#2b9e65"><title>四卡可用 · 6.190–6.194 ms</title></rect>
+<rect x="283.540" y="662.000" width="2.387" height="7.000" rx="0" fill="#2b9e65"><title>四卡可用 · 6.194–6.278 ms</title></rect>
+<rect x="285.927" y="662.000" width="13.701" height="7.000" rx="0" fill="#2b9e65"><title>四卡可用 · 6.278–6.759 ms</title></rect>
+<rect x="327.555" y="662.000" width="1.503" height="7.000" rx="0" fill="#2b9e65"><title>四卡可用 · 7.739–7.792 ms</title></rect>
+<rect x="329.063" y="662.000" width="0.102" height="7.000" rx="0" fill="#2b9e65"><title>四卡可用 · 7.792–7.795 ms</title></rect>
+<rect x="329.170" y="662.000" width="0.030" height="7.000" rx="0" fill="#2b9e65"><title>四卡可用 · 7.795–7.797 ms</title></rect>
+<rect x="329.205" y="662.000" width="0.426" height="7.000" rx="0" fill="#2b9e65"><title>四卡可用 · 7.797–7.812 ms</title></rect>
+<rect x="329.637" y="662.000" width="5.325" height="7.000" rx="0" fill="#2b9e65"><title>四卡可用 · 7.812–7.999 ms</title></rect>
+<rect x="361.709" y="662.000" width="92.245" height="7.000" rx="0" fill="#2b9e65"><title>四卡可用 · 8.937–12.174 ms</title></rect>
+<rect x="453.959" y="662.000" width="2.050" height="7.000" rx="0" fill="#2b9e65"><title>四卡可用 · 12.174–12.246 ms</title></rect>
+<rect x="456.015" y="662.000" width="8.541" height="7.000" rx="0" fill="#2b9e65"><title>四卡可用 · 12.246–12.546 ms</title></rect>
+<rect x="464.555" y="662.000" width="42.206" height="7.000" rx="0" fill="#2b9e65"><title>四卡可用 · 12.546–14.027 ms</title></rect>
+<rect x="536.599" y="662.000" width="1.405" height="7.000" rx="0" fill="#2b9e65"><title>四卡可用 · 15.074–15.123 ms</title></rect>
+<text x="747" y="583" font-size="13" fill="#112b43" font-weight="700" text-anchor="start">反向  33.47 ms  ·  四卡累计可用 24.09 ms</text>
+<line x1="747.0" y1="589" x2="747.0" y2="671" stroke="#d4e1eb" stroke-width="1"/>
+<text x="747.0" y="686" font-size="11" fill="#63798c" font-weight="400" text-anchor="middle">0</text>
+<line x1="889.5" y1="589" x2="889.5" y2="671" stroke="#d4e1eb" stroke-width="1"/>
+<text x="889.5" y="686" font-size="11" fill="#63798c" font-weight="400" text-anchor="middle">10</text>
+<line x1="1032.0" y1="589" x2="1032.0" y2="671" stroke="#d4e1eb" stroke-width="1"/>
+<text x="1032.0" y="686" font-size="11" fill="#63798c" font-weight="400" text-anchor="middle">20</text>
+<line x1="1174.5" y1="589" x2="1174.5" y2="671" stroke="#d4e1eb" stroke-width="1"/>
+<text x="1174.5" y="686" font-size="11" fill="#63798c" font-weight="400" text-anchor="middle">30</text>
+<line x1="1317.0" y1="589" x2="1317.0" y2="671" stroke="#d4e1eb" stroke-width="1"/>
+<text x="1317.0" y="686" font-size="11" fill="#63798c" font-weight="400" text-anchor="middle">40 ms</text>
+<text x="738" y="600" font-size="11" fill="#63798c" font-weight="400" text-anchor="end">GPU 0</text>
+<line x1="747" y1="602" x2="1317" y2="602" stroke="#e9eff4" stroke-width="1"/>
+<rect x="747.693" y="590.000" width="0.785" height="6.000" rx="0" fill="#9da9b5"><title>GPU 0 · mem · 0.049–0.104 ms · 8</title></rect>
+<rect x="748.539" y="597.000" width="14.085" height="5.000" rx="0" fill="#e0a12d"><title>GPU 0 · AG · 0.108–1.096 ms · ncclDevKernel_AllGather_RING</title></rect>
+<rect x="815.215" y="590.000" width="15.628" height="6.000" rx="0" fill="#9ab5d5"><title>GPU 0 · other · 4.787–5.884 ms · triton_poi_fused_add_cat_mul_rsub_sigmoid_silu_split_0</title></rect>
+<rect x="879.855" y="597.000" width="15.616" height="5.000" rx="0" fill="#e0a12d"><title>GPU 0 · AG · 9.323–10.419 ms · ncclDevKernel_AllGather_RING</title></rect>
+<rect x="934.212" y="597.000" width="15.349" height="5.000" rx="0" fill="#9856a8"><title>GPU 0 · RS · 13.138–14.215 ms · ncclDevKernel_ReduceScatter_bf16_RING</title></rect>
+<rect x="949.603" y="590.000" width="0.015" height="6.000" rx="0" fill="#9da9b5"><title>GPU 0 · mem · 14.218–14.219 ms · memset</title></rect>
+<rect x="949.650" y="590.000" width="6.025" height="6.000" rx="0" fill="#9ab5d5"><title>GPU 0 · other · 14.221–14.644 ms · rmsnorm_bwd_general_kernel</title></rect>
+<rect x="955.682" y="590.000" width="0.100" height="6.000" rx="0" fill="#9ab5d5"><title>GPU 0 · other · 14.644–14.651 ms · rmsnorm_bwd_finalize_general_kernel</title></rect>
+<rect x="955.788" y="590.000" width="1.030" height="6.000" rx="0" fill="#9ab5d5"><title>GPU 0 · other · 14.652–14.724 ms · vectorized_elementwise_kernel</title></rect>
+<rect x="956.890" y="597.000" width="13.239" height="5.000" rx="0" fill="#e0a12d"><title>GPU 0 · AG · 14.729–15.658 ms · ncclDevKernel_AllGather_RING</title></rect>
+<rect x="988.208" y="590.000" width="2.001" height="6.000" rx="0" fill="#9ab5d5"><title>GPU 0 · other · 16.927–17.067 ms · triton_poi_fused__to_copy_clone_mul_sigmoid_sigmoid_backward_view_0</title></rect>
+<rect x="990.205" y="590.000" width="1.028" height="6.000" rx="0" fill="#08949d"><title>GPU 0 · FA · 17.067–17.139 ms · kernel_cutlass_kernel_flash_attncuteflash_bwd_preprocessFlashAttentionBackwardPreprocess_object_at__tensorptrbf16gmemalign16oi64div81i64div8i64div8_tensorptrbf16gmemalign16oi64div81i64div_0</title></rect>
+<rect x="991.235" y="590.000" width="43.603" height="6.000" rx="0" fill="#08949d"><title>GPU 0 · FA · 17.139–20.199 ms · kernel_cutlass_kernel_flash_attncutesm100_hd256_2cta_fmha_backward_dqkernelBlackwellFusedMultiHeadAttentionBackwardDQKernel_object_at__TiledMMA_ThrLayoutVMNK21111000_PermutationMNK____MMA_0</title></rect>
+<rect x="1034.845" y="590.000" width="69.604" height="6.000" rx="0" fill="#08949d"><title>GPU 0 · FA · 20.200–25.084 ms · kernel_cutlass_dkdv_bwd_flash_attncutesm100_hd256_2cta_fmha_backward_dkdvkernelBlackwellFusedMultiHeadAttentionBackwardDKDVKernel_object_at__TiledMMA_ThrLayoutVMNK21111000_PermutationMNK__1</title></rect>
+<rect x="1104.452" y="590.000" width="1.105" height="6.000" rx="0" fill="#9ab5d5"><title>GPU 0 · other · 25.084–25.162 ms · fused_rope_backward_kernel</title></rect>
+<rect x="1105.562" y="590.000" width="2.731" height="6.000" rx="0" fill="#9ab5d5"><title>GPU 0 · other · 25.162–25.354 ms · fused_rope_backward_kernel</title></rect>
+<rect x="1108.295" y="590.000" width="0.676" height="6.000" rx="0" fill="#9ab5d5"><title>GPU 0 · other · 25.354–25.402 ms · rmsnorm_bwd_general_kernel</title></rect>
+<rect x="1108.976" y="590.000" width="0.202" height="6.000" rx="0" fill="#9ab5d5"><title>GPU 0 · other · 25.402–25.416 ms · rmsnorm_bwd_finalize_general_kernel</title></rect>
+<rect x="1109.185" y="590.000" width="3.573" height="6.000" rx="0" fill="#9ab5d5"><title>GPU 0 · other · 25.416–25.667 ms · rmsnorm_bwd_general_kernel</title></rect>
+<rect x="1112.760" y="590.000" width="0.202" height="6.000" rx="0" fill="#9ab5d5"><title>GPU 0 · other · 25.667–25.681 ms · rmsnorm_bwd_finalize_general_kernel</title></rect>
+<rect x="1112.966" y="590.000" width="16.702" height="6.000" rx="0" fill="#9ab5d5"><title>GPU 0 · other · 25.682–26.854 ms · CatArrayBatchedCopy</title></rect>
+<rect x="1148.505" y="597.000" width="30.975" height="5.000" rx="0" fill="#e0a12d"><title>GPU 0 · AG · 28.176–30.349 ms · ncclDevKernel_AllGather_RING</title></rect>
+<rect x="1188.686" y="597.000" width="25.544" height="5.000" rx="0" fill="#9856a8"><title>GPU 0 · RS · 30.996–32.788 ms · ncclDevKernel_ReduceScatter_bf16_RING</title></rect>
+<rect x="1214.260" y="590.000" width="0.023" height="6.000" rx="0" fill="#9da9b5"><title>GPU 0 · mem · 32.790–32.792 ms · memset</title></rect>
+<rect x="1214.326" y="590.000" width="6.068" height="6.000" rx="0" fill="#9ab5d5"><title>GPU 0 · other · 32.795–33.221 ms · rmsnorm_bwd_general_kernel</title></rect>
+<rect x="1220.403" y="590.000" width="0.100" height="6.000" rx="0" fill="#9ab5d5"><title>GPU 0 · other · 33.221–33.228 ms · rmsnorm_bwd_finalize_general_kernel</title></rect>
+<rect x="1220.508" y="590.000" width="1.021" height="6.000" rx="0" fill="#9ab5d5"><title>GPU 0 · other · 33.229–33.300 ms · vectorized_elementwise_kernel</title></rect>
+<rect x="1221.589" y="590.000" width="0.101" height="6.000" rx="0" fill="#9da9b5"><title>GPU 0 · mem · 33.304–33.312 ms · 8</title></rect>
+<rect x="1221.730" y="590.000" width="0.031" height="6.000" rx="0" fill="#9da9b5"><title>GPU 0 · mem · 33.314–33.317 ms · 8</title></rect>
+<rect x="1221.807" y="590.000" width="0.189" height="6.000" rx="0" fill="#9da9b5"><title>GPU 0 · mem · 33.320–33.333 ms · 8</title></rect>
+<rect x="1222.040" y="590.000" width="0.031" height="6.000" rx="0" fill="#9da9b5"><title>GPU 0 · mem · 33.336–33.338 ms · 8</title></rect>
+<rect x="1222.098" y="590.000" width="0.032" height="6.000" rx="0" fill="#9da9b5"><title>GPU 0 · mem · 33.340–33.342 ms · 8</title></rect>
+<rect x="1222.160" y="590.000" width="0.024" height="6.000" rx="0" fill="#9da9b5"><title>GPU 0 · mem · 33.345–33.346 ms · 8</title></rect>
+<rect x="1222.219" y="590.000" width="0.421" height="6.000" rx="0" fill="#9da9b5"><title>GPU 0 · mem · 33.349–33.378 ms · 8</title></rect>
+<rect x="1222.691" y="590.000" width="0.228" height="6.000" rx="0" fill="#9da9b5"><title>GPU 0 · mem · 33.382–33.398 ms · 8</title></rect>
+<rect x="762.620" y="590.000" width="24.636" height="6.000" rx="0" fill="#3c70c6"><title>GPU 0 · GEMM · 1.096–2.825 ms · nvjet_sm100_tst_128x256_64x6_2x2_2cta_h_bz_NNT</title></rect>
+<rect x="787.209" y="590.000" width="28.003" height="6.000" rx="0" fill="#3c70c6"><title>GPU 0 · GEMM · 2.822–4.787 ms · nvjet_sm100_tss_320x192_64x3_2x2_2cta_h_badd_NTT</title></rect>
+<rect x="830.839" y="590.000" width="49.696" height="6.000" rx="0" fill="#3c70c6"><title>GPU 0 · GEMM · 5.883–9.371 ms · nvjet_sm100_tst_128x256_64x6_2x1_2cta_v_bz_NNT</title></rect>
+<rect x="895.508" y="590.000" width="48.080" height="6.000" rx="0" fill="#3c70c6"><title>GPU 0 · GEMM · 10.422–13.796 ms · nvjet_sm100_tss_256x256_64x4_2x2_2cta_h_badd_NTT</title></rect>
+<rect x="970.126" y="590.000" width="8.862" height="6.000" rx="0" fill="#3c70c6"><title>GPU 0 · GEMM · 15.658–16.280 ms · nvjet_sm100_tst_128x256_64x6_2x2_2cta_h_bz_NNT</title></rect>
+<rect x="978.935" y="590.000" width="9.271" height="6.000" rx="0" fill="#3c70c6"><title>GPU 0 · GEMM · 16.276–16.927 ms · nvjet_sm100_tss_256x256_64x4_2x4_2cta_h_badd_NTT</title></rect>
+<rect x="1129.664" y="590.000" width="19.163" height="6.000" rx="0" fill="#3c70c6"><title>GPU 0 · GEMM · 26.854–28.198 ms · nvjet_sm100_tst_128x256_64x6_2x1_2cta_v_bz_NNT</title></rect>
+<rect x="1179.513" y="590.000" width="19.739" height="6.000" rx="0" fill="#3c70c6"><title>GPU 0 · GEMM · 30.352–31.737 ms · nvjet_sm100_tss_256x256_64x4_2x2_2cta_h_badd_NTT</title></rect>
+<rect x="1223.770" y="597.000" width="0.155" height="5.000" rx="0" fill="#c85a7c"><title>GPU 0 · graph 外或邻层 NCCL · ncclDevKernel_AllGather_RING</title></rect>
+<text x="738" y="617" font-size="11" fill="#63798c" font-weight="400" text-anchor="end">GPU 1</text>
+<line x1="747" y1="619" x2="1317" y2="619" stroke="#e9eff4" stroke-width="1"/>
+<rect x="747.028" y="607.000" width="0.758" height="6.000" rx="0" fill="#9da9b5"><title>GPU 1 · mem · 0.002–0.055 ms · 8</title></rect>
+<rect x="747.851" y="614.000" width="14.519" height="5.000" rx="0" fill="#e0a12d"><title>GPU 1 · AG · 0.060–1.079 ms · ncclDevKernel_AllGather_RING</title></rect>
+<rect x="812.351" y="607.000" width="14.061" height="6.000" rx="0" fill="#9ab5d5"><title>GPU 1 · other · 4.586–5.573 ms · triton_poi_fused_add_cat_mul_rsub_sigmoid_silu_split_0</title></rect>
+<rect x="874.051" y="614.000" width="21.162" height="5.000" rx="0" fill="#e0a12d"><title>GPU 1 · AG · 8.916–10.401 ms · ncclDevKernel_AllGather_RING</title></rect>
+<rect x="932.837" y="614.000" width="16.465" height="5.000" rx="0" fill="#9856a8"><title>GPU 1 · RS · 13.041–14.197 ms · ncclDevKernel_ReduceScatter_bf16_RING</title></rect>
+<rect x="949.353" y="607.000" width="0.015" height="6.000" rx="0" fill="#9da9b5"><title>GPU 1 · mem · 14.200–14.201 ms · memset</title></rect>
+<rect x="949.401" y="607.000" width="6.081" height="6.000" rx="0" fill="#9ab5d5"><title>GPU 1 · other · 14.204–14.630 ms · rmsnorm_bwd_general_kernel</title></rect>
+<rect x="955.489" y="607.000" width="0.100" height="6.000" rx="0" fill="#9ab5d5"><title>GPU 1 · other · 14.631–14.638 ms · rmsnorm_bwd_finalize_general_kernel</title></rect>
+<rect x="955.596" y="607.000" width="1.035" height="6.000" rx="0" fill="#9ab5d5"><title>GPU 1 · other · 14.638–14.711 ms · vectorized_elementwise_kernel</title></rect>
+<rect x="956.698" y="614.000" width="13.367" height="5.000" rx="0" fill="#e0a12d"><title>GPU 1 · AG · 14.716–15.654 ms · ncclDevKernel_AllGather_RING</title></rect>
+<rect x="988.467" y="607.000" width="1.984" height="6.000" rx="0" fill="#9ab5d5"><title>GPU 1 · other · 16.945–17.084 ms · triton_poi_fused__to_copy_clone_mul_sigmoid_sigmoid_backward_view_0</title></rect>
+<rect x="990.447" y="607.000" width="1.032" height="6.000" rx="0" fill="#08949d"><title>GPU 1 · FA · 17.084–17.156 ms · kernel_cutlass_kernel_flash_attncuteflash_bwd_preprocessFlashAttentionBackwardPreprocess_object_at__tensorptrbf16gmemalign16oi64div81i64div8i64div8_tensorptrbf16gmemalign16oi64div81i64div_0</title></rect>
+<rect x="991.482" y="607.000" width="44.384" height="6.000" rx="0" fill="#08949d"><title>GPU 1 · FA · 17.157–20.271 ms · kernel_cutlass_kernel_flash_attncutesm100_hd256_2cta_fmha_backward_dqkernelBlackwellFusedMultiHeadAttentionBackwardDQKernel_object_at__TiledMMA_ThrLayoutVMNK21111000_PermutationMNK____MMA_0</title></rect>
+<rect x="1035.869" y="607.000" width="71.454" height="6.000" rx="0" fill="#08949d"><title>GPU 1 · FA · 20.272–25.286 ms · kernel_cutlass_dkdv_bwd_flash_attncutesm100_hd256_2cta_fmha_backward_dkdvkernelBlackwellFusedMultiHeadAttentionBackwardDKDVKernel_object_at__TiledMMA_ThrLayoutVMNK21111000_PermutationMNK__1</title></rect>
+<rect x="1107.325" y="607.000" width="1.130" height="6.000" rx="0" fill="#9ab5d5"><title>GPU 1 · other · 25.286–25.365 ms · fused_rope_backward_kernel</title></rect>
+<rect x="1108.460" y="607.000" width="2.777" height="6.000" rx="0" fill="#9ab5d5"><title>GPU 1 · other · 25.366–25.560 ms · fused_rope_backward_kernel</title></rect>
+<rect x="1111.240" y="607.000" width="0.698" height="6.000" rx="0" fill="#9ab5d5"><title>GPU 1 · other · 25.561–25.610 ms · rmsnorm_bwd_general_kernel</title></rect>
+<rect x="1111.943" y="607.000" width="0.202" height="6.000" rx="0" fill="#9ab5d5"><title>GPU 1 · other · 25.610–25.624 ms · rmsnorm_bwd_finalize_general_kernel</title></rect>
+<rect x="1112.152" y="607.000" width="3.618" height="6.000" rx="0" fill="#9ab5d5"><title>GPU 1 · other · 25.625–25.879 ms · rmsnorm_bwd_general_kernel</title></rect>
+<rect x="1115.773" y="607.000" width="0.189" height="6.000" rx="0" fill="#9ab5d5"><title>GPU 1 · other · 25.879–25.892 ms · rmsnorm_bwd_finalize_general_kernel</title></rect>
+<rect x="1115.967" y="607.000" width="17.081" height="6.000" rx="0" fill="#9ab5d5"><title>GPU 1 · other · 25.892–27.091 ms · CatArrayBatchedCopy</title></rect>
+<rect x="1151.733" y="614.000" width="28.062" height="5.000" rx="0" fill="#e0a12d"><title>GPU 1 · AG · 28.402–30.372 ms · ncclDevKernel_AllGather_RING</title></rect>
+<rect x="1189.238" y="614.000" width="25.275" height="5.000" rx="0" fill="#9856a8"><title>GPU 1 · RS · 31.034–32.808 ms · ncclDevKernel_ReduceScatter_bf16_RING</title></rect>
+<rect x="1214.563" y="607.000" width="0.023" height="6.000" rx="0" fill="#9da9b5"><title>GPU 1 · mem · 32.811–32.813 ms · memset</title></rect>
+<rect x="1214.630" y="607.000" width="6.141" height="6.000" rx="0" fill="#9ab5d5"><title>GPU 1 · other · 32.816–33.247 ms · rmsnorm_bwd_general_kernel</title></rect>
+<rect x="1220.781" y="607.000" width="0.105" height="6.000" rx="0" fill="#9ab5d5"><title>GPU 1 · other · 33.248–33.255 ms · rmsnorm_bwd_finalize_general_kernel</title></rect>
+<rect x="1220.890" y="607.000" width="1.035" height="6.000" rx="0" fill="#9ab5d5"><title>GPU 1 · other · 33.255–33.328 ms · vectorized_elementwise_kernel</title></rect>
+<rect x="1221.976" y="607.000" width="0.102" height="6.000" rx="0" fill="#9da9b5"><title>GPU 1 · mem · 33.332–33.339 ms · 8</title></rect>
+<rect x="1222.127" y="607.000" width="0.029" height="6.000" rx="0" fill="#9da9b5"><title>GPU 1 · mem · 33.342–33.344 ms · 8</title></rect>
+<rect x="1222.202" y="607.000" width="0.195" height="6.000" rx="0" fill="#9da9b5"><title>GPU 1 · mem · 33.348–33.361 ms · 8</title></rect>
+<rect x="1222.436" y="607.000" width="0.027" height="6.000" rx="0" fill="#9da9b5"><title>GPU 1 · mem · 33.364–33.366 ms · 8</title></rect>
+<rect x="1222.494" y="607.000" width="0.027" height="6.000" rx="0" fill="#9da9b5"><title>GPU 1 · mem · 33.368–33.370 ms · 8</title></rect>
+<rect x="1222.548" y="607.000" width="0.029" height="6.000" rx="0" fill="#9da9b5"><title>GPU 1 · mem · 33.372–33.374 ms · 8</title></rect>
+<rect x="1222.606" y="607.000" width="0.430" height="6.000" rx="0" fill="#9da9b5"><title>GPU 1 · mem · 33.376–33.406 ms · 8</title></rect>
+<rect x="1223.082" y="607.000" width="0.230" height="6.000" rx="0" fill="#9da9b5"><title>GPU 1 · mem · 33.409–33.425 ms · 8</title></rect>
+<rect x="762.367" y="607.000" width="23.841" height="6.000" rx="0" fill="#3c70c6"><title>GPU 1 · GEMM · 1.078–2.751 ms · nvjet_sm100_tst_128x256_64x6_2x2_2cta_h_bz_NNT</title></rect>
+<rect x="786.156" y="607.000" width="26.192" height="6.000" rx="0" fill="#3c70c6"><title>GPU 1 · GEMM · 2.748–4.586 ms · nvjet_sm100_tss_320x192_64x3_2x2_2cta_h_badd_NTT</title></rect>
+<rect x="826.406" y="607.000" width="48.315" height="6.000" rx="0" fill="#3c70c6"><title>GPU 1 · GEMM · 5.572–8.963 ms · nvjet_sm100_tst_128x256_64x6_2x1_2cta_v_bz_NNT</title></rect>
+<rect x="895.247" y="607.000" width="46.768" height="6.000" rx="0" fill="#3c70c6"><title>GPU 1 · GEMM · 10.403–13.685 ms · nvjet_sm100_tss_256x256_64x4_2x2_2cta_h_badd_NTT</title></rect>
+<rect x="970.062" y="607.000" width="8.761" height="6.000" rx="0" fill="#3c70c6"><title>GPU 1 · GEMM · 15.653–16.268 ms · nvjet_sm100_tst_128x256_64x6_2x2_2cta_h_bz_NNT</title></rect>
+<rect x="978.770" y="607.000" width="9.694" height="6.000" rx="0" fill="#3c70c6"><title>GPU 1 · GEMM · 16.265–16.945 ms · nvjet_sm100_tss_256x256_64x4_2x4_2cta_h_badd_NTT</title></rect>
+<rect x="1133.044" y="607.000" width="19.090" height="6.000" rx="0" fill="#3c70c6"><title>GPU 1 · GEMM · 27.091–28.431 ms · nvjet_sm100_tst_128x256_64x6_2x1_2cta_v_bz_NNT</title></rect>
+<rect x="1179.829" y="607.000" width="20.131" height="6.000" rx="0" fill="#3c70c6"><title>GPU 1 · GEMM · 30.374–31.787 ms · nvjet_sm100_tss_256x256_64x4_2x2_2cta_h_badd_NTT</title></rect>
+<text x="738" y="634" font-size="11" fill="#63798c" font-weight="400" text-anchor="end">GPU 2</text>
+<line x1="747" y1="636" x2="1317" y2="636" stroke="#e9eff4" stroke-width="1"/>
+<rect x="747.000" y="624.000" width="0.771" height="6.000" rx="0" fill="#9da9b5"><title>GPU 2 · mem · 0.000–0.054 ms · 8</title></rect>
+<rect x="747.846" y="631.000" width="14.193" height="5.000" rx="0" fill="#e0a12d"><title>GPU 2 · AG · 0.059–1.055 ms · ncclDevKernel_AllGather_RING</title></rect>
+<rect x="812.905" y="624.000" width="14.867" height="6.000" rx="0" fill="#9ab5d5"><title>GPU 2 · other · 4.625–5.668 ms · triton_poi_fused_add_cat_mul_rsub_sigmoid_silu_split_0</title></rect>
+<rect x="875.576" y="631.000" width="19.204" height="5.000" rx="0" fill="#e0a12d"><title>GPU 2 · AG · 9.023–10.371 ms · ncclDevKernel_AllGather_RING</title></rect>
+<rect x="933.033" y="631.000" width="16.084" height="5.000" rx="0" fill="#9856a8"><title>GPU 2 · RS · 13.055–14.184 ms · ncclDevKernel_ReduceScatter_bf16_RING</title></rect>
+<rect x="949.163" y="624.000" width="0.015" height="6.000" rx="0" fill="#9da9b5"><title>GPU 2 · mem · 14.187–14.188 ms · memset</title></rect>
+<rect x="949.211" y="624.000" width="6.218" height="6.000" rx="0" fill="#9ab5d5"><title>GPU 2 · other · 14.190–14.627 ms · rmsnorm_bwd_general_kernel</title></rect>
+<rect x="955.436" y="624.000" width="0.099" height="6.000" rx="0" fill="#9ab5d5"><title>GPU 2 · other · 14.627–14.634 ms · rmsnorm_bwd_finalize_general_kernel</title></rect>
+<rect x="955.541" y="624.000" width="1.049" height="6.000" rx="0" fill="#9ab5d5"><title>GPU 2 · other · 14.634–14.708 ms · vectorized_elementwise_kernel</title></rect>
+<rect x="956.666" y="631.000" width="13.649" height="5.000" rx="0" fill="#e0a12d"><title>GPU 2 · AG · 14.713–15.671 ms · ncclDevKernel_AllGather_RING</title></rect>
+<rect x="989.379" y="624.000" width="2.007" height="6.000" rx="0" fill="#9ab5d5"><title>GPU 2 · other · 17.009–17.150 ms · triton_poi_fused__to_copy_clone_mul_sigmoid_sigmoid_backward_view_0</title></rect>
+<rect x="991.382" y="624.000" width="1.053" height="6.000" rx="0" fill="#08949d"><title>GPU 2 · FA · 17.150–17.224 ms · kernel_cutlass_kernel_flash_attncuteflash_bwd_preprocessFlashAttentionBackwardPreprocess_object_at__tensorptrbf16gmemalign16oi64div81i64div8i64div8_tensorptrbf16gmemalign16oi64div81i64div_0</title></rect>
+<rect x="992.438" y="624.000" width="48.115" height="6.000" rx="0" fill="#08949d"><title>GPU 2 · FA · 17.224–20.600 ms · kernel_cutlass_kernel_flash_attncutesm100_hd256_2cta_fmha_backward_dqkernelBlackwellFusedMultiHeadAttentionBackwardDQKernel_object_at__TiledMMA_ThrLayoutVMNK21111000_PermutationMNK____MMA_0</title></rect>
+<rect x="1040.556" y="624.000" width="76.940" height="6.000" rx="0" fill="#08949d"><title>GPU 2 · FA · 20.600–26.000 ms · kernel_cutlass_dkdv_bwd_flash_attncutesm100_hd256_2cta_fmha_backward_dkdvkernelBlackwellFusedMultiHeadAttentionBackwardDKDVKernel_object_at__TiledMMA_ThrLayoutVMNK21111000_PermutationMNK__1</title></rect>
+<rect x="1117.500" y="624.000" width="1.202" height="6.000" rx="0" fill="#9ab5d5"><title>GPU 2 · other · 26.000–26.084 ms · fused_rope_backward_kernel</title></rect>
+<rect x="1118.707" y="624.000" width="2.901" height="6.000" rx="0" fill="#9ab5d5"><title>GPU 2 · other · 26.085–26.288 ms · fused_rope_backward_kernel</title></rect>
+<rect x="1121.607" y="624.000" width="0.717" height="6.000" rx="0" fill="#9ab5d5"><title>GPU 2 · other · 26.288–26.339 ms · rmsnorm_bwd_general_kernel</title></rect>
+<rect x="1122.327" y="624.000" width="0.205" height="6.000" rx="0" fill="#9ab5d5"><title>GPU 2 · other · 26.339–26.353 ms · rmsnorm_bwd_finalize_general_kernel</title></rect>
+<rect x="1122.539" y="624.000" width="3.746" height="6.000" rx="0" fill="#9ab5d5"><title>GPU 2 · other · 26.354–26.616 ms · rmsnorm_bwd_general_kernel</title></rect>
+<rect x="1126.288" y="624.000" width="0.202" height="6.000" rx="0" fill="#9ab5d5"><title>GPU 2 · other · 26.617–26.631 ms · rmsnorm_bwd_finalize_general_kernel</title></rect>
+<rect x="1126.494" y="624.000" width="18.516" height="6.000" rx="0" fill="#9ab5d5"><title>GPU 2 · other · 26.631–27.931 ms · CatArrayBatchedCopy</title></rect>
+<rect x="1164.117" y="631.000" width="16.093" height="5.000" rx="0" fill="#e0a12d"><title>GPU 2 · AG · 29.271–30.401 ms · ncclDevKernel_AllGather_RING</title></rect>
+<rect x="1190.601" y="631.000" width="24.287" height="5.000" rx="0" fill="#9856a8"><title>GPU 2 · RS · 31.130–32.834 ms · ncclDevKernel_ReduceScatter_bf16_RING</title></rect>
+<rect x="1214.923" y="624.000" width="0.024" height="6.000" rx="0" fill="#9da9b5"><title>GPU 2 · mem · 32.837–32.838 ms · memset</title></rect>
+<rect x="1214.997" y="624.000" width="6.371" height="6.000" rx="0" fill="#9ab5d5"><title>GPU 2 · other · 32.842–33.289 ms · rmsnorm_bwd_general_kernel</title></rect>
+<rect x="1221.378" y="624.000" width="0.108" height="6.000" rx="0" fill="#9ab5d5"><title>GPU 2 · other · 33.290–33.297 ms · rmsnorm_bwd_finalize_general_kernel</title></rect>
+<rect x="1221.490" y="624.000" width="1.057" height="6.000" rx="0" fill="#9ab5d5"><title>GPU 2 · other · 33.298–33.372 ms · vectorized_elementwise_kernel</title></rect>
+<rect x="1222.589" y="624.000" width="0.105" height="6.000" rx="0" fill="#9da9b5"><title>GPU 2 · mem · 33.375–33.382 ms · 8</title></rect>
+<rect x="1222.736" y="624.000" width="0.031" height="6.000" rx="0" fill="#9da9b5"><title>GPU 2 · mem · 33.385–33.387 ms · 8</title></rect>
+<rect x="1222.811" y="624.000" width="0.196" height="6.000" rx="0" fill="#9da9b5"><title>GPU 2 · mem · 33.390–33.404 ms · 8</title></rect>
+<rect x="1223.040" y="624.000" width="0.033" height="6.000" rx="0" fill="#9da9b5"><title>GPU 2 · mem · 33.406–33.409 ms · 8</title></rect>
+<rect x="1223.098" y="624.000" width="0.033" height="6.000" rx="0" fill="#9da9b5"><title>GPU 2 · mem · 33.410–33.413 ms · 8</title></rect>
+<rect x="1223.157" y="624.000" width="0.033" height="6.000" rx="0" fill="#9da9b5"><title>GPU 2 · mem · 33.414–33.417 ms · 8</title></rect>
+<rect x="1223.215" y="624.000" width="0.432" height="6.000" rx="0" fill="#9da9b5"><title>GPU 2 · mem · 33.419–33.449 ms · 8</title></rect>
+<rect x="1223.690" y="624.000" width="0.235" height="6.000" rx="0" fill="#9da9b5"><title>GPU 2 · mem · 33.452–33.468 ms · 8</title></rect>
+<rect x="762.035" y="624.000" width="24.055" height="6.000" rx="0" fill="#3c70c6"><title>GPU 2 · GEMM · 1.055–2.743 ms · nvjet_sm100_tst_128x256_64x6_2x2_2cta_h_bz_NNT</title></rect>
+<rect x="786.037" y="624.000" width="26.865" height="6.000" rx="0" fill="#3c70c6"><title>GPU 2 · GEMM · 2.739–4.625 ms · nvjet_sm100_tss_320x192_64x3_2x2_2cta_h_badd_NTT</title></rect>
+<rect x="827.769" y="624.000" width="48.535" height="6.000" rx="0" fill="#3c70c6"><title>GPU 2 · GEMM · 5.668–9.074 ms · nvjet_sm100_tst_128x256_64x6_2x1_2cta_v_bz_NNT</title></rect>
+<rect x="894.812" y="624.000" width="47.830" height="6.000" rx="0" fill="#3c70c6"><title>GPU 2 · GEMM · 10.373–13.729 ms · nvjet_sm100_tss_256x256_64x4_2x2_2cta_h_badd_NTT</title></rect>
+<rect x="970.309" y="624.000" width="8.959" height="6.000" rx="0" fill="#3c70c6"><title>GPU 2 · GEMM · 15.671–16.300 ms · nvjet_sm100_tst_128x256_64x6_2x2_2cta_h_bz_NNT</title></rect>
+<rect x="979.215" y="624.000" width="10.161" height="6.000" rx="0" fill="#3c70c6"><title>GPU 2 · GEMM · 16.296–17.009 ms · nvjet_sm100_tss_256x256_64x4_2x4_2cta_h_badd_NTT</title></rect>
+<rect x="1145.006" y="624.000" width="19.400" height="6.000" rx="0" fill="#3c70c6"><title>GPU 2 · GEMM · 27.930–29.292 ms · nvjet_sm100_tst_128x256_64x6_2x1_2cta_v_bz_NNT</title></rect>
+<rect x="1180.246" y="624.000" width="20.955" height="6.000" rx="0" fill="#3c70c6"><title>GPU 2 · GEMM · 30.403–31.874 ms · nvjet_sm100_tss_256x256_64x4_2x2_2cta_h_badd_NTT</title></rect>
+<text x="738" y="651" font-size="11" fill="#63798c" font-weight="400" text-anchor="end">GPU 3</text>
+<line x1="747" y1="653" x2="1317" y2="653" stroke="#e9eff4" stroke-width="1"/>
+<rect x="747.208" y="641.000" width="0.762" height="6.000" rx="0" fill="#9da9b5"><title>GPU 3 · mem · 0.015–0.068 ms · 8</title></rect>
+<rect x="748.054" y="648.000" width="14.188" height="5.000" rx="0" fill="#e0a12d"><title>GPU 3 · AG · 0.074–1.070 ms · ncclDevKernel_AllGather_RING</title></rect>
+<rect x="811.833" y="641.000" width="14.664" height="6.000" rx="0" fill="#9ab5d5"><title>GPU 3 · other · 4.550–5.579 ms · triton_poi_fused_add_cat_mul_rsub_sigmoid_silu_split_0</title></rect>
+<rect x="872.506" y="648.000" width="22.590" height="5.000" rx="0" fill="#e0a12d"><title>GPU 3 · AG · 8.807–10.393 ms · ncclDevKernel_AllGather_RING</title></rect>
+<rect x="933.259" y="648.000" width="16.012" height="5.000" rx="0" fill="#9856a8"><title>GPU 3 · RS · 13.071–14.194 ms · ncclDevKernel_ReduceScatter_bf16_RING</title></rect>
+<rect x="949.324" y="641.000" width="0.015" height="6.000" rx="0" fill="#9da9b5"><title>GPU 3 · mem · 14.198–14.199 ms · memset</title></rect>
+<rect x="949.371" y="641.000" width="6.131" height="6.000" rx="0" fill="#9ab5d5"><title>GPU 3 · other · 14.202–14.632 ms · rmsnorm_bwd_general_kernel</title></rect>
+<rect x="955.510" y="641.000" width="0.102" height="6.000" rx="0" fill="#9ab5d5"><title>GPU 3 · other · 14.632–14.639 ms · rmsnorm_bwd_finalize_general_kernel</title></rect>
+<rect x="955.617" y="641.000" width="1.043" height="6.000" rx="0" fill="#9ab5d5"><title>GPU 3 · other · 14.640–14.713 ms · vectorized_elementwise_kernel</title></rect>
+<rect x="956.730" y="648.000" width="13.471" height="5.000" rx="0" fill="#e0a12d"><title>GPU 3 · AG · 14.718–15.663 ms · ncclDevKernel_AllGather_RING</title></rect>
+<rect x="988.249" y="641.000" width="1.988" height="6.000" rx="0" fill="#9ab5d5"><title>GPU 3 · other · 16.930–17.069 ms · triton_poi_fused__to_copy_clone_mul_sigmoid_sigmoid_backward_view_0</title></rect>
+<rect x="990.232" y="641.000" width="1.028" height="6.000" rx="0" fill="#08949d"><title>GPU 3 · FA · 17.069–17.141 ms · kernel_cutlass_kernel_flash_attncuteflash_bwd_preprocessFlashAttentionBackwardPreprocess_object_at__tensorptrbf16gmemalign16oi64div81i64div8i64div8_tensorptrbf16gmemalign16oi64div81i64div_0</title></rect>
+<rect x="991.263" y="641.000" width="44.711" height="6.000" rx="0" fill="#08949d"><title>GPU 3 · FA · 17.141–20.279 ms · kernel_cutlass_kernel_flash_attncutesm100_hd256_2cta_fmha_backward_dqkernelBlackwellFusedMultiHeadAttentionBackwardDQKernel_object_at__TiledMMA_ThrLayoutVMNK21111000_PermutationMNK____MMA_0</title></rect>
+<rect x="1035.977" y="641.000" width="67.012" height="6.000" rx="0" fill="#08949d"><title>GPU 3 · FA · 20.279–24.982 ms · kernel_cutlass_dkdv_bwd_flash_attncutesm100_hd256_2cta_fmha_backward_dkdvkernelBlackwellFusedMultiHeadAttentionBackwardDKDVKernel_object_at__TiledMMA_ThrLayoutVMNK21111000_PermutationMNK__1</title></rect>
+<rect x="1102.989" y="641.000" width="1.044" height="6.000" rx="0" fill="#9ab5d5"><title>GPU 3 · other · 24.982–25.055 ms · fused_rope_backward_kernel</title></rect>
+<rect x="1104.038" y="641.000" width="2.618" height="6.000" rx="0" fill="#9ab5d5"><title>GPU 3 · other · 25.055–25.239 ms · fused_rope_backward_kernel</title></rect>
+<rect x="1106.659" y="641.000" width="0.663" height="6.000" rx="0" fill="#9ab5d5"><title>GPU 3 · other · 25.239–25.286 ms · rmsnorm_bwd_general_kernel</title></rect>
+<rect x="1107.327" y="641.000" width="0.189" height="6.000" rx="0" fill="#9ab5d5"><title>GPU 3 · other · 25.286–25.299 ms · rmsnorm_bwd_finalize_general_kernel</title></rect>
+<rect x="1107.523" y="641.000" width="3.450" height="6.000" rx="0" fill="#9ab5d5"><title>GPU 3 · other · 25.300–25.542 ms · rmsnorm_bwd_general_kernel</title></rect>
+<rect x="1110.975" y="641.000" width="0.187" height="6.000" rx="0" fill="#9ab5d5"><title>GPU 3 · other · 25.542–25.555 ms · rmsnorm_bwd_finalize_general_kernel</title></rect>
+<rect x="1111.166" y="641.000" width="15.569" height="6.000" rx="0" fill="#9ab5d5"><title>GPU 3 · other · 25.556–26.648 ms · CatArrayBatchedCopy</title></rect>
+<rect x="1144.694" y="648.000" width="35.259" height="5.000" rx="0" fill="#e0a12d"><title>GPU 3 · AG · 27.908–30.383 ms · ncclDevKernel_AllGather_RING</title></rect>
+<rect x="1190.232" y="648.000" width="24.325" height="5.000" rx="0" fill="#9856a8"><title>GPU 3 · RS · 31.104–32.811 ms · ncclDevKernel_ReduceScatter_bf16_RING</title></rect>
+<rect x="1214.592" y="641.000" width="0.023" height="6.000" rx="0" fill="#9da9b5"><title>GPU 3 · mem · 32.813–32.815 ms · memset</title></rect>
+<rect x="1214.663" y="641.000" width="6.329" height="6.000" rx="0" fill="#9ab5d5"><title>GPU 3 · other · 32.818–33.263 ms · rmsnorm_bwd_general_kernel</title></rect>
+<rect x="1221.001" y="641.000" width="0.106" height="6.000" rx="0" fill="#9ab5d5"><title>GPU 3 · other · 33.263–33.271 ms · rmsnorm_bwd_finalize_general_kernel</title></rect>
+<rect x="1221.112" y="641.000" width="1.043" height="6.000" rx="0" fill="#9ab5d5"><title>GPU 3 · other · 33.271–33.344 ms · vectorized_elementwise_kernel</title></rect>
+<rect x="1222.214" y="641.000" width="0.108" height="6.000" rx="0" fill="#9da9b5"><title>GPU 3 · mem · 33.348–33.356 ms · 8</title></rect>
+<rect x="1222.355" y="641.000" width="0.033" height="6.000" rx="0" fill="#9da9b5"><title>GPU 3 · mem · 33.358–33.361 ms · 8</title></rect>
+<rect x="1222.431" y="641.000" width="0.197" height="6.000" rx="0" fill="#9da9b5"><title>GPU 3 · mem · 33.364–33.377 ms · 8</title></rect>
+<rect x="1222.665" y="641.000" width="0.033" height="6.000" rx="0" fill="#9da9b5"><title>GPU 3 · mem · 33.380–33.382 ms · 8</title></rect>
+<rect x="1222.722" y="641.000" width="0.034" height="6.000" rx="0" fill="#9da9b5"><title>GPU 3 · mem · 33.384–33.386 ms · 8</title></rect>
+<rect x="1222.785" y="641.000" width="0.026" height="6.000" rx="0" fill="#9da9b5"><title>GPU 3 · mem · 33.388–33.390 ms · 8</title></rect>
+<rect x="1222.844" y="641.000" width="0.428" height="6.000" rx="0" fill="#9da9b5"><title>GPU 3 · mem · 33.393–33.423 ms · 8</title></rect>
+<rect x="1223.316" y="641.000" width="0.233" height="6.000" rx="0" fill="#9da9b5"><title>GPU 3 · mem · 33.426–33.442 ms · 8</title></rect>
+<rect x="762.239" y="641.000" width="23.466" height="6.000" rx="0" fill="#3c70c6"><title>GPU 3 · GEMM · 1.069–2.716 ms · nvjet_sm100_tst_128x256_64x6_2x2_2cta_h_bz_NNT</title></rect>
+<rect x="785.657" y="641.000" width="26.173" height="6.000" rx="0" fill="#3c70c6"><title>GPU 3 · GEMM · 2.713–4.550 ms · nvjet_sm100_tss_320x192_64x3_2x2_2cta_h_badd_NTT</title></rect>
+<rect x="826.493" y="641.000" width="46.673" height="6.000" rx="0" fill="#3c70c6"><title>GPU 3 · GEMM · 5.578–8.854 ms · nvjet_sm100_tst_128x256_64x6_2x1_2cta_v_bz_NNT</title></rect>
+<rect x="895.130" y="641.000" width="47.373" height="6.000" rx="0" fill="#3c70c6"><title>GPU 3 · GEMM · 10.395–13.719 ms · nvjet_sm100_tss_256x256_64x4_2x2_2cta_h_badd_NTT</title></rect>
+<rect x="970.195" y="641.000" width="8.733" height="6.000" rx="0" fill="#3c70c6"><title>GPU 3 · GEMM · 15.663–16.276 ms · nvjet_sm100_tst_128x256_64x6_2x2_2cta_h_bz_NNT</title></rect>
+<rect x="978.878" y="641.000" width="9.369" height="6.000" rx="0" fill="#3c70c6"><title>GPU 3 · GEMM · 16.272–16.930 ms · nvjet_sm100_tss_256x256_64x4_2x4_2cta_h_badd_NTT</title></rect>
+<rect x="1126.731" y="641.000" width="18.241" height="6.000" rx="0" fill="#3c70c6"><title>GPU 3 · GEMM · 26.648–27.928 ms · nvjet_sm100_tst_128x256_64x6_2x1_2cta_v_bz_NNT</title></rect>
+<rect x="1179.996" y="641.000" width="20.360" height="6.000" rx="0" fill="#3c70c6"><title>GPU 3 · GEMM · 30.386–31.814 ms · nvjet_sm100_tss_256x256_64x4_2x2_2cta_h_badd_NTT</title></rect>
+<text x="738" y="668" font-size="11" fill="#16764f" font-weight="700" text-anchor="end">可用</text>
+<rect x="747.000" y="662.000" width="570.000" height="7.000" rx="1" fill="#e7f2eb"/>
+<rect x="762.624" y="662.000" width="49.207" height="7.000" rx="0" fill="#2b9e65"><title>四卡可用 · 1.096–4.550 ms</title></rect>
+<rect x="811.833" y="662.000" width="0.515" height="7.000" rx="0" fill="#2b9e65"><title>四卡可用 · 4.550–4.586 ms</title></rect>
+<rect x="812.351" y="662.000" width="0.552" height="7.000" rx="0" fill="#2b9e65"><title>四卡可用 · 4.586–4.625 ms</title></rect>
+<rect x="812.905" y="662.000" width="2.307" height="7.000" rx="0" fill="#2b9e65"><title>四卡可用 · 4.625–4.787 ms</title></rect>
+<rect x="815.215" y="662.000" width="57.291" height="7.000" rx="0" fill="#2b9e65"><title>四卡可用 · 4.787–8.807 ms</title></rect>
+<rect x="895.508" y="662.000" width="37.329" height="7.000" rx="0" fill="#2b9e65"><title>四卡可用 · 10.422–13.041 ms</title></rect>
+<rect x="949.650" y="662.000" width="5.779" height="7.000" rx="0" fill="#2b9e65"><title>四卡可用 · 14.221–14.627 ms</title></rect>
+<rect x="955.436" y="662.000" width="0.046" height="7.000" rx="0" fill="#2b9e65"><title>四卡可用 · 14.627–14.630 ms</title></rect>
+<rect x="955.489" y="662.000" width="0.014" height="7.000" rx="0" fill="#2b9e65"><title>四卡可用 · 14.631–14.632 ms</title></rect>
+<rect x="955.510" y="662.000" width="0.026" height="7.000" rx="0" fill="#2b9e65"><title>四卡可用 · 14.632–14.634 ms</title></rect>
+<rect x="955.541" y="662.000" width="0.049" height="7.000" rx="0" fill="#2b9e65"><title>四卡可用 · 14.634–14.638 ms</title></rect>
+<rect x="955.596" y="662.000" width="0.016" height="7.000" rx="0" fill="#2b9e65"><title>四卡可用 · 14.638–14.639 ms</title></rect>
+<rect x="955.617" y="662.000" width="0.058" height="7.000" rx="0" fill="#2b9e65"><title>四卡可用 · 14.640–14.644 ms</title></rect>
+<rect x="955.682" y="662.000" width="0.100" height="7.000" rx="0" fill="#2b9e65"><title>四卡可用 · 14.644–14.651 ms</title></rect>
+<rect x="955.788" y="662.000" width="0.802" height="7.000" rx="0" fill="#2b9e65"><title>四卡可用 · 14.652–14.708 ms</title></rect>
+<rect x="970.315" y="662.000" width="17.890" height="7.000" rx="0" fill="#2b9e65"><title>四卡可用 · 15.671–16.927 ms</title></rect>
+<rect x="988.208" y="662.000" width="0.039" height="7.000" rx="0" fill="#2b9e65"><title>四卡可用 · 16.927–16.930 ms</title></rect>
+<rect x="988.249" y="662.000" width="0.215" height="7.000" rx="0" fill="#2b9e65"><title>四卡可用 · 16.930–16.945 ms</title></rect>
+<rect x="988.467" y="662.000" width="0.910" height="7.000" rx="0" fill="#2b9e65"><title>四卡可用 · 16.945–17.009 ms</title></rect>
+<rect x="989.379" y="662.000" width="1.853" height="7.000" rx="0" fill="#2b9e65"><title>四卡可用 · 17.009–17.139 ms</title></rect>
+<rect x="991.235" y="662.000" width="0.025" height="7.000" rx="0" fill="#2b9e65"><title>四卡可用 · 17.139–17.141 ms</title></rect>
+<rect x="991.263" y="662.000" width="0.216" height="7.000" rx="0" fill="#2b9e65"><title>四卡可用 · 17.141–17.156 ms</title></rect>
+<rect x="991.482" y="662.000" width="0.953" height="7.000" rx="0" fill="#2b9e65"><title>四卡可用 · 17.157–17.224 ms</title></rect>
+<rect x="992.438" y="662.000" width="42.400" height="7.000" rx="0" fill="#2b9e65"><title>四卡可用 · 17.224–20.199 ms</title></rect>
+<rect x="1034.845" y="662.000" width="1.021" height="7.000" rx="0" fill="#2b9e65"><title>四卡可用 · 20.200–20.271 ms</title></rect>
+<rect x="1035.869" y="662.000" width="0.105" height="7.000" rx="0" fill="#2b9e65"><title>四卡可用 · 20.272–20.279 ms</title></rect>
+<rect x="1035.977" y="662.000" width="4.576" height="7.000" rx="0" fill="#2b9e65"><title>四卡可用 · 20.279–20.600 ms</title></rect>
+<rect x="1040.556" y="662.000" width="63.477" height="7.000" rx="0" fill="#2b9e65"><title>四卡可用 · 20.600–25.055 ms</title></rect>
+<rect x="1104.038" y="662.000" width="0.411" height="7.000" rx="0" fill="#2b9e65"><title>四卡可用 · 25.055–25.084 ms</title></rect>
+<rect x="1104.452" y="662.000" width="1.105" height="7.000" rx="0" fill="#2b9e65"><title>四卡可用 · 25.084–25.162 ms</title></rect>
+<rect x="1105.562" y="662.000" width="1.095" height="7.000" rx="0" fill="#2b9e65"><title>四卡可用 · 25.162–25.239 ms</title></rect>
+<rect x="1106.659" y="662.000" width="0.663" height="7.000" rx="0" fill="#2b9e65"><title>四卡可用 · 25.239–25.286 ms</title></rect>
+<rect x="1107.327" y="662.000" width="0.189" height="7.000" rx="0" fill="#2b9e65"><title>四卡可用 · 25.286–25.299 ms</title></rect>
+<rect x="1107.523" y="662.000" width="0.769" height="7.000" rx="0" fill="#2b9e65"><title>四卡可用 · 25.300–25.354 ms</title></rect>
+<rect x="1108.295" y="662.000" width="0.160" height="7.000" rx="0" fill="#2b9e65"><title>四卡可用 · 25.354–25.365 ms</title></rect>
+<rect x="1108.460" y="662.000" width="0.511" height="7.000" rx="0" fill="#2b9e65"><title>四卡可用 · 25.366–25.402 ms</title></rect>
+<rect x="1108.976" y="662.000" width="0.202" height="7.000" rx="0" fill="#2b9e65"><title>四卡可用 · 25.402–25.416 ms</title></rect>
+<rect x="1109.185" y="662.000" width="1.788" height="7.000" rx="0" fill="#2b9e65"><title>四卡可用 · 25.416–25.542 ms</title></rect>
+<rect x="1110.975" y="662.000" width="0.187" height="7.000" rx="0" fill="#2b9e65"><title>四卡可用 · 25.542–25.555 ms</title></rect>
+<rect x="1111.166" y="662.000" width="0.071" height="7.000" rx="0" fill="#2b9e65"><title>四卡可用 · 25.556–25.560 ms</title></rect>
+<rect x="1111.240" y="662.000" width="0.698" height="7.000" rx="0" fill="#2b9e65"><title>四卡可用 · 25.561–25.610 ms</title></rect>
+<rect x="1111.943" y="662.000" width="0.202" height="7.000" rx="0" fill="#2b9e65"><title>四卡可用 · 25.610–25.624 ms</title></rect>
+<rect x="1112.152" y="662.000" width="0.605" height="7.000" rx="0" fill="#2b9e65"><title>四卡可用 · 25.625–25.667 ms</title></rect>
+<rect x="1112.760" y="662.000" width="0.202" height="7.000" rx="0" fill="#2b9e65"><title>四卡可用 · 25.667–25.681 ms</title></rect>
+<rect x="1112.966" y="662.000" width="2.804" height="7.000" rx="0" fill="#2b9e65"><title>四卡可用 · 25.682–25.879 ms</title></rect>
+<rect x="1115.773" y="662.000" width="0.189" height="7.000" rx="0" fill="#2b9e65"><title>四卡可用 · 25.879–25.892 ms</title></rect>
+<rect x="1115.967" y="662.000" width="1.530" height="7.000" rx="0" fill="#2b9e65"><title>四卡可用 · 25.892–26.000 ms</title></rect>
+<rect x="1117.500" y="662.000" width="1.202" height="7.000" rx="0" fill="#2b9e65"><title>四卡可用 · 26.000–26.084 ms</title></rect>
+<rect x="1118.707" y="662.000" width="3.617" height="7.000" rx="0" fill="#2b9e65"><title>四卡可用 · 26.085–26.339 ms</title></rect>
+<rect x="1122.327" y="662.000" width="0.205" height="7.000" rx="0" fill="#2b9e65"><title>四卡可用 · 26.339–26.353 ms</title></rect>
+<rect x="1122.539" y="662.000" width="3.746" height="7.000" rx="0" fill="#2b9e65"><title>四卡可用 · 26.354–26.616 ms</title></rect>
+<rect x="1126.288" y="662.000" width="0.202" height="7.000" rx="0" fill="#2b9e65"><title>四卡可用 · 26.617–26.631 ms</title></rect>
+<rect x="1126.494" y="662.000" width="18.200" height="7.000" rx="0" fill="#2b9e65"><title>四卡可用 · 26.631–27.908 ms</title></rect>
+<rect x="1180.246" y="662.000" width="8.441" height="7.000" rx="0" fill="#2b9e65"><title>四卡可用 · 30.403–30.996 ms</title></rect>
+<rect x="1214.997" y="662.000" width="5.397" height="7.000" rx="0" fill="#2b9e65"><title>四卡可用 · 32.842–33.221 ms</title></rect>
+<rect x="1220.403" y="662.000" width="0.100" height="7.000" rx="0" fill="#2b9e65"><title>四卡可用 · 33.221–33.228 ms</title></rect>
+<rect x="1220.508" y="662.000" width="0.263" height="7.000" rx="0" fill="#2b9e65"><title>四卡可用 · 33.229–33.247 ms</title></rect>
+<rect x="1220.781" y="662.000" width="0.105" height="7.000" rx="0" fill="#2b9e65"><title>四卡可用 · 33.248–33.255 ms</title></rect>
+<rect x="1220.890" y="662.000" width="0.102" height="7.000" rx="0" fill="#2b9e65"><title>四卡可用 · 33.255–33.263 ms</title></rect>
+<rect x="1221.001" y="662.000" width="0.106" height="7.000" rx="0" fill="#2b9e65"><title>四卡可用 · 33.263–33.271 ms</title></rect>
+<rect x="1221.112" y="662.000" width="0.256" height="7.000" rx="0" fill="#2b9e65"><title>四卡可用 · 33.271–33.289 ms</title></rect>
+<rect x="1221.378" y="662.000" width="0.108" height="7.000" rx="0" fill="#2b9e65"><title>四卡可用 · 33.290–33.297 ms</title></rect>
+<rect x="1221.490" y="662.000" width="0.038" height="7.000" rx="0" fill="#2b9e65"><title>四卡可用 · 33.298–33.300 ms</title></rect>
+<rect x="34.000" y="701.000" width="1332.000" height="164.000" rx="11" fill="#ffffff" stroke="#d4e1eb"/>
+<text x="53" y="724" font-size="15" fill="#915e30" font-weight="700" text-anchor="start">DP4 + FSDP-3 · 同 communicator</text>
+<text x="53" y="762" font-size="14" fill="#495f72" font-weight="400" text-anchor="start">该组合没有可用的 Nsight Systems trace。</text>
+<rect x="34.000" y="876.000" width="1332.000" height="164.000" rx="11" fill="#ffffff" stroke="#d4e1eb"/>
+<text x="53" y="899" font-size="15" fill="#7a4592" font-weight="700" text-anchor="start">DP4 + FSDP-3 · 独立 AG communicator</text>
+<text x="53" y="937" font-size="14" fill="#495f72" font-weight="400" text-anchor="start">该组合没有可用的 Nsight Systems trace。</text>
+<rect x="34.000" y="1051.000" width="1332.000" height="143.000" rx="11" fill="#ffffff" stroke="#d4e1eb"/>
+<text x="53" y="1074" font-size="15" fill="#63798c" font-weight="700" text-anchor="start">DDP · 纯 DP4</text>
+<text x="53" y="1112" font-size="14" fill="#495f72" font-weight="400" text-anchor="start">该 MBS × Seq 没有可用的纯 DP4 replay。</text>
+<rect x="34.000" y="1205.000" width="1332.000" height="204.000" rx="12" fill="#ffffff" stroke="#d4e1eb"/>
+<text x="54" y="1237" font-size="18" fill="#112b43" font-weight="700" text-anchor="start">CP4 反向还能放多长的 FSDP 通信</text>
+<text x="54" y="1263" font-size="15" fill="#16764f" font-weight="700" text-anchor="start">四卡窗口中位数   累计 / 最长严格连续 / 最长无 NCCL（允许计算间隙） = 11.76 / 2.99 / 7.91 ms</text>
+<text x="54" y="1289" font-size="14" fill="#495f72" font-weight="400" text-anchor="start">DP4 + FSDP-3 · 同 communicator 缺少该形状的实测参照。</text>
+<text x="54" y="1313" font-size="14" fill="#495f72" font-weight="400" text-anchor="start">DP4 + FSDP-3 · 独立 AG communicator 缺少该形状的实测参照。</text>
+<text x="54" y="1343" font-size="14" fill="#495f72" font-weight="400" text-anchor="start">TP4 反向两次 RS 与 GEMM 的同卡重叠中位数为 657 / 698 µs。该组的 tp_comm_overlap=false。</text>
+<text x="54" y="1373" font-size="14" fill="#495f72" font-weight="400" text-anchor="start">窗口比较使用 CP4 的 DDP trace 与 CP1 的 FSDP trace。实际 CP + FSDP 的就绪偏斜和资源争用需在组合配置上验证。</text>
+<text x="46" y="1430" font-size="13" fill="#495f72" font-weight="400" text-anchor="start">DDP 参数 AG 在 optimizer step 同步执行。FSDP 启用层级参数预取，两套 FSDP 的 GBS 可不同。</text>
+</g></svg>

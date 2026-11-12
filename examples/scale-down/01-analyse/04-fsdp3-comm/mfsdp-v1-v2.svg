@@ -1,0 +1,116 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="1440" height="1040" viewBox="0 0 1440 1040"
+     role="img" aria-labelledby="title description">
+  <title id="title">Megatron-FSDP v1 与 v2 实现对比</title>
+  <desc id="description">并排比较两种 ZeRO-3 实现的入口、权重聚合、梯度归约和 CUDA Graph 捕获边界。底部区分 0.19.0 的实验源码、0.20.0 的训练接入与尚未合入的 TE partial graph 草案。</desc>
+  <defs>
+    <marker id="arrow" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto">
+      <path d="M1,1 L7,4 L1,7" fill="none" stroke="#75889a" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
+    </marker>
+    <style>
+      text { fill: #14283c; font-family: -apple-system, BlinkMacSystemFont, "PingFang SC", "Noto Sans CJK SC", "Microsoft YaHei", sans-serif; }
+      .mono { font-family: "SFMono-Regular", Menlo, Consolas, monospace; font-size: 17px; }
+      .eyebrow { fill: #415f76; font-size: 15px; font-weight: 700; letter-spacing: 2px; }
+      .title { font-size: 43px; font-weight: 750; }
+      .subtitle { fill: #486174; font-size: 20px; }
+      .panel-title { font-size: 28px; font-weight: 700; }
+      .stage { font-size: 18px; font-weight: 700; }
+      .detail { fill: #405b6e; font-size: 17px; }
+      .footnote { fill: #486174; font-size: 16px; }
+      .timeline-title { font-size: 21px; font-weight: 700; }
+      .blue { fill: #1c5892; }
+      .teal { fill: #106957; }
+      .amber { fill: #8b5100; }
+      .connector { stroke: #75889a; stroke-width: 1.8; marker-end: url(#arrow); }
+    </style>
+  </defs>
+
+  <rect width="1440" height="1040" fill="#f3f6f9"/>
+  <text x="48" y="49" class="eyebrow">MEGATRON CORE / TRAINING RUNTIME</text>
+  <text x="48" y="103" class="title">Megatron-FSDP v1 与 v2</text>
+  <text x="48" y="140" class="subtitle">同一 ZeRO-3 分片策略下的参数聚合、梯度归约和 graph 边界</text>
+  <rect x="1117" y="85" width="275" height="44" rx="22" fill="#e2ebf2"/>
+  <text x="1254.5" y="113" class="mono" text-anchor="middle">optim_grads_params</text>
+
+  <g aria-label="Megatron-FSDP v1">
+    <rect x="48" y="168" width="656" height="636" rx="18" fill="#ffffff" stroke="#cbd9e6"/>
+    <text x="76" y="212" class="panel-title blue">v1 · Bucket pipeline</text>
+    <text x="76" y="241" class="detail">原 27B trace · core_v0.19.0_scale_down</text>
+
+    <rect x="76" y="265" width="600" height="80" rx="11" fill="#edf4fb"/>
+    <text x="96" y="292" class="stage blue">模型入口</text>
+    <text x="96" y="320" class="mono">FullyShardedDataParallel → MegatronFSDP</text>
+    <line x1="376" y1="347" x2="376" y2="365" class="connector"/>
+
+    <rect x="76" y="367" width="600" height="92" rx="11" fill="#edf4fb"/>
+    <text x="96" y="394" class="stage blue">权重 All-Gather</text>
+    <text x="96" y="420" class="mono">AllGatherPipeline → all_gather_into_tensor()</text>
+    <text x="96" y="444" class="detail">FSDP hooks 推进 bucket 预取和等待</text>
+    <line x1="376" y1="461" x2="376" y2="479" class="connector"/>
+
+    <rect x="76" y="481" width="600" height="56" rx="11" fill="#f2f5f8"/>
+    <text x="376" y="516" class="stage" text-anchor="middle">使用完整参数计算 forward / backward</text>
+    <line x1="376" y1="539" x2="376" y2="557" class="connector"/>
+
+    <rect x="76" y="559" width="600" height="92" rx="11" fill="#edf4fb"/>
+    <text x="96" y="586" class="stage blue">梯度 Reduce-Scatter</text>
+    <text x="96" y="612" class="mono">GradReducePipeline → reduce_scatter_tensor()</text>
+    <text x="96" y="636" class="detail">本次 BF16 路径先缩放整桶梯度，再发 RS</text>
+
+    <rect x="76" y="673" width="600" height="108" rx="11" fill="#f5f8fb" stroke="#cbd9e6"/>
+    <text x="96" y="700" class="stage blue">本次 27B trace 的 full_iteration</text>
+    <text x="96" y="730" class="detail">整步 forward + backward 一起录制 AG、GEMM 和 RS</text>
+    <text x="96" y="756" class="detail">持久双缓冲保持 replay 所需的地址稳定</text>
+  </g>
+
+  <g aria-label="Megatron-FSDP v2">
+    <rect x="736" y="168" width="656" height="636" rx="18" fill="#ffffff" stroke="#cbdcd7"/>
+    <text x="764" y="212" class="panel-title teal">v2 · Per-unit runtime</text>
+    <text x="764" y="241" class="detail">实验分支 cf473f207 · megatron_fsdp_version=2</text>
+
+    <rect x="764" y="265" width="600" height="80" rx="11" fill="#eaf6f2"/>
+    <text x="784" y="292" class="stage teal">模型入口</text>
+    <text x="784" y="320" class="mono">fully_shard() → FsdpModule + FsdpContext</text>
+    <line x1="1064" y1="347" x2="1064" y2="365" class="connector"/>
+
+    <rect x="764" y="367" width="600" height="92" rx="11" fill="#eaf6f2"/>
+    <text x="784" y="394" class="stage teal">权重 All-Gather</text>
+    <text x="784" y="420" class="mono">FsdpModule.unshard() → DBuffer.redistribute()</text>
+    <text x="784" y="444" class="detail">参数组将权重从 Shard 转成 Replicate</text>
+    <line x1="1064" y1="461" x2="1064" y2="479" class="connector"/>
+
+    <rect x="764" y="481" width="600" height="56" rx="11" fill="#f2f5f8"/>
+    <text x="1064" y="516" class="stage" text-anchor="middle">使用完整参数计算 forward / backward</text>
+    <line x1="1064" y1="539" x2="1064" y2="557" class="connector"/>
+
+    <rect x="764" y="559" width="600" height="92" rx="11" fill="#eaf6f2"/>
+    <text x="784" y="586" class="stage teal">梯度 Reduce-Scatter</text>
+    <text x="784" y="612" class="mono">FsdpModule.post_backward() → DBuffer.redistribute()</text>
+    <text x="784" y="636" class="detail">Partial → Shard，需要缩放时在归约后处理本地结果</text>
+
+    <rect x="764" y="673" width="600" height="108" rx="11" fill="#f3f8f6" stroke="#cbdcd7"/>
+    <text x="784" y="700" class="stage teal">#9112 的 TE partial graph · Draft</text>
+    <text x="784" y="730" class="detail">Capture 暂停 FSDP hooks，保留完整参数 buffer 地址</text>
+    <text x="784" y="756" class="detail">Replay 经 nn.Module.__call__，AG / RS 在 graph 外</text>
+  </g>
+
+  <text x="48" y="833" class="footnote">两条路径最终都调用 PyTorch distributed / NCCL。箭头描述单个 FSDP unit 的依赖，层间操作可以重叠。</text>
+
+  <text x="48" y="870" class="timeline-title">v2 的引入时间</text>
+  <g aria-label="版本时间线">
+    <rect x="48" y="889" width="432" height="114" rx="12" fill="#ffffff" stroke="#cbd9e6"/>
+    <text x="69" y="922" class="timeline-title blue">0.19.0 · 实验源码</text>
+    <text x="69" y="951" class="detail">#5387 引入实验性的 fully_shard()</text>
+    <text x="69" y="978" class="detail">v2 仍在开发，源码位于 experimental/</text>
+
+    <rect x="504" y="889" width="432" height="114" rx="12" fill="#ffffff" stroke="#cbdcd7"/>
+    <text x="525" y="922" class="timeline-title teal">0.20.0 · 训练接入</text>
+    <text x="525" y="951" class="detail">#5865 的 v2 adapter 随正式版发布</text>
+    <text x="525" y="978" class="detail">含受支持 dense 配置的整步 graph</text>
+
+    <rect x="960" y="889" width="432" height="114" rx="12" fill="#fff7eb" stroke="#e5d3b3"/>
+    <text x="981" y="922" class="timeline-title amber">#9112 · 2026-11-08</text>
+    <text x="981" y="951" class="detail">在已有 v2 上接入 TE partial graph</text>
+    <text x="981" y="978" class="detail">截至 2026-11-10 仍为 Draft</text>
+  </g>
+</svg>

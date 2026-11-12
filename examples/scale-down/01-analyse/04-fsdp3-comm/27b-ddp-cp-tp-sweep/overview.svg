@@ -1,0 +1,127 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1400" height="968" viewBox="0 0 1400 968" role="img" aria-labelledby="title desc">
+<title id="title">27B CP4 / TP4 / DP4 + FSDP-3 · 九组汇总</title><desc id="desc">比较九个形状下的 CP4 连续窗口和 FSDP3 参数 AG、梯度 RS 的实际时间。</desc>
+<g font-family="Arial, Hiragino Sans GB, PingFang SC, Microsoft YaHei, sans-serif">
+<rect x="0.000" y="0.000" width="1400.000" height="968.000" rx="0" fill="#f3f7fb"/>
+<rect x="0.000" y="0.000" width="1400.000" height="7.000" rx="0" fill="#2b638e"/>
+<text x="44" y="40" font-size="14" fill="#245e88" font-weight="700" text-anchor="start">GB200  /  NSIGHT SYSTEMS  /  CUDA GRAPH REPLAY</text>
+<text x="43" y="81" font-size="31" fill="#112b43" font-weight="700" text-anchor="start">27B CP4 / TP4 / DP4 + FSDP-3 · 九组汇总</text>
+<text x="45" y="113" font-size="15" fill="#495f72" font-weight="400" text-anchor="start">4 × GB200  ·  BF16  ·  8 层 full attention  ·  点击 MBS × Seq 打开该配置的四卡轨道</text>
+<rect x="34.000" y="136.000" width="1332.000" height="622.000" rx="12" fill="#ffffff" stroke="#d4e1eb"/>
+<text x="221" y="166" font-size="14" fill="#112b43" font-weight="700" text-anchor="start">DDP · CP4</text>
+<text x="467" y="166" font-size="14" fill="#112b43" font-weight="700" text-anchor="start">DDP · TP4 + SP</text>
+<text x="714" y="166" font-size="14" fill="#112b43" font-weight="700" text-anchor="start">DP4 + FSDP-3 · 同 communicator</text>
+<text x="1038" y="166" font-size="14" fill="#112b43" font-weight="700" text-anchor="start">DP4 + FSDP-3 · 独立 AG communicator</text>
+<text x="56" y="190" font-size="13" fill="#495f72" font-weight="400" text-anchor="start">DDP 每格  前向 / 反向耗时 · CP 反向累计 / 严格连续 / 无 NCCL 连续；TP 前向 / 反向重叠率。</text>
+<text x="56" y="211" font-size="13" fill="#495f72" font-weight="400" text-anchor="start">FSDP 每格  前 AG / 反 AG / RS 单卡驻留；下一行反 AG / RS 末卡进入后时长和四卡共同重叠组数。</text>
+<rect x="46.000" y="224.000" width="1307.000" height="53.000" rx="4" fill="#eff4f8"/>
+<a href="mbs1-seq4k.svg">
+<text x="58" y="256" font-size="15" fill="#245e88" font-weight="700" text-anchor="start">MBS 1 × 4K</text>
+</a>
+<text x="221" y="245" font-size="15" fill="#112b43" font-weight="700" text-anchor="start">0.96 / 2.43 ms</text>
+<text x="221" y="267" font-size="13" fill="#16764f" font-weight="700" text-anchor="start">0.96 / 0.36 / 0.81 ms</text>
+<text x="467" y="245" font-size="15" fill="#112b43" font-weight="700" text-anchor="start">1.05 / 2.28 ms</text>
+<text x="467" y="267" font-size="13" fill="#495f72" font-weight="400" text-anchor="start">0.15 / 22.22%</text>
+<text x="714" y="245" font-size="15" fill="#112b43" font-weight="700" text-anchor="start">1.24 / 1.38 / 2.39 ms</text>
+<text x="714" y="267" font-size="13" fill="#495f72" font-weight="400" text-anchor="start">1.34 / 1.32 ms  ·  0/24 组</text>
+<text x="1038" y="245" font-size="15" fill="#112b43" font-weight="700" text-anchor="start">1.35 / 2.21 / 2.40 ms</text>
+<text x="1038" y="267" font-size="13" fill="#495f72" font-weight="400" text-anchor="start">1.75 / 1.67 ms  ·  48/48 组</text>
+<rect x="46.000" y="281.000" width="1307.000" height="53.000" rx="4" fill="#ffffff"/>
+<a href="mbs1-seq8k.svg">
+<text x="58" y="313" font-size="15" fill="#245e88" font-weight="700" text-anchor="start">MBS 1 × 8K</text>
+</a>
+<text x="221" y="302" font-size="15" fill="#112b43" font-weight="700" text-anchor="start">1.74 / 4.43 ms</text>
+<text x="221" y="324" font-size="13" fill="#16764f" font-weight="700" text-anchor="start">1.52 / 0.50 / 1.22 ms</text>
+<text x="467" y="302" font-size="15" fill="#112b43" font-weight="700" text-anchor="start">1.95 / 4.36 ms</text>
+<text x="467" y="324" font-size="13" fill="#495f72" font-weight="400" text-anchor="start">0.09 / 14.43%</text>
+<text x="714" y="302" font-size="15" fill="#112b43" font-weight="700" text-anchor="start">1.39 / 1.62 / 2.81 ms</text>
+<text x="714" y="324" font-size="13" fill="#495f72" font-weight="400" text-anchor="start">1.41 / 1.34 ms  ·  0/24 组</text>
+<text x="1038" y="302" font-size="15" fill="#112b43" font-weight="700" text-anchor="start">1.41 / 2.25 / 2.49 ms</text>
+<text x="1038" y="324" font-size="13" fill="#495f72" font-weight="400" text-anchor="start">1.60 / 1.47 ms  ·  46/48 组</text>
+<rect x="46.000" y="338.000" width="1307.000" height="53.000" rx="4" fill="#eff4f8"/>
+<a href="mbs1-seq16k.svg">
+<text x="58" y="370" font-size="15" fill="#245e88" font-weight="700" text-anchor="start">MBS 1 × 16K</text>
+</a>
+<text x="221" y="359" font-size="15" fill="#112b43" font-weight="700" text-anchor="start">3.56 / 9.42 ms</text>
+<text x="221" y="381" font-size="13" fill="#16764f" font-weight="700" text-anchor="start">2.62 / 0.76 / 1.99 ms</text>
+<text x="467" y="359" font-size="15" fill="#112b43" font-weight="700" text-anchor="start">4.06 / 8.70 ms</text>
+<text x="467" y="381" font-size="13" fill="#495f72" font-weight="400" text-anchor="start">0.05 / 19.40%</text>
+<text x="714" y="359" font-size="15" fill="#112b43" font-weight="700" text-anchor="start">1.43 / 1.74 / 4.99 ms</text>
+<text x="714" y="381" font-size="13" fill="#495f72" font-weight="400" text-anchor="start">1.37 / 1.49 ms  ·  0/24 组</text>
+<text x="1038" y="359" font-size="15" fill="#112b43" font-weight="700" text-anchor="start">1.44 / 3.34 / 3.63 ms</text>
+<text x="1038" y="381" font-size="13" fill="#495f72" font-weight="400" text-anchor="start">1.44 / 1.36 ms  ·  0/48 组</text>
+<rect x="46.000" y="395.000" width="1307.000" height="53.000" rx="4" fill="#ffffff"/>
+<a href="mbs2-seq4k.svg">
+<text x="58" y="427" font-size="15" fill="#245e88" font-weight="700" text-anchor="start">MBS 2 × 4K</text>
+</a>
+<text x="221" y="416" font-size="15" fill="#112b43" font-weight="700" text-anchor="start">1.80 / 3.99 ms</text>
+<text x="221" y="438" font-size="13" fill="#16764f" font-weight="700" text-anchor="start">2.03 / 0.72 / 1.44 ms</text>
+<text x="467" y="416" font-size="15" fill="#112b43" font-weight="700" text-anchor="start">1.93 / 3.95 ms</text>
+<text x="467" y="438" font-size="13" fill="#495f72" font-weight="400" text-anchor="start">0.21 / 15.53%</text>
+<text x="714" y="416" font-size="15" fill="#112b43" font-weight="700" text-anchor="start">1.34 / 1.55 / 2.47 ms</text>
+<text x="714" y="438" font-size="13" fill="#495f72" font-weight="400" text-anchor="start">1.37 / 1.33 ms  ·  0/24 组</text>
+<text x="1038" y="416" font-size="15" fill="#112b43" font-weight="700" text-anchor="start">1.35 / 2.39 / 2.45 ms</text>
+<text x="1038" y="438" font-size="13" fill="#495f72" font-weight="400" text-anchor="start">1.57 / 1.46 ms  ·  24/24 组</text>
+<rect x="46.000" y="452.000" width="1307.000" height="53.000" rx="4" fill="#eff4f8"/>
+<a href="mbs2-seq8k.svg">
+<text x="58" y="484" font-size="15" fill="#245e88" font-weight="700" text-anchor="start">MBS 2 × 8K</text>
+</a>
+<text x="221" y="473" font-size="15" fill="#112b43" font-weight="700" text-anchor="start">3.36 / 8.06 ms</text>
+<text x="221" y="495" font-size="13" fill="#16764f" font-weight="700" text-anchor="start">3.29 / 1.07 / 2.32 ms</text>
+<text x="467" y="473" font-size="15" fill="#112b43" font-weight="700" text-anchor="start">3.80 / 7.80 ms</text>
+<text x="467" y="495" font-size="13" fill="#495f72" font-weight="400" text-anchor="start">0.11 / 18.91%</text>
+<text x="714" y="484" font-size="14" fill="#63798c" font-weight="400" text-anchor="start">无 trace</text>
+<text x="1038" y="473" font-size="15" fill="#112b43" font-weight="700" text-anchor="start">1.54 / 3.05 / 3.60 ms</text>
+<text x="1038" y="495" font-size="13" fill="#495f72" font-weight="400" text-anchor="start">1.45 / 1.35 ms  ·  0/24 组</text>
+<rect x="46.000" y="509.000" width="1307.000" height="53.000" rx="4" fill="#ffffff"/>
+<a href="mbs2-seq16k.svg">
+<text x="58" y="541" font-size="15" fill="#245e88" font-weight="700" text-anchor="start">MBS 2 × 16K</text>
+</a>
+<text x="221" y="530" font-size="15" fill="#112b43" font-weight="700" text-anchor="start">7.21 / 19.11 ms</text>
+<text x="221" y="552" font-size="13" fill="#16764f" font-weight="700" text-anchor="start">5.36 / 1.56 / 3.76 ms</text>
+<text x="467" y="530" font-size="15" fill="#112b43" font-weight="700" text-anchor="start">7.86 / 16.92 ms</text>
+<text x="467" y="552" font-size="13" fill="#495f72" font-weight="400" text-anchor="start">0.02 / 16.95%</text>
+<text x="714" y="530" font-size="15" fill="#112b43" font-weight="700" text-anchor="start">1.94 / 1.86 / 4.55 ms</text>
+<text x="714" y="552" font-size="13" fill="#495f72" font-weight="400" text-anchor="start">1.44 / 1.65 ms  ·  0/24 组</text>
+<text x="1038" y="530" font-size="15" fill="#112b43" font-weight="700" text-anchor="start">1.57 / 4.99 / 4.60 ms</text>
+<text x="1038" y="552" font-size="13" fill="#495f72" font-weight="400" text-anchor="start">1.45 / 1.44 ms  ·  0/24 组</text>
+<rect x="46.000" y="566.000" width="1307.000" height="53.000" rx="4" fill="#eff4f8"/>
+<a href="mbs4-seq4k.svg">
+<text x="58" y="598" font-size="15" fill="#245e88" font-weight="700" text-anchor="start">MBS 4 × 4K</text>
+</a>
+<text x="221" y="587" font-size="15" fill="#112b43" font-weight="700" text-anchor="start">3.34 / 7.63 ms</text>
+<text x="221" y="609" font-size="13" fill="#16764f" font-weight="700" text-anchor="start">3.68 / 1.29 / 2.63 ms</text>
+<text x="467" y="587" font-size="15" fill="#112b43" font-weight="700" text-anchor="start">3.68 / 7.41 ms</text>
+<text x="467" y="609" font-size="13" fill="#495f72" font-weight="400" text-anchor="start">0.11 / 19.16%</text>
+<text x="714" y="587" font-size="15" fill="#112b43" font-weight="700" text-anchor="start">1.52 / 1.63 / 4.73 ms</text>
+<text x="714" y="609" font-size="13" fill="#495f72" font-weight="400" text-anchor="start">1.32 / 1.46 ms  ·  0/24 组</text>
+<text x="1038" y="587" font-size="15" fill="#112b43" font-weight="700" text-anchor="start">1.28 / 3.36 / 3.33 ms</text>
+<text x="1038" y="609" font-size="13" fill="#495f72" font-weight="400" text-anchor="start">1.44 / 1.35 ms  ·  0/12 组</text>
+<rect x="46.000" y="623.000" width="1307.000" height="53.000" rx="4" fill="#ffffff"/>
+<a href="mbs4-seq8k.svg">
+<text x="58" y="655" font-size="15" fill="#245e88" font-weight="700" text-anchor="start">MBS 4 × 8K</text>
+</a>
+<text x="221" y="644" font-size="15" fill="#112b43" font-weight="700" text-anchor="start">6.59 / 16.44 ms</text>
+<text x="221" y="666" font-size="13" fill="#16764f" font-weight="700" text-anchor="start">6.63 / 1.98 / 4.70 ms</text>
+<text x="467" y="644" font-size="15" fill="#112b43" font-weight="700" text-anchor="start">7.33 / 15.13 ms</text>
+<text x="467" y="666" font-size="13" fill="#495f72" font-weight="400" text-anchor="start">0.02 / 17.89%</text>
+<text x="714" y="644" font-size="15" fill="#112b43" font-weight="700" text-anchor="start">1.80 / 2.31 / 5.91 ms</text>
+<text x="714" y="666" font-size="13" fill="#495f72" font-weight="400" text-anchor="start">1.43 / 1.64 ms  ·  0/24 组</text>
+<text x="1038" y="644" font-size="15" fill="#112b43" font-weight="700" text-anchor="start">1.54 / 3.26 / 3.51 ms</text>
+<text x="1038" y="666" font-size="13" fill="#495f72" font-weight="400" text-anchor="start">1.49 / 1.51 ms  ·  0/12 组</text>
+<rect x="46.000" y="680.000" width="1307.000" height="53.000" rx="4" fill="#eff4f8"/>
+<a href="mbs4-seq16k.svg">
+<text x="58" y="712" font-size="15" fill="#245e88" font-weight="700" text-anchor="start">MBS 4 × 16K</text>
+</a>
+<text x="221" y="701" font-size="15" fill="#112b43" font-weight="700" text-anchor="start">14.29 / 35.17 ms</text>
+<text x="221" y="723" font-size="13" fill="#16764f" font-weight="700" text-anchor="start">11.76 / 2.99 / 7.91 ms</text>
+<text x="467" y="701" font-size="15" fill="#112b43" font-weight="700" text-anchor="start">15.41 / 33.57 ms</text>
+<text x="467" y="723" font-size="13" fill="#495f72" font-weight="400" text-anchor="start">0.01 / 16.61%</text>
+<text x="714" y="712" font-size="14" fill="#63798c" font-weight="400" text-anchor="start">无 trace</text>
+<text x="1038" y="712" font-size="14" fill="#63798c" font-weight="400" text-anchor="start">无 trace</text>
+<rect x="34.000" y="775.000" width="1332.000" height="156.000" rx="12" fill="#ffffff" stroke="#d4e1eb"/>
+<text x="54" y="805" font-size="18" fill="#112b43" font-weight="700" text-anchor="start">用连续窗口判断 CP 中的调度空间</text>
+<text x="54" y="833" font-size="14" fill="#495f72" font-weight="400" text-anchor="start">严格连续要求四卡同时计算且无 NCCL。无 NCCL 连续允许层内短计算间隙，只统计四卡都在同一层的区间。</text>
+<text x="54" y="859" font-size="14" fill="#495f72" font-weight="400" text-anchor="start">独立 AG communicator 的理想并发以 max(AG, RS) 对照。同 communicator 用串行 AG + RS。两者均用末卡进入后的时长。</text>
+<text x="54" y="885" font-size="14" fill="#495f72" font-weight="400" text-anchor="start">CP1 的 DP4 FSDP 与 CP4 DDP 是独立实测。保留 4 卡时，CP4 × DP1 的 FSDP dense 分片组仍为 4。</text>
+<text x="54" y="910" font-size="13" fill="#495f72" font-weight="400" text-anchor="start">逐 case 图列出严格连续段达到参照时长的样本比例。通过表示时间上有空间，实际并发还取决于就绪与带宽。</text>
+</g></svg>
