@@ -373,7 +373,7 @@ RUN_DATE=261031-130000 bash examples/scale-down/01-analyse/04-fsdp3-comm/benchma
   --node-rank 0 --master-addr <rank0-host> --master-port 29501
 ```
 
-其他节点把 `--node-rank 0` 改为 `1`、`2`、`3`。多节点 DLC 不会由脚本设置 `GLOO_SOCKET_IFNAME`。
+其他节点把 `--node-rank 0` 改为 `1`、`2`、`3`。
 
 PP 固定为 1，MoE 的 EP 固定为 4；FSDP 在全部 DP×CP rank 上分片，TP 是 DTensor mesh 的 `tp` 维。MoE case 的 GPU 数必须是 4 的倍数。
 
@@ -385,7 +385,9 @@ bash examples/scale-down/01-analyse/04-fsdp3-comm/run_pretrain_fsdp3.sh \
   --num-layers 4 --num-experts 64 --cuda-graph on --profile nsys
 ```
 
-训练命令通过 `torch.distributed.run --no-python` 让每个 worker 执行 `numarun python ...`。脚本依次检查目标设备上的 `numarun`、仓库 `.cache/numarun`（需要 `numactl`）、`numactl --localalloc` 的本地 NUMA 内存策略，都不可用时才取消绑定。四 GPU 单节点运行会设置 `GLOO_SOCKET_IFNAME=eth0`；多节点 DLC 不注入该变量。
+训练命令通过 `torch.distributed.run --no-python` 让每个 worker 执行 `numarun python ...`。脚本依次检查目标设备上的 `numarun`、仓库 `.cache/numarun`（需要 `numactl`）、`numactl --localalloc` 的本地 NUMA 内存策略，都不可用时才取消绑定。
+
+实际启动时，[Gloo 网卡 helper](../../../../scripts/scale-down/common/gloo_socket_ifname.sh) 用 `ip -o -4 addr show up` 验证环境中的 `GLOO_SOCKET_IFNAME`。需要自动选择时，单节点优先 `eth0`，多节点优先 `bond1`，另一个接口作为备选。最终选择写入 `run_info.txt`。
 
 结果目录保持为 `results/01-analyse/04-fsdp3-comm/`，case 名包含层数、MTP 层数、routed expert 数（dense 为 0，未裁剪为 `full`）和 CUDA graph 模式，并按节点保存：
 

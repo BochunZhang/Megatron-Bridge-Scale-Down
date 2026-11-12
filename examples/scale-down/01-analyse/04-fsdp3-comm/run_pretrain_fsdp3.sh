@@ -489,9 +489,6 @@ elif command -v numactl >/dev/null 2>&1; then
     NUMA_WRAPPER=(numactl --localalloc); NUMA_MODE=numactl
 fi
 
-# Single-node four-GPU Gloo uses the GB200 host interface. DLC multi-node
-# launchers own their network environment and do not receive this override.
-if (( NNODES == 1 && GPU_COUNT == 4 )); then export GLOO_SOCKET_IFNAME=eth0; else unset GLOO_SOCKET_IFNAME || true; fi
 # HybridEP topology on GB200 NVL72: the whole EP group sits in one MNNVL domain.
 if [[ "${DISPATCHER}" == hybridep ]]; then
     export NUM_OF_HYBRID_EP_RANKS_PER_NVLINK_DOMAIN="${EXPERT_PARALLEL}" NVLINK_DOMAIN_SIZE=72 USE_MNNVL=1
@@ -694,10 +691,11 @@ INFO=(
 )
 if [[ "${DRY_RUN}" == true ]]; then
     printf '%s\n' "${INFO[*]}" >&2
-    printf 'GLOO_SOCKET_IFNAME=%s\nPYTORCH_CUDA_ALLOC_CONF=%s\nNCCL_GRAPH_REGISTER=%s\nNCCL_NVLS_ENABLE=%s\nNVTE_CUTEDSL_FUSED_GROUPED_MLP=%s\ncommand:' "${GLOO_SOCKET_IFNAME:-<unset>}" "${PYTORCH_CUDA_ALLOC_CONF:-<unset>}" "${NCCL_GRAPH_REGISTER:-<unset>}" "${NCCL_NVLS_ENABLE:-<unset>}" "${NVTE_CUTEDSL_FUSED_GROUPED_MLP:-<unset>}" >&2
+    printf 'GLOO_SOCKET_IFNAME=%s\nPYTORCH_CUDA_ALLOC_CONF=%s\nNCCL_GRAPH_REGISTER=%s\nNCCL_NVLS_ENABLE=%s\nNVTE_CUTEDSL_FUSED_GROUPED_MLP=%s\ncommand:' "${GLOO_SOCKET_IFNAME:-<auto>}" "${PYTORCH_CUDA_ALLOC_CONF:-<unset>}" "${NCCL_GRAPH_REGISTER:-<unset>}" "${NCCL_NVLS_ENABLE:-<unset>}" "${NVTE_CUTEDSL_FUSED_GROUPED_MLP:-<unset>}" >&2
     printf ' %q' "${COMMAND[@]}" >&2; printf '\n' >&2
     exit 0
 fi
+ARCHIVE_DIR=""
 if [[ -e "${RESULT_DIR}/launch.json" || ( "${STABLE_RESULT_DIR}" == true && -d "${RESULT_DIR}" ) ]]; then
     [[ "${RESUME}" == true ]] || { echo "result already exists: ${RESULT_DIR} (use --resume)" >&2; exit 2; }
     if grep -qx 'status=0' "${RESULT_DIR}/run_info.txt" 2>/dev/null && has_required_profile; then
@@ -705,6 +703,13 @@ if [[ -e "${RESULT_DIR}/launch.json" || ( "${STABLE_RESULT_DIR}" == true && -d "
         exit 0
     fi
     ARCHIVE_DIR="${RESULT_DIR}.attempt-$(date +%y%m%d-%H%M%S)-$$"
+fi
+# Resolve Gloo only when a new training process needs a local interface.
+# shellcheck source=../../../../scripts/scale-down/common/gloo_socket_ifname.sh
+source "${REPO_ROOT}/scripts/scale-down/common/gloo_socket_ifname.sh"
+resolve_gloo_socket_ifname "${NNODES}" >&2
+INFO+=("gloo_socket_ifname=${GLOO_SOCKET_IFNAME}")
+if [[ -n "${ARCHIVE_DIR}" ]]; then
     mv "${RESULT_DIR}" "${ARCHIVE_DIR}"
     echo "archived incomplete or failed attempt: ${ARCHIVE_DIR}" >&2
 fi
