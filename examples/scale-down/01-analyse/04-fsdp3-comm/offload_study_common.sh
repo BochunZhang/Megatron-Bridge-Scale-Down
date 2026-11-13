@@ -15,6 +15,8 @@ if [[ "${GROUP}" == 05-nccl ]]; then MODELS=(27b); fi
 LAUNCHER=("${BENCHMARK_DIR}/run_pretrain_fsdp3.sh")
 DRY_RUN=false
 PRINT_CASE_DIRS=false
+RESUME_CASES=false
+ACTIVE_CASE_LOCK=""
 FAILED=0
 NVME_PATH="${NVME_PATH:-}"
 NCCL_LIB="${NCCL_LIB:-}"
@@ -68,6 +70,7 @@ run_case() {
     local script_name="${STUDY_SCRIPT%.sh}"
     local result_group="${GROUP}/${script_name//_/-}"
     local result_args=(--stable-result-dir)
+    if [[ "${RESUME_CASES}" == true ]]; then result_args+=(--resume); fi
     if [[ -n "${name}" ]]; then
         result_args+=(--run-name "${name}")
     fi
@@ -78,6 +81,7 @@ run_case() {
         --results-root "${OUTPUT_DIR}/${result_group}" "${result_args[@]}" "$@")
     local label="${result_group}${name:+/${name}} model=${model} fsdp=${fsdp} graph=${graph} tp=${tp} cp=${cp} mbs=${mbs} seq=${seq}"
     local case_dir=""
+    local claim_dir=""
     if [[ "${DRY_RUN}" == true && "${PRINT_CASE_DIRS}" == false ]]; then
         args+=(--dry-run)
     else
@@ -92,30 +96,46 @@ run_case() {
             printf '%s\n' "${case_dir}"
             return 0
         fi
-        if [[ -d "${case_dir}" ]]; then
-            printf 'skip existing case: %s\n' "${case_dir}" >&2
+        # Resumable cases need a separate claim so an incomplete result can be retried.
+        claim_dir="${case_dir}"
+        local skip_reason=existing
+        if [[ "${RESUME_CASES}" == true ]]; then
+            claim_dir="${case_dir}.lock"
+            skip_reason=active
+        fi
+        if [[ -d "${claim_dir}" ]]; then
+            printf 'skip %s case: %s\n' "${skip_reason}" "${case_dir}" >&2
             return 0
         fi
         if declare -F prepare_case >/dev/null; then
             prepare_case "${name}"
         fi
-        # Claim the case directory before launching so parallel invocations also skip it.
-        mkdir -p -- "${case_dir%/*}"
-        if ! mkdir -- "${case_dir}" 2>/dev/null; then
-            [[ -d "${case_dir}" ]] || fail "Cannot create case directory: ${case_dir}"
-            printf 'skip existing case: %s\n' "${case_dir}" >&2
+        mkdir -p -- "${claim_dir%/*}"
+        if ! mkdir -- "${claim_dir}" 2>/dev/null; then
+            [[ -d "${claim_dir}" ]] || fail "Cannot create case claim: ${claim_dir}"
+            printf 'skip %s case: %s\n' "${skip_reason}" "${case_dir}" >&2
             return 0
         fi
+        if [[ "${RESUME_CASES}" == true ]]; then ACTIVE_CASE_LOCK="${claim_dir}"; fi
     fi
     printf 'case %s\n' "${label}" >&2
     if ! "${LAUNCHER[@]}" "${args[@]}"; then
-        if [[ -n "${case_dir}" ]]; then
+        if [[ -n "${case_dir}" && "${RESUME_CASES}" == false ]]; then
             rmdir -- "${case_dir}" 2>/dev/null || true
         fi
         printf 'failed %s\n' "${label}" >&2
         FAILED=$((FAILED + 1))
     fi
+    release_case_lock
 }
 
+release_case_lock() {
+    if [[ -n "${ACTIVE_CASE_LOCK}" ]]; then
+        rmdir -- "${ACTIVE_CASE_LOCK}"
+        ACTIVE_CASE_LOCK=""
+    fi
+}
+
+trap release_case_lock EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM

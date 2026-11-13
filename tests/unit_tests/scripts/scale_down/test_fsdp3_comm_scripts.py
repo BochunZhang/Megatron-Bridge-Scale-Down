@@ -15,6 +15,7 @@ REPO_ROOT = Path(__file__).resolve().parents[4]
 EXAMPLE = REPO_ROOT / "examples/scale-down/01-analyse/04-fsdp3-comm"
 BENCHMARK = EXAMPLE / "benchmark_fsdp3.sh"
 RUN_ONE = EXAMPLE / "run_pretrain_fsdp3.sh"
+DDP_CP_TP_STUDY = EXAMPLE / "02-comm-overlap/02_ddp_cp_tp.sh"
 RUN_DATE = "261031-120000"
 
 
@@ -408,6 +409,30 @@ def test_baseline_saves_stable_case_paths_under_each_experiment(
 
 
 @pytest.mark.unit
+@pytest.mark.parametrize("model", ["27b", "2.4t"])
+def test_ddp_cp_tp_study_compares_matched_tp_overlap_cases(tmp_path: Path, model: str):
+    result = _run(DDP_CP_TP_STUDY, "--model", model, "--dry-run", "--output-dir", str(tmp_path))
+    assert result.returncode == 0, result.stderr
+    cp4, tp4, tp4_overlap = _commands(result.stderr)
+    overlap_flag = "comm_overlap.tp_comm_overlap=true"
+    assert overlap_flag not in shlex.split(cp4)
+
+    def training_args(command: str) -> list[str]:
+        return [
+            arg for arg in shlex.split(command) if not arg.startswith(("--output=", "logger.save_config_filepath="))
+        ]
+
+    baseline_args = training_args(tp4)
+    assert "model.tensor_model_parallel_size=4" in baseline_args
+    assert "model.context_parallel_size=1" in baseline_args
+    assert "model.sequence_parallel=true" in baseline_args
+    assert overlap_flag not in baseline_args
+    assert training_args(tp4_overlap) == [*baseline_args, overlap_flag]
+    assert "-tp-overlap-" in _report_base(tp4_overlap).name
+    assert "-tp-overlap-" not in _report_base(tp4).name
+
+
+@pytest.mark.unit
 @pytest.mark.parametrize("script", ["01_priority.sh", "02_symmetric_multicast.sh", "03_ag_pause.sh"])
 def test_nccl_studies_use_the_cta_pause_build_and_automatic_kernel_selection(script: str):
     result = _run(
@@ -435,7 +460,9 @@ def test_nccl_studies_use_the_cta_pause_build_and_automatic_kernel_selection(scr
 
 
 @pytest.mark.unit
-@pytest.mark.parametrize("script", sorted(EXAMPLE.glob("[0-9][0-9]-*/[0-9][0-9]_*.sh")), ids=lambda p: p.stem)
+@pytest.mark.parametrize(
+    "script", sorted(set(EXAMPLE.glob("[0-9][0-9]-*/[0-9][0-9]_*.sh")) - {DDP_CP_TP_STUDY}), ids=lambda p: p.stem
+)
 def test_numbered_studies_skip_existing_case_directories(tmp_path: Path, script: Path):
     args = ("--model", "27b", "--output-dir", str(tmp_path))
     dry_run = _run(script, *args, "--dry-run", NVME_PATH="", NCCL_LIB="")
@@ -456,8 +483,26 @@ def test_numbered_studies_skip_existing_case_directories(tmp_path: Path, script:
     assert all(not any(case_dir.iterdir()) for case_dir in case_dirs)
 
 
+@pytest.fixture
+def fake_nsys_env(tmp_path: Path) -> dict[str, str]:
+    fake_ip = tmp_path / "ip"
+    fake_ip.write_text("#!/bin/sh\nprintf '%s\\n' '2: eth0 inet 192.0.2.1/24'\n")
+    fake_ip.chmod(0o755)
+    fake_nsys = tmp_path / "nsys"
+    fake_nsys.write_text(
+        '#!/bin/sh\nfor arg; do\n  case "$arg" in\n'
+        '    --output=*)\n'
+        '      printf "report\\n" > "${arg#--output=}.nsys-rep"\n'
+        '      printf "measured %s\\n" "${arg#--output=}"\n'
+        "      exit 0;;\n"
+        "  esac\ndone\nexit 1\n"
+    )
+    fake_nsys.chmod(0o755)
+    return {"PATH": f"{tmp_path}:{os.environ['PATH']}", "GLOO_SOCKET_IFNAME": "eth0"}
+
+
 @pytest.mark.unit
-def test_numbered_study_launches_missing_case_next_to_existing_one(tmp_path: Path):
+def test_numbered_study_launches_missing_case_next_to_existing_one(tmp_path: Path, fake_nsys_env: dict[str, str]):
     script = EXAMPLE / "01-baseline/01_cuda_graph.sh"
     args = ("--model", "27b", "--output-dir", str(tmp_path))
     dry_run = _run(script, *args, "--dry-run")
@@ -467,24 +512,54 @@ def test_numbered_study_launches_missing_case_next_to_existing_one(tmp_path: Pat
     legacy_case_dir = tmp_path / "01-baseline" / f"{missing.parent.parent.name}-baseline"
     legacy_case_dir.mkdir()
 
-    fake_ip = tmp_path / "ip"
-    fake_ip.write_text("#!/bin/sh\nprintf '%s\\n' '2: eth0 inet 192.0.2.1/24'\n")
-    fake_ip.chmod(0o755)
-    fake_nsys = tmp_path / "nsys"
-    fake_nsys.write_text(
-        '#!/bin/sh\nfor arg; do\n  case "$arg" in\n'
-        '    --output=*) printf "report\\n" > "${arg#--output=}.nsys-rep"; exit 0;;\n'
-        "  esac\ndone\nexit 1\n"
-    )
-    fake_nsys.chmod(0o755)
-
-    result = _run(script, *args, PATH=f"{tmp_path}:{os.environ['PATH']}", GLOO_SOCKET_IFNAME="eth0")
+    result = _run(script, *args, **fake_nsys_env)
     assert result.returncode == 0, result.stderr
     assert f"skip existing case: {existing.parent.parent}" in result.stderr
     assert not existing.parent.exists()
     assert not any(legacy_case_dir.iterdir())
     assert (missing.parent / "run_info.txt").read_text().splitlines()[-1] == "status=0"
     assert missing.with_suffix(".nsys-rep").stat().st_size > 0
+
+
+@pytest.mark.unit
+def test_ddp_cp_tp_study_skips_completed_measurements_and_retries_partial_ones(
+    tmp_path: Path, fake_nsys_env: dict[str, str]
+):
+    args = ("--model", "27b", "--output-dir", str(tmp_path))
+    dry_run = _run(DDP_CP_TP_STUDY, *args, "--dry-run")
+    assert dry_run.returncode == 0, dry_run.stderr
+    reports = list(map(_report_base, _commands(dry_run.stderr)))
+    cp4, tp4, tp4_overlap = reports
+    plan = _run(DDP_CP_TP_STUDY, *args, "--print-case-dirs")
+    assert plan.returncode == 0, plan.stderr
+    assert list(map(Path, plan.stdout.splitlines())) == [report.parent.parent for report in reports]
+
+    cp4.parent.mkdir(parents=True)
+    (cp4.parent / "run_info.txt").write_text("status=0\n")
+    Path(f"{cp4}.nsys-rep").write_text("existing report\n")
+    tp4.parent.mkdir(parents=True)
+    (tp4.parent / "run_info.txt").write_text("status=0\n")
+    Path(f"{tp4}.nsys-rep").touch()
+    tp4_overlap.parent.parent.mkdir(parents=True)
+
+    result = _run(DDP_CP_TP_STUDY, *args, **fake_nsys_env)
+    assert result.returncode == 0, result.stderr
+    assert f"skip completed case: {cp4.parent}" in result.stderr
+    assert [line for line in result.stdout.splitlines() if line.startswith("measured ")] == [
+        f"measured {tp4}",
+        f"measured {tp4_overlap}",
+    ]
+    (archived_tp4,) = tp4.parent.parent.glob("node0.attempt-*")
+    assert (archived_tp4 / f"{tp4.name}.nsys-rep").stat().st_size == 0
+
+    rerun = _run(DDP_CP_TP_STUDY, *args, **fake_nsys_env)
+    assert rerun.returncode == 0, rerun.stderr
+    assert "measured " not in rerun.stdout
+    assert [line for line in rerun.stderr.splitlines() if line.startswith("skip completed case:")] == [
+        f"skip completed case: {report.parent}" for report in reports
+    ]
+    assert Path(f"{cp4}.nsys-rep").read_text() == "existing report\n"
+    assert not list(cp4.parent.parent.parent.glob("*.lock"))
 
 
 @pytest.mark.unit
