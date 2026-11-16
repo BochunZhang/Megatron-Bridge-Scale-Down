@@ -237,6 +237,29 @@ PM sampling / warp state sampling 的 pass 数是动态决定的，这两类很�
   同时到达同一个 kernel，ncu 可能在参与者没到齐的情况下就开始 profile。
 - 默认只 profile 每组的第一个 CUDA context；需要选 GPU 时，用 `-- --devices ...` 透传给 ncu。
 
+## 单发起 rank 的 AG 和 RS 字节量
+
+在单节点 GB200 上，先构建 NCCL 2.32.3 的实验库，再分别采一次
+`AllGather_STMC` 和 `ReduceScatter_LDMC`。
+
+```bash
+bash install/install-nccl-2.32.3-rank0-only.sh
+bash examples/gb200/ncu-torch-all-gather/run_ncu_torch_ag_rs_rank0_only.sh
+```
+
+四张卡各有一个 NCU TCP communicator 实例，每个 workload 都启动独立的应用重放任务。
+默认 BF16、1 GiB（AG 每卡输出、RS 每卡输入），每次只采热身后的一个 kernel。
+每个 workload 下保存各 rank 的 `.ncu-rep[z]` 和原始 CSV，合并文件
+`nvlink_bytes.csv` 按 workload 和 rank 给出 TX/RX × Requests/Responses × User/Protocol 的八项
+`.sum`，以及两个方向的总字节数，单位为 byte。
+
+补丁的 `NCCL_SYM_MULTIMEM_RANK0_ONLY=1` 只让 communicator rank 0 发出数据指令，
+所有 rank 仍参与 window 注册和 kernel 前后的 barrier。AG 校验每卡的 rank 0 槽位已写入，
+其余槽位保持零。RS 校验 rank 0 的分片已归约，其余 rank 的输出保持零。
+接收卡的硬件响应和 barrier 流量都计入相应字节数。
+同一份实验库可用 `--full --nccl-lib nccl/nccl-2.32.3-rank0-only/build/lib/libnccl.so.2`
+恢复全 rank 数据指令，用作对照。`--dry-run` 可预览两个采集命令。
+
 ## AG + RS 同时执行（`--ag-rs`）
 
 - RS 用的实现：ring / nvls 和 AG 一样由 `NCCL_ALGO` 决定；symm 是 `ReduceScatter_LDMC`（multicast load-reduce），

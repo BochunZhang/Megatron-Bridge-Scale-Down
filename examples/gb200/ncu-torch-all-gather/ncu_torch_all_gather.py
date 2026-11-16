@@ -92,9 +92,12 @@ def _nccl_backend(pg: dist.ProcessGroup) -> dist.ProcessGroupNCCL:
     return pg._get_backend(torch.device("cuda"))
 
 
-def _check_output(out: torch.Tensor, world_size: int, shard: int) -> None:
-    """Chunk ``k`` of the gathered tensor must hold ``k + 1`` everywhere."""
-    expected = torch.arange(1, world_size + 1, device=out.device, dtype=out.dtype).repeat_interleave(shard)
+def _check_output(out: torch.Tensor, world_size: int, shard: int, *, rank0_only: bool = False) -> None:
+    """Check each gathered chunk, including untouched zeros in rank-0-only mode."""
+    values = torch.arange(1, world_size + 1, device=out.device, dtype=out.dtype)
+    if rank0_only:
+        values[1:].zero_()
+    expected = values.repeat_interleave(shard)
     if not torch.equal(out, expected):
         bad = (out != expected).nonzero()[0].item()
         raise RuntimeError(f"all-gather output wrong at element {bad}: {out[bad].item()} != {expected[bad].item()}")
@@ -105,6 +108,9 @@ def main() -> None:
     args = _parse_args()
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s")
     _check_env(args.algo)
+    rank0_only = os.environ.get("NCCL_SYM_MULTIMEM_RANK0_ONLY") == "1"
+    if rank0_only and args.algo != "symm":
+        raise ValueError("NCCL_SYM_MULTIMEM_RANK0_ONLY=1 requires --algo symm")
 
     local_rank = int(os.environ["LOCAL_RANK"])
     device = torch.device("cuda", local_rank)
@@ -149,11 +155,13 @@ def main() -> None:
             args.iters,
         )
 
+    if rank0_only and args.warmup:
+        out.zero_()
     for _ in range(args.warmup):
         dist.all_gather_into_tensor(out, inp)
     torch.cuda.synchronize()
     if args.warmup:
-        _check_output(out, world_size, shard)
+        _check_output(out, world_size, shard, rank0_only=rank0_only)
     dist.barrier(group=cpu_group)
 
     out.zero_()
@@ -171,12 +179,12 @@ def main() -> None:
             for _ in range(args.iters):
                 dist.all_gather_into_tensor(out, inp)
             torch.cuda.synchronize()
-    _check_output(out, world_size, shard)
+    _check_output(out, world_size, shard, rank0_only=rank0_only)
     if capture is not None:
         capture.write(rank=rank)
     dist.barrier(group=cpu_group)
     if rank == 0:
-        logger.info("all-gather output correct after warmup and the %s range", NVTX_RANGE)
+        logger.info("all-gather output correct after warmup and the %s range (rank0_only=%s)", NVTX_RANGE, rank0_only)
 
     if pool is not None:
         # Release the windows before the pool's memory goes away.

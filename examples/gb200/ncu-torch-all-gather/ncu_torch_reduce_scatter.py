@@ -42,9 +42,9 @@ def _parse_args() -> argparse.Namespace:
     return args
 
 
-def _check_output(out: torch.Tensor, *, rank: int, world_size: int) -> None:
+def _check_output(out: torch.Tensor, *, rank: int, world_size: int, rank0_only: bool = False) -> None:
     # Every rank contributes rank % 2 + 1. Rank 0 also adds the destination rank to each shard.
-    expected = world_size + world_size // 2 + rank
+    expected = 0 if rank0_only and rank != 0 else world_size + world_size // 2 + rank
     if not torch.all(out == expected):
         raise RuntimeError(f"rank {rank}: reduce-scatter shard should contain only {expected}")
 
@@ -53,6 +53,7 @@ def main() -> None:
     """Warm up, profile one reduce-scatter, and check the output after each phase."""
     args = _parse_args()
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s")
+    rank0_only = os.environ.get("NCCL_SYM_MULTIMEM_RANK0_ONLY") == "1"
     world_size = int(os.environ["WORLD_SIZE"])
     if world_size < 2:
         raise ValueError("ReduceScatter_LDMC requires at least two ranks")
@@ -83,10 +84,12 @@ def main() -> None:
     backend.register_mem_pool(pool, symm=True)
     torch.cuda.synchronize()
 
+    if rank0_only:
+        out.zero_()
     for _ in range(args.warmup):
         dist.reduce_scatter_tensor(out, inp)
     torch.cuda.synchronize()
-    _check_output(out, rank=rank, world_size=world_size)
+    _check_output(out, rank=rank, world_size=world_size, rank0_only=rank0_only)
 
     out.zero_()
     capture = None
@@ -100,13 +103,17 @@ def main() -> None:
         with nvtx.range(NVTX_RANGE):
             dist.reduce_scatter_tensor(out, inp)
             torch.cuda.synchronize()
-    _check_output(out, rank=rank, world_size=world_size)
+    _check_output(out, rank=rank, world_size=world_size, rank0_only=rank0_only)
     if capture is not None:
         capture.write(rank=rank)
     dist.barrier(group=cpu_group)
     if rank == 0:
         logger.info(
-            "Reduce-scatter verified on %d ranks, %d MiB %s input per rank", world_size, args.size_mib, args.dtype
+            "Reduce-scatter verified on %d ranks, %d MiB %s input per rank (rank0_only=%s)",
+            world_size,
+            args.size_mib,
+            args.dtype,
+            rank0_only,
         )
 
     backend.deregister_mem_pool(pool)
