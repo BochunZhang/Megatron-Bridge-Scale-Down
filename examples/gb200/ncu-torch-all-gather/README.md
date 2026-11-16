@@ -255,6 +255,10 @@ bash examples/gb200/ncu-torch-all-gather/run_ncu_torch_ag_rs_rank0_only.sh
 `nvlink_bytes.csv` 按 workload 和 rank 给出 TX/RX × Requests/Responses × User/Protocol 的八项
 `.sum`，以及两个方向的总字节数，单位为 byte。
 
+PM sampling 默认使用 10 µs 间隔和每卡 32 MiB 缓冲区，为多 rank 重放中的等待留出余量。
+汇总前会对照每项计数器所属重放的 kernel 起止时间检查采样覆盖，边界允许一个采样间隔。
+覆盖不足时保留原始报告并报错，可用 `--pm-sampling-buffer-size` 或 `--pm-sampling-interval` 调整后重采。
+
 补丁的 `NCCL_SYM_MULTIMEM_RANK0_ONLY=1` 只让 communicator rank 0 发出数据指令，
 所有 rank 仍参与 window 注册和 kernel 前后的 barrier。AG 校验每卡的 rank 0 槽位已写入，
 其余槽位保持零。RS 校验 rank 0 的分片已归约，其余 rank 的输出保持零。

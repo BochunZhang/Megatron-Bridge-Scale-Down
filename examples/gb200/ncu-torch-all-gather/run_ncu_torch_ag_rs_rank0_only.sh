@@ -31,6 +31,8 @@ Usage: run_ncu_torch_ag_rs_rank0_only.sh [options]
   --nccl-lib PATH   Preload this libnccl.so.2 (default in rank0-only mode:
                     nccl/nccl-2.32.3-rank0-only/build/lib/libnccl.so.2)
   --ncu PATH        Nsight Compute executable (default: ncu)
+  --pm-sampling-interval NS     PM sampling interval (default: 10000 ns)
+  --pm-sampling-buffer-size B   PM sampling buffer per GPU (default: 33554432 bytes)
   --timeout SEC     Limit per AG or RS capture (default: 1800)
   --output-dir DIR  Default: results/gb200/ncu-torch-all-gather/ag-rs-rank0-only-<time>
   --dry-run         Show both commands without running them
@@ -48,6 +50,7 @@ script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 repo_root="$(cd -- "${script_dir}/../../.." && pwd)"
 gpus="${CUDA_VISIBLE_DEVICES:-0,1,2,3}"
 size_mib=1024 dtype=bf16 warmup=1 ncu_bin=ncu timeout_sec=1800 nccl_lib="" output_dir=""
+pm_interval_ns=10000 pm_buffer_bytes=$((32 * 1024 * 1024))
 rank0_only=1
 dry_run=false
 
@@ -56,7 +59,7 @@ while (( $# )); do
         -h|--help) usage; exit 0 ;;
         --full) rank0_only=0; shift ;;
         --dry-run) dry_run=true; shift ;;
-        --gpus|--size-mib|--dtype|--warmup|--nccl-lib|--ncu|--timeout|--output-dir)
+        --gpus|--size-mib|--dtype|--warmup|--nccl-lib|--ncu|--timeout|--output-dir|--pm-sampling-interval|--pm-sampling-buffer-size)
             [[ -n "${2:-}" && "$2" != --* ]] || die "$1 needs a value"
             case "$1" in
                 --gpus) gpus="$2" ;;
@@ -65,6 +68,8 @@ while (( $# )); do
                 --warmup) warmup="$2" ;;
                 --nccl-lib) nccl_lib="$2" ;;
                 --ncu) ncu_bin="$2" ;;
+                --pm-sampling-interval) pm_interval_ns="$2" ;;
+                --pm-sampling-buffer-size) pm_buffer_bytes="$2" ;;
                 --timeout) timeout_sec="$2" ;;
                 --output-dir) output_dir="$2" ;;
             esac
@@ -80,6 +85,8 @@ nranks=${#gpu_list[@]}
     || die "--gpus must list distinct devices"
 [[ "$size_mib" =~ ^[1-9][0-9]*$ && "$warmup" =~ ^[1-9][0-9]*$ && "$timeout_sec" =~ ^[1-9][0-9]*$ ]] \
     || die "--size-mib, --warmup and --timeout must be positive integers"
+[[ "$pm_interval_ns" =~ ^[1-9][0-9]*$ && "$pm_buffer_bytes" =~ ^[1-9][0-9]*$ ]] \
+    || die "--pm-sampling-interval and --pm-sampling-buffer-size must be positive integers"
 [[ "$dtype" =~ ^(bf16|fp32)$ ]] || die "--dtype must be bf16 or fp32"
 element_bytes=2
 [[ "$dtype" == bf16 ]] || element_bytes=4
@@ -150,6 +157,7 @@ sys.stdout.write(".".join(map(str, ProcessGroupNCCL.get_runtime_nccl_version()))
     {
         echo "ncu=$ncu_bin $ncu_version NCCL=$nccl_version nccl_lib=${nccl_lib:-<from torch>}"
         echo "gpus=$gpus issuer_mode=$issuer_mode size_mib=$size_mib shard_bytes=$shard_bytes dtype=$dtype warmup=$warmup"
+        echo "pm_sampling_interval_ns=$pm_interval_ns pm_sampling_buffer_size_bytes=$pm_buffer_bytes"
         env | grep -E '^(NCCL_|CUDA_VISIBLE_DEVICES=|LD_PRELOAD=)' | sort
     } >"$output_dir/config.txt"
 fi
@@ -177,6 +185,7 @@ with socket.socket() as sock:
 '
 }
 
+reports=()
 for mode in ag rs; do
     mode_dir="$output_dir/$mode"
     if [[ "$mode" == ag ]]; then
@@ -205,6 +214,7 @@ for mode in ag rs; do
         --nvtx --nvtx-include "${nvtx_range}/"
         --lockstep-kernel-launch --lockstep-nvtx-include "${nvtx_range}/"
         --kernel-name-base function --kernel-name "regex:^ncclSymkDevKernel_${kernel}(_[A-Za-z0-9_]+)?$"
+        --pm-sampling-interval "$pm_interval_ns" --pm-sampling-buffer-size "$pm_buffer_bytes"
         --launch-count 1 --metrics "${pm_metrics%,}" --export "${mode_dir}/rank%q{RANK}-report"
         -- uv run --no-sync python "${worker[@]}" --size-mib "$size_mib" --dtype "$dtype" --warmup "$warmup")
     echo "[$mode] gpus=$gpus issuer_mode=$issuer_mode NCCL_SYM_KERNEL=$NCCL_SYM_KERNEL NCCL_SYM_MULTIMEM_RANK0_ONLY=$rank0_only"
@@ -240,13 +250,16 @@ for mode in ag rs; do
         [[ -n "$report" ]] || die "$mode: missing rank $rank NCU report under $mode_dir (expected rank${rank}-report*.ncu-rep[z])"
         "$ncu_bin" --import "$report" --page raw --csv --print-units base --print-kernel-base function \
             >"$mode_dir/rank${rank}.csv"
+        reports+=("$report")
     done
 done
 $dry_run && exit 0
 
-uv run --no-sync python - "$output_dir" "$gpus" "$issuer_mode" "$shard_bytes" "${metrics[@]}" <<'PYTHON'
+uv run --no-sync python - "$output_dir" "$gpus" "$issuer_mode" "$shard_bytes" "$ncu_bin" "${metrics[*]}" "${reports[@]}" <<'PYTHON'
 import csv
+import io
 import re
+import subprocess
 import sys
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
@@ -255,12 +268,60 @@ output = Path(sys.argv[1])
 gpus = sys.argv[2].split(",")
 issuer_mode = sys.argv[3]
 shard_bytes = int(sys.argv[4])
-metrics = sys.argv[5:]
+ncu_bin = sys.argv[5]
+metrics = sys.argv[6].split()
+reports = iter(sys.argv[7:])
 summary = []
+csv.field_size_limit(sys.maxsize)
+
+
+def metric_instances(cell):
+    # NCU details format: aggregate (correlation ID: value; correlation ID: value).
+    _, _, values = cell.partition(" (")
+    if values:
+        for entry in values.removesuffix(")").split("; "):
+            yield entry.split(": ", 1)
+
+
+def check_sample_coverage(report):
+    detailed_csv = subprocess.check_output(
+        [ncu_bin, "--import", report, "--page", "raw", "--csv", "--print-units", "base",
+         "--print-metric-instances", "details"],
+        text=True,
+    )
+    rows = csv.DictReader(io.StringIO(detailed_csv))
+    next(rows, None)  # Units row.
+    detail = next(rows, {})
+    group_by_metric = {
+        column: group
+        for group, names in metric_instances(detail.get("profiler__pmsampler_pass_groups", ""))
+        for column in re.findall(r"pmsampling:[\w.]+", names)
+    }
+    interval_by_group = dict(metric_instances(detail.get("profiler__pmsampler_interval_time", "")))
+    for metric in metrics:
+        column = f"pmsampling:{metric}"
+        try:
+            group = group_by_metric[column]
+            interval = int(interval_by_group[group])
+            start, end = (
+                int(next(metric_instances(detail[f"profiler__timestamp_workload_{edge}_{group}"]))[0].split()[0])
+                for edge in ("start", "end")
+            )
+            timestamps = [int(key.split()[0]) for key, _ in metric_instances(detail[column])]
+            first, last = timestamps[0], timestamps[-1]
+        except (KeyError, IndexError, StopIteration, ValueError):
+            raise SystemExit(f"{report}: missing PM coverage data for {column}") from None
+        if interval <= 0 or end <= start or first > start + interval or last < end - interval:
+            raise SystemExit(
+                f"{report}: incomplete PM sampling for {column} (first sample {first - start:+,} ns from "
+                f"kernel start, last sample {last - end:+,} ns from kernel end). "
+                "Increase --pm-sampling-buffer-size or --pm-sampling-interval and rerun."
+            )
 
 for mode, kernel in (("ag", "AllGather_STMC"), ("rs", "ReduceScatter_LDMC")):
     for rank, gpu in enumerate(gpus):
         raw = output / mode / f"rank{rank}.csv"
+        check_sample_coverage(next(reports))
         with raw.open(newline="") as handle:
             rows = csv.DictReader(handle)
             units = next(rows, {})
