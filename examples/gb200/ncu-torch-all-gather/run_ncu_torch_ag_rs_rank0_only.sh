@@ -32,7 +32,7 @@ Usage: run_ncu_torch_ag_rs_rank0_only.sh [options]
                     nccl/nccl-2.32.3-rank0-only/build/lib/libnccl.so.2)
   --ncu PATH        Nsight Compute executable (default: ncu)
   --timeout SEC     Limit per AG or RS capture (default: 1800)
-  --output-dir DIR  Default: results/gb200/ncu-torch-all-gather/ag-rs-bytes-<time>
+  --output-dir DIR  Default: results/gb200/ncu-torch-all-gather/ag-rs-rank0-only-<time>
   --dry-run         Show both commands without running them
   -h, --help
 
@@ -97,7 +97,7 @@ if [[ -n "$nccl_lib" && "$nccl_lib" != /* ]]; then
     nccl_lib="${PWD}/${nccl_lib}"
 fi
 
-output_dir="${output_dir:-${repo_root}/results/gb200/ncu-torch-all-gather/ag-rs-bytes-$(date +%Y%m%d-%H%M%S)}"
+output_dir="${output_dir:-${repo_root}/results/gb200/ncu-torch-all-gather/ag-rs-rank0-only-$(date +%Y%m%d-%H%M%S)}"
 [[ "$output_dir" = /* ]] || output_dir="${PWD}/${output_dir}"
 if ! $dry_run; then
     ncu_home="${repo_root}/NVIDIA-Nsight-Compute-2026.4"
@@ -205,7 +205,7 @@ for mode in ag rs; do
         --nvtx --nvtx-include "${nvtx_range}/"
         --lockstep-kernel-launch --lockstep-nvtx-include "${nvtx_range}/"
         --kernel-name-base function --kernel-name "regex:^ncclSymkDevKernel_${kernel}(_[A-Za-z0-9_]+)?$"
-        --launch-count 1 --metrics "${pm_metrics%,}" --export "${mode_dir}/rank%q{RANK}"
+        --launch-count 1 --metrics "${pm_metrics%,}" --export "${mode_dir}/rank%q{RANK}-report"
         -- uv run --no-sync python "${worker[@]}" --size-mib "$size_mib" --dtype "$dtype" --warmup "$warmup")
     echo "[$mode] gpus=$gpus issuer_mode=$issuer_mode NCCL_SYM_KERNEL=$NCCL_SYM_KERNEL NCCL_SYM_MULTIMEM_RANK0_ONLY=$rank0_only"
     printf ' %q' "${cmd[@]}"
@@ -229,10 +229,15 @@ for mode in ag rs; do
         grep -Fq "$patched_banner" "${logs[@]}" \
             || die "$mode: NCCL did not report the rank0-only build; see $mode_dir"
     fi
+    # NCU can append its own number to the export name. The rank is in the delimited prefix.
     for (( rank = 0; rank < nranks; rank++ )); do
-        report="$mode_dir/rank${rank}.ncu-repz"
-        [[ -s "$report" ]] || report="$mode_dir/rank${rank}.ncu-rep"
-        [[ -s "$report" ]] || die "$mode: missing rank $rank NCU report under $mode_dir"
+        report=""
+        for candidate in "$mode_dir/rank${rank}-report"*.ncu-rep{,z}; do
+            [[ -f "$candidate" && -s "$candidate" ]] || continue
+            [[ -z "$report" ]] || die "$mode: multiple rank $rank NCU reports: $report and $candidate"
+            report="$candidate"
+        done
+        [[ -n "$report" ]] || die "$mode: missing rank $rank NCU report under $mode_dir (expected rank${rank}-report*.ncu-rep[z])"
         "$ncu_bin" --import "$report" --page raw --csv --print-units base --print-kernel-base function \
             >"$mode_dir/rank${rank}.csv"
     done

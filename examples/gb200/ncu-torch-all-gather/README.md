@@ -249,7 +249,9 @@ bash examples/gb200/ncu-torch-all-gather/run_ncu_torch_ag_rs_rank0_only.sh
 
 四张卡各有一个 NCU TCP communicator 实例，每个 workload 都启动独立的应用重放任务。
 默认 BF16、1 GiB（AG 每卡输出、RS 每卡输入），每次只采热身后的一个 kernel。
-每个 workload 下保存各 rank 的 `.ncu-rep[z]` 和原始 CSV，合并文件
+默认目录为 `results/gb200/ncu-torch-all-gather/ag-rs-rank0-only-<时间>/`。
+每个 workload 保存各 rank 的原始报告和 `rank<N>.csv`。报告名前缀
+`rank<N>-report` 标识应用 rank，后面可能带 NCU 添加的编号。合并文件
 `nvlink_bytes.csv` 按 workload 和 rank 给出 TX/RX × Requests/Responses × User/Protocol 的八项
 `.sum`，以及两个方向的总字节数，单位为 byte。
 
