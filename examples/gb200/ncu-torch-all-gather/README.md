@@ -247,17 +247,18 @@ bash install/install-nccl-2.32.3-rank0-only.sh
 bash examples/gb200/ncu-torch-all-gather/run_ncu_torch_ag_rs_rank0_only.sh
 ```
 
-四张卡各有一个 NCU TCP communicator 实例，每个 workload 都启动独立的应用重放任务。
+每个 workload 分别启动一个 NCU，用 shmem communicator 包住单节点四卡
+`torch.distributed.run`，执行 application replay。
 默认 BF16、1 GiB（AG 每卡输出、RS 每卡输入），每次只采热身后的一个 kernel。
 默认目录为 `results/gb200/ncu-torch-all-gather/ag-rs-rank0-only-<时间>/`。
-每个 workload 保存各 rank 的原始报告和 `rank<N>.csv`。报告名前缀
-`rank<N>-report` 标识应用 rank，后面可能带 NCU 添加的编号。合并文件
+每个 workload 保存一份原始报告和 `report.csv`，汇总时校验每张可见 GPU 恰好有一条 kernel 结果。
+用 `--communicator tcp` 可改为每个 rank 一份原始报告和 `rank<N>.csv`。
 `nvlink_bytes.csv` 按 workload 和 rank 给出 TX/RX × Requests/Responses × User/Protocol 的八项
 `.sum`，以及两个方向的总字节数，单位为 byte。
 
-PM sampling 默认使用 10 µs 间隔和每卡 32 MiB 缓冲区，为多 rank 重放中的等待留出余量。
-汇总前会对照每项计数器所属重放的 kernel 起止时间检查采样覆盖，边界允许一个采样间隔。
-覆盖不足时保留原始报告并报错，可用 `--pm-sampling-buffer-size` 或 `--pm-sampling-interval` 调整后重采。
+PM sampling 默认由 NCU 选择间隔和缓冲区，可用 `--pm-sampling-interval` 和
+`--pm-sampling-buffer-size` 指定。原来的 TCP 启动方式、10 µs 间隔、每卡 32 MiB 缓冲区
+以及逐指标的采样首尾覆盖检查保存在 `run_ncu_torch_ag_rs_rank0_only_backup.sh`。
 
 补丁的 `NCCL_SYM_MULTIMEM_RANK0_ONLY=1` 只让 communicator rank 0 发出数据指令，
 所有 rank 仍参与 window 注册和 kernel 前后的 barrier。AG 校验每卡的 rank 0 槽位已写入，
