@@ -37,16 +37,6 @@ die() { echo "ERROR: $*" >&2; exit 1; }
 script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 repo_root="$(cd -- "${script_dir}/../../.." && pwd)"
 
-# Application replay relaunches the workers. Give each invocation fresh paths so it
-# can keep the NCCL connection log and the benchmark's no-overwrite result file.
-if [[ "${1:-}" == --worker ]]; then
-    run_dir="$(mktemp -d "${2}/worker-rank${RANK}.XXXXXX")"
-    export NCCL_DEBUG_FILE="${run_dir}/nccl-%h-%p.log"
-    shift 2
-    exec uv run --no-sync python "${script_dir}/../nvls-collective/p2p_push_pull_benchmark.py" \
-        --output-dir "$run_dir" "$@"
-fi
-
 ncu_bin=ncu
 output_dir=""
 communicator=shmem
@@ -94,6 +84,7 @@ pm_metrics="$(printf 'pmsampling:%s,' "${metrics[@]}")"
 
 export CUDA_DEVICE_ORDER=PCI_BUS_ID CUDA_VISIBLE_DEVICES=0,1
 export NCCL_NVLS_ENABLE=0 NCCL_P2P_USE_CUDA_MEMCPY=0 NCCL_DEBUG=INFO NCCL_DEBUG_SUBSYS=INIT,P2P,ENV
+nvtx_range=ncu_p2p
 
 free_port() {
     uv run --no-sync python -c '
@@ -108,22 +99,25 @@ with socket.socket() as sock:
 
 for mode in push pull; do
     mode_dir="${output_dir}/${mode}"
+    # Each application replay pass has new worker PIDs, as in the AllGather launcher.
+    export NCCL_DEBUG_FILE="${mode_dir}/nccl-%h-%p.log"
     export NCCL_P2P_READ_ENABLE=0
     [[ "$mode" == push ]] || export NCCL_P2P_READ_ENABLE=1
 
     ncu_args=(
         --replay-mode application --target-processes all --clock-control none
-        --nvtx --nvtx-include 'trial0/'
-        --kernel-name-base function --kernel-name 'regex:^ncclDevKernel_SendRecv'
+        --nvtx --nvtx-include "${nvtx_range}/"
+        --kernel-name-base function --kernel-name 'regex:^ncclDevKernel_SendRecv' --launch-count 1
         --metrics "${pm_metrics%,}"
     )
-    worker=(bash "${script_dir}/run_ncu_torch_p2p.sh" --worker "$mode_dir"
-        --workload "$mode" --sizes-mib 1024 --warmup 1 --trials 1 --iters 1)
+    worker_cmd=("${script_dir}/ncu_torch_p2p.py"
+        --workload "$mode" --size-mib 1024 --dtype bf16 --warmup 1 --iters 1)
     if [[ "$communicator" == shmem ]]; then
         report_names=(p2p)
         cmd=("$ncu_bin" --communicator shmem --communicator-shmem-num-peers 2 --devices 0,1
             "${ncu_args[@]}" --export "${mode_dir}/p2p"
-            uv run --no-sync python -m torch.distributed.run --standalone --nproc-per-node 2 --no-python "${worker[@]}")
+            uv run --no-sync python -m torch.distributed.run --standalone --nnodes 1 --nproc-per-node 2
+            "${worker_cmd[@]}")
     else
         export MASTER_ADDR=127.0.0.1 MASTER_PORT='<torch port>'
         ncu_port='<ncu port>'
@@ -135,9 +129,9 @@ for mode in push pull; do
         report_names=(p2p-rank0 p2p-rank1)
         cmd=(bash "${script_dir}/ncu_tcp_ranks.sh" 2 "$ncu_bin"
             --communicator tcp --communicator-tcp-num-peers 2 --communicator-tcp-port "$ncu_port"
-            --lockstep-kernel-launch --lockstep-nvtx-include 'trial0/'
+            --lockstep-kernel-launch --lockstep-nvtx-include "${nvtx_range}/"
             "${ncu_args[@]}" --export "${mode_dir}/p2p-rank%q{RANK}"
-            -- "${worker[@]}")
+            -- uv run --no-sync python "${worker_cmd[@]}")
     fi
     printf '[%s] CUDA_VISIBLE_DEVICES=%s NCCL_P2P_READ_ENABLE=%s\n' "$mode" "$CUDA_VISIBLE_DEVICES" "$NCCL_P2P_READ_ENABLE"
     printf ' %q' "${cmd[@]}"
