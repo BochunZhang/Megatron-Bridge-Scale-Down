@@ -32,6 +32,7 @@ _QWEN35_27B_BASE = "Qwen/Qwen3.5-27B"
 _QWEN35_122B_A10B_BASE = "Qwen/Qwen3.5-122B-A10B"
 _QWEN35_397B_A17B_BASE = "Qwen/Qwen3.5-397B-A17B"
 _QWEN38_2P4T_A95B_BASE = "Qwen/Qwen3.8-2.4T-A95B"
+_QWEN38_27B_BASE = "Qwen/Qwen3.8-27B"
 
 
 def _qwen35_text_4gpu_gb200_fsdp1_config(
@@ -507,6 +508,15 @@ def qwen38_text_2p4t_a95b_pretrain_4gpu_gb200_bf16_fsdp1_config() -> ConfigConta
         "Qwen3_5MoeForCausalLM",
         is_moe=True,
     )
+
+
+def qwen38_text_27b_pretrain_4gpu_gb200_bf16_fsdp1_config() -> ConfigContainer:
+    """Return a Qwen3.8-27B text-only recipe for mock pretraining on 4 GB200s.
+
+    The recipe derives dimensions from the Hugging Face text config. The
+    Megatron attention output gate uses sigmoid where Qwen3.8 uses swish.
+    """
+    return _qwen35_text_4gpu_gb200_fsdp1_config(_QWEN38_27B_BASE, "Qwen3_5ForCausalLM", is_moe=False)
 
 
 def qwen35_text_9b_pretrain_4gpu_gb200_bf16_fsdp1_config() -> ConfigContainer:

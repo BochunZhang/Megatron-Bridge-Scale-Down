@@ -18,6 +18,7 @@ import os
 import sys
 import time
 from collections import deque
+from contextlib import ExitStack
 from datetime import datetime, timedelta
 from typing import Any, Callable, Optional, Union
 
@@ -435,7 +436,7 @@ def train(
         ):
             if model_config.cuda_graph_warmup_steps > 0 and should_toggle_forward_pre_hook:
                 disable_forward_pre_hook(model, param_sync=False)
-            cuda_graph_helper.create_cudagraphs()
+            _capture_te_cuda_graphs(cuda_graph_helper, model)
             if model_config.cuda_graph_warmup_steps > 0 and should_toggle_forward_pre_hook:
                 enable_forward_pre_hook(model)
                 cuda_graph_helper.cuda_graph_set_manual_hooks()
@@ -1656,6 +1657,24 @@ def _handle_mxfp8_param_buffer_copy(
             for optim_instance in optimizer.chained_optimizers:
                 if isinstance(optim_instance, DistributedOptimizer):
                     optim_instance._copy_main_params_to_param_buffer()
+
+
+def _capture_te_cuda_graphs(cuda_graph_helper: TECudaGraphHelper, model: list[MegatronModule]) -> None:
+    # TE calls transformer layers directly during capture, bypassing Megatron-FSDP.forward()
+    # and its switch from optimizer DTensors to resident compute parameters.
+    with ExitStack() as stack:
+        for model_chunk in model:
+            if not isinstance(model_chunk, megatron_FSDP):
+                continue
+            fsdp = model_chunk.module
+            if (
+                fsdp.data_parallel_sharding_strategy in ("optim", "optim_grads")
+                and not getattr(fsdp, "cpu_offload_weight", False)
+                and fsdp.is_param_fsdp_distributed
+            ):
+                stack.callback(fsdp._replace_param_with_distributed_if_needed)
+                fsdp._replace_param_with_raw_if_needed()
+        cuda_graph_helper.create_cudagraphs()
 
 
 def _delete_local_cuda_graphs(model: list[MegatronModule], config: ConfigContainer) -> None:

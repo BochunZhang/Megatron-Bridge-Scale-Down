@@ -33,6 +33,7 @@ MTP_NUM_LAYERS=""
 DISPATCHER="${DISPATCHER:-hybridep}"
 CUDA_GRAPH="${CUDA_GRAPH:-off}"
 LOCAL_ATTENTION_GRAPH=false
+TE_CUDA_GRAPH=false
 MERGE_GRAPHS=false
 FORCE_BALANCE=false
 FSDP_LEVEL="${FSDP_LEVEL:-3}"
@@ -62,10 +63,11 @@ EXTRA_OVERRIDES=()
 
 usage() {
     cat <<'USAGE'
-Usage: run_pretrain_fsdp3.sh --model 27b|397b|2.4t|122b --seq-length N [options]
+Usage: run_pretrain_fsdp3.sh --model 27b|qwen38-27b|397b|2.4t|122b --seq-length N [options]
 
 Models: 27b / 397b / 122b are Qwen3.5-27B / 397B-A17B / 122B-A10B; 2.4t (alias 2p4t)
-is Qwen3.8-2.4T-A95B. The model selects its 4-GPU GB200 FSDP1 recipe.
+is Qwen3.8-2.4T-A95B. qwen38-27b is Qwen3.8-27B.
+The model selects its 4-GPU GB200 FSDP1 recipe.
 
 Options:
   --recipe NAME                  Override the recipe selected by --model
@@ -130,7 +132,8 @@ Options:
                                  (moe_router_force_load_balancing), so tokens spread
                                  uniformly over experts; benchmark only, the loss is
                                  not meaningful. Names get "-fb"
-  --dtype|--precision bf16|mxfp8 Compute mode (default: bf16)
+  --dtype|--precision bf16|mxfp8|nvfp4
+                                 Compute mode (default: bf16)
   --mxfp8                        Same as --dtype mxfp8
   --offload MODULE[,MODULE...]   CPU offload for optimizer, weight, and/or gradient.
                                  CUDA graph testing requires FSDP3.
@@ -144,6 +147,8 @@ Options:
   --cpu-optimizer                Run AdamW on CPU; implies optimizer and gradient offload
   --local-attention-graph        Use native attention-only graphs with --cuda-graph on,
                                  BF16 FSDP1 or FSDP3 and TP=1 (including on dense models)
+  --te-cuda-graph                Use TE layer graphs with --cuda-graph on and FSDP1/2:
+                                 attention + MLP for dense; attention only for MoE
   --nvme-path DIR                Use the native NVMe AIO extension for weights, gradients and AdamW state;
                                  implies --cpu-optimizer. DIR is local to each node.
   MEGATRON_LM_DIR                Optional environment variable pointing to the MCore checkout
@@ -208,6 +213,7 @@ while [[ $# -gt 0 ]]; do
         --nvme-path) need_value "$@"; NVME_PATH="$2"; [[ -n "${NVME_PATH}" ]] || { echo "--nvme-path requires a directory" >&2; exit 2; }; shift 2;;
         --offload) need_value "$@"; OFFLOAD="$2"; [[ -n "${OFFLOAD}" ]] || { echo "--offload requires a module list" >&2; exit 2; }; shift 2;;
         --local-attention-graph) LOCAL_ATTENTION_GRAPH=true; shift;;
+        --te-cuda-graph) TE_CUDA_GRAPH=true; shift;;
         --gpu|--gpus) need_value "$@"; GPU_COUNT="$2"; shift 2;;
         --nproc-per-node) need_value "$@"; GPUS_PER_NODE="$2"; shift 2;;
         --nnodes) need_value "$@"; NNODES="$2"; shift 2;;
@@ -252,11 +258,14 @@ case "${MODEL}" in
     397b) MODEL_ID=Qwen/Qwen3.5-397B-A17B; MODEL_TAG=qwen35_397b; DEFAULT_RECIPE=qwen35_text_397b_a17b_pretrain_4gpu_gb200_bf16_fsdp1_config;;
     122b) MODEL_ID=Qwen/Qwen3.5-122B-A10B; MODEL_TAG=qwen35_122b; DEFAULT_RECIPE=qwen35_text_122b_a10b_pretrain_4gpu_gb200_bf16_fsdp1_config;;
     27b) MODEL_ID=Qwen/Qwen3.5-27B; MODEL_TAG=qwen35_27b; DEFAULT_RECIPE=qwen35_text_27b_pretrain_4gpu_gb200_bf16_fsdp1_config;;
+    qwen38-27b) MODEL_ID=Qwen/Qwen3.8-27B; MODEL_TAG=qwen38_27b; DEFAULT_RECIPE=qwen38_text_27b_pretrain_4gpu_gb200_bf16_fsdp1_config;;
     2.4t) MODEL_ID=Qwen/Qwen3.8-2.4T-A95B; MODEL_TAG=qwen38_2.4t; DEFAULT_RECIPE=qwen38_text_2p4t_a95b_pretrain_4gpu_gb200_bf16_fsdp1_config;;
-    *) echo "Unsupported model: ${MODEL} (use 27b, 397b, 2.4t or 122b)" >&2; exit 2;;
+    *) echo "Unsupported model: ${MODEL} (use 27b, qwen38-27b, 397b, 2.4t or 122b)" >&2; exit 2;;
 esac
+DENSE=false
+[[ "${MODEL}" == 27b || "${MODEL}" == qwen38-27b ]] && DENSE=true
 RECIPE="${RECIPE:-${DEFAULT_RECIPE}}"
-case "${DTYPE}" in bf16|mxfp8) ;; *) echo "--dtype must be bf16 or mxfp8" >&2; exit 2;; esac
+case "${DTYPE}" in bf16|mxfp8|nvfp4) ;; *) echo "--dtype must be bf16, mxfp8 or nvfp4" >&2; exit 2;; esac
 case "${PROFILE}" in none|nsys) ;; *) echo "--profile must be none or nsys" >&2; exit 2;; esac
 [[ -n "${METRIC_FREQUENCY}" ]] && PROFILE=nsys
 case "${DISPATCHER}" in hybridep|alltoall) ;; *) echo "--dispatcher must be hybridep or alltoall" >&2; exit 2;; esac
@@ -371,7 +380,7 @@ if [[ -n "${MTP_NUM_LAYERS}" ]] && ! [[ "${MTP_NUM_LAYERS}" =~ ^[0-9]+$ ]]; then
 [[ "${ATTENTION}" != linear || -n "${NUM_LAYERS}" ]] || { echo "--linear requires --num-layers" >&2; exit 2; }
 # MoE cases always use expert parallelism; the EP group folds onto the same
 # GPUs as the TP x DP x CP mesh, so EP only needs to divide the world size.
-if [[ "${MODEL}" == 27b ]]; then
+if [[ "${DENSE}" == true ]]; then
     [[ "${FORCE_BALANCE}" == false ]] || { echo "--force-balance only applies to MoE models" >&2; exit 2; }
     EXPERT_PARALLEL="${EXPERT_PARALLEL:-1}"
     [[ "${EXPERT_PARALLEL}" == 1 ]] || { echo "dense model 27b only supports --ep 1" >&2; exit 2; }
@@ -394,21 +403,30 @@ fi
 
 GRAPH_IMPL=none
 GRAPH_MODULES="[]"
+if [[ "${TE_CUDA_GRAPH}" == true ]]; then
+    [[ "${CUDA_GRAPH}" == on && "${LOCAL_ATTENTION_GRAPH}" == false && ( "${FSDP_LEVEL}" == 1 || "${FSDP_LEVEL}" == 2 ) ]] || {
+        echo "--te-cuda-graph requires --cuda-graph on, --fsdp 1 or 2, and no --local-attention-graph" >&2; exit 2
+    }
+fi
 if [[ "${LOCAL_ATTENTION_GRAPH}" == true && ( "${CUDA_GRAPH}" != on || ( "${FSDP_LEVEL}" != 1 && "${FSDP_LEVEL}" != 3 ) ) ]]; then
     echo "--local-attention-graph requires --cuda-graph on and --fsdp 1 or 3" >&2; exit 2
 fi
 if [[ "${CUDA_GRAPH}" == on ]]; then
-    if [[ "${FSDP_LEVEL}" == ddp ]]; then
+    if [[ "${TE_CUDA_GRAPH}" == true ]]; then
         GRAPH_IMPL=transformer_engine
-        if [[ "${MODEL}" == 27b ]]; then
+        GRAPH_MODULES="[attn]"
+        [[ "${DENSE}" == true ]] && GRAPH_MODULES="[attn,mlp]"
+    elif [[ "${FSDP_LEVEL}" == ddp ]]; then
+        GRAPH_IMPL=transformer_engine
+        if [[ "${DENSE}" == true ]]; then
             GRAPH_MODULES="[attn,mlp]"
-        elif [[ "${DTYPE}" == mxfp8 && "${DISPATCHER}" == alltoall ]]; then
-            # FP8 router padding makes all-to-all preprocess synchronize token counts to host.
+        elif [[ "${DTYPE}" != bf16 && "${DISPATCHER}" == alltoall ]]; then
+            # Quantized router padding makes all-to-all preprocess synchronize token counts to host.
             GRAPH_MODULES="[attn,moe_router]"
         else
             GRAPH_MODULES="[attn,moe_router,moe_preprocess]"
         fi
-    elif [[ "${MODEL}" == 27b && "${LOCAL_ATTENTION_GRAPH}" == false ]]; then
+    elif [[ "${DENSE}" == true && "${LOCAL_ATTENTION_GRAPH}" == false ]]; then
         GRAPH_IMPL=full_iteration
     else
         [[ "${FSDP_LEVEL}" == 1 || "${FSDP_LEVEL}" == 3 ]] || {
@@ -421,7 +439,7 @@ if [[ "${CUDA_GRAPH}" == on ]]; then
         [[ "${SYMMETRIC}" == false ]] || { echo "FSDP attention CUDA graphs require --symmetric to be off" >&2; exit 2; }
         GRAPH_IMPL=local
         GRAPH_MODULES="[attn]"
-        if [[ "${MODEL}" != 27b && "${LOCAL_ATTENTION_GRAPH}" == false ]]; then
+        if [[ "${DENSE}" == false && "${LOCAL_ATTENTION_GRAPH}" == false ]]; then
             GRAPH_MODULES="[attn,moe_router,moe_preprocess]"
         fi
     fi
@@ -446,10 +464,10 @@ SEQUENCE_PARALLEL=false
 # the launcher disables MTP unless --mtp-num-layers is given.
 LAYERS_TAG="${NUM_LAYERS:-full}"
 MTP_TAG="${MTP_NUM_LAYERS:-0}"
-if [[ "${MODEL}" == 27b ]]; then EXPERTS_TAG=0; else EXPERTS_TAG="${NUM_EXPERTS:-full}"; fi
+if [[ "${DENSE}" == true ]]; then EXPERTS_TAG=0; else EXPERTS_TAG="${NUM_EXPERTS:-full}"; fi
 # --overlap adds "-overlap" and --symmetric adds "-symm". Synchronous DDP uses
 # "-sync-ag" while --ddp-overlap uses the existing DDP name for forward prefetch.
-# MXFP8 uses "-mxfp8", forced balanced routing "-fb", --full / --linear
+# Quantized modes include the dtype, forced balanced routing "-fb", --full / --linear
 # "-attn_<full|linear>" after the layer count, and TP > 1 "-tp_<N>" before CP.
 OVERLAP_TAG=""
 [[ "${OVERLAP}" == true ]] && OVERLAP_TAG="-overlap"
@@ -457,7 +475,7 @@ OVERLAP_TAG=""
 [[ "${SYMMETRIC}" == true ]] && OVERLAP_TAG+="-symm"
 [[ "${FSDP_LEVEL}" == ddp && "${DDP_OVERLAP}" == false ]] && OVERLAP_TAG+="-sync-ag"
 DTYPE_TAG=""
-[[ "${DTYPE}" == mxfp8 ]] && DTYPE_TAG="-mxfp8"
+[[ "${DTYPE}" != bf16 || "${TE_CUDA_GRAPH}" == true ]] && DTYPE_TAG="-${DTYPE}"
 [[ "${FORCE_BALANCE}" == true ]] && DTYPE_TAG+="-fb"
 ATTN_TAG=""
 [[ "${ATTENTION}" != hybrid ]] && ATTN_TAG="-attn_${ATTENTION}"
@@ -465,6 +483,10 @@ TP_TAG=""
 (( TENSOR_PARALLEL > 1 )) && TP_TAG="-tp_${TENSOR_PARALLEL}"
 [[ "${TP_COMM_OVERLAP}" == true ]] && TP_TAG+="-tp-overlap"
 CG_TAG="${CUDA_GRAPH}"
+if [[ "${TE_CUDA_GRAPH}" == true ]]; then
+    CG_TAG+="-te-attn"
+    [[ "${DENSE}" == true ]] && CG_TAG+="-mlp"
+fi
 [[ "${GRAPH_IMPL}" == local ]] && CG_TAG+="-partial"
 [[ "${GRAPH_IMPL}" == local && "${GRAPH_MODULES}" == *moe_router* ]] && CG_TAG+="-moe"
 [[ "${GRAPH_TRACE}" == graph ]] && CG_TAG+="-merge"
@@ -486,6 +508,9 @@ fi
 # nsys report name, e.g. qwen35_27b-fsdp_3-mxfp8-experts_0-cg_off-tp_2-cp_1-ep_1-mbs_1-gbs_8-seq_4k.
 if (( SEQ_LENGTH % 1024 == 0 )); then SEQ_TAG="$((SEQ_LENGTH / 1024))k"; else SEQ_TAG="${SEQ_LENGTH}"; fi
 NSYS_NAME="${MODEL_TAG}-${DP_TAG}${OVERLAP_TAG}${DTYPE_TAG}${ATTN_TAG}-experts_${EXPERTS_TAG}-cg_${CG_TAG}${TP_TAG}-cp_${CONTEXT_PARALLEL}-ep_${EXPERT_PARALLEL}-mbs_${MICRO_BATCH_SIZE}-gbs_${GLOBAL_BATCH_SIZE}-seq_${SEQ_TAG}${OFFLOAD_TAG}${METRIC_TAG}"
+if [[ "${TE_CUDA_GRAPH}" == true ]]; then
+    NSYS_NAME+="-dp_${DATA_PARALLEL}"
+fi
 has_required_profile() {
     [[ "${STABLE_RESULT_DIR}" == false || "${PROFILE}" != nsys || "${NODE_RANK}" != 0 ||
         -s "${RESULT_DIR}/${NSYS_NAME}.nsys-rep" ]]
@@ -623,6 +648,10 @@ if [[ "${CUDA_GRAPH}" == on ]]; then
     # the first step, before capture.
     export NCCL_GRAPH_REGISTER=0
 fi
+if [[ "${TE_CUDA_GRAPH}" == true ]]; then
+    # The captured layer returns raw gradients to the FSDP hooks during replay.
+    OVERRIDES+=("model.gradient_accumulation_fusion=false" "ddp.megatron_fsdp_cuda_graph_mode=false")
+fi
 [[ -n "${NUM_LAYERS}" ]] && OVERRIDES+=("model.num_layers=${NUM_LAYERS}")
 [[ -n "${NUM_EXPERTS}" ]] && OVERRIDES+=("model.num_moe_experts=${NUM_EXPERTS}")
 [[ -n "${MOE_LAYER_FREQ}" ]] && OVERRIDES+=("model.moe_layer_freq=${MOE_LAYER_FREQ}")
@@ -631,10 +660,16 @@ case "${DISPATCHER}" in
     alltoall) OVERRIDES+=("model.moe_token_dispatcher_type=alltoall" "model.moe_flex_dispatcher_backend=null" "model.moe_flex_dispatcher_num_sms=null");;
     hybridep) OVERRIDES+=("model.moe_token_dispatcher_type=flex" "model.moe_flex_dispatcher_backend=hybridep" "model.moe_flex_dispatcher_num_sms=${HYBRIDEP_NUM_SMS}");;
 esac
-if [[ "${DTYPE}" == mxfp8 ]]; then
-    OVERRIDES+=("mixed_precision.fp8=e4m3" "mixed_precision.fp8_recipe=mxfp8" "mixed_precision.fp8_param_gather=false" "mixed_precision.reuse_grad_buf_for_mxfp8_param_ag=false")
-    [[ "${MODEL}" != 27b ]] && OVERRIDES+=("model.moe_router_padding_for_fp8=true")
-fi
+case "${DTYPE}" in
+    mxfp8)
+        OVERRIDES+=("mixed_precision.fp8=e4m3" "mixed_precision.fp8_recipe=mxfp8" "mixed_precision.fp8_param_gather=false" "mixed_precision.reuse_grad_buf_for_mxfp8_param_ag=false")
+        [[ "${DENSE}" == false ]] && OVERRIDES+=("model.moe_router_padding_for_fp8=true")
+        ;;
+    nvfp4)
+        OVERRIDES+=("mixed_precision.fp4=e2m1" "mixed_precision.fp4_recipe=nvfp4" "mixed_precision.fp4_param_gather=false")
+        [[ "${DENSE}" == false ]] && OVERRIDES+=("model.moe_router_padding_for_quantization=true")
+        ;;
+esac
 # MCore draws N(0,1) router logits per rank and keeps the router GEMM, top-k, dispatch
 # and expert compute; only the expert choice of each token becomes uniform random.
 [[ "${FORCE_BALANCE}" == true ]] && OVERRIDES+=("model.moe_router_force_load_balancing=true")
