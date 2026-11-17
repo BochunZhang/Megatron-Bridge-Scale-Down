@@ -16,21 +16,22 @@ set -euo pipefail
 
 usage() {
     cat <<'USAGE'
-Profile one 1024 MiB NCCL P2P transfer per mode, push then pull, on a GB200 node.
+Profile one 1024 MiB NCCL P2P transfer per selected mode on a GB200 node.
 GPU0 is the sender and GPU1 is the receiver in both modes. Requires ncu 2026.4 or newer.
 Uses TCP application replay, with one NCU process and report per rank.
 
 Usage: run_ncu_torch_p2p.sh [options]
   --ncu PATH                   Nsight Compute executable (default: ncu)
   --communicator tcp           Explicitly select TCP (default)
+  --workload push|pull|both    Select modes to profile (default: both, push then pull)
   --pm-sampling-interval NS    PM sampling interval (default: 10000 ns)
   --pm-sampling-buffer-size B  PM sampling buffer per GPU (default: 33554432 bytes)
   --timeout SEC                Limit per push or pull capture (default: 1800)
   --output-dir DIR             Default: results/gb200/ncu-torch-all-gather/p2p-<time>
-  --dry-run                    Show both commands without running them
+  --dry-run                    Show the selected commands without running them
   -h, --help
 
-Writes per-rank NCU reports, raw CSVs, launch commands and logs under push/ and pull/.
+Writes per-rank NCU reports, raw CSVs, launch commands and logs under each selected mode.
 After checking PM sampling coverage, nvlink_bytes.csv gives one row per rank and mode.
 Values use byte .sum metrics, including all eight
 TX/RX x request/response x user/protocol categories and the TX/RX totals.
@@ -42,19 +43,20 @@ die() { echo "ERROR: $*" >&2; exit 1; }
 script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 repo_root="$(cd -- "${script_dir}/../../.." && pwd)"
 
-ncu_bin=ncu output_dir="" timeout_sec=1800
+ncu_bin=ncu output_dir="" timeout_sec=1800 workload=both
 pm_interval_ns=10000 pm_buffer_bytes=$((32 * 1024 * 1024))
 dry_run=false
 while (( $# )); do
     case "$1" in
         -h|--help) usage; exit 0 ;;
         --dry-run) dry_run=true; shift ;;
-        --ncu|--output-dir|--communicator|--pm-sampling-interval|--pm-sampling-buffer-size|--timeout)
+        --ncu|--output-dir|--communicator|--workload|--pm-sampling-interval|--pm-sampling-buffer-size|--timeout)
             [[ -n "${2:-}" && "$2" != --* ]] || die "$1 needs a value"
             case "$1" in
                 --ncu) ncu_bin="$2" ;;
                 --output-dir) output_dir="$2" ;;
                 --communicator) [[ "$2" == tcp ]] || die "expected --communicator tcp" ;;
+                --workload) workload="$2" ;;
                 --pm-sampling-interval) pm_interval_ns="$2" ;;
                 --pm-sampling-buffer-size) pm_buffer_bytes="$2" ;;
                 --timeout) timeout_sec="$2" ;;
@@ -63,6 +65,11 @@ while (( $# )); do
         *) die "unknown argument: $1 (see --help)" ;;
     esac
 done
+case "$workload" in
+    both) workloads=(push pull) ;;
+    push|pull) workloads=("$workload") ;;
+    *) die "expected --workload push, pull or both" ;;
+esac
 [[ "$pm_interval_ns" =~ ^[1-9][0-9]*$ && "$pm_buffer_bytes" =~ ^[1-9][0-9]*$ && "$timeout_sec" =~ ^[1-9][0-9]*$ ]] \
     || die "PM sampling interval, buffer size and timeout must be positive integers"
 
@@ -108,7 +115,7 @@ with socket.socket() as sock:
 }
 
 reports=()
-for mode in push pull; do
+for mode in "${workloads[@]}"; do
     mode_dir="${output_dir}/${mode}"
     # Each application replay pass has new worker PIDs, as in the AllGather launcher.
     export NCCL_DEBUG_FILE="${mode_dir}/nccl-%h-%p.log"
@@ -163,7 +170,7 @@ for mode in push pull; do
 done
 $dry_run && exit 0
 
-uv run --no-sync python - "$output_dir" "$ncu_bin" "${metrics[*]}" "${reports[@]}" <<'PYTHON'
+uv run --no-sync python - "$output_dir" "$ncu_bin" "${workloads[*]}" "${metrics[*]}" "${reports[@]}" <<'PYTHON'
 import csv
 import io
 import re
@@ -174,8 +181,9 @@ from pathlib import Path
 
 output = Path(sys.argv[1])
 ncu_bin = sys.argv[2]
-metrics = sys.argv[3].split()
-reports = iter(sys.argv[4:])
+workloads = sys.argv[3].split()
+metrics = sys.argv[4].split()
+reports = iter(sys.argv[5:])
 payload_bytes = 1024 * 1024**2
 summary = []
 csv.field_size_limit(sys.maxsize)
@@ -226,7 +234,8 @@ def check_sample_coverage(report):
             )
 
 
-for mode, payload_packet in (("push", "request"), ("pull", "response")):
+for mode in workloads:
+    payload_packet = "request" if mode == "push" else "response"
     for rank, role, direction in ((0, "sender", "nvltx"), (1, "receiver", "nvlrx")):
         raw = output / mode / f"rank{rank}.csv"
         check_sample_coverage(next(reports))
