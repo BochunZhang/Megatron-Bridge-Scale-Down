@@ -2004,7 +2004,7 @@ class TestConfigContainerValidation:
         finally:
             restore_get_world_size_safe(og_ws, cfg_mod)
 
-    @pytest.mark.parametrize("strategy", ["optim", "optim_grads_params"])
+    @pytest.mark.parametrize("strategy", ["optim", "optim_grads", "optim_grads_params"])
     def test_cuda_graph_local_attention_uses_native_fsdp_support(self, strategy, monkeypatch):
         from megatron.core.transformer import cuda_graphs
 
@@ -2012,7 +2012,7 @@ class TestConfigContainerValidation:
         monkeypatch.setattr(
             cuda_graphs,
             "_FSDP_ATTENTION_GRAPH_SHARDING_STRATEGIES",
-            ("optim", "optim_grads_params"),
+            ("optim", "optim_grads", "optim_grads_params"),
             raising=False,
         )
         gpt_model_cfg = create_test_gpt_config(cuda_graph_impl="local", use_te_rng_tracker=True)
@@ -2033,8 +2033,8 @@ class TestConfigContainerValidation:
             assert cuda_graph_module_names(container.model) == ["attn"]
             validate_cuda_graph_configuration(container.model)  # GPT provider validation
             monkeypatch.delattr(cuda_graphs, "_FSDP_ATTENTION_GRAPH_SHARDING_STRATEGIES")
-            if strategy == "optim":
-                with pytest.raises(ValueError, match="FSDP1.*require a Megatron-LM checkout"):
+            if strategy in ("optim", "optim_grads"):
+                with pytest.raises(ValueError, match="FSDP[12].*require a Megatron-LM checkout"):
                     validate_cuda_graph_configuration(container.model)
             else:
                 validate_cuda_graph_configuration(container.model)

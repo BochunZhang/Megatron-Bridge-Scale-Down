@@ -33,7 +33,7 @@ MTP_NUM_LAYERS=""
 DISPATCHER="${DISPATCHER:-hybridep}"
 CUDA_GRAPH="${CUDA_GRAPH:-off}"
 LOCAL_ATTENTION_GRAPH=false
-TE_CUDA_GRAPH=false
+LABEL_DTYPE_AND_DP=false
 MERGE_GRAPHS=false
 FORCE_BALANCE=false
 FSDP_LEVEL="${FSDP_LEVEL:-3}"
@@ -107,8 +107,9 @@ Options:
                                  names get "-tp-overlap"
   --cp N                         Context parallel size (default: 1)
   --cuda-graph off|on            off: no CUDA graph (default). on with FSDP: dense uses
-                                 full_iteration; MoE graphs attention, router and preprocess with
-                                 BF16 FSDP1 or FSDP3, TP=1 and no --symmetric.
+                                 full_iteration; MoE uses native local graphs for attention,
+                                 router and preprocess. Extended FSDP1/2 support for HybridEP,
+                                 TP and quantized compute requires the corresponding MCore code.
                                  FSDP3 also graphs eligible parameter prefetches.
                                  on with DDP: TE per-layer graphs, dense attn+mlp,
                                  MoE attn+moe_router+moe_preprocess where supported.
@@ -147,8 +148,8 @@ Options:
   --cpu-optimizer                Run AdamW on CPU; implies optimizer and gradient offload
   --local-attention-graph        Use native attention-only graphs with --cuda-graph on,
                                  BF16 FSDP1 or FSDP3 and TP=1 (including on dense models)
-  --te-cuda-graph                Use TE layer graphs with --cuda-graph on and FSDP1/2:
-                                 attention + MLP for dense; attention only for MoE
+  --label-dtype-and-dp            Label BF16 explicitly, add DP size to the report name
+                                 and label full-iteration graphs explicitly
   --nvme-path DIR                Use the native NVMe AIO extension for weights, gradients and AdamW state;
                                  implies --cpu-optimizer. DIR is local to each node.
   MEGATRON_LM_DIR                Optional environment variable pointing to the MCore checkout
@@ -213,7 +214,7 @@ while [[ $# -gt 0 ]]; do
         --nvme-path) need_value "$@"; NVME_PATH="$2"; [[ -n "${NVME_PATH}" ]] || { echo "--nvme-path requires a directory" >&2; exit 2; }; shift 2;;
         --offload) need_value "$@"; OFFLOAD="$2"; [[ -n "${OFFLOAD}" ]] || { echo "--offload requires a module list" >&2; exit 2; }; shift 2;;
         --local-attention-graph) LOCAL_ATTENTION_GRAPH=true; shift;;
-        --te-cuda-graph) TE_CUDA_GRAPH=true; shift;;
+        --label-dtype-and-dp) LABEL_DTYPE_AND_DP=true; shift;;
         --gpu|--gpus) need_value "$@"; GPU_COUNT="$2"; shift 2;;
         --nproc-per-node) need_value "$@"; GPUS_PER_NODE="$2"; shift 2;;
         --nnodes) need_value "$@"; NNODES="$2"; shift 2;;
@@ -403,20 +404,11 @@ fi
 
 GRAPH_IMPL=none
 GRAPH_MODULES="[]"
-if [[ "${TE_CUDA_GRAPH}" == true ]]; then
-    [[ "${CUDA_GRAPH}" == on && "${LOCAL_ATTENTION_GRAPH}" == false && ( "${FSDP_LEVEL}" == 1 || "${FSDP_LEVEL}" == 2 ) ]] || {
-        echo "--te-cuda-graph requires --cuda-graph on, --fsdp 1 or 2, and no --local-attention-graph" >&2; exit 2
-    }
-fi
 if [[ "${LOCAL_ATTENTION_GRAPH}" == true && ( "${CUDA_GRAPH}" != on || ( "${FSDP_LEVEL}" != 1 && "${FSDP_LEVEL}" != 3 ) ) ]]; then
     echo "--local-attention-graph requires --cuda-graph on and --fsdp 1 or 3" >&2; exit 2
 fi
 if [[ "${CUDA_GRAPH}" == on ]]; then
-    if [[ "${TE_CUDA_GRAPH}" == true ]]; then
-        GRAPH_IMPL=transformer_engine
-        GRAPH_MODULES="[attn]"
-        [[ "${DENSE}" == true ]] && GRAPH_MODULES="[attn,mlp]"
-    elif [[ "${FSDP_LEVEL}" == ddp ]]; then
+    if [[ "${FSDP_LEVEL}" == ddp ]]; then
         GRAPH_IMPL=transformer_engine
         if [[ "${DENSE}" == true ]]; then
             GRAPH_MODULES="[attn,mlp]"
@@ -428,6 +420,11 @@ if [[ "${CUDA_GRAPH}" == on ]]; then
         fi
     elif [[ "${DENSE}" == true && "${LOCAL_ATTENTION_GRAPH}" == false ]]; then
         GRAPH_IMPL=full_iteration
+    elif [[ "${DENSE}" == false && "${LOCAL_ATTENTION_GRAPH}" == false &&
+        "${DISPATCHER}" == hybridep && "${SYMMETRIC}" == false && -z "${OFFLOAD}" &&
+        ( "${FSDP_LEVEL}" == 1 || "${FSDP_LEVEL}" == 2 ) ]]; then
+        GRAPH_IMPL=local
+        GRAPH_MODULES="[attn,moe_router,moe_preprocess]"
     else
         [[ "${FSDP_LEVEL}" == 1 || "${FSDP_LEVEL}" == 3 ]] || {
             echo "FSDP attention CUDA graphs require --fsdp 1 or 3" >&2; exit 2;
@@ -475,7 +472,7 @@ OVERLAP_TAG=""
 [[ "${SYMMETRIC}" == true ]] && OVERLAP_TAG+="-symm"
 [[ "${FSDP_LEVEL}" == ddp && "${DDP_OVERLAP}" == false ]] && OVERLAP_TAG+="-sync-ag"
 DTYPE_TAG=""
-[[ "${DTYPE}" != bf16 || "${TE_CUDA_GRAPH}" == true ]] && DTYPE_TAG="-${DTYPE}"
+[[ "${DTYPE}" != bf16 || "${LABEL_DTYPE_AND_DP}" == true ]] && DTYPE_TAG="-${DTYPE}"
 [[ "${FORCE_BALANCE}" == true ]] && DTYPE_TAG+="-fb"
 ATTN_TAG=""
 [[ "${ATTENTION}" != hybrid ]] && ATTN_TAG="-attn_${ATTENTION}"
@@ -483,10 +480,7 @@ TP_TAG=""
 (( TENSOR_PARALLEL > 1 )) && TP_TAG="-tp_${TENSOR_PARALLEL}"
 [[ "${TP_COMM_OVERLAP}" == true ]] && TP_TAG+="-tp-overlap"
 CG_TAG="${CUDA_GRAPH}"
-if [[ "${TE_CUDA_GRAPH}" == true ]]; then
-    CG_TAG+="-te-attn"
-    [[ "${DENSE}" == true ]] && CG_TAG+="-mlp"
-fi
+[[ "${LABEL_DTYPE_AND_DP}" == true && "${GRAPH_IMPL}" == full_iteration ]] && CG_TAG+="-full-iteration"
 [[ "${GRAPH_IMPL}" == local ]] && CG_TAG+="-partial"
 [[ "${GRAPH_IMPL}" == local && "${GRAPH_MODULES}" == *moe_router* ]] && CG_TAG+="-moe"
 [[ "${GRAPH_TRACE}" == graph ]] && CG_TAG+="-merge"
@@ -508,7 +502,7 @@ fi
 # nsys report name, e.g. qwen35_27b-fsdp_3-mxfp8-experts_0-cg_off-tp_2-cp_1-ep_1-mbs_1-gbs_8-seq_4k.
 if (( SEQ_LENGTH % 1024 == 0 )); then SEQ_TAG="$((SEQ_LENGTH / 1024))k"; else SEQ_TAG="${SEQ_LENGTH}"; fi
 NSYS_NAME="${MODEL_TAG}-${DP_TAG}${OVERLAP_TAG}${DTYPE_TAG}${ATTN_TAG}-experts_${EXPERTS_TAG}-cg_${CG_TAG}${TP_TAG}-cp_${CONTEXT_PARALLEL}-ep_${EXPERT_PARALLEL}-mbs_${MICRO_BATCH_SIZE}-gbs_${GLOBAL_BATCH_SIZE}-seq_${SEQ_TAG}${OFFLOAD_TAG}${METRIC_TAG}"
-if [[ "${TE_CUDA_GRAPH}" == true ]]; then
+if [[ "${LABEL_DTYPE_AND_DP}" == true ]]; then
     NSYS_NAME+="-dp_${DATA_PARALLEL}"
 fi
 has_required_profile() {
@@ -647,10 +641,6 @@ if [[ "${CUDA_GRAPH}" == on ]]; then
     # buffers during capture; the --symmetric windows are registered explicitly after
     # the first step, before capture.
     export NCCL_GRAPH_REGISTER=0
-fi
-if [[ "${TE_CUDA_GRAPH}" == true ]]; then
-    # The captured layer returns raw gradients to the FSDP hooks during replay.
-    OVERRIDES+=("model.gradient_accumulation_fusion=false" "ddp.megatron_fsdp_cuda_graph_mode=false")
 fi
 [[ -n "${NUM_LAYERS}" ]] && OVERRIDES+=("model.num_layers=${NUM_LAYERS}")
 [[ -n "${NUM_EXPERTS}" ]] && OVERRIDES+=("model.num_moe_experts=${NUM_EXPERTS}")

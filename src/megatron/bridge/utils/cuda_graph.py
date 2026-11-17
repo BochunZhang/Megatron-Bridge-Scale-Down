@@ -152,7 +152,8 @@ def validate_cuda_graph_configuration(
             if fsdp_strategy is not None:
                 config._bridge_fsdp_attention_graph_strategy = fsdp_strategy
             strategy = getattr(config, "_bridge_fsdp_attention_graph_strategy", None)
-            if strategy in ("optim", "optim_grads_params"):
+            fsdp_names = {"optim": "FSDP1", "optim_grads": "FSDP2", "optim_grads_params": "FSDP3"}
+            if strategy in fsdp_names:
                 from megatron.core.transformer import cuda_graphs
 
                 # Older scale-down checkouts implement only the sharded-weight path.
@@ -165,9 +166,8 @@ def validate_cuda_graph_configuration(
                     or strategy not in supported
                     or not modules <= ({"attn"} | supported_modules)
                 ):
-                    fsdp_name = "FSDP1" if strategy == "optim" else "FSDP3"
                     raise ValueError(
-                        f"Local {fsdp_name} CUDA graphs with scopes {graph_modules} "
+                        f"Local {fsdp_names[strategy]} CUDA graphs with scopes {graph_modules} "
                         "require a Megatron-LM checkout with that support."
                     )
                 return

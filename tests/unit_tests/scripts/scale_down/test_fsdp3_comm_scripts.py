@@ -16,6 +16,7 @@ EXAMPLE = REPO_ROOT / "examples/scale-down/01-analyse/04-fsdp3-comm"
 BENCHMARK = EXAMPLE / "benchmark_fsdp3.sh"
 RUN_ONE = EXAMPLE / "run_pretrain_fsdp3.sh"
 DDP_CP_TP_STUDY = EXAMPLE / "02-comm-overlap/02_ddp_cp_tp.sh"
+TFLOPS = EXAMPLE.parent / "05-tflops/benchmark_tflops.sh"
 RUN_DATE = "261031-120000"
 
 
@@ -326,6 +327,31 @@ def test_full_iteration_cuda_graph_for_dense_fsdp(tmp_path: Path):
             "rerun_state_machine.check_for_nan_in_loss=false" in command
             and "ddp.check_for_nan_in_grad=false" in command
         )
+
+
+def test_tflops_uses_native_fsdp_graphs_for_all_precisions(tmp_path: Path):
+    result = _run(TFLOPS, "--dry-run", "--results-root", str(tmp_path), RUN_DATE=RUN_DATE)
+    assert result.returncode == 0, result.stderr
+    commands = _commands(result.stderr)
+    assert len(commands) == 36
+    assert len({_report_base(command) for command in commands}) == len(commands)
+    for command in commands:
+        args = shlex.split(command)
+        report = _report_base(command).name
+        assert "train.train_iters=20" in args
+        assert "profiling.profile_step_start=7" in args and "profiling.profile_step_end=8" in args
+        if report.startswith("qwen38_27b"):
+            assert "model.cuda_graph_impl=full_iteration" in args
+            assert "model.cuda_graph_modules=[]" in args
+            assert "ddp.megatron_fsdp_cuda_graph_mode=true" in args
+            assert "-cg_on-full-iteration-" in report
+        else:
+            assert report.startswith("qwen38_2.4t")
+            assert "model.cuda_graph_impl=local" in args
+            assert "model.cuda_graph_modules=[attn,moe_router,moe_preprocess]" in args
+            assert "ddp.megatron_fsdp_cuda_graph_mode=false" in args
+            assert "-cg_on-partial-moe-" in report
+        assert any(f"-{dtype}-" in report for dtype in ("bf16", "mxfp8", "nvfp4"))
 
 
 def test_partial_cuda_graph_for_moe_fsdp(tmp_path: Path):
@@ -668,7 +694,7 @@ def test_run_one_cuda_graph_disables_nccl_graph_register_with_expandable_segment
 def test_moe_partial_cuda_graph_rejects_unsupported_fsdp_configs(tmp_path: Path):
     common = ("--model", "2.4t", "--seq-length", "1024", "--cuda-graph", "on", "--dry-run")
     for args, message in (
-        (("--fsdp", "2"), "require --fsdp 1 or 3"),
+        (("--fsdp", "2", "--dispatcher", "alltoall"), "require --fsdp 1 or 3"),
         (("--fsdp", "1", "--offload", "weight"), "offload with --cuda-graph on requires --fsdp 3"),
         (("--dtype", "mxfp8"), "require --dtype bf16"),
         (("--tp", "2"), "require --tp 1"),
@@ -679,7 +705,7 @@ def test_moe_partial_cuda_graph_rejects_unsupported_fsdp_configs(tmp_path: Path)
         assert message in result.stderr
     result = _run(
         BENCHMARK,
-        "--model", "397b", "--fsdp", "3,2", "--seq", "256", "--cuda-graph", "on",
+        "--model", "397b", "--fsdp", "3,2", "--seq", "256", "--cuda-graph", "on", "--dispatcher", "alltoall",
         "--output-dir", str(tmp_path), "--dry-run",
     )
     assert result.returncode == 2 and "require --fsdp 1 or 3" in result.stderr

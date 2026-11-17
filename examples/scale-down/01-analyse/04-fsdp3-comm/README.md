@@ -263,14 +263,14 @@ bash examples/scale-down/01-analyse/04-fsdp3-comm/benchmark_fsdp3.sh --model 397
 | `off` | 任意 | `cuda_graph_impl=none` | `cuda_graph_impl=none` |
 | `on` | `3` | `cuda_graph_impl=full_iteration`，捕获整轮 forward + backward | `cuda_graph_impl=local`、`cuda_graph_modules=[attn,moe_router,moe_preprocess]`，符合条件的 FSDP 参数预取单独进图 |
 | `on` | `1` | `cuda_graph_impl=full_iteration` | 同样的原生 MoE partial graph，读取常驻 GPU 的计算权重 |
-| `on` | `2` | `cuda_graph_impl=full_iteration` | MoE partial graph 支持 FSDP1 和 FSDP3 |
+| `on` | `2` | `cuda_graph_impl=full_iteration` | HybridEP 且权重常驻 GPU 时，使用与 FSDP1 相同的原生 MoE partial graph |
 | `on` | `ddp` | `cuda_graph_impl=transformer_engine`，`cuda_graph_modules=[attn,mlp]`：每层整层一个 graph | `cuda_graph_impl=transformer_engine`，`cuda_graph_modules=[attn,moe_router,moe_preprocess]`：dispatch / routed experts / combine 保持 eager；hybridep 与 alltoall 都可用 |
 
-### FSDP1 和 FSDP3 的 partial graph
+### FSDP 的 partial graph
 
-使用 BF16、TP=PP=1，关闭 `--symmetric`。CP>1 时，attention graph 包含前后向的 CP 通信。两种 FSDP 策略均关闭 fused gradient accumulation，并保留 NaN 检查。前 3 轮走 eager，第 4 轮开始 replay。默认 MoE 范围的结果名包含 `cg_on-partial-moe`。显式使用 `--local-attention-graph` 时只捕获 attention，结果名包含 `cg_on-partial`。
+使用 PP=1 并关闭 `--symmetric`。FSDP3 和显式 `--local-attention-graph` 使用 BF16、TP=1。权重常驻 GPU 的 HybridEP FSDP1/2 可用支持该组合的 MCore 捕获 TP 和量化计算。CP>1 时，attention graph 包含前后向的 CP 通信。Partial graph 关闭 fused gradient accumulation，并保留 NaN 检查。前 3 轮走 eager，第 4 轮开始 replay。默认 MoE 范围的结果名包含 `cg_on-partial-moe`。显式使用 `--local-attention-graph` 时只捕获 attention，结果名包含 `cg_on-partial`。
 
-- FSDP1 的 graph 读取常驻 GPU 的计算权重。Optimizer step 后同步 all-gather 更新这些地址中的权重。
+- FSDP1/2 的 graph 读取常驻 GPU 的计算权重。Optimizer step 后同步 all-gather 更新这些地址中的权重。
 - FSDP3 启用 max-pool double buffering。预取图在 all-gather stream 上写入槽位，attention 和 router graph 通过外层 FSDP hook 等待权重就绪。选择 `--offload weight` 时，参数 H2D 和 all-gather 走 eager，仍写入同一组固定槽位。只卸载 gradient 或 optimizer 时，参数预取图仍然启用。
 
 梯度通信、EP dispatch/combine 和 routed expert 计算留在图外。MoE 的默认 sweep 在无 offload 时对 FSDP1 和 FSDP3 都启用 partial graph。FSDP1 的 partial graph 要求 GPU 常驻权重和同步参数 all-gather。

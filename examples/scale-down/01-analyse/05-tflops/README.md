@@ -17,11 +17,14 @@
 
 两级都开梯度规约 overlap，使用 BF16 reduce-scatter 和 FP32 main gradient，optimizer step 后同步做参数 all-gather。四卡下 dense FSDP 的 DP×CP 组在 DP4/CP4 为 4 rank，在 TP4 为 1 rank。MoE expert DP 组在三种布局下均为 1 rank。
 
-BF16、MXFP8、NVFP4 共用 BF16 参数通信。三种精度使用相同的 TE CUDA Graph 范围，27B 捕获 attention + MLP，2.4T 捕获 attention，MoE 路由、dispatch、expert 和 combine 在图外执行。量化 MoE 使用对应精度的 token 对齐。
+BF16、MXFP8、NVFP4 共用 BF16 参数通信。CUDA Graph 路径与 [04-fsdp3-comm](../04-fsdp3-comm/README.md#cuda-graph) 对齐。
+
+- 27B 使用 `full_iteration`，捕获整轮 forward 和 backward。Optimizer step 在图外执行。
+- 2.4T 使用原生 `local` partial graph，范围为 `[attn,moe_router,moe_preprocess]`。HybridEP dispatch、routed expert 计算、combine 和 FSDP 梯度规约在图外执行。量化 MoE 使用对应精度的 token 对齐。
 
 ## 运行
 
-运行环境需要支持 MXFP8/NVFP4 的 Transformer Engine、HybridEP 和 Nsight Systems。FSDP2 需要 Megatron-LM 的单 rank 梯度 bucket 修复。启动器优先使用相邻的 `megatron-lm` checkout，可用 `MEGATRON_LM_DIR` 指定包含该修复的源码位置。 [Megatron-LM 修复 3e41a5fa1](https://github.com/BochunZhang/Megatron-LM-Scale-Down/commit/3e41a5fa12bcebba0719db0ac48ae62b58add4c7)
+运行环境需要支持 MXFP8/NVFP4 的 Transformer Engine、HybridEP 和 Nsight Systems。Megatron-LM 使用 `core_v0.19.0_scale_down` 的 `8e771a34f` 或包含该提交的版本，它包含 FSDP2 单 rank 梯度 bucket 修复，以及支持 FSDP1/2 常驻权重、TP 和量化计算的 MoE local partial graph 实现。启动器优先使用相邻的 `megatron-lm` checkout，也可用 `MEGATRON_LM_DIR` 指定部署的源码位置。 [Megatron-LM 原生 partial graph 8e771a34f](https://github.com/BochunZhang/Megatron-LM-Scale-Down/commit/8e771a34f38afa6e7dd744d6b94cd87ed944b056)
 
 ```bash
 study=examples/scale-down/01-analyse/05-tflops/benchmark_tflops.sh

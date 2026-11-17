@@ -21,6 +21,7 @@ usage() {
 Usage: benchmark_tflops.sh [options]
 
 Run the 4-GPU CUDA Graph training matrix for Qwen3.8-27B and Qwen3.8-2.4T.
+Use full-iteration graphs for 27B and native local MoE partial graphs for 2.4T.
 Each case runs 20 iterations with 4 full-attention layers, no MTP, GBS=32,
 MBS=1, BF16 gradient communication and FP32 main gradients. MoE uses 64
 experts and EP=4.
@@ -98,7 +99,7 @@ if [[ -z "${MEGATRON_LM_DIR:-}" && -d "${REPO_ROOT}/../megatron-lm/megatron/core
 fi
 common=(
     --gpus 4 --nproc-per-node 4 --nnodes 1 --node-rank 0
-    --num-layers 4 --full --mtp-num-layers 0 --cuda-graph on --te-cuda-graph
+    --num-layers 4 --full --mtp-num-layers 0 --cuda-graph on --label-dtype-and-dp
     --gbs 32 --mbs 1 --train-iters 20 --profile "${PROFILE}" --profile-start 7 --profile-end 8
     --results-root "${RESULTS_ROOT}/${RUN_DATE}" --run-date "${RUN_DATE}" --stable-result-dir
     --override logger.log_throughput=true
