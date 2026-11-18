@@ -15,6 +15,7 @@ REPO_ROOT = Path(__file__).resolve().parents[4]
 EXAMPLE = REPO_ROOT / "examples/scale-down/01-analyse/04-fsdp3-comm"
 BENCHMARK = EXAMPLE / "benchmark_fsdp3.sh"
 RUN_ONE = EXAMPLE / "run_pretrain_fsdp3.sh"
+FSDP_STUDY = EXAMPLE / "01-baseline/03_fsdp3.sh"
 DDP_CP_TP_STUDY = EXAMPLE / "02-comm-overlap/02_ddp_cp_tp.sh"
 TFLOPS = EXAMPLE.parent / "05-tflops/benchmark_tflops.sh"
 RUN_DATE = "261031-120000"
@@ -36,6 +37,14 @@ def _commands(stderr: str) -> list[str]:
 
 def _report_base(command: str) -> Path:
     return next(Path(arg.removeprefix("--output=")) for arg in shlex.split(command) if arg.startswith("--output="))
+
+
+def _node_dir(command: str) -> Path:
+    return next(
+        Path(arg.removeprefix("logger.save_config_filepath=")).parent
+        for arg in shlex.split(command)
+        if arg.startswith("logger.save_config_filepath=")
+    )
 
 
 def _sweep(tmp_path: Path, *args: str) -> list[str]:
@@ -418,7 +427,7 @@ def test_moe_fsdp3_offload_allows_native_partial_graph(tmp_path: Path):
 @pytest.mark.unit
 @pytest.mark.parametrize(
     ("script", "result_group", "case_count"),
-    [("01_cuda_graph.sh", "01-cuda-graph", 2), ("02_mbs.sh", "02-mbs", 3), ("03_fsdp3.sh", "03-fsdp3", 2)],
+    [("01_cuda_graph.sh", "01-cuda-graph", 2), ("02_mbs.sh", "02-mbs", 3)],
 )
 def test_baseline_saves_stable_case_paths_under_each_experiment(
     tmp_path: Path, script: str, result_group: str, case_count: int
@@ -432,6 +441,39 @@ def test_baseline_saves_stable_case_paths_under_each_experiment(
         assert node_dir.name == "node0"
         assert node_dir.parent.parent == tmp_path / "01-baseline" / result_group
         assert node_dir.parent.name.endswith("-profile_nsys")
+
+
+@pytest.mark.unit
+def test_fsdp_study_runs_every_sharding_level_before_switching_profiler(tmp_path: Path):
+    result = _run(FSDP_STUDY, "--dry-run", "--output-dir", str(tmp_path))
+    assert result.returncode == 0, result.stderr
+    commands = _commands(result.stderr)
+    strategies = ("optim", "optim_grads", "optim_grads_params")
+    expected = [
+        (mode, model, level, strategy)
+        for mode in ("none", "nsys", "pytorch")
+        for model in ("27b", "2.4t")
+        for level, strategy in enumerate(strategies, start=1)
+    ]
+    for command, (mode, model, level, strategy) in zip(commands, expected, strict=True):
+        args = shlex.split(command)
+        node_dir = _node_dir(command)
+        assert node_dir.name == "node0"
+        assert node_dir.parent.parent == tmp_path / "01-baseline/03-fsdp3"
+        assert node_dir.parent.name.startswith(f"model_{model}-fsdp_{level}-")
+        assert node_dir.parent.name.endswith(f"-profile_{mode}")
+        assert f"ddp.data_parallel_sharding_strategy={strategy}" in args
+        assert f"profiling.use_nsys_profiler={str(mode == 'nsys').lower()}" in args
+        assert f"profiling.use_pytorch_profiler={str(mode == 'pytorch').lower()}" in args
+        if mode == "nsys":
+            assert command.startswith("command: nsys profile ")
+            assert _report_base(command).parent == node_dir
+        else:
+            assert "nsys" not in args
+        if mode == "pytorch":
+            assert "profiling.profile_ranks=[0,1,2,3]" in args
+            assert "profiling.profile_step_start=8" in args and "profiling.profile_step_end=9" in args
+            assert f"logger.tensorboard_dir={node_dir / 'tensorboard'}" in args
 
 
 @pytest.mark.unit
@@ -487,7 +529,9 @@ def test_nccl_studies_use_the_cta_pause_build_and_automatic_kernel_selection(scr
 
 @pytest.mark.unit
 @pytest.mark.parametrize(
-    "script", sorted(set(EXAMPLE.glob("[0-9][0-9]-*/[0-9][0-9]_*.sh")) - {DDP_CP_TP_STUDY}), ids=lambda p: p.stem
+    "script",
+    sorted(set(EXAMPLE.glob("[0-9][0-9]-*/[0-9][0-9]_*.sh")) - {DDP_CP_TP_STUDY, FSDP_STUDY}),
+    ids=lambda p: p.stem,
 )
 def test_numbered_studies_skip_existing_case_directories(tmp_path: Path, script: Path):
     args = ("--model", "27b", "--output-dir", str(tmp_path))
@@ -586,6 +630,63 @@ def test_ddp_cp_tp_study_skips_completed_measurements_and_retries_partial_ones(
     ]
     assert Path(f"{cp4}.nsys-rep").read_text() == "existing report\n"
     assert not list(cp4.parent.parent.parent.glob("*.lock"))
+
+
+@pytest.mark.unit
+def test_fsdp_study_retries_only_incomplete_pytorch_profiles(tmp_path: Path, fake_nsys_env: dict[str, str]):
+    args = ("--model", "27b", "--output-dir", str(tmp_path / "results"))
+    plan = _run(FSDP_STUDY, *args, "--print-case-dirs")
+    assert plan.returncode == 0, plan.stderr
+    node_dirs = [Path(path) / "node0" for path in plan.stdout.splitlines()]
+    assert len(node_dirs) == 9
+    unfinished = next(
+        node_dir
+        for node_dir in node_dirs
+        if "-fsdp_2-" in node_dir.parent.name and node_dir.parent.name.endswith("-profile_pytorch")
+    )
+    dry_run = _run(FSDP_STUDY, *args, "--dry-run")
+    assert dry_run.returncode == 0, dry_run.stderr
+    assert list(map(_node_dir, _commands(dry_run.stderr))) == node_dirs
+    for command, node_dir in zip(_commands(dry_run.stderr), node_dirs, strict=True):
+        node_dir.mkdir(parents=True)
+        (node_dir / "run_info.txt").write_text("status=0\n")
+        if node_dir.parent.name.endswith("-profile_nsys"):
+            Path(f"{_report_base(command)}.nsys-rep").write_text("existing report\n")
+        if node_dir.parent.name.endswith("-profile_pytorch"):
+            trace_dir = node_dir / "torch_profile"
+            trace_dir.mkdir()
+            for rank in range(4):
+                (trace_dir / f"rank-{rank}.json.gz").write_text("existing trace\n")
+    (unfinished / "torch_profile/rank-3.json.gz").write_bytes(b"")
+
+    fake_uv = tmp_path / "uv"
+    fake_uv.write_text(
+        '#!/bin/sh\nfor arg; do\n  case "$arg" in\n'
+        '    logger.tensorboard_dir=*) tensorboard="${arg#*=}";;\n'
+        '    profiling.use_pytorch_profiler=true) profiler=true;;\n'
+        '  esac\ndone\n[ "$profiler" = true ] || exit 2\n'
+        'trace_dir="${tensorboard%/tensorboard}/torch_profile"\nmkdir -p "$trace_dir"\n'
+        'for rank in 0 1 2 3; do\n'
+        '  [ "$rank" = "${OMIT_PROFILE_RANK:-}" ] || printf "new trace\\n" > "$trace_dir/rank-$rank.json.gz"\n'
+        'done\n'
+        'exit 0\n'
+    )
+    fake_uv.chmod(0o755)
+    failed = _run(FSDP_STUDY, *args, **fake_nsys_env, OMIT_PROFILE_RANK="3")
+    assert failed.returncode != 0
+    assert failed.stderr.count("skip completed case:") == 8
+    assert (unfinished / "run_info.txt").read_text().splitlines()[-1] == "status=1"
+    assert not (unfinished / "torch_profile/rank-3.json.gz").exists()
+    (previous,) = unfinished.parent.glob("node0.attempt-*")
+    assert (previous / "torch_profile/rank-3.json.gz").stat().st_size == 0
+
+    recovered = _run(FSDP_STUDY, *args, **fake_nsys_env)
+    assert recovered.returncode == 0, recovered.stderr
+    assert recovered.stderr.count("skip completed case:") == 8
+    assert len(list(unfinished.parent.glob("node0.attempt-*"))) == 2
+    assert (unfinished / "run_info.txt").read_text().splitlines()[-1] == "status=0"
+    assert (unfinished / "torch_profile/rank-3.json.gz").read_text() == "new trace\n"
+    assert not list(unfinished.parent.parent.glob("*.lock"))
 
 
 @pytest.mark.unit

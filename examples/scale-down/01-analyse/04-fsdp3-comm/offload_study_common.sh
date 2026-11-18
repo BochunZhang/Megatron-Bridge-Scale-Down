@@ -16,6 +16,7 @@ LAUNCHER=("${BENCHMARK_DIR}/run_pretrain_fsdp3.sh")
 DRY_RUN=false
 PRINT_CASE_DIRS=false
 RESUME_CASES=false
+STUDY_PROFILE=nsys
 ACTIVE_CASE_LOCK=""
 FAILED=0
 NVME_PATH="${NVME_PATH:-}"
@@ -77,9 +78,9 @@ run_case() {
     local args=("${model_args[@]}"
         --model "${model}" --full --dtype bf16 --gpu 4 --nproc-per-node 4 --nnodes 1 --node-rank 0
         --gbs 16 --mbs "${mbs}" --seq "${seq}" --tp "${tp}" --cp "${cp}" --fsdp "${fsdp}" --cuda-graph "${graph}"
-        --nsys --train-iters 10 --profile-start 7 --profile-end 8
+        --profile "${STUDY_PROFILE}" --train-iters 10 --profile-start 7 --profile-end 8
         --results-root "${OUTPUT_DIR}/${result_group}" "${result_args[@]}" "$@")
-    local label="${result_group}${name:+/${name}} model=${model} fsdp=${fsdp} graph=${graph} tp=${tp} cp=${cp} mbs=${mbs} seq=${seq}"
+    local label="${result_group}${name:+/${name}} model=${model} fsdp=${fsdp} graph=${graph} tp=${tp} cp=${cp} mbs=${mbs} seq=${seq} profile=${STUDY_PROFILE}"
     local case_dir=""
     local claim_dir=""
     if [[ "${DRY_RUN}" == true && "${PRINT_CASE_DIRS}" == false ]]; then

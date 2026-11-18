@@ -23,11 +23,11 @@ Qwen3.8-2.4T-A95B 的 HF 配置是纯文本的 `Qwen3_5MoeForCausalLM`（没有 
 
 ### FSDP3 offload 专项实验
 
-以下五组在一台 4 卡 GB200 上运行。固定 BF16、full attention、GBS=16、27B 裁剪 8 层、2.4T 裁剪 4 层和 64 experts。默认 MBS=1，只有 `02_mbs.sh` 扫描 1、2、4。TP=CP=1 用 seq=4096，CP=4 或 TP=4 用 seq=16384。所有案例采集 Nsight Systems CUDA/NVTX trace，关闭 GPU metrics。
+以下五组在一台 4 卡 GB200 上运行。固定 BF16、full attention、GBS=16、27B 裁剪 8 层、2.4T 裁剪 4 层和 64 experts。默认 MBS=1，只有 `02_mbs.sh` 扫描 1、2、4。TP=CP=1 用 seq=4096，CP=4 或 TP=4 用 seq=16384。编号脚本默认采集 Nsight Systems CUDA/NVTX trace，`03_fsdp3.sh` 额外运行无 profiler 和 PyTorch Profiler 对照。Nsight 轮关闭 GPU metrics。
 
 | 组 | 脚本 | 对照 |
 | --- | --- | --- |
-| `01-baseline` | [01_cuda_graph.sh](01-baseline/01_cuda_graph.sh)、[02_mbs.sh](01-baseline/02_mbs.sh)、[03_fsdp3.sh](01-baseline/03_fsdp3.sh) | FSDP3 eager/graph、固定拓扑扫 MBS、FSDP1/FSDP3。27B 两边用 full-iteration graph，2.4T 两边用原生 MoE partial graph。 |
+| `01-baseline` | [01_cuda_graph.sh](01-baseline/01_cuda_graph.sh)、[02_mbs.sh](01-baseline/02_mbs.sh)、[03_fsdp3.sh](01-baseline/03_fsdp3.sh) | FSDP3 eager/graph、固定拓扑扫 MBS，以及两种模型的 FSDP1/2/3 对照。27B 使用 full-iteration graph，2.4T 使用原生 MoE partial graph。 |
 | `02-comm-overlap` | [01_fsdp3_cp_overlap.sh](02-comm-overlap/01_fsdp3_cp_overlap.sh)、[02_ddp_cp_tp.sh](02-comm-overlap/02_ddp_cp_tp.sh) | FSDP3 在 CP=1/4 内分别比较 AG/RS 共用与独立 communicator。27B 用 full-iteration graph，2.4T 用 eager。DDP + graph 对比 CP4 与 TP4 的通信，并在 TP4 下对照 Transformer Engine TP overlap 的开启与关闭。 |
 | `03-cpu-offload` | [01_weight_offload.sh](03-cpu-offload/01_weight_offload.sh)、[02_cpu_grad_optimizer.sh](03-cpu-offload/02_cpu_grad_optimizer.sh) | 两个模型都在 CP=1 和 CP=4 测权重回载 × AG/RS overlap。固定 CP=1、卸载组件和各模型的 graph 范围，逐项把梯度累加和 AdamW 移到 CPU。 |
 | `04-nvme` | [01_dram_vs_nvme.sh](04-nvme/01_dram_vs_nvme.sh) | eager CPU 累加 + CPU AdamW，比较 DRAM 与 NVMe。默认用 `/tmp/megatron-fsdp3-nvme`，启动前检查默认目录所在设备。可用 `--nvme-path DIR` 或 `NVME_PATH` 指向节点的本地 NVMe 目录。 |
@@ -35,9 +35,30 @@ Qwen3.8-2.4T-A95B 的 HF 配置是纯文本的 `Qwen3_5MoeForCausalLM`（没有 
 
 从仓库根目录运行。默认结果根目录为 `results/01-analyse/04-fsdp3-comm/`。所有编号脚本使用 `<组名>/<小项目>/model_<配置>/node0/`。小项目名取脚本名去掉 `.sh` 并将下划线换成连字符。编号实验省略时间戳，`01-baseline` 省略 `-baseline`，其余组在 case 目录名中保留用于区分实验变体的标签。
 
-`02_ddp_cp_tp.sh` 对每个模型依次运行 CP4、TP4、TP4 + overlap。它在目标 case 的 `node0/` 下同时找到 `run_info.txt` 中的 `status=0` 和非空的对应 `.nsys-rep` 时跳过。启动器会归档未完成的 `node0/` 并重新测量。
+`02_ddp_cp_tp.sh` 对每个模型依次运行 CP4、TP4、TP4 + overlap。它与 `03_fsdp3.sh` 都会检查 `run_info.txt` 中的 `status=0` 和该模式要求的 trace 文件，跳过已完成的 case。启动器会归档未完成的 `node0/` 并重新测量。
 
 其他编号脚本在目标 `model_…/` 已存在时跳过，包括空目录和上次失败的目录。需要复跑时可指定新的 `--output-dir DIR`。可用 `--model 27b` 限定模型，或用 `--dry-run` 查看完整计划。
+
+### FSDP1 / FSDP2 / FSDP3 baseline
+
+`03_fsdp3.sh` 依次运行三轮，每轮覆盖 27B 和 2.4T 上的 FSDP1、FSDP2、FSDP3，共 18 个 case。第一轮 `none` 用于比较稳态步耗时，第二轮 `nsys` 生成 CUDA/NVTX 报告，第三轮 `pytorch` 使用 PyTorch Profiler。两个 profiler 都采集 step 7（从 0 计数，对应日志 iteration 8）。结果名中的 `profile_none`、`profile_nsys` 和 `profile_pytorch` 对应三个采集模式。
+
+FSDP1/2 都在 optimizer 更新并写回模型参数后，在同一个 optimizer step 内同步 all-gather 参数。FSDP2 仍然在每个 microbatch 的 backward 做梯度 reduce-scatter overlap。2.4T 的 FSDP2 partial Graph 需要包含 `8e771a34f` 的 Megatron-LM checkout，通过 `MEGATRON_LM_DIR` 指定。
+
+```bash
+MEGATRON_LM_DIR=/path/to/megatron-lm bash \
+  examples/scale-down/01-analyse/04-fsdp3-comm/01-baseline/03_fsdp3.sh \
+  --output-dir results/01-analyse/04-fsdp3-comm/fsdp-level-baseline
+```
+
+每个 `profile_pytorch` case 的 `node0/torch_profile/` 包含 `rank-0.json.gz` 至 `rank-3.json.gz`。下载每个 case 的整个 `torch_profile/` 目录，在本机逐个加载。
+
+```python
+from hta.trace_analysis import TraceAnalysis
+
+analysis = TraceAnalysis(trace_dir="/path/to/case/node0/torch_profile", include_last_profiler_step=True)
+overlap = analysis.get_comm_comp_overlap(visualize=False)
+```
 
 用 `migrate_results.py` 迁移原先直接保存在组目录下的结果。脚本按当前测试矩阵匹配，完整迁移 case 目录及历史尝试。同一个旧 case 对应多个小项目时，每个目标都获得一份结果。若某个目标已有结果，该 case 的源目录与目标目录都保留，脚本报告冲突。未匹配的旧目录会列出来供检查。使用过自定义结果根目录时，给迁移脚本传同一个 `--output-dir DIR`。
 
@@ -81,7 +102,7 @@ MEGATRON_LM_DIR=/path/to/megatron-lm bash "$study/05-nccl/03_ag_pause.sh" --outp
 | `--force-balance` | — | 见「强制均衡路由」 |
 | `--dtype` / `--mxfp8` | `bf16`、`mxfp8` | 默认 BF16 |
 | `--offload` | `optimizer`、`weight`、`gradient`，可逗号组合 | 每个 case 卸载指定模块，目录和 nsys 报告名追加 `-offload_<模块>` |
-| `--profile` / `--nsys` | `none`、`nsys` | sweep 默认 `nsys`，单 case 默认 `none` |
+| `--profile` / `--nsys` | `none`、`nsys`、`pytorch` | sweep 默认 `nsys`，单 case 默认 `none`。`--nsys` 等价于 `--profile nsys` |
 | `--metric [HZ]` | 10–200000 Hz | 启用 nsys 并采集 node 0 上所有 GPU 的硬件指标。默认 20000 Hz，可用 `--metric 10000` 指定频率。结果目录和报告名追加 `-metric_<HZ>` |
 | `--merge` | — | nsys 不展开 CUDA graph，每次 graph launch 画成一个整体（`--cuda-graph-trace=graph`）；只对 nsys 且 `--cuda-graph on` 的 case 生效，在 graph 标记后追加 `-merge`。见「Nsys」 |
 

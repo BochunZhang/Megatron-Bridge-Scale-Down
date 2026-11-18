@@ -108,7 +108,7 @@ Options:
   --cpu-grad-accumulation       Accumulate reduced gradient shards on CPU in each case
   --cpu-optimizer               CPU AdamW and host gradient accumulation in each case
   --nvme-path DIR               Native NVMe AIO offload in each case (requires FSDP3)
-  --profile none|nsys           Profiling mode (default: nsys); --nsys is an alias
+  --profile none|nsys|pytorch   Profiling mode (default: nsys); --nsys is an alias
   --metric [HZ]                 Enable nsys GPU metrics on all GPUs on node 0
                                 (default frequency: 20000 Hz)
   --merge                       nsys draws each CUDA graph launch as one block

@@ -153,8 +153,9 @@ Options:
   --nvme-path DIR                Use the native NVMe AIO extension for weights, gradients and AdamW state;
                                  implies --cpu-optimizer. DIR is local to each node.
   MEGATRON_LM_DIR                Optional environment variable pointing to the MCore checkout
-  --profile none|nsys            Profiling mode (default: none). nsys records the GPUs
-                                 of node 0 into one report
+  --profile none|nsys|pytorch    Profiling mode (default: none). nsys records node 0
+                                 into one report. pytorch exports per-rank Chrome traces
+                                 under each node's torch_profile directory.
   --nsys                         Alias for --profile nsys
   --metric [HZ]                  Enable nsys GPU metrics on all GPUs on node 0
                                  (default frequency: 20000 Hz)
@@ -267,7 +268,10 @@ DENSE=false
 [[ "${MODEL}" == 27b || "${MODEL}" == qwen38-27b ]] && DENSE=true
 RECIPE="${RECIPE:-${DEFAULT_RECIPE}}"
 case "${DTYPE}" in bf16|mxfp8|nvfp4) ;; *) echo "--dtype must be bf16, mxfp8 or nvfp4" >&2; exit 2;; esac
-case "${PROFILE}" in none|nsys) ;; *) echo "--profile must be none or nsys" >&2; exit 2;; esac
+case "${PROFILE}" in none|nsys|pytorch) ;; *) echo "--profile must be none, nsys or pytorch" >&2; exit 2;; esac
+if [[ "${PROFILE}" == pytorch && -n "${METRIC_FREQUENCY}" ]]; then
+    echo "--metric requires Nsight Systems and cannot be used with --profile pytorch" >&2; exit 2
+fi
 [[ -n "${METRIC_FREQUENCY}" ]] && PROFILE=nsys
 case "${DISPATCHER}" in hybridep|alltoall) ;; *) echo "--dispatcher must be hybridep or alltoall" >&2; exit 2;; esac
 case "${CUDA_GRAPH}" in off|on) ;; *) echo "--cuda-graph must be off or on" >&2; exit 2;; esac
@@ -366,8 +370,8 @@ DATA_PARALLEL=$((GPU_COUNT / (TENSOR_PARALLEL * CONTEXT_PARALLEL)))
 (( GLOBAL_BATCH_SIZE % (MICRO_BATCH_SIZE * DATA_PARALLEL) == 0 )) || {
     echo "global batch size ${GLOBAL_BATCH_SIZE} is not divisible by MBS*DP=${MICRO_BATCH_SIZE}*${DATA_PARALLEL}" >&2; exit 2
 }
-if [[ "${PROFILE}" == nsys ]] && ! (( PROFILE_START < PROFILE_END && PROFILE_END < TRAIN_ITERS )); then
-    echo "nsys requires profile-start < profile-end < train-iters" >&2; exit 2
+if [[ "${PROFILE}" != none ]] && ! (( PROFILE_START < PROFILE_END && PROFILE_END < TRAIN_ITERS )); then
+    echo "${PROFILE} requires profile-start < profile-end < train-iters" >&2; exit 2
 fi
 if (( NNODES > 1 )); then
     [[ -n "${MASTER_ADDR}" ]] || { echo "multi-node runs require --master-addr or MASTER_ADDR" >&2; exit 2; }
@@ -506,6 +510,13 @@ if [[ "${LABEL_DTYPE_AND_DP}" == true ]]; then
     NSYS_NAME+="-dp_${DATA_PARALLEL}"
 fi
 has_required_profile() {
+    if [[ "${PROFILE}" == pytorch ]]; then
+        local rank
+        for (( rank = FIRST_PROFILE_RANK; rank < FIRST_PROFILE_RANK + GPUS_PER_NODE; rank++ )); do
+            [[ -s "${RESULT_DIR}/torch_profile/rank-${rank}.json.gz" ]] || return 1
+        done
+        return 0
+    fi
     [[ "${STABLE_RESULT_DIR}" == false || "${PROFILE}" != nsys || "${NODE_RANK}" != 0 ||
         -s "${RESULT_DIR}/${NSYS_NAME}.nsys-rep" ]]
 }
@@ -533,11 +544,24 @@ fi
 export NCCL_DEBUG=WARN
 unset NCCL_DEBUG_SUBSYS NCCL_DEBUG_FILE || true
 
-# nsys records node 0 only: its ranks 0..nproc-per-node-1 (the 4 GPUs of one GB200
-# tray) call cudaProfilerStart / Stop, and only node 0 runs under nsys, so a run
-# leaves exactly one report.
-PROFILE_RANKS=0
-for (( rank = 1; rank < GPUS_PER_NODE; rank++ )); do PROFILE_RANKS+=",${rank}"; done
+# Nsight Systems records node 0. PyTorch exports one trace for each local worker
+# using its global rank, under that node's result directory.
+FIRST_PROFILE_RANK=0
+PROFILER_START="${PROFILE_START}"
+PROFILER_END="${PROFILE_END}"
+TENSORBOARD_DIR=null
+if [[ "${PROFILE}" == pytorch ]]; then
+    FIRST_PROFILE_RANK=$((NODE_RANK * GPUS_PER_NODE))
+    # Bridge advances the PyTorch schedule before executing training iteration 0.
+    # Shift the schedule boundaries to capture the same training steps as Nsight.
+    PROFILER_START=$((PROFILE_START + 1))
+    PROFILER_END=$((PROFILE_END + 1))
+    TENSORBOARD_DIR="${RESULT_DIR}/tensorboard"
+fi
+PROFILE_RANKS="${FIRST_PROFILE_RANK}"
+for (( rank = FIRST_PROFILE_RANK + 1; rank < FIRST_PROFILE_RANK + GPUS_PER_NODE; rank++ )); do
+    PROFILE_RANKS+=",${rank}"
+done
 # DDP replicates parameters and gradients (the distributed optimizer still shards
 # optimizer state); fsdp_dtensor checkpoints only exist for Megatron-FSDP.
 if [[ "${FSDP_LEVEL}" == ddp ]]; then
@@ -569,9 +593,10 @@ OVERRIDES=(
     # CommOverlapConfig.setup() applies these settings to DDP at runtime.
     "comm_overlap.overlap_grad_reduce=${GRAD_OVERLAP}" "comm_overlap.overlap_param_gather=${PARAM_OVERLAP}"
     "checkpoint.save=null" "checkpoint.load=null"
-    "logger.log_interval=1" "logger.tensorboard_dir=null" "logger.save_config_filepath=${RESULT_DIR}/config.yaml"
+    "logger.log_interval=1" "logger.tensorboard_dir=${TENSORBOARD_DIR}" "logger.save_config_filepath=${RESULT_DIR}/config.yaml"
     "profiling.use_nsys_profiler=$([[ "${PROFILE}" == nsys ]] && echo true || echo false)"
-    "profiling.use_pytorch_profiler=false" "profiling.profile_step_start=${PROFILE_START}" "profiling.profile_step_end=${PROFILE_END}"
+    "profiling.use_pytorch_profiler=$([[ "${PROFILE}" == pytorch ]] && echo true || echo false)"
+    "profiling.profile_step_start=${PROFILER_START}" "profiling.profile_step_end=${PROFILER_END}"
     "profiling.profile_ranks=[${PROFILE_RANKS}]"
     # nvtx_ranges also turns on Megatron-FSDP's per-layer all-gather / reduce-scatter
     # ranges ("FSDP AG fwd prefetch L2 ...", "FSDP RS L1 ...").
@@ -580,8 +605,8 @@ OVERRIDES=(
     # record_param_comms for FSDP all-gather / reduce-scatter, carries tensor shapes.
     "profiling.record_shapes=$([[ "${PROFILE}" == nsys ]] && echo true || echo false)"
 )
-if [[ "${FSDP_LEVEL}" == ddp && "${DDP_OVERLAP}" == false ]]; then
-    # Bridge re-enables gather overlap if either DDP or the optimizer requests it.
+if [[ "${PARAM_OVERLAP}" == false ]]; then
+    # Keep synchronous post-update gathers even if a recipe requests optimizer overlap.
     OVERRIDES+=("optimizer.overlap_param_gather=false"
         "optimizer.overlap_param_gather_with_optimizer_step=false"
         "comm_overlap.overlap_param_gather_with_optimizer_step=false")
@@ -731,6 +756,7 @@ INFO=(
     "mtp=${MTP_TAG}" "experts=${EXPERTS_TAG}" "force_balance=${FORCE_BALANCE}" "cuda_graph=${CUDA_GRAPH}" "cuda_graph_trace=${GRAPH_TRACE}" "seq=${SEQ_LENGTH}"
     "tp=${TENSOR_PARALLEL}" "sp=${SEQUENCE_PARALLEL}" "cp=${CONTEXT_PARALLEL}" "dp=${DATA_PARALLEL}" "ep=${EXPERT_PARALLEL}"
     "dispatcher=${DISPATCHER}" "mbs=${MICRO_BATCH_SIZE}" "gbs=${GLOBAL_BATCH_SIZE}" "gpus=${GPU_COUNT}"
+    "profile=${PROFILE}" "profile_start=${PROFILE_START}" "profile_end=${PROFILE_END}"
     "num_microbatches=${NUM_MICROBATCHES}" "numa=${NUMA_MODE}" "offload=${OFFLOAD:-none}"
     "cpu_grad_accumulation=${CPU_GRAD_ACCUMULATION}" "cpu_optimizer=${CPU_OPTIMIZER}" "nvme=$([[ -n ${NVME_PATH} ]] && echo true || echo false)"
 )
@@ -759,6 +785,10 @@ if [[ -n "${ARCHIVE_DIR}" ]]; then
     echo "archived incomplete or failed attempt: ${ARCHIVE_DIR}" >&2
 fi
 mkdir -p "${RESULT_DIR}"
+if [[ "${PROFILE}" == pytorch ]]; then
+    # The profiler writes to ../torch_profile relative to this directory.
+    mkdir -p "${TENSORBOARD_DIR}"
+fi
 printf 'command:' >"${RESULT_DIR}/command.txt"
 printf ' %q' "${COMMAND[@]}" >>"${RESULT_DIR}/command.txt"
 printf '\n' >>"${RESULT_DIR}/command.txt"
@@ -773,7 +803,11 @@ set -e
 STATUS=${PIPE_STATUSES[0]}
 if (( STATUS == 0 )); then STATUS=${PIPE_STATUSES[1]}; fi
 if (( STATUS == 0 )) && ! has_required_profile; then
-    echo "missing or empty nsys report: ${RESULT_DIR}/${NSYS_NAME}.nsys-rep" >&2
+    if [[ "${PROFILE}" == pytorch ]]; then
+        echo "missing or empty PyTorch rank trace in ${RESULT_DIR}/torch_profile" >&2
+    else
+        echo "missing or empty nsys report: ${RESULT_DIR}/${NSYS_NAME}.nsys-rep" >&2
+    fi
     STATUS=1
 fi
 printf 'status=%s\n' "${STATUS}" >>"${RESULT_DIR}/run_info.txt"
