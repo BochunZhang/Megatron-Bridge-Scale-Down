@@ -43,11 +43,11 @@ Qwen3.8-2.4T-A95B 的 HF 配置是纯文本的 `Qwen3_5MoeForCausalLM`（没有 
 
 `03_fsdp3.sh` 依次运行三轮，每轮覆盖 27B 和 2.4T 上的 FSDP1、FSDP2、FSDP3，共 18 个 case。第一轮 `none` 用于比较稳态步耗时，第二轮 `nsys` 生成 CUDA/NVTX 报告，第三轮 `pytorch` 使用 PyTorch Profiler。两个 profiler 都采集 step 7（从 0 计数，对应日志 iteration 8）。结果名中的 `profile_none`、`profile_nsys` 和 `profile_pytorch` 对应三个采集模式。
 
-FSDP1/2 都在 optimizer 更新并写回模型参数后，在同一个 optimizer step 内同步 all-gather 参数。FSDP2 仍然在每个 microbatch 的 backward 做梯度 reduce-scatter overlap。2.4T 的 FSDP2 partial Graph 需要包含 `8e771a34f` 的 Megatron-LM checkout，通过 `MEGATRON_LM_DIR` 指定。
+FSDP1/2 都在 optimizer 更新并写回模型参数后，在同一个 optimizer step 内同步 all-gather 参数。FSDP2 仍然在每个 microbatch 的 backward 做梯度 reduce-scatter overlap。2.4T 的 FSDP2 partial Graph 由 Bridge 固定的 Megatron-LM 版本提供。使用 `MEGATRON_LM_DIR` 切换至外部 checkout 时，该 checkout 需要包含 `8e771a34f`。
 
 ```bash
-MEGATRON_LM_DIR=/path/to/megatron-lm bash \
-  examples/scale-down/01-analyse/04-fsdp3-comm/01-baseline/03_fsdp3.sh \
+git submodule update --init 3rdparty/Megatron-LM
+bash examples/scale-down/01-analyse/04-fsdp3-comm/01-baseline/03_fsdp3.sh \
   --output-dir results/01-analyse/04-fsdp3-comm/fsdp-level-baseline
 ```
 
