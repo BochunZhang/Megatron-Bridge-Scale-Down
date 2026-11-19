@@ -33,6 +33,8 @@ Qwen3.8-2.4T-A95B 的 HF 配置是纯文本的 `Qwen3_5MoeForCausalLM`（没有 
 | `04-nvme` | [01_dram_vs_nvme.sh](04-nvme/01_dram_vs_nvme.sh) | eager CPU 累加 + CPU AdamW，比较 DRAM 与 NVMe。默认用 `/tmp/megatron-fsdp3-nvme`，启动前检查默认目录所在设备。可用 `--nvme-path DIR` 或 `NVME_PATH` 指向节点的本地 NVMe 目录。 |
 | `05-nccl` | [01_priority.sh](05-nccl/01_priority.sh)、[02_symmetric_multicast.sh](05-nccl/02_symmetric_multicast.sh)、[03_ag_pause.sh](05-nccl/03_ag_pause.sh) | 27B graph 下的默认/高优先级、AG 和 RS 独立 communicator × symmetric multicast、AG pause 1536/3072/4608 cycles。三脚本默认加载已有的 `nccl/nccl-2.32.3-cta-with-pause/build/lib/libnccl.so.2`。可用 `--nccl-lib FILE` 或 `NCCL_LIB` 覆盖。 |
 
+`01_cuda_graph.sh` 固定每个模型对照里的首个参数 bucket AG 位置。27B 的 eager 和 full-iteration Graph 都在首个 microbatch 的 forward 发起 embedding AG，两个 case 目录都带 `-forward-ag`。2.4T 的 eager 和 partial Graph 都在 optimizer 尾部发起下一步的首个参数 bucket AG。
+
 从仓库根目录运行。默认结果根目录为 `results/01-analyse/04-fsdp3-comm/`。所有编号脚本使用 `<组名>/<小项目>/model_<配置>/node0/`。小项目名取脚本名去掉 `.sh` 并将下划线换成连字符。编号实验省略时间戳，`01-baseline` 省略 `-baseline`，其余组在 case 目录名中保留用于区分实验变体的标签。
 
 `02_ddp_cp_tp.sh` 对每个模型依次运行 CP4、TP4、TP4 + overlap。它与 `03_fsdp3.sh` 都会检查 `run_info.txt` 中的 `status=0` 和该模式要求的 trace 文件，跳过已完成的 case。启动器会归档未完成的 `node0/` 并重新测量。

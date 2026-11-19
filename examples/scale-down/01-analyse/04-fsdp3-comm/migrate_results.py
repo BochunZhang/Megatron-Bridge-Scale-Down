@@ -28,6 +28,8 @@ def _migration_plan(output_dir: Path) -> dict[Path, list[Path]]:
         group = script.parent.name
         for path in result.stdout.splitlines():
             target = Path(path)
+            if script.name == "01_cuda_graph.sh":
+                target = target.with_name(target.name.removesuffix("-forward-ag"))
             old_name = f"{target.name}-baseline" if group == "01-baseline" else target.name
             plan.setdefault(output_dir / group / old_name, []).append(target)
     return plan

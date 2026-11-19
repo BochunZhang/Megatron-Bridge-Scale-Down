@@ -444,6 +444,24 @@ def test_baseline_saves_stable_case_paths_under_each_experiment(
 
 
 @pytest.mark.unit
+@pytest.mark.parametrize(
+    ("model", "gather_in_start_param_sync", "result_suffix"),
+    [("27b", "false", "-forward-ag"), ("2.4t", "true", "-profile_nsys")],
+)
+def test_cuda_graph_study_matches_first_bucket_all_gather_placement(
+    tmp_path: Path, model: str, gather_in_start_param_sync: str, result_suffix: str
+):
+    script = EXAMPLE / "01-baseline/01_cuda_graph.sh"
+    result = _run(script, "--model", model, "--dry-run", "--output-dir", str(tmp_path))
+    assert result.returncode == 0, result.stderr
+    off, on = _commands(result.stderr)
+    for command in (off, on):
+        gather_flags = [arg for arg in shlex.split(command) if arg.startswith("ddp.fsdp_all_gather_in_start_param_sync=")]
+        assert gather_flags == [f"ddp.fsdp_all_gather_in_start_param_sync={gather_in_start_param_sync}"]
+        assert _node_dir(command).parent.name.endswith(result_suffix)
+
+
+@pytest.mark.unit
 def test_fsdp_study_runs_every_sharding_level_before_switching_profiler(tmp_path: Path):
     result = _run(FSDP_STUDY, "--dry-run", "--output-dir", str(tmp_path))
     assert result.returncode == 0, result.stderr
@@ -579,7 +597,8 @@ def test_numbered_study_launches_missing_case_next_to_existing_one(tmp_path: Pat
     assert dry_run.returncode == 0, dry_run.stderr
     existing, missing = map(_report_base, _commands(dry_run.stderr))
     existing.parent.parent.mkdir(parents=True)
-    legacy_case_dir = tmp_path / "01-baseline" / f"{missing.parent.parent.name}-baseline"
+    legacy_name = missing.parent.parent.name.removesuffix("-forward-ag")
+    legacy_case_dir = tmp_path / "01-baseline" / f"{legacy_name}-baseline"
     legacy_case_dir.mkdir()
 
     result = _run(script, *args, **fake_nsys_env)
@@ -695,6 +714,7 @@ def test_migrate_legacy_results_preserves_shared_artifacts_and_conflicts(tmp_pat
     baseline_plan = _run(EXAMPLE / "01-baseline/01_cuda_graph.sh", *args, "--model", "27b", "--print-case-dirs")
     assert baseline_plan.returncode == 0, baseline_plan.stderr
     baseline_target = next(Path(path) for path in baseline_plan.stdout.splitlines() if "-cg_on-" in path)
+    baseline_target = baseline_target.with_name(baseline_target.name.removesuffix("-forward-ag"))
     baseline_group = baseline_target.parent.parent
     baseline_source = baseline_group / f"{baseline_target.name}-baseline"
     baseline_targets = [
