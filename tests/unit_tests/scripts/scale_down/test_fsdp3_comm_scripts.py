@@ -445,6 +445,31 @@ def test_baseline_saves_stable_case_paths_under_each_experiment(
 
 @pytest.mark.unit
 @pytest.mark.parametrize(
+    ("options", "level", "strategy", "overlap"),
+    [((), 1, "optim", "false"), (("--fsdp", "3"), 3, "optim_grads_params", "true")],
+    ids=["default-fsdp1", "explicit-fsdp3"],
+)
+def test_mbs_study_sharding_and_param_gather(
+    tmp_path: Path, options: tuple[str, ...], level: int, strategy: str, overlap: str
+):
+    script = EXAMPLE / "01-baseline/02_mbs.sh"
+    result = _run(script, "--dry-run", "--output-dir", str(tmp_path), *options)
+    assert result.returncode == 0, result.stderr
+    matrix = [(model, mbs) for model in ("27b", "2.4t") for mbs in (1, 2, 4)]
+    for command, (model, mbs) in zip(_commands(result.stderr), matrix, strict=True):
+        args = shlex.split(command)
+        assert _node_dir(command).parent.name.startswith(f"model_{model}-fsdp_{level}-")
+        assert f"train.micro_batch_size={mbs}" in args and "train.global_batch_size=16" in args
+        assert f"ddp.data_parallel_sharding_strategy={strategy}" in args
+        assert f"ddp.overlap_param_gather={overlap}" in args
+        assert f"comm_overlap.overlap_param_gather={overlap}" in args
+        if level == 1:
+            assert "optimizer.overlap_param_gather=false" in args
+            assert "optimizer.overlap_param_gather_with_optimizer_step=false" in args
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
     ("model", "gather_in_start_param_sync", "result_suffix"),
     [("27b", "false", "-forward-ag"), ("2.4t", "true", "-profile_nsys")],
 )

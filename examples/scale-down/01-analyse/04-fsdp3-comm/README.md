@@ -35,6 +35,8 @@ Qwen3.8-2.4T-A95B 的 HF 配置是纯文本的 `Qwen3_5MoeForCausalLM`（没有 
 
 `01_cuda_graph.sh` 固定每个模型对照里的首个参数 bucket AG 位置。27B 的 eager 和 full-iteration Graph 都在首个 microbatch 的 forward 发起 embedding AG，两个 case 目录都带 `-forward-ag`。2.4T 的 eager 和 partial Graph 都在 optimizer 尾部发起下一步的首个参数 bucket AG。
 
+`01-baseline/02_mbs.sh` 默认以 FSDP1 扫描 MBS=1、2、4。每步累积完梯度后做梯度 RS，optimizer 更新并写回参数后，在同一个 optimizer step 内同步执行参数 AG。使用 `bash "$study/01-baseline/02_mbs.sh" --fsdp 3` 可按原 FSDP3 配置运行相同的 MBS 扫描。结果目录名中的 `fsdp_1` 和 `fsdp_3` 区分两组数据。
+
 从仓库根目录运行。默认结果根目录为 `results/01-analyse/04-fsdp3-comm/`。所有编号脚本使用 `<组名>/<小项目>/model_<配置>/node0/`。小项目名取脚本名去掉 `.sh` 并将下划线换成连字符。编号实验省略时间戳，`01-baseline` 省略 `-baseline`，其余组在 case 目录名中保留用于区分实验变体的标签。
 
 `02_ddp_cp_tp.sh` 对每个模型依次运行 CP4、TP4、TP4 + overlap。它与 `03_fsdp3.sh` 都会检查 `run_info.txt` 中的 `status=0` 和该模式要求的 trace 文件，跳过已完成的 case。启动器会归档未完成的 `node0/` 并重新测量。

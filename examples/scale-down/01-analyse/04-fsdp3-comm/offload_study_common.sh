@@ -26,7 +26,7 @@ fail() { echo "$*" >&2; exit 2; }
 
 while (( $# )); do
     case "$1" in
-        --model|--output-dir|--nvme-path|--nccl-lib)
+        --model|--output-dir|--nvme-path|--nccl-lib|--fsdp)
             [[ -n "${2:-}" && "$2" != --* ]] || fail "Missing value for $1"
             case "$1" in
                 --model)
@@ -34,6 +34,10 @@ while (( $# )); do
                     [[ "${GROUP}" != 05-nccl || "$2" == 27b ]] || fail "05-nccl uses only the 27b model"
                     MODELS=("$2");;
                 --output-dir) OUTPUT_DIR="$2";;
+                --fsdp)
+                    [[ "${STUDY_SCRIPT}" == 02_mbs.sh ]] || fail "--fsdp applies to 02_mbs.sh"
+                    [[ "$2" == 1 || "$2" == 3 ]] || fail "--fsdp must be 1 or 3"
+                    MBS_FSDP="$2";;
                 --nvme-path)
                     [[ "${GROUP}" == 04-nvme ]] || fail "--nvme-path applies to 04-nvme"
                     NVME_PATH="$2";;
@@ -46,6 +50,9 @@ while (( $# )); do
         --print-case-dirs) PRINT_CASE_DIRS=true; shift;;
         -h|--help)
             printf 'Usage: %s [--model 27b|2.4t] [--output-dir DIR] [--dry-run | --print-case-dirs]\n' "$0"
+            if [[ "${STUDY_SCRIPT}" == 02_mbs.sh ]]; then
+                echo '  --fsdp 1|3    MBS sweep sharding level (default: 1, synchronous parameter AG in optimizer step)'
+            fi
             case "${GROUP}" in
                 04-nvme) echo '  --nvme-path DIR    Directory on local NVMe (default: /tmp/megatron-fsdp3-nvme, or set NVME_PATH)';;
                 05-nccl)

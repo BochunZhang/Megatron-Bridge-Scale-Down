@@ -19,8 +19,12 @@ DEFAULT_OUTPUT_DIR = STUDY_DIR.parents[3] / "results/01-analyse/04-fsdp3-comm"
 def _migration_plan(output_dir: Path) -> dict[Path, list[Path]]:
     plan: dict[Path, list[Path]] = {}
     for script in sorted(STUDY_DIR.glob("[0-9][0-9]-*/[0-9][0-9]_*.sh")):
+        command = ["bash", str(script), "--output-dir", str(output_dir), "--print-case-dirs"]
+        if script.name == "02_mbs.sh":
+            # The legacy MBS sweep used FSDP3 for every microbatch size.
+            command.extend(["--fsdp", "3"])
         result = subprocess.run(
-            ["bash", str(script), "--output-dir", str(output_dir), "--print-case-dirs"],
+            command,
             check=True,
             capture_output=True,
             text=True,
