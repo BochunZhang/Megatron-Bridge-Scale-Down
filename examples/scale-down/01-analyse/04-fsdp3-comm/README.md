@@ -43,6 +43,23 @@ Qwen3.8-2.4T-A95B 的 HF 配置是纯文本的 `Qwen3_5MoeForCausalLM`（没有 
 
 其他编号脚本在目标 `model_…/` 已存在时跳过，包括空目录和上次失败的目录。需要复跑时可指定新的 `--output-dir DIR`。可用 `--model 27b` 限定模型，或用 `--dry-run` 查看完整计划。
 
+在 `02-comm-overlap/` 下，两个脚本均可用 `--profile pytorch` 采集供 HTA 分析的四卡 trace。DDP 的六组对照从仓库根目录运行：
+
+```bash
+study=examples/scale-down/01-analyse/04-fsdp3-comm
+bash "$study/02-comm-overlap/02_ddp_cp_tp.sh" --profile pytorch
+```
+
+FSDP3 的 shared/split AG-RS 对照使用同目录下的 `01_fsdp3_cp_overlap.sh --profile pytorch`。两者默认使用 Nsight Systems。PyTorch 模式按 `status=0` 和 `node0/torch_profile/rank-{0,1,2,3}.json.gz` 四份非空 trace 判断完成。
+
+下载每个 case 的 `torch_profile/` 后，在装有 `traceinsight==0.6.1` 的环境中运行：
+
+```bash
+python "$study/hta_overlap.py" --include-tp-userbuffers /path/to/case/node0/torch_profile
+```
+
+输出按 rank 统计通信与计算重叠的百分比、通信区间总时长和未被计算覆盖的通信时长。脚本识别 HybridEP dispatch、combine 和路由信息 gather；`--include-tp-userbuffers` 额外计入 TE Userbuffers 数据、信号 kernel 及显式 PtoP 拷贝。`--include-ep-sync` 可将 HybridEP 的跨卡同步计入通信时间。
+
 ### FSDP1 / FSDP2 / FSDP3 baseline
 
 `03_fsdp3.sh` 依次运行三轮，每轮覆盖 27B 和 2.4T 上的 FSDP1、FSDP2、FSDP3，共 18 个 case。第一轮 `none` 用于比较稳态步耗时，第二轮 `nsys` 生成 CUDA/NVTX 报告，第三轮 `pytorch` 使用 PyTorch Profiler。两个 profiler 都采集 step 7（从 0 计数，对应日志 iteration 8）。结果名中的 `profile_none`、`profile_nsys` 和 `profile_pytorch` 对应三个采集模式。

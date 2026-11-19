@@ -520,6 +520,27 @@ def test_fsdp_study_runs_every_sharding_level_before_switching_profiler(tmp_path
 
 
 @pytest.mark.unit
+@pytest.mark.parametrize(
+    ("script", "case_count"),
+    [(EXAMPLE / "02-comm-overlap/01_fsdp3_cp_overlap.sh", 8), (DDP_CP_TP_STUDY, 6)],
+    ids=["fsdp3-cp-overlap", "ddp-cp-tp"],
+)
+def test_comm_overlap_studies_support_pytorch_profile(tmp_path: Path, script: Path, case_count: int):
+    result = _run(script, "--profile", "pytorch", "--dry-run", "--output-dir", str(tmp_path))
+    assert result.returncode == 0, result.stderr
+    commands = _commands(result.stderr)
+    assert len(commands) == case_count
+    for command in commands:
+        args = shlex.split(command)
+        node_dir = _node_dir(command)
+        assert "-profile_pytorch-" in node_dir.parent.name
+        assert f"logger.tensorboard_dir={node_dir}/tensorboard" in args
+        assert "profiling.use_pytorch_profiler=true" in args and "profiling.use_nsys_profiler=false" in args
+        assert "profiling.profile_ranks=[0,1,2,3]" in args
+        assert "profiling.profile_step_start=8" in args and "profiling.profile_step_end=9" in args
+
+
+@pytest.mark.unit
 @pytest.mark.parametrize("model", ["27b", "2.4t"])
 def test_ddp_cp_tp_study_compares_matched_tp_overlap_cases(tmp_path: Path, model: str):
     result = _run(DDP_CP_TP_STUDY, "--model", model, "--dry-run", "--output-dir", str(tmp_path))

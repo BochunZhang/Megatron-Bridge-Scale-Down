@@ -7,7 +7,8 @@ set -euo pipefail
 
 BENCHMARK_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${BENCHMARK_DIR}/../../../.." && pwd)"
-GROUP="$(basename "$(dirname "${BASH_SOURCE[1]}")")"
+STUDY_DIR="$(cd "$(dirname "${BASH_SOURCE[1]}")" && pwd)"
+GROUP="${STUDY_DIR##*/}"
 STUDY_SCRIPT="${BASH_SOURCE[1]##*/}"
 OUTPUT_DIR="${OUTPUT_DIR:-${REPO_ROOT}/results/01-analyse/04-fsdp3-comm}"
 MODELS=(27b 2.4t)
@@ -26,7 +27,7 @@ fail() { echo "$*" >&2; exit 2; }
 
 while (( $# )); do
     case "$1" in
-        --model|--output-dir|--nvme-path|--nccl-lib|--fsdp)
+        --model|--output-dir|--nvme-path|--nccl-lib|--fsdp|--profile)
             [[ -n "${2:-}" && "$2" != --* ]] || fail "Missing value for $1"
             case "$1" in
                 --model)
@@ -34,6 +35,11 @@ while (( $# )); do
                     [[ "${GROUP}" != 05-nccl || "$2" == 27b ]] || fail "05-nccl uses only the 27b model"
                     MODELS=("$2");;
                 --output-dir) OUTPUT_DIR="$2";;
+                --profile)
+                    [[ "${GROUP}" == 02-comm-overlap ]] || fail "--profile applies to 02-comm-overlap"
+                    [[ "$2" == nsys || "$2" == pytorch ]] || fail "--profile must be nsys or pytorch"
+                    STUDY_PROFILE="$2"
+                    if [[ "$2" == pytorch ]]; then RESUME_CASES=true; fi;;
                 --fsdp)
                     [[ "${STUDY_SCRIPT}" == 02_mbs.sh ]] || fail "--fsdp applies to 02_mbs.sh"
                     [[ "$2" == 1 || "$2" == 3 ]] || fail "--fsdp must be 1 or 3"
@@ -54,6 +60,7 @@ while (( $# )); do
                 echo '  --fsdp 1|3    MBS sweep sharding level (default: 1, synchronous parameter AG in optimizer step)'
             fi
             case "${GROUP}" in
+                02-comm-overlap) echo '  --profile nsys|pytorch    Capture Nsight Systems (default) or per-rank PyTorch traces for HTA';;
                 04-nvme) echo '  --nvme-path DIR    Directory on local NVMe (default: /tmp/megatron-fsdp3-nvme, or set NVME_PATH)';;
                 05-nccl)
                     echo '  --nccl-lib FILE    Override the NCCL library (or set NCCL_LIB); 27b only'
