@@ -20,6 +20,7 @@ Qwen3.8-2.4T-A95B 的 HF 配置是纯文本的 `Qwen3_5MoeForCausalLM`（没有 
 - `run_pretrain_fsdp3.sh`：启动一个 case，`--model` 选择模型与对应的 GB200 recipe（`--recipe` 可覆盖）；
 - `benchmark_fsdp3.sh`：对列表选项取笛卡尔积，逐个调用 `run_pretrain_fsdp3.sh`。启动第一个 case 前，所有 case 会先用 `run_pretrain_fsdp3.sh --print-result-dir` 做一遍和真实启动相同的校验；单个 case 失败（例如 OOM）只记录下来，sweep 继续。
 - `benchmark_fsdp3_suite.sh`：原 8 项综合矩阵，使用 GBS=8。
+- `benchmark_fsdp3_all.sh`：按编号串行运行 `01-baseline` 到 `05-nccl` 下的全部实验脚本。各 case 默认锁频到 TDP。
 
 每个实际启动的 case 默认在本节点执行 `nvidia-smi --lock-gpu-clocks=tdp,tdp`。通用启动器、矩阵和编号实验都接受 `--unlock`，在启动前执行 `nvidia-smi --reset-gpu-clocks`。启动账户需具备修改 GPU 频率的权限。设置作用于本节点上 `nvidia-smi` 可见的所有 GPU，并持续到重新设置或重置。结果元数据记录 `gpu_clocks`。对照两种频率模式时，为新的运行指定单独的 `--output-dir`（通用启动器使用 `--results-root`），以免续跑直接复用已完成的 case。
 
@@ -40,6 +41,16 @@ Qwen3.8-2.4T-A95B 的 HF 配置是纯文本的 `Qwen3_5MoeForCausalLM`（没有 
 `01-baseline/02_mbs.sh` 默认以 FSDP1 扫描 MBS=1、2、4。每步累积完梯度后做梯度 RS，optimizer 更新并写回参数后，在同一个 optimizer step 内同步执行参数 AG。使用 `bash "$study/01-baseline/02_mbs.sh" --fsdp 3` 可按原 FSDP3 配置运行相同的 MBS 扫描。结果目录名中的 `fsdp_1` 和 `fsdp_3` 区分两组数据。
 
 从仓库根目录运行。默认结果根目录为 `results/01-analyse/04-fsdp3-comm/`。所有编号脚本使用 `<组名>/<小项目>/model_<配置>/node0/`。小项目名取脚本名去掉 `.sh` 并将下划线换成连字符。编号实验省略时间戳，`01-baseline` 省略 `-baseline`，其余组在 case 目录名中保留用于区分实验变体的标签。
+
+在同一台 4 卡 GB200 节点上运行全部编号实验：
+
+```bash
+study=examples/scale-down/01-analyse/04-fsdp3-comm
+bash "$study/benchmark_fsdp3_all.sh" --dry-run
+bash "$study/benchmark_fsdp3_all.sh"
+```
+
+总入口默认写入 `results/01-analyse/04-fsdp3-comm-tdp/`，加 `--unlock` 时写入 `results/01-analyse/04-fsdp3-comm-unlocked/`。可用 `--output-dir DIR` 覆盖。NVMe 和 NCCL 实验沿用各自默认路径，可通过 `NVME_PATH` 和 `NCCL_LIB` 覆盖。重跑沿用各脚本的续跑规则。单个脚本失败后继续下一个，最终返回非零状态。
 
 `02_ddp_cp_tp.sh` 对每个模型依次运行 CP4、TP4、TP4 + overlap。它与 `03_fsdp3.sh` 都会检查 `run_info.txt` 中的 `status=0` 和该模式要求的 trace 文件，跳过已完成的 case。启动器会归档未完成的 `node0/` 并重新测量。
 

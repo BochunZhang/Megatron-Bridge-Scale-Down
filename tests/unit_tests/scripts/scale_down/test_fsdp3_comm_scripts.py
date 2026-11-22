@@ -14,6 +14,7 @@ import pytest
 REPO_ROOT = Path(__file__).resolve().parents[4]
 EXAMPLE = REPO_ROOT / "examples/scale-down/01-analyse/04-fsdp3-comm"
 BENCHMARK = EXAMPLE / "benchmark_fsdp3.sh"
+ALL_STUDIES = EXAMPLE / "benchmark_fsdp3_all.sh"
 RUN_ONE = EXAMPLE / "run_pretrain_fsdp3.sh"
 FSDP_STUDY = EXAMPLE / "01-baseline/03_fsdp3.sh"
 DDP_CP_TP_STUDY = EXAMPLE / "02-comm-overlap/02_ddp_cp_tp.sh"
@@ -57,6 +58,33 @@ def test_benchmark_requires_a_model():
     result = _run(BENCHMARK, "--dry-run")
     assert result.returncode == 2
     assert "--model is required" in result.stderr
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    ("options", "mode", "clocks"), [((), "tdp", "tdp,tdp"), (("--unlock",), "unlocked", "unlocked")]
+)
+def test_all_numbered_studies_use_the_requested_gpu_clocks(options: tuple[str, ...], mode: str, clocks: str):
+    env = {"OUTPUT_DIR": "", "NVME_PATH": "", "NCCL_LIB": ""}
+    result = _run(ALL_STUDIES, "--dry-run", *options, **env)
+    assert result.returncode == 0, result.stderr
+    studies = sorted(EXAMPLE.glob("[0-9][0-9]-*/[0-9][0-9]_*.sh"))
+    assert studies
+    assert [line for line in result.stderr.splitlines() if line.startswith("Study ")] == [
+        f"Study {study.relative_to(EXAMPLE)}" for study in studies
+    ]
+    result_root = REPO_ROOT / f"results/01-analyse/04-fsdp3-comm-{mode}"
+    planned_cases = []
+    for study in studies:
+        plan = _run(study, "--print-case-dirs", "--output-dir", str(result_root), *options, **env)
+        assert plan.returncode == 0, plan.stderr
+        assert plan.stdout.strip()
+        planned_cases.extend(Path(line) for line in plan.stdout.splitlines())
+    commands = _commands(result.stderr)
+    assert [_node_dir(command).parent for command in commands] == planned_cases
+    assert [line for line in result.stderr.splitlines() if line.startswith("gpu_clocks=")] == [
+        f"gpu_clocks={clocks}"
+    ] * len(commands)
 
 
 def test_default_sweep_per_model_crops_layers_and_experts(tmp_path: Path):
