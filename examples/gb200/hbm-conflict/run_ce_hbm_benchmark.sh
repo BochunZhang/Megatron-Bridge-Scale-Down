@@ -26,9 +26,11 @@ Usage: bash run_ce_hbm_benchmark.sh [options]
   -h, --help          Show this help
 
 task1 GEMM, task2 GEMM+H2D, task3 GEMM+HBM-source CE multicast AG,
-task4 GEMM+host-source CE multicast AG. Baselines run H2D, HBM-source AG,
-and host-source AG alone, respectively. Multi-GPU cases run on one host.
-AG requires at least three GPUs in one NVLink multicast clique and NCCL 2.32.2 or newer.
+task4 GEMM+host-source CE multicast AG, task6 GEMM+CE D2H AllGather.
+Baselines 1–4 run H2D, HBM-source AG, host-source AG, and CE D2H AG, respectively.
+Select task6 or baseline4 explicitly. Multi-GPU cases run on one Linux host.
+Multicast AG requires at least three GPUs in one NVLink multicast clique and NCCL 2.32.2 or newer.
+CE D2H AG requires at least two GPUs and page-locked host receive buffers.
 An explicit --cases list takes precedence over --baseline.
 The launcher saves one raw Nsight report per case. Run analyse_ce_hbm.py separately for SQLite export and analysis.
 EOF
@@ -115,7 +117,7 @@ for gpu in "${gpus[@]}"; do
     seen_gpus+="$gpu,"
 done
 
-case_re='(task[1-4]|baseline[1-3])'
+case_re='(task[1-46]|baseline[1-4])'
 [[ "$case_ids" =~ ^${case_re}(,${case_re})*$ ]] || die "invalid case list $case_ids"
 IFS=, read -r -a cases <<< "$case_ids"
 lock_gpus="${gpus[0]}"
@@ -124,8 +126,12 @@ for case_id in "${cases[@]}"; do
     [[ "$seen_cases" != *",$case_id,"* ]] || die "duplicate case $case_id"
     seen_cases+="$case_id,"
     case "$case_id" in
-        task[34]|baseline[23])
-            (( ${#gpus[@]} >= 3 )) || die "$case_id needs at least three GPUs for NCCL multicast"
+        task[346]|baseline[234])
+            if [[ "$case_id" == task6 || "$case_id" == baseline4 ]]; then
+                (( ${#gpus[@]} >= 2 )) || die "$case_id needs at least two GPUs for CE D2H AllGather"
+            else
+                (( ${#gpus[@]} >= 3 )) || die "$case_id needs at least three GPUs for NCCL multicast"
+            fi
             (( size_mib * 1048576 % ${#gpus[@]} == 0 )) || die "--size-mib must split evenly across all AG ranks"
             lock_gpus="$gpu_ids"
             ;;
@@ -248,7 +254,11 @@ run_case() {
     local name="$1" mode="$2" devices="$3" ranks="$4" shape="${5:-}"
     local case_dir="$output_dir/$name" trace=cuda,nvtx
     local report="$case_dir/nsys/$name"
-    [[ "$mode" != *ag-* ]] || trace+=,nccl
+    local nccl_multicast=false
+    if [[ "$mode" == *ag-hbm || "$mode" == *ag-host ]]; then
+        trace+=,nccl
+        nccl_multicast=true
+    fi
     # One Nsight session puts all workers and selected GPU metrics on the same timeline.
     local -a command=("$NSYS_BIN" profile
         --trace="$trace" --cuda-trace-scope=process-tree --cuda-trace-all-apis=true --sample=none --cpuctxsw=none
@@ -260,7 +270,7 @@ run_case() {
     if [[ -n "$shape" ]]; then command+=(--gemm "$shape"); fi
 
     local -a run_env=(env)
-    if [[ "$mode" == *ag-* ]]; then
+    if $nccl_multicast; then
         # Keep the configured NCCL library and transport. Scope the CE and log options to this AG case.
         local nccl_raw_dir="$case_dir/nccl-raw"
         run_env+=(
@@ -299,7 +309,7 @@ run_case() {
         printf 'error: %s has no Nsight report at %s.nsys-rep\n' "$name" "$report" >&2
         return 1
     fi
-    if [[ "$mode" == *ag-* ]]; then
+    if $nccl_multicast; then
         validate_nccl_ce_ag "$case_dir" "$ranks"
     fi
 }
@@ -312,9 +322,11 @@ for case_id in "${cases[@]}"; do
         task2) mode=gemm-h2d ;;
         task3) mode=gemm-ag-hbm ;;
         task4) mode=gemm-ag-host ;;
+        task6) mode=gemm-ag-d2h ;;
         baseline1) mode=h2d ;;
         baseline2) mode=ag-hbm ;;
         baseline3) mode=ag-host ;;
+        baseline4) mode=ag-d2h ;;
     esac
     case "$mode" in
         *ag-*) devices="$gpu_ids"; ranks="${#gpus[@]}" ;;

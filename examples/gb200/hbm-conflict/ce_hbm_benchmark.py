@@ -36,7 +36,7 @@ from torch.cuda import nvtx
 
 
 logger = logging.getLogger(__name__)
-MODES = ("gemm", "gemm-h2d", "gemm-ag-hbm", "gemm-ag-host", "h2d", "ag-hbm", "ag-host")
+MODES = ("gemm", "gemm-h2d", "gemm-ag-hbm", "gemm-ag-host", "gemm-ag-d2h", "h2d", "ag-hbm", "ag-host", "ag-d2h")
 TimingPair = tuple[torch.cuda.Event, torch.cuda.Event]
 
 
@@ -156,6 +156,13 @@ def _run_case(args: argparse.Namespace, device: torch.device, *, cleanup: ExitSt
                 raise RuntimeError(f"Rank {rank} received incorrect H2D bytes")
 
         comm, reset_comm, validate_comm = copy_h2d, destination.zero_, validate_h2d
+    elif comm_kind == "ag-d2h":
+        from ce_host_output import HostOutputCopyEngineAllGather
+
+        all_gather = HostOutputCopyEngineAllGather(device, rank=rank, world_size=world_size, size_bytes=size_bytes)
+        cleanup.callback(all_gather.close)
+        comm, reset_comm, validate_comm = all_gather.run, all_gather.reset_output, all_gather.validate
+        comm_payload_bytes = size_bytes - size_bytes // world_size
     elif comm_kind is not None:
         all_gather = NcclCopyEngineAllGather(device, rank, world_size, size_bytes, comm_kind == "ag-host")
         cleanup.callback(all_gather.close)
@@ -275,7 +282,9 @@ def _run_case(args: argparse.Namespace, device: torch.device, *, cleanup: ExitSt
     args.output_dir.mkdir(parents=True, exist_ok=True)
     output = args.output_dir / f"events.rank_{rank:02d}.json"
     output.write_text(json.dumps(result, indent=2) + "\n", encoding="utf-8")
-    logger.info("Rank %d recorded %d GEMMs and %d copies in %s", rank, len(gemm_events), comm_rounds, output)
+    logger.info(
+        "Rank %d recorded %d GEMMs and %d communication rounds in %s", rank, len(gemm_events), comm_rounds, output
+    )
     dist.barrier()
     if not result["output_correct"]:
         raise RuntimeError(f"Rank {rank} output validation failed. See {output}")

@@ -13,7 +13,7 @@ bash examples/gb200/hbm-conflict/run_ce_hbm_benchmark.sh \
 ```
 
 `--gemm` 顺序为 `[M,N,K]`。默认只测 `[8192,8192,7168]`，GEMM 使用 BF16 和预分配输出。
-`--size-mib` 默认 1024，表示单次 H2D 或每张 GPU 的完整 AG 输出大小，AG 输出字节数须按 rank 平分。
+`--size-mib` 默认 1024，表示单次 H2D 或每个 rank 的完整 AG 输出大小，AG 输出字节数须按 rank 平分。
 例如三卡时可以用 `--size-mib 1023`。每个 GEMM case 按 shape 各跑一次，通信 baseline 与 shape 无关。
 常规运行省略 `--cases` 时，默认运行 `task1` 至 `task4`，加 `--baseline` 会追加 `baseline1` 至 `baseline3`。
 显式指定 `--cases` 时按给出的列表运行，可以直接列出 baseline。用 `--cases task4,baseline3` 可只测 CPU 源 multicast AG。
@@ -25,21 +25,23 @@ bash examples/gb200/hbm-conflict/run_ce_hbm_benchmark.sh \
 | `task2` | 1 | GEMM | CPU pinned → HBM |
 | `task3` | ≥3 | GEMM | HBM → multicast HBM |
 | `task4` | ≥3 | GEMM | CPU pinned → multicast HBM |
+| `task6` | ≥2 | GEMM | HBM → 各 rank 的 pinned Host 接收区 |
 | `baseline1` | 1 | — | CPU pinned → HBM |
 | `baseline2` | ≥3 | — | HBM → multicast HBM |
 | `baseline3` | ≥3 | — | CPU pinned → multicast HBM |
+| `baseline4` | ≥2 | — | HBM → 各 rank 的 pinned Host 接收区 |
 
-每个 rank 使用 PyTorch ProcessGroupNCCL 的 `_comm_ptr()` 调用当前 NCCL 库的 `ncclAllGather`。接收缓冲区
+在 multicast case 中，每个 rank 使用 PyTorch ProcessGroupNCCL 的 `_comm_ptr()` 调用当前 NCCL 库的 `ncclAllGather`。接收缓冲区
 由 NCCL allocator 分配在 HBM 并注册为 symmetric window。CPU 源 case 直接传入 CUDA pinned tensor 的地址，
 发送端使用未注册的 host buffer。NCCL copy engine 将本地 shard 写到 multicast 接收地址的对应槽位。
 单轮 CUDA event 覆盖整个本地 NCCL 调用，包括 NCCL 在拷贝前后的 NVLS 同步。
 
-AG case 独立设置 `NCCL_CTA_POLICY=ZERO`、`NCCL_WIN_ENABLE=1`、`NCCL_NVLS_ENABLE=1` 和
+multicast AG case 独立设置 `NCCL_CTA_POLICY=ZERO`、`NCCL_WIN_ENABLE=1`、`NCCL_NVLS_ENABLE=1` 和
 `NCCL_CE_COLL_AG_MULTICAST_THRESHOLD=4611686018427387904`，命令与有效设置保存在 `command.txt` 和
 `nccl-raw/nccl-*.log`。启动器检查 rank 0 的实际 AllGather 调优日志，要求该分片大小对应
 `AllGather [Copy Engine]: ... Bytes -> cudaMemcpy; CE synchronization with NVLS` 且 multicast 阈值已生效。
 出现其他 AllGather 路径或证据缺失时，该 case 报错。worker 验证每个 rank 的接收槽位，手动分析用 nsys
-核对实际 memcpy 字节和 GPU 活动。AG case 同时启用 Nsight Systems 的 NCCL trace，便于对照 NCCL API、CUDA 拷贝和 GEMM。
+核对实际 memcpy 字节和 GPU 活动。multicast case 同时启用 Nsight Systems 的 NCCL trace，便于对照 NCCL API、CUDA 拷贝和 GEMM。
 
 启动器用 `nvidia-smi --lock-gpu-clocks=tdp,tdp` 设置参与测试的 GPU，需要锁频和 GPU metrics 权限。实际
 时钟轨道会随报告保留。Gloo 启动使用 `GLOO_SOCKET_IFNAME`，优先选有效的已有设置，其次 `eth0`、`bond1`，
@@ -75,6 +77,26 @@ uv run --active --no-sync python examples/gb200/hbm-conflict/analyse_ce_hbm.py \
 HBM 和链路指标是设备级采样，可对照独跑与并跑窗口。采样值保留 nsys 的计数器含义，payload GB/s 则由
 传输大小和时间计算。
 [Nsight Systems GPU Metrics](https://docs.nvidia.com/nsight-systems/UserGuide/index.html#gpu-metrics)
+
+### AllGather 直接写入 Host
+
+`task6` 和 `baseline4` 按需运行。每张 GPU 用 Copy Engine 将自己的 HBM shard 直接写到每个 rank 的
+共享 pinned Host 接收缓冲区，包括自己的缓冲区。四卡、`--size-mib 1024` 时，每 rank 每轮发出四次
+256 MiB D2H，最终每个 Host 接收区有 1 GiB 数据。worker 在计时前清空各自的接收区，采集结束后在
+CPU 上逐 shard 校验。该测试走 D2H 单播，原 NCCL multicast case 走 NVLink multicast，两者的发送流量
+也不同。单个 CUDA event 覆盖本 rank 四次发出的拷贝，整轮输出在所有发送 rank 完成后可用。
+接收区通过 Linux memfd 共享，每个 rank 按自身的 Host NUMA 内存策略分配接收页。
+
+复用上一批的六个 GEMM 尺寸，并在同一批采集 GPU 0 独跑、HBM 目标和 Host 目标的数据。
+
+```bash
+bash examples/gb200/hbm-conflict/run_ce_hbm_benchmark.sh \
+  --gpus 0,1,2,3 --cases task1,task3,task6,baseline4 --mc-self-import 1 \
+  --gemm '[2,8192,7168],[4,8192,7168],[8,8192,7168],[16,8192,7168],[32,8192,7168],[64,8192,7168]'
+```
+
+对照 GPU 0 的 GEMM GPU kernel 时间和与 payload 的实际重叠。分析器检查每轮 D2H 字节数、pinned
+目标和 C2C TX 活动。`baseline4` 记录 Host 目标 AllGather 独跑时的搬运速率。
 
 ### R580 上的 multicast handle self-import 对照
 

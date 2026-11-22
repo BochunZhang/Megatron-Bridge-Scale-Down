@@ -37,7 +37,7 @@ from analyse_hbm_conflict import Sample, export_sqlite, merge_intervals, overlap
 LOGGER = logging.getLogger(__name__)
 _RANGE = re.compile(r"(gemm|comm)(\d+)")
 # Older suites used task5 for the host-source multicast case.
-_CASE_DIR = re.compile(r"(?:task[1-5]|baseline[1-3])-.+")
+_CASE_DIR = re.compile(r"(?:task[1-6]|baseline[1-4])-.+")
 _REQUIRED_METRICS = {
     "DRAM read": re.compile(r"dram.*read|read.*dram", re.I),
     "DRAM write": re.compile(r"dram.*write|write.*dram", re.I),
@@ -45,6 +45,8 @@ _REQUIRED_METRICS = {
     "NVLink TX": re.compile(r"^(?!.*(?:c2c|ctc)).*(?:nvlink.*(?:\btx\b|transmit)|\bnvltx(?:\b|_))", re.I),
 }
 _C2C_RX = re.compile(r"(?:c2c|ctc).*?(?:rx|receiv|read).*?user", re.I)
+_C2C_TX = re.compile(r"(?:c2c|ctc).*?(?:tx|transmit|write).*?user", re.I)
+_D2H_COPY = re.compile(r"\b(?:dtoh|d2h|device[- ]to[- ]host)\b", re.I)
 _GPU_ACTIVITY = ("KERNEL", "MEMCPY", "MEMCPY2")
 _CONFIG_FIELDS = ("case", "mode", "world_size", "gemm_mnk", "size_bytes", "comm_payload_bytes")
 
@@ -227,6 +229,8 @@ def _busy(activities: Sequence[Activity]) -> list[tuple[int, int]]:
 
 def _analyse_rank(record: dict, activities: dict[str, list[Activity]], samples: dict[int, list[Sample]]) -> dict:
     errors = []
+    mode = record["mode"]
+    host_destination = mode.endswith("ag-d2h")
     gemm_events = _event_intervals(record, "gemm")
     comm_events = _event_intervals(record, "comm")
     gemm = _iterations(activities, label_prefix="gemm")
@@ -237,11 +241,11 @@ def _analyse_rank(record: dict, activities: dict[str, list[Activity]], samples: 
         errors.append(f"expected {len(gemm_events)} GEMM kernel ranges, found indices {sorted(gemm)}")
     if not copies_complete:
         errors.append(f"expected {len(comm_events)} payload copy ranges, found indices {sorted(copies)}")
-    if record["mode"] != "gemm" and not comm_events:
+    if mode != "gemm" and not comm_events:
         errors.append("no communication rounds measured")
     if record.get("comm_rounds_measured", len(comm_events)) != len(comm_events):
         errors.append("communication round count differs from event count")
-    if record["mode"].startswith("gemm") != (record["gemm_mnk"] is not None and bool(gemm_events)):
+    if mode.startswith("gemm") != (record["gemm_mnk"] is not None and bool(gemm_events)):
         errors.append("recorded GEMM shape or rounds do not match the selected mode")
     if record["output_correct"] is not True:
         errors.append("worker reported incorrect output")
@@ -251,12 +255,15 @@ def _analyse_rank(record: dict, activities: dict[str, list[Activity]], samples: 
     if comm_kernels:
         errors.append(f"communication launched kernels instead of a CE-only path: {comm_kernels}")
     source_bytes = record["size_bytes"]
-    if "ag-" in record["mode"]:
+    if "ag-" in mode and not host_destination:
         source_bytes //= record["world_size"]
     native_ag = record.get("nccl_version") is not None
     for index, group in sorted(copies.items()):
         total = sum(op.size_bytes for op in group)
-        if native_ag and total != source_bytes:
+        if host_destination and total != source_bytes:
+            errors.append(f"comm{index:02d}: traced {total} copy bytes, expected {source_bytes} bytes of D2H fan-out")
+            copies_complete = False
+        elif native_ag and total != source_bytes:
             errors.append(
                 f"comm{index:02d}: traced {total} copy bytes, expected one multicast shard of {source_bytes}"
             )
@@ -266,20 +273,19 @@ def _analyse_rank(record: dict, activities: dict[str, list[Activity]], samples: 
             copies_complete = False
     compute_ops = [op for group in gemm.values() for op in group]
     copy_ops = [op for group in copies.values() for op in group]
-    if record["mode"].endswith("ag-hbm") and any(
-        re.search(r"host|pinned|pageable", op.src_kind, re.I) for op in copy_ops
-    ):
+    if mode.endswith("ag-hbm") and any(re.search(r"host|pinned|pageable", op.src_kind, re.I) for op in copy_ops):
         errors.append("HBM-source AG has a payload copy with a CUPTI host source")
-    if (
-        native_ag
-        and record["mode"].endswith("ag-host")
-        and any("pinned" not in op.src_kind.lower() for op in copy_ops)
-    ):
+    if native_ag and mode.endswith("ag-host") and any("pinned" not in op.src_kind.lower() for op in copy_ops):
         errors.append("host-source AG has a payload copy without a CUPTI pinned source")
-    if record["mode"].endswith("h2d") and any(
-        re.search(r"device|unified|managed", op.src_kind, re.I) for op in copy_ops
-    ):
+    if mode.endswith("h2d") and any(re.search(r"device|unified|managed", op.src_kind, re.I) for op in copy_ops):
         errors.append("H2D has a payload copy with a CUPTI non-host source")
+    if host_destination and any(
+        not _D2H_COPY.search(op.copy_kind)
+        or "device" not in op.src_kind.lower()
+        or "pinned" not in op.dst_kind.lower()
+        for op in copy_ops
+    ):
+        errors.append("host-destination AG has a payload copy outside the CUPTI device-to-pinned-host path")
     devices = {op.device for op in compute_ops or copy_ops}
     device = next(iter(devices)) if len(devices) == 1 else None
     if device is None:
@@ -331,10 +337,13 @@ def _analyse_rank(record: dict, activities: dict[str, list[Activity]], samples: 
         missing = [kind for kind, pattern in _REQUIRED_METRICS.items() if not any(pattern.search(n) for n in counters)]
         if missing:
             errors.append(f"{window}: no sampled {', '.join(missing)} counters on GPU {metric_device}")
-        if window == "copy_span" and record["mode"].endswith(("h2d", "ag-host")):
+        if window == "copy_span" and mode.endswith(("h2d", "ag-host")):
             if not any(_C2C_RX.search(name) and values["peak"] > 0 for name, values in counters.items()):
                 errors.append(f"{window}: no positive C2C user RX samples for host-sourced copies")
-        if window == "copy_span" and "ag-" in record["mode"]:
+        if window == "copy_span" and host_destination:
+            if not any(_C2C_TX.search(name) and values["peak"] > 0 for name, values in counters.items()):
+                errors.append(f"{window}: no positive C2C user TX samples for host-destination copies")
+        if window == "copy_span" and "ag-" in mode and not host_destination:
             for direction in ("NVLink RX", "NVLink TX"):
                 if not any(
                     _REQUIRED_METRICS[direction].search(name) and values["peak"] > 0
@@ -478,10 +487,11 @@ def _render(cases: Sequence[dict], *, root: Path) -> str:
         "Coverage is the fraction of those intervals overlapping this rank's traced payload copies, excluding signal writes.",
         "Coverage uses this rank's outgoing copies. GPU counters are device-wide.",
         "CUDA-event coverage uses the stream-ordered interval between the operation's start and end events.",
-        "Source GB/s uses the size of one outgoing shard or H2D transfer and its CUDA-event duration.",
+        "Source GB/s uses outgoing bytes divided by CUDA-event duration. Multicast sends one shard per rank.",
+        "Direct D2H AllGather sends one shard per destination rank, including the local rank.",
         "NCCL AG event durations include stream-ordered peer synchronization. Earlier direct multicast runs timed only copy.",
         "Receive payload proxy GB/s normalizes logical receive bytes by the rank's event duration.",
-        "For multicast AG the logical receive bytes exclude the local shard.",
+        "For AllGather the logical receive bytes exclude the local shard.",
         "CUPTI copy bytes and source/destination enums in summary.json describe outgoing copies as traced.",
         "GPU metric CSV windows span the first to last traced kernel or payload copy and include any intervening gaps.",
         "Counter units and scopes follow Nsight Systems. DRAM bandwidth metrics indicate interface activity and NVLink",

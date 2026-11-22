@@ -261,3 +261,71 @@ def test_the_pause_patch_slows_the_unicast_allgather():
     assert 'NCCL_PARAM(SymAgStPauseCycles, "SYM_AG_ST_PAUSE_CYCLES", 0)' in patch
     assert "args->agStPauseCycles" in patch
     assert "if (pauseCycles != 0) ncclSymkPauseCycles(pauseCycles);" in patch
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    ("case", "mode", "copies", "copy_kind", "dst_kind", "c2c_tx", "expected_error"),
+    [
+        ("task6-gemm-ag-d2h", "gemm-ag-d2h", 4, "2 (Device-to-Host)", "1 (Pinned)", 32, None),
+        ("baseline4-ag-d2h", "ag-d2h", 4, "2 (Device-to-Host)", "1 (Pinned)", 32, None),
+        ("task6-gemm-ag-d2h", "gemm-ag-d2h", 3, "2 (Device-to-Host)", "1 (Pinned)", 32, "bytes of D2H fan-out"),
+        ("task6-gemm-ag-d2h", "gemm-ag-d2h", 4, "8 (Device-to-Device)", "2 (Device)", 32, "device-to-pinned-host"),
+        ("task6-gemm-ag-d2h", "gemm-ag-d2h", 4, "2 (Device-to-Host)", "1 (Pinned)", 0, "no positive C2C user TX"),
+    ],
+)
+def test_ce_host_destination_requires_direct_d2h_fan_out(
+    case, mode, copies, copy_kind, dst_kind, c2c_tx, expected_error
+):
+    analyse_ce = _load("analyse_ce_hbm")
+    assert analyse_ce._CASE_DIR.fullmatch(case)
+    size_bytes = 1 << 30
+    world_size = 4
+    shard_bytes = size_bytes // world_size
+    has_gemm = mode.startswith("gemm")
+    record = {
+        "case": case,
+        "mode": mode,
+        "rank": 0,
+        "physical_gpu": 0,
+        "world_size": world_size,
+        "size_bytes": size_bytes,
+        "comm_payload_bytes": size_bytes - shard_bytes,
+        "comm_ms": [[0.001, 0.002]],
+        "gemm_mnk": [16, 8192, 7168] if has_gemm else None,
+        "gemm_ms": [[0.00115, 0.00125]] if has_gemm else [],
+        "output_correct": True,
+    }
+    activities = {
+        "comm00": [
+            analyse_ce.Activity(
+                1100 + i * 100, 1200 + i * 100, 0, "MEMCPY", shard_bytes, copy_kind, "2 (Device)", dst_kind
+            )
+            for i in range(copies)
+        ],
+    }
+    if has_gemm:
+        activities["gemm00"] = [analyse_ce.Activity(1150, 1250, 0, "gemm_kernel", 0, "", "", "")]
+    samples = {
+        0: [
+            analyse.Sample(1175, "DRAM Read Bandwidth", 5),
+            analyse.Sample(1175, "DRAM Write Bandwidth", 1),
+            analyse.Sample(1175, "NVLink RX Requests User Data", 0),
+            analyse.Sample(1175, "NVLink TX Requests User Data", 0),
+            analyse.Sample(1175, "CTC TX Throughput User Data [GB/s]", c2c_tx),
+        ]
+    }
+
+    result = analyse_ce._analyse_rank(record, activities, samples)
+
+    if expected_error is not None:
+        assert len(result["errors"]) == 1
+        assert expected_error in result["errors"][0]
+    else:
+        assert result["errors"] == []
+        (round_result,) = result["communication"]
+        assert round_result["event_source_GBps"] == size_bytes / 1000
+        assert round_result["event_receive_payload_proxy_GBps"] == (size_bytes - shard_bytes) / 1000
+        assert round_result["nsys_payload_copy_bytes"] == size_bytes
+        if has_gemm:
+            assert result["gemms"][0]["nsys_copy_coverage"] == 1.0
