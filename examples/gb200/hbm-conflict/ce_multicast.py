@@ -38,6 +38,9 @@ def _loaded_nccl() -> ctypes.CDLL:
     if len(libraries) != 1:
         raise RuntimeError(f"Expected exactly one loaded libnccl, found {sorted(libraries)}")
     library = libraries.pop()
+    expected = os.environ.get("CE_HBM_EXPECTED_NCCL_LIB")
+    if expected is not None and library != os.path.realpath(expected):
+        raise RuntimeError(f"Expected NCCL at {expected}, but PyTorch loaded {library}")
     nccl = ctypes.CDLL(library, mode=os.RTLD_NOW | os.RTLD_NOLOAD)
     nccl.ncclGetVersion.argtypes = [ctypes.POINTER(ctypes.c_int)]
     nccl.ncclGetErrorString.argtypes = [ctypes.c_int]

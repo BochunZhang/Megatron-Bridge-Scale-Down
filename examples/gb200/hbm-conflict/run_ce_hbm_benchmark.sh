@@ -11,13 +11,15 @@ Profile GB200 BF16 GEMM and copy-engine traffic with Nsight Systems 2026.6.1.
 Usage: bash run_ce_hbm_benchmark.sh [options]
   --gemm SHAPES       '[M,N,K]' or '[M,N,K],[M,N,K]' (default: '[8192,8192,7168]')
   --gpus IDS          Ordered GPU IDs (default: 0,1,2,3 or the first four visible GPUs)
-  --cases IDS         Comma-separated case IDs (default: task1,task2,task3,task4,baseline1,baseline2,baseline3)
+  --cases IDS         Comma-separated case IDs (default: all cases, or task3,baseline2 with --mc-self-import)
   --size-mib N        H2D size and full AG output size per rank (default: 1024)
   --warmup N          Standalone warmup iterations per active lane (default: 5)
   --gemm-rounds N     GEMMs per rank and shape (default: 20)
   --comm-rounds N     Standalone transfers, or minimum transfers when overlapped (default: 25)
   --nsys PATH         Nsight Systems 2026.6.1 executable (also NSYS_BIN)
   --nsys-freq HZ      GPU metrics sampling rate (default: 10000)
+  --nccl-lib PATH     Override the libnccl.so.2 preloaded for AG cases
+  --mc-self-import M  Use the patched NCCL with 0 (control), 1 (self-import), or ab (both)
   --output-dir DIR    Results directory (default: results/gb200/hbm-conflict/gpu-num-N/<timestamp>-ce)
   --dry-run           Show commands without starting jobs or changing GPU clocks
   -h, --help          Show this help
@@ -39,15 +41,16 @@ NSYS_BIN="${NSYS_BIN:-NsightSystems-2026.6.1/bin/nsys}"
 gpu_ids="${CUDA_VISIBLE_DEVICES:-0,1,2,3}"
 IFS=, read -r -a default_gpus <<< "$gpu_ids"
 gpu_ids="$(IFS=,; printf '%s' "${default_gpus[*]:0:4}")"
-case_ids=task1,task2,task3,task4,baseline1,baseline2,baseline3
+case_ids=""
 gemms='[8192,8192,7168]'
 size_mib=1024 warmup=5 gemm_rounds=20 comm_rounds=25 nsys_freq=10000
 ce_multicast_threshold=4611686018427387904
-output_dir="" dry_run=false
+output_dir="" dry_run=false nccl_lib="" mc_self_import=""
+original_args=("$@")
 
 while (( $# )); do
     case "$1" in
-        --gemm|--gpus|--cases|--size-mib|--warmup|--gemm-rounds|--comm-rounds|--nsys|--nsys-freq|--output-dir)
+        --gemm|--gpus|--cases|--size-mib|--warmup|--gemm-rounds|--comm-rounds|--nsys|--nsys-freq|--nccl-lib|--mc-self-import|--output-dir)
             (( $# >= 2 )) && [[ -n "$2" ]] || die "$1 requires a value"
             case "$1" in
                 --gemm) gemms="$2" ;;
@@ -59,6 +62,8 @@ while (( $# )); do
                 --comm-rounds) comm_rounds="$2" ;;
                 --nsys) NSYS_BIN="$2" ;;
                 --nsys-freq) nsys_freq="$2" ;;
+                --nccl-lib) nccl_lib="$2" ;;
+                --mc-self-import) mc_self_import="$2" ;;
                 --output-dir) output_dir="$2" ;;
             esac
             shift 2 ;;
@@ -67,6 +72,23 @@ while (( $# )); do
         *) die "unknown argument $1" ;;
     esac
 done
+
+if [[ -n "$mc_self_import" ]]; then
+    [[ "$mc_self_import" == 0 || "$mc_self_import" == 1 || "$mc_self_import" == ab ]] \
+        || die "--mc-self-import must be 0, 1, or ab"
+    nccl_lib="${nccl_lib:-$repo_root/nccl/nccl-2.32.3-ce-mc-self-import/build/lib/libnccl.so.2}"
+    case_ids="${case_ids:-task3,baseline2}"
+fi
+case_ids="${case_ids:-task1,task2,task3,task4,baseline1,baseline2,baseline3}"
+if [[ -n "$nccl_lib" ]]; then
+    [[ "$nccl_lib" = /* ]] || nccl_lib="$PWD/$nccl_lib"
+    if ! $dry_run && [[ ! -f "$nccl_lib" ]]; then
+        if [[ -n "$mc_self_import" ]]; then
+            die "NCCL library not found at $nccl_lib. Build it with bash $repo_root/install/install-nccl-2.32.3-ce-multicast-handler.sh"
+        fi
+        die "NCCL library not found at $nccl_lib"
+    fi
+fi
 
 for value in "$size_mib" "$warmup" "$gemm_rounds" "$comm_rounds" "$nsys_freq"; do
     [[ "$value" =~ ^[1-9][0-9]*$ ]] || die "expected a positive integer, got $value"
@@ -112,6 +134,14 @@ done
 
 output_dir="${output_dir:-$repo_root/results/gb200/hbm-conflict/gpu-num-${#gpus[@]}/$(date +%Y%m%d-%H%M%S)-ce}"
 [[ "$output_dir" = /* ]] || output_dir="$PWD/$output_dir"
+if [[ "$mc_self_import" == ab ]]; then
+    for setting in 0 1; do
+        bash "$script_dir/run_ce_hbm_benchmark.sh" "${original_args[@]}" \
+            --mc-self-import "$setting" --output-dir "$output_dir/self-import-$setting"
+    done
+    printf 'A/B results directory: %s\n' "$output_dir"
+    exit 0
+fi
 [[ "$NSYS_BIN" = /* ]] || NSYS_BIN="$PWD/$NSYS_BIN"
 export CUDA_DEVICE_ORDER=PCI_BUS_ID
 lock_command=(nvidia-smi -i "$lock_gpus" --lock-gpu-clocks=tdp,tdp)
@@ -139,6 +169,13 @@ else
         "gpu_ids=$gpu_ids" "lock_gpus=$lock_gpus" "gemm=$gemms" "cases=$case_ids" \
         "size_mib=$size_mib" "warmup=$warmup" "gemm_rounds=$gemm_rounds" "comm_rounds=$comm_rounds" \
         "nsys_freq=$nsys_freq" "cwd=$PWD" >"$output_dir/run_info.txt"
+    if [[ -n "$nccl_lib" ]]; then
+        printf '%s\n' "nccl_lib=$nccl_lib" >>"$output_dir/run_info.txt"
+        sha256sum -- "$nccl_lib" >>"$output_dir/run_info.txt"
+    fi
+    if [[ -n "$mc_self_import" ]]; then
+        printf '%s\n' "NCCL_CE_MC_SELF_IMPORT=$mc_self_import" >>"$output_dir/run_info.txt"
+    fi
     show_command "${lock_command[@]}" >>"$output_dir/run_info.txt"
     "${lock_command[@]}" 2>&1 | tee "$output_dir/gpu_clock_lock.log"
     "${clock_query[@]}" >"$output_dir/gpu_clocks.before.csv"
@@ -179,6 +216,18 @@ validate_nccl_ce_ag() {
         printf 'error: NCCL multicast Copy Engine AllGather was not confirmed in %s\n' "$rank_zero" >&2
         return 1
     fi
+    if [[ -n "$mc_self_import" ]]; then
+        local switch_log="NCCL_CE_MC_SELF_IMPORT set by environment to ${mc_self_import}."
+        local import_log="CE multicast rank 0 self-imported FABRIC handle"
+        if ! awk -v switch_log="$switch_log" -v import_log="$import_log" -v enabled="$mc_self_import" '
+            index($0, "NCCL version 2.32.3-ce-mc-self-import+cuda") { patched=1 }
+            index($0, switch_log) { configured=1 }
+            index($0, import_log) { imported=1 }
+            END { exit !(patched && configured && (imported+0) == enabled) }' "$rank_zero"; then
+            printf 'error: self-import setting %s was not confirmed in %s\n' "$mc_self_import" "$rank_zero" >&2
+            return 1
+        fi
+    fi
     printf 'Verified NCCL multicast Copy Engine AllGather in %s\n' "$rank_zero"
 }
 
@@ -208,6 +257,12 @@ run_case() {
             NCCL_DEBUG=INFO NCCL_DEBUG_SUBSYS=INIT,TUNING,ENV
             "NCCL_DEBUG_FILE=${nccl_raw_dir//%/%%}/nccl-%h-%p.log"
         )
+        if [[ -n "$nccl_lib" ]]; then
+            run_env+=("LD_PRELOAD=${nccl_lib}${LD_PRELOAD:+:$LD_PRELOAD}" "CE_HBM_EXPECTED_NCCL_LIB=$nccl_lib")
+        fi
+        if [[ -n "$mc_self_import" ]]; then
+            run_env+=("NCCL_CE_MC_SELF_IMPORT=$mc_self_import")
+        fi
         local nccl_socket="${NCCL_SOCKET_IFNAME:-}"
         local gloo_socket="${GLOO_SOCKET_IFNAME:-${GLOO_SOCKET_NAME:-}}"
         if [[ -z "$nccl_socket" && -n "$gloo_socket" ]]; then

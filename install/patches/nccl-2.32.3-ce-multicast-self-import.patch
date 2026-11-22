@@ -1,0 +1,119 @@
+diff --git a/makefiles/version.mk b/makefiles/version.mk
+index db924347f06261d672fff1c912e79a216a275980..9da2c951131254054bca46c013a877579d3c5e68 100644
+--- a/makefiles/version.mk
++++ b/makefiles/version.mk
+@@ -9,5 +9,5 @@
+ NCCL_MAJOR   := 2
+ NCCL_MINOR   := 32
+ NCCL_PATCH   := 3
+-NCCL_SUFFIX  :=
++NCCL_SUFFIX  := -ce-mc-self-import
+ PKG_REVISION := 1
+diff --git a/src/dev_runtime.cc b/src/dev_runtime.cc
+index 2bad06e7a130a65dc19562ee9fa994b26fe4e4c6..f6e872dd4c1282f45f4810448aa8d3623e79194c 100644
+--- a/src/dev_runtime.cc
++++ b/src/dev_runtime.cc
+@@ -34,6 +34,7 @@ NCCL_PARAM(EnableVersionCheck, "ENABLE_VERSION_CHECK", 1);
+ NCCL_PARAM(ElasticBufferRegister, "ELASTIC_BUFFER_REGISTER", 1);
+ NCCL_PARAM(SymReuseSysmemHandles, "SYM_REUSE_SYSMEM_HANDLES", 0);
+ NCCL_PARAM(DevApiJit, "DEV_API_JIT", 0);
++NCCL_PARAM(CeMcSelfImport, "CE_MC_SELF_IMPORT", 0);
+
+ extern struct ncclDevCommCompat ncclDevCommCompat_v22902, ncclDevCommCompat_v22907, ncclDevCommCompat_v23000,
+   ncclDevCommCompat_v23100;
+@@ -491,6 +492,7 @@ ncclResult_t symTeamObtain(struct ncclComm* comm, struct ncclTeam team, bool mul
+     } else {
+ #if CUDART_VERSION >= 12010
+       CUmemGenericAllocationHandle mcHandle = 0;
++      CUmemGenericAllocationHandle createdMcHandle = 0;
+       CUdeviceptr mcAddr = 0;
+       CUmulticastObjectProp mcProp = {};
+       char shareableHandle[NVLS_HANDLE_SIZE] = {};
+@@ -499,23 +501,44 @@ ncclResult_t symTeamObtain(struct ncclComm* comm, struct ncclTeam team, bool mul
+       mcProp.handleTypes = ncclCuMemHandleType;
+       mcProp.flags = 0;
+       mcProp.size = devr->bigSize;
++      // All ranks must agree on this opt-in because it adds a bootstrap exchange.
++      const bool selfImport = mcProp.handleTypes == CU_MEM_HANDLE_TYPE_FABRIC && ncclParamCeMcSelfImport() == 1;
+       if (team.rank == 0) {
+-        NCCLCHECKGOTO(ncclMcCreate(comm, &mcProp, team.rank, team.nRanks, &mcHandle, shareableHandle), ret, fail);
+-        NCCLCHECKGOTO(bootstrapIntraNodeBroadcast(comm->bootstrap, t->worldRankList, team.rank, team.nRanks, 0,
+-                                                  shareableHandle, NVLS_HANDLE_SIZE),
++        NCCLCHECKGOTO(ncclMcCreate(comm, &mcProp, team.rank, team.nRanks, &mcHandle, shareableHandle), ret,
++                      fail_mcHandle);
++      }
++      NCCLCHECKGOTO(bootstrapIntraNodeBroadcast(comm->bootstrap, t->worldRankList, team.rank, team.nRanks, 0,
++                                                shareableHandle, NVLS_HANDLE_SIZE),
++                    ret, fail_mcHandle);
++
++      if (selfImport) {
++        ncclUniqueArrayPtr<ncclResult_t> results{nullptr};
++        NCCLCHECKGOTO(ncclCalloc(results, team.nRanks), ret, fail_mcHandle);
++        CUmemGenericAllocationHandle importedMcHandle = 0;
++        ncclResult_t& localResult = results[team.rank];
++        localResult = ncclMcImport(comm, shareableHandle, t->worldRankList[0], &importedMcHandle);
++        if (localResult == ncclSuccess) {
++          // Keep the creator's reference alive until every peer has imported.
++          createdMcHandle = mcHandle;
++          mcHandle = importedMcHandle;
++          CUCHECKGOTO(cuMulticastAddDevice(mcHandle, comm->cudaDev), localResult, exchangeImportResults);
++        }
++      exchangeImportResults:
++        // Propagate import and add-device failures before any rank enters the blocking cuMemMap.
++        NCCLCHECKGOTO(bootstrapIntraNodeAllGather(comm->bootstrap, t->worldRankList, team.rank, team.nRanks,
++                                                   results.get(), sizeof(ncclResult_t)),
+                       ret, fail_mcHandle);
++        for (int r = 0; r < team.nRanks; r++) {
++          NCCLCHECKGOTO(results[r], ret, fail_mcHandle);
++        }
+       } else {
+-        NCCLCHECKGOTO(bootstrapIntraNodeBroadcast(comm->bootstrap, t->worldRankList, team.rank, team.nRanks, 0,
+-                                                  shareableHandle, NVLS_HANDLE_SIZE),
+-                      ret, fail);
+-        NCCLCHECKGOTO(ncclMcImport(comm, shareableHandle, t->worldRankList[0], &mcHandle), ret, fail);
++        if (team.rank != 0) {
++          NCCLCHECKGOTO(ncclMcImport(comm, shareableHandle, t->worldRankList[0], &mcHandle), ret, fail_mcHandle);
++        }
++        CUCHECKGOTO(cuMulticastAddDevice(mcHandle, comm->cudaDev), ret, fail_mcHandle);
+       }
+-
+-      CUCHECKGOTO(cuMulticastAddDevice(mcHandle, comm->cudaDev), ret, fail_mcHandle);
+       CUCHECKGOTO(cuMemAddressReserve(&mcAddr, devr->bigSize, NCCL_MAX_PAGE_SIZE, 0, 0), ret, fail_mcHandle);
+-      // NOTE(preexisting): cuMemMap blocks until every device has been added, and no
+-      // abort-aware barrier precedes it, so a peer failing before its addDevice can
+-      // strand survivors here during abort. ncclMcGroupBuildPartitions guards its map with one.
++      // The stock path relies on cuMemMap to wait for all devices to be added.
+       CUCHECKGOTO(cuMemMap(mcAddr, devr->bigSize, 0, mcHandle, 0), ret, fail_mcHandle_mcAddr);
+       {
+         CUmemAccessDesc accessDesc = {};
+@@ -531,6 +554,11 @@ ncclResult_t symTeamObtain(struct ncclComm* comm, struct ncclTeam team, bool mul
+       for (struct ncclDevrMemory* mem = devr->memHead; mem != nullptr; mem = mem->next) {
+         NCCLCHECKGOTO(symBindTeamMemory(comm, t, mem), ret, fail_mcHandle_mcAddr_unmap_mems);
+       }
++      if (createdMcHandle != 0) {
++        CUCHECKGOTO(cuMemRelease(createdMcHandle), ret, fail_mcHandle_mcAddr_unmap_mems);
++        createdMcHandle = 0;
++        INFO(NCCL_INIT, "CE multicast rank 0 self-imported FABRIC handle");
++      }
+       if (needBarrier != nullptr) *needBarrier = true;
+
+       if (false) {
+@@ -539,6 +567,8 @@ ncclResult_t symTeamObtain(struct ncclComm* comm, struct ncclTeam team, bool mul
+         for (struct ncclDevrMemory* mem = devr->memHead; mem != nullptr; mem = mem->next) {
+           symUnbindTeamMemory(comm, t, mem);
+         }
++        t->mcHandle = 0;
++        t->mcBasePtr = nullptr;
+       fail_mcHandle_mcAddr_unmap:
+         CUCHECKIGNORE(cuMemUnmap(mcAddr, devr->bigSize));
+         goto fail_mcHandle_mcAddr; // silence unused label warning
+@@ -546,7 +576,8 @@ ncclResult_t symTeamObtain(struct ncclComm* comm, struct ncclTeam team, bool mul
+         CUCHECKIGNORE(cuMemAddressFree(mcAddr, devr->bigSize));
+         goto fail_mcHandle; // silence unused label warning
+       fail_mcHandle:
+-        CUCHECKIGNORE(cuMemRelease(mcHandle));
++        if (mcHandle != 0) CUCHECKIGNORE(cuMemRelease(mcHandle));
++        if (createdMcHandle != 0) CUCHECKIGNORE(cuMemRelease(createdMcHandle));
+         goto fail; // silence unused label warning
+       }
+ #else

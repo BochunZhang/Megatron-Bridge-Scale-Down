@@ -75,6 +75,54 @@ HBM 和链路指标是设备级采样，可对照独跑与并跑窗口。采样�
 传输大小和时间计算。
 [Nsight Systems GPU Metrics](https://docs.nvidia.com/nsight-systems/UserGuide/index.html#gpu-metrics)
 
+### R580 上的 multicast handle self-import 对照
+
+在同一台 R580 GB200 节点，用 NCCL `v2.32.3-1` 构建带 self-import 开关的库。启用时，LSA team
+的 rank 0 导入自己导出的 FABRIC multicast handle，用导入的 handle 建立映射。两组共用同一个
+NCCL 二进制，task 3 仍由每张卡独立分配 256 MiB HBM 输入和 1 GiB HBM 输出。这个实验使用
+PyTorch PR #192530 的 handle 生命周期处理。 [PyTorch PR #192530](https://github.com/pytorch/pytorch/pull/192530)
+
+```bash
+bash install/install-nccl-2.32.3-ce-multicast-handler.sh \
+  --cuda-home "${CUDA_HOME:-/usr/local/cuda-13.0}"
+
+bash examples/gb200/hbm-conflict/run_ce_hbm_benchmark.sh \
+  --gpus 0,1,2,3 --mc-self-import ab
+```
+
+`--mc-self-import ab` 会自动为 AG 作业预加载独立安装脚本默认生成的 `libnccl.so.2`，依次运行
+`task3,baseline2` 的关闭组和启用组，结果存入同一目录下的 `self-import-0` 和 `self-import-1`。
+单跑一组用 `--mc-self-import 0` 或 `1`。自定义安装路径可用 `--nccl-lib PATH` 覆盖。
+PyTorch 需要动态链接到单一 `libnccl.so.2`，worker 会检查实际加载路径。每组记录库的 SHA256，
+启动器检查开关、NCCL 构建标识和 multicast 路径，并要求启用组的 rank 0 日志出现
+`CE multicast rank 0 self-imported FABRIC handle`。
+
+用 Nsight Systems 打开两组 task 3 和 baseline 2 的 `.nsys-rep`，对照同一物理 GPU 上的
+256 MiB payload 拷贝。判断依据是 GPU 0 的 `Channel type` 是否从 `Compute` 变成
+`Async Memcpy`，并检查所有 rank 的 payload 拷贝数量与各自 `comm_rounds_measured` 一致，
+且 `output_correct` 为 true。P2P 的 source 和 destination 两条轨道显示同一笔拷贝，只数 source。
+对照 baseline 2 搬运窗口内的 `SMs Active`，可以检查无 GEMM 时 GPU 0 的 SM 活动是否随之消失。
+每轮 4 B 的同步写与 payload 分开核对。
+
+有 Nsight Systems `DumpTimeline` 的分析主机也可以对每份报告统计「次数、CUDA deviceId、硬件通道」。
+将 `DUMP_TIMELINE` 设为该二进制路径，`report` 设为待查的 `.nsys-rep`。
+
+```bash
+(
+  set -o pipefail
+  "$DUMP_TIMELINE" --input "$report" --full --format=n,d --show-all |
+    jq -er '
+      .GenericHierarchyRows[]
+      | select(.Path | test("/CudaDevices/[0-9]+/.*/Streams/[0-9]+/Memory/Memcpy/"))
+      | . as $row | .Rows[].ViewDataElements[]
+      | select(.Text | endswith(" (destination)") | not)
+      | select(.Tooltip | contains("268435456&nbsp;bytes"))
+      | [($row.Path | capture("/CudaDevices/(?<gpu>[0-9]+)/").gpu),
+         (.Tooltip | capture("Channel&nbsp;type:&nbsp;(?<type>[^<]+)").type | gsub("&nbsp;"; " "))]
+      | @tsv' | sort | uniq -c
+)
+```
+
 ## 回答的问题
 
 GPU 0–3 做 GEMM 时，如果分出几个 SM 在这 4 张卡之间搬数据（AllGather），对端写进本卡 HBM 的流量和
