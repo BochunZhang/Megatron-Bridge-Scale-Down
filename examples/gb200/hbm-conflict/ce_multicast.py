@@ -122,7 +122,18 @@ class MulticastAllGather:
         self._driver = ctypes.CDLL("libcuda.so.1")
         self._memcpy_batch, copy_flags = _load_memcpy_batch(self._driver)
 
-        symm_mem.set_backend("CUDA")
+        # PyTorch may register the default allocator directly without adding it
+        # to the named lookup used by set_backend().
+        backend = symm_mem.get_backend(device)
+        if backend != "CUDA":
+            try:
+                symm_mem.set_backend("CUDA")
+            except RuntimeError as exc:
+                raise RuntimeError(
+                    f"CE multicast requires PyTorch's CUDA symmetric-memory allocator. "
+                    f"Active allocator: {backend!r}. PyTorch {torch.__version__}, CUDA build {torch.version.cuda}, "
+                    f"loaded from {torch.__file__}."
+                ) from exc
         self._output = symm_mem.empty(size_bytes, dtype=torch.uint8, device=device)
         self._symmetric_output = symm_mem.rendezvous(self._output, dist.group.WORLD)
         if self._symmetric_output is None:
