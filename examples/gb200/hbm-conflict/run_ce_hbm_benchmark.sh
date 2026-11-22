@@ -25,6 +25,7 @@ Usage: bash run_ce_hbm_benchmark.sh [options]
 task1 GEMM, task2 GEMM+H2D, task3 GEMM+HBM-source CE multicast AG,
 task4 GEMM+host-source CE multicast AG. Baselines run H2D, HBM-source AG,
 and host-source AG alone, respectively. Multi-GPU cases run on one host.
+AG requires at least three GPUs in one NVLink multicast clique and NCCL 2.32.2 or newer.
 The launcher saves raw Nsight reports. Run analyse_ce_hbm.py separately for SQLite export and analysis.
 EOF
 }
@@ -41,6 +42,7 @@ gpu_ids="$(IFS=,; printf '%s' "${default_gpus[*]:0:4}")"
 case_ids=task1,task2,task3,task4,baseline1,baseline2,baseline3
 gemms='[8192,8192,7168]'
 size_mib=1024 warmup=5 gemm_rounds=20 comm_rounds=25 nsys_freq=50000
+ce_multicast_threshold=4611686018427387904
 output_dir="" dry_run=false
 
 while (( $# )); do
@@ -88,7 +90,8 @@ for case_id in "${cases[@]}"; do
     seen_cases+="$case_id,"
     case "$case_id" in
         task[34]|baseline[23])
-            (( ${#gpus[@]} >= 2 )) || die "$case_id needs at least two GPUs"
+            (( ${#gpus[@]} >= 3 )) || die "$case_id needs at least three GPUs for NCCL multicast"
+            (( size_mib * 1048576 % ${#gpus[@]} == 0 )) || die "--size-mib must split evenly across all AG ranks"
             lock_gpus="$gpu_ids"
             ;;
     esac
@@ -152,19 +155,74 @@ IFS=, read -r -a devices <<< "$CUDA_VISIBLE_DEVICES"
 exec "$NSYS_BIN" profile --gpu-metrics-devices="${devices[$LOCAL_RANK]}" "$@"
 '
 
+validate_nccl_ce_ag() {
+    local case_dir="$1" ranks="$2" log rank_zero=""
+    local expected="NCCL INFO AllGather [Copy Engine]: $((size_mib * 1048576 / ranks)) Bytes -> cudaMemcpy; CE synchronization with NVLS"
+    local threshold_log="NCCL_CE_COLL_AG_MULTICAST_THRESHOLD set by environment to $ce_multicast_threshold."
+    for log in "$case_dir"/nccl-raw/nccl-*.log; do
+        [[ -s "$log" ]] || continue
+        if awk -v ranks="$ranks" '$0 ~ ("NCCL INFO .* rank 0 nranks " ranks " .* - Init COMPLETE$") { found=1 }
+            END { exit !found }' "$log"; then
+            rank_zero="$log"
+            break
+        fi
+    done
+    if [[ -z "$rank_zero" ]]; then
+        printf 'error: no rank 0 NCCL initialization log in %s/nccl-raw\n' "$case_dir" >&2
+        return 1
+    fi
+    # NCCL only emits collective tuning choices on rank 0. NVLS sync and an
+    # effective threshold above the shard size force the multicast data branch.
+    if ! awk -v expected="$expected" -v threshold="$threshold_log" '
+        index($0, threshold) { configured=1 }
+        /NCCL INFO AllGather( \[[^]]+\])?: [0-9]+ Bytes -> / {
+            if (substr($0, index($0, "NCCL INFO AllGather")) == expected) correct++
+            else { print "Unexpected NCCL AllGather path: " $0; fallback=1 }
+        }
+        END {
+            if (!configured) print "Missing NCCL environment evidence: " threshold
+            if (!correct) print "Missing NCCL tuning evidence: " expected
+            exit (!configured || !correct || fallback)
+        }' "$rank_zero" >&2; then
+        printf 'error: NCCL multicast Copy Engine AllGather was not confirmed in %s\n' "$rank_zero" >&2
+        return 1
+    fi
+    printf 'Verified NCCL multicast Copy Engine AllGather in %s\n' "$rank_zero"
+}
+
 run_case() {
     local name="$1" mode="$2" devices="$3" ranks="$4" shape="${5:-}"
-    local case_dir="$output_dir/$name" rank
+    local case_dir="$output_dir/$name" rank trace=cuda,nvtx
+    [[ "$mode" != *ag-* ]] || trace+=,nccl
     local -a command=(uv run --active --no-sync python -m torch.distributed.run --standalone --nnodes=1
         --nproc_per_node="$ranks" --no-python bash -c "$profile_worker" hbm-ce
-        --trace=cuda,nvtx --cuda-trace-all-apis=true --sample=none --cpuctxsw=none
+        --trace="$trace" --cuda-trace-all-apis=true --sample=none --cpuctxsw=none
         --capture-range=cudaProfilerApi --capture-range-end=stop
         --gpu-metrics-set=gb10x-ct --gpu-metrics-frequency="$nsys_freq" --output="$case_dir/nsys/$name.rank_%q{RANK}"
         python "$script_dir/ce_hbm_benchmark.py" --case "$name" --mode "$mode" --output-dir "$case_dir"
         --size-mib "$size_mib" --warmup "$warmup" --gemm-rounds "$gemm_rounds" --comm-rounds "$comm_rounds")
     if [[ -n "$shape" ]]; then command+=(--gemm "$shape"); fi
 
-    local -a run_env=(env "CUDA_VISIBLE_DEVICES=$devices" "CUDA_DEVICE_ORDER=$CUDA_DEVICE_ORDER"
+    local -a run_env=(env)
+    if [[ "$mode" == *ag-* ]]; then
+        # Keep the configured NCCL library and transport. Scope the CE and log options to this AG case.
+        local nccl_raw_dir="$case_dir/nccl-raw"
+        run_env+=(
+            NCCL_COMM_BLOCKING=1 NCCL_CUMEM_ENABLE=1
+            NCCL_CTA_POLICY=ZERO NCCL_WIN_ENABLE=1 NCCL_NVLS_ENABLE=1
+            "NCCL_CE_COLL_AG_MULTICAST_THRESHOLD=$ce_multicast_threshold"
+            NCCL_DEBUG=INFO NCCL_DEBUG_SUBSYS=INIT,TUNING,ENV
+            "NCCL_DEBUG_FILE=${nccl_raw_dir//%/%%}/nccl-%h-%p.log"
+        )
+        local nccl_socket="${NCCL_SOCKET_IFNAME:-}"
+        local gloo_socket="${GLOO_SOCKET_IFNAME:-${GLOO_SOCKET_NAME:-}}"
+        if [[ -z "$nccl_socket" && -n "$gloo_socket" ]]; then
+            nccl_socket="=$gloo_socket"
+        fi
+        [[ -z "$nccl_socket" ]] || run_env+=("NCCL_SOCKET_IFNAME=$nccl_socket")
+        $dry_run || mkdir -p -- "$nccl_raw_dir" || return
+    fi
+    run_env+=("CUDA_VISIBLE_DEVICES=$devices" "CUDA_DEVICE_ORDER=$CUDA_DEVICE_ORDER"
         "GLOO_SOCKET_IFNAME=${GLOO_SOCKET_IFNAME:-${GLOO_SOCKET_NAME:-}}"
         "NSYS_BIN=$NSYS_BIN" "NSYS_TMPDIR=$case_dir/nsys/.tmp")
     if $dry_run; then
@@ -181,6 +239,9 @@ run_case() {
             return 1
         }
     done
+    if [[ "$mode" == *ag-* ]]; then
+        validate_nccl_ce_ag "$case_dir" "$ranks"
+    fi
 }
 
 failed=0

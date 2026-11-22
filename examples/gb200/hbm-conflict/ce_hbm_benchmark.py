@@ -12,11 +12,10 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Measure BF16 GEMMs with local H2D or multicast copy-engine background traffic.
+"""Measure BF16 GEMMs with local H2D or NCCL copy-engine AllGather traffic.
 
-Run one torchrun worker per GPU on one host. The AG modes repeatedly write immutable,
-rank-disjoint shards and use a rank barrier before releasing the measured batch and after
-draining it. Each CUDA-event copy interval measures this rank's outgoing operation.
+Run one torchrun worker per GPU on one host. Gloo coordinates the measured batch.
+In AG modes, each CUDA-event interval includes NCCL's stream-ordered collective synchronization.
 """
 
 from __future__ import annotations
@@ -28,6 +27,7 @@ import math
 import os
 import sys
 from collections.abc import Callable
+from contextlib import ExitStack
 from pathlib import Path
 
 import torch
@@ -111,9 +111,9 @@ def _overlap_fractions(gemms: list[list[float]], copies: list[list[float]]) -> l
     return fractions
 
 
-def _run_case(args: argparse.Namespace, device: torch.device) -> None:
+def _run_case(args: argparse.Namespace, device: torch.device, *, cleanup: ExitStack) -> None:
     sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "benchmark"))
-    from ce_multicast import MulticastAllGather
+    from ce_multicast import NcclCopyEngineAllGather
     from mbench.gate import LaunchGate
 
     rank, world_size = dist.get_rank(), dist.get_world_size()
@@ -123,6 +123,7 @@ def _run_case(args: argparse.Namespace, device: torch.device) -> None:
     comm_kind = args.mode.removeprefix("gemm-") if args.mode != "gemm" else None
     size_bytes = args.size_mib << 20
     comm_payload_bytes = 0
+    nccl_version = None
     gemm_stream, comm_stream = torch.cuda.Stream(), torch.cuda.Stream()
     control_stream = torch.cuda.Stream()
     gemm: Callable[[], object] | None = None
@@ -156,9 +157,11 @@ def _run_case(args: argparse.Namespace, device: torch.device) -> None:
 
         comm, reset_comm, validate_comm = copy_h2d, destination.zero_, validate_h2d
     elif comm_kind is not None:
-        all_gather = MulticastAllGather(device, rank, world_size, size_bytes, comm_kind == "ag-host")
+        all_gather = NcclCopyEngineAllGather(device, rank, world_size, size_bytes, comm_kind == "ag-host")
+        cleanup.callback(all_gather.close)
         comm, reset_comm, validate_comm = all_gather.run, all_gather.reset_output, all_gather.validate
         comm_payload_bytes = size_bytes - size_bytes // world_size
+        nccl_version = all_gather.version
 
     torch.cuda.synchronize(device)
     dist.barrier()
@@ -225,8 +228,7 @@ def _run_case(args: argparse.Namespace, device: torch.device) -> None:
     finally:
         gate.close()
 
-    # Each local sync guarantees completion of its outgoing peer writes. This
-    # barrier makes the received data safe to inspect on every destination.
+    # Finish the measured stream on every rank before inspecting the outputs.
     dist.barrier()
     comm_correct = True
     if validate_comm is not None:
@@ -252,6 +254,7 @@ def _run_case(args: argparse.Namespace, device: torch.device) -> None:
         "pci_address": pci_address,
         "case": args.case,
         "mode": args.mode,
+        "nccl_version": nccl_version,
         "gemm_mnk": args.gemm if do_gemm else None,
         "gemm_ms": gemm_intervals,
         "comm_ms": comm_intervals,
@@ -284,7 +287,8 @@ def main(argv: list[str] | None = None) -> None:
     torch.cuda.set_device(device)
     dist.init_process_group("gloo")
     try:
-        _run_case(args, device)
+        with ExitStack() as cleanup:
+            _run_case(args, device, cleanup=cleanup)
     finally:
         dist.destroy_process_group()
 

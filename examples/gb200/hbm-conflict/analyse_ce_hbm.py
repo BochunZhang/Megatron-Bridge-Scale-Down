@@ -212,9 +212,15 @@ def _analyse_rank(record: dict, activities: dict[str, list[Activity]], samples: 
     source_bytes = record["size_bytes"]
     if "ag-" in record["mode"]:
         source_bytes //= record["world_size"]
+    native_ag = record.get("nccl_version") is not None
     for index, group in sorted(copies.items()):
         total = sum(op.size_bytes for op in group)
-        if total < source_bytes:
+        if native_ag and total != source_bytes:
+            errors.append(
+                f"comm{index:02d}: traced {total} copy bytes, expected one multicast shard of {source_bytes}"
+            )
+            copies_complete = False
+        elif total < source_bytes:
             errors.append(f"comm{index:02d}: traced {total} copy bytes, expected at least {source_bytes} source bytes")
             copies_complete = False
     compute_ops = [op for group in gemm.values() for op in group]
@@ -223,6 +229,12 @@ def _analyse_rank(record: dict, activities: dict[str, list[Activity]], samples: 
         re.search(r"host|pinned|pageable", op.src_kind, re.I) for op in copy_ops
     ):
         errors.append("HBM-source AG has a payload copy with a CUPTI host source")
+    if (
+        native_ag
+        and record["mode"].endswith("ag-host")
+        and any("pinned" not in op.src_kind.lower() for op in copy_ops)
+    ):
+        errors.append("host-source AG has a payload copy without a CUPTI pinned source")
     if record["mode"].endswith("h2d") and any(
         re.search(r"device|unified|managed", op.src_kind, re.I) for op in copy_ops
     ):
@@ -339,12 +351,13 @@ def _analyse_case(case_dir: Path, *, reports_dir: Path, nsys_bin: str) -> dict:
     if not records:
         raise ValueError("missing events.rank_*.json")
     config = {key: records[min(records)][key] for key in _CONFIG_FIELDS}
+    config["nccl_version"] = records[min(records)].get("nccl_version")
     expected_ranks = set(range(config["world_size"]))
     if config["case"] != case or set(records) != expected_ranks:
         raise ValueError(
             f"inconsistent case or missing event ranks, expected {sorted(expected_ranks)}, got {sorted(records)}"
         )
-    if any(any(record[key] != val for key, val in config.items()) for record in records.values()):
+    if any(any(record.get(key) != val for key, val in config.items()) for record in records.values()):
         raise ValueError("worker case configuration differs between ranks")
 
     reports = {}
@@ -385,8 +398,9 @@ def _render(cases: Sequence[dict], *, root: Path) -> str:
         "Copies issued by peer ranks are absent from the rank-local trace. GPU counters are device-wide.",
         "CUDA-event coverage uses the stream-ordered interval between the operation's start and end events.",
         "Source GB/s uses the size of one outgoing shard or H2D transfer and its CUDA-event duration.",
-        "Receive payload proxy GB/s normalizes logical receive bytes by the rank's outgoing event duration.",
-        "For multicast AG the logical receive bytes exclude the local shard. Peer completion is outside this timing.",
+        "NCCL AG event durations include stream-ordered peer synchronization. Earlier direct multicast runs timed only copy.",
+        "Receive payload proxy GB/s normalizes logical receive bytes by the rank's event duration.",
+        "For multicast AG the logical receive bytes exclude the local shard.",
         "CUPTI copy bytes and source/destination enums in summary.json describe outgoing copies as traced.",
         "GPU metric CSV windows span the first to last traced kernel or payload copy and include any intervening gaps.",
         "Counter units and scopes follow Nsight Systems. DRAM bandwidth metrics indicate interface activity and NVLink",

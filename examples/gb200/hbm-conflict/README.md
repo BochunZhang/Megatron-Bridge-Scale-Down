@@ -3,7 +3,9 @@
 ## Copy Engine 和 HBM 争用测试
 
 在 GB200 节点的工作目录准备 `NsightSystems-2026.6.1/bin/nsys`，并启用已安装 CUDA PyTorch 的虚拟环境。也可用
-`NSYS_BIN` 指定同版本的安装路径。多卡测试使用同一台主机、同一 NVLink multicast 域内的 GPU。
+`NSYS_BIN` 指定同版本的安装路径。多卡测试使用同一台主机、同一 NVLink multicast clique 内至少三张 GPU。
+AG 使用当前环境中 PyTorch 加载的 NCCL，最低版本为 2.32.2。NCCL 构建和 CUDA 驱动须支持目标为 multicast
+地址的批量拷贝，CPU 源 case 还需要支持从 pinned host memory 向该地址拷贝。
 
 ```bash
 bash examples/gb200/hbm-conflict/run_ce_hbm_benchmark.sh \
@@ -11,25 +13,32 @@ bash examples/gb200/hbm-conflict/run_ce_hbm_benchmark.sh \
 ```
 
 `--gemm` 顺序为 `[M,N,K]`。默认只测 `[8192,8192,7168]`，GEMM 使用 BF16 和预分配输出。
-`--size-mib` 默认 1024，表示单次 H2D 或每张 GPU 的完整 AG 输出大小。每个 GEMM case 按 shape
-各跑一次，通信 baseline 与 shape 无关。`--cases task4,baseline3` 可只测 CPU 源 multicast AG。
+`--size-mib` 默认 1024，表示单次 H2D 或每张 GPU 的完整 AG 输出大小，AG 输出字节数须按 rank 平分。
+例如三卡时可以用 `--size-mib 1023`。每个 GEMM case 按 shape 各跑一次，通信 baseline 与 shape 无关。
+`--cases task4,baseline3` 可只测 CPU 源 multicast AG。
 `--dry-run` 展开所有命令。
 
 | Case | GPU 数 | 计算 | 搬运 |
 | --- | --- | --- | --- |
 | `task1` | 1 | GEMM | — |
 | `task2` | 1 | GEMM | CPU pinned → HBM |
-| `task3` | ≥2 | GEMM | HBM → multicast HBM |
-| `task4` | ≥2 | GEMM | CPU pinned → multicast HBM |
+| `task3` | ≥3 | GEMM | HBM → multicast HBM |
+| `task4` | ≥3 | GEMM | CPU pinned → multicast HBM |
 | `baseline1` | 1 | — | CPU pinned → HBM |
-| `baseline2` | ≥2 | — | HBM → multicast HBM |
-| `baseline3` | ≥2 | — | CPU pinned → multicast HBM |
+| `baseline2` | ≥3 | — | HBM → multicast HBM |
+| `baseline3` | ≥3 | — | CPU pinned → multicast HBM |
 
-AG 用 PyTorch symmetric memory 建立 multicast 输出。每个 rank 提交一次 `cuMemcpyBatchAsync`，将自己的 shard
-直接写入 multicast 地址的对应槽位。`multimem.st` 是 SM kernel 的 PTX 指令，CE case 测的是写同类 multicast
-地址的 DMA 路径。CPU 源 case 将 pinned tensor 直接传给 CUDA API。该入口使用 CUDA 13.0 的 driver ABI，
-需要支持 multicast copy 的驱动和 PyTorch build。测试脚本验证每个 rank 的接收槽位，手动分析会检查 nsys 的 memcpy 记录。
-单轮区间只测该 rank 自己发出的 copy。所有 rank 在测量结束后同步，再读取完整 AG 输出。[CUDA Driver API](https://docs.nvidia.com/cuda/cuda-driver-api/group__CUDA__MEM.html)
+每个 rank 使用 PyTorch ProcessGroupNCCL 的 `_comm_ptr()` 调用当前 NCCL 库的 `ncclAllGather`。接收缓冲区
+由 NCCL allocator 分配在 HBM 并注册为 symmetric window。CPU 源 case 直接传入 CUDA pinned tensor 的地址，
+发送端使用未注册的 host buffer。NCCL copy engine 将本地 shard 写到 multicast 接收地址的对应槽位。
+单轮 CUDA event 覆盖整个本地 NCCL 调用，包括 NCCL 在拷贝前后的 NVLS 同步。
+
+AG case 独立设置 `NCCL_CTA_POLICY=ZERO`、`NCCL_WIN_ENABLE=1`、`NCCL_NVLS_ENABLE=1` 和
+`NCCL_CE_COLL_AG_MULTICAST_THRESHOLD=4611686018427387904`，命令与有效设置保存在 `command.txt` 和
+`nccl-raw/nccl-*.log`。启动器检查 rank 0 的实际 AllGather 调优日志，要求该分片大小对应
+`AllGather [Copy Engine]: ... Bytes -> cudaMemcpy; CE synchronization with NVLS` 且 multicast 阈值已生效。
+出现其他 AllGather 路径或证据缺失时，该 case 报错。worker 验证每个 rank 的接收槽位，手动分析用 nsys
+核对实际 memcpy 字节和 GPU 活动。AG case 同时启用 Nsight Systems 的 NCCL trace，便于对照 NCCL API、CUDA 拷贝和 GEMM。
 
 启动器用 `nvidia-smi --lock-gpu-clocks=tdp,tdp` 设置参与测试的 GPU，需要锁频和 GPU metrics 权限。实际
 时钟轨道会随报告保留。Gloo 启动使用 `GLOO_SOCKET_IFNAME`，优先选有效的已有设置，其次 `eth0`、`bond1`，
