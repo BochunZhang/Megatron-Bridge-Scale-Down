@@ -10,6 +10,8 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/../../../.." && pwd)"
 RESULTS_ROOT="${RESULTS_ROOT:-${REPO_ROOT}/results/01-analyse/04-fsdp3-comm}"
+# shellcheck source=../gpu_clocks.sh
+source "${SCRIPT_DIR}/../gpu_clocks.sh"
 
 MODEL=""
 RECIPE=""
@@ -56,6 +58,7 @@ MASTER_PORT="${MASTER_PORT:-29501}"
 RUN_DATE="${RUN_DATE:-$(date +%y%m%d-%H%M%S)}"
 RUN_NAME=""
 STABLE_RESULT_DIR=false
+UNLOCK_GPU_CLOCKS=false
 DRY_RUN=false
 PRINT_RESULT_DIR=false
 RESUME=false
@@ -170,6 +173,7 @@ Options:
                                  require a nonempty node 0 report for successful nsys runs
   --results-root PATH            Result root
   --override KEY=VALUE           Additional run_recipe.py override (repeatable)
+  --unlock                       Restore automatic GPU clocks (TDP lock by default)
   --resume                       Skip a completed case; archive a failed or
                                  incomplete result and rerun it
   --dry-run                      Print the resolved command and exit
@@ -246,6 +250,7 @@ while [[ $# -gt 0 ]]; do
         --results-root) need_value "$@"; RESULTS_ROOT="$2"; shift 2;;
         --stable-result-dir) STABLE_RESULT_DIR=true; shift;;
         --override) need_value "$@"; EXTRA_OVERRIDES+=("$2"); shift 2;;
+        --unlock) UNLOCK_GPU_CLOCKS=true; shift;;
         --resume) RESUME=true; shift;;
         --dry-run) DRY_RUN=true; shift;;
         --print-result-dir) PRINT_RESULT_DIR=true; shift;;
@@ -749,6 +754,7 @@ if [[ -n "${MEGATRON_LM_DIR:-}" ]]; then
     COMMAND+=(env "PYTHONPATH=${MLM_SOURCE}${PYTHONPATH:+:${PYTHONPATH}}")
 fi
 COMMAND+=(uv run --no-sync python "${TRAIN_ARGS[@]}")
+GPU_CLOCK_MODE=$(gpu_clock_mode "${UNLOCK_GPU_CLOCKS}")
 
 INFO=(
     "model=${MODEL}" "recipe=${RECIPE}" "fsdp=${FSDP_LEVEL}" "overlap=${OVERLAP}" "symmetric=${SYMMETRIC}" "dtype=${DTYPE}" "layers=${LAYERS_TAG}" "attention=${ATTENTION}"
@@ -762,6 +768,7 @@ INFO=(
 )
 if [[ "${DRY_RUN}" == true ]]; then
     printf '%s\n' "${INFO[*]}" >&2
+    printf 'gpu_clocks=%s\n' "${GPU_CLOCK_MODE}" >&2
     printf 'GLOO_SOCKET_IFNAME=%s\nPYTORCH_CUDA_ALLOC_CONF=%s\nNCCL_GRAPH_REGISTER=%s\nNCCL_NVLS_ENABLE=%s\nNVTE_CUTEDSL_FUSED_GROUPED_MLP=%s\ncommand:' "${GLOO_SOCKET_IFNAME:-<auto>}" "${PYTORCH_CUDA_ALLOC_CONF:-<unset>}" "${NCCL_GRAPH_REGISTER:-<unset>}" "${NCCL_NVLS_ENABLE:-<unset>}" "${NVTE_CUTEDSL_FUSED_GROUPED_MLP:-<unset>}" >&2
     printf ' %q' "${COMMAND[@]}" >&2; printf '\n' >&2
     exit 0
@@ -780,6 +787,7 @@ fi
 source "${REPO_ROOT}/scripts/scale-down/common/gloo_socket_ifname.sh"
 resolve_gloo_socket_ifname "${NNODES}" >&2
 INFO+=("gloo_socket_ifname=${GLOO_SOCKET_IFNAME}")
+configure_gpu_clocks "${UNLOCK_GPU_CLOCKS}"
 if [[ -n "${ARCHIVE_DIR}" ]]; then
     mv "${RESULT_DIR}" "${ARCHIVE_DIR}"
     echo "archived incomplete or failed attempt: ${ARCHIVE_DIR}" >&2
@@ -793,9 +801,10 @@ printf 'command:' >"${RESULT_DIR}/command.txt"
 printf ' %q' "${COMMAND[@]}" >>"${RESULT_DIR}/command.txt"
 printf '\n' >>"${RESULT_DIR}/command.txt"
 cat >"${RESULT_DIR}/launch.json" <<JSON
-{"model":"${MODEL_ID}","recipe":"${RECIPE}","run_name":"${RUN_NAME}","dtype":"${DTYPE}","fsdp":${FSDP_JSON},"fsdp_cpu_offload":${OFFLOAD_JSON},"fsdp_cpu_grad_accumulation":${CPU_GRAD_ACCUMULATION},"fsdp_cpu_optimizer":${CPU_OPTIMIZER},"fsdp_nvme":$([[ -n ${NVME_PATH} ]] && echo true || echo false),"data_parallel":"${DP_TAG}","create_all_gather_group":${OVERLAP},"create_reduce_scatter_group":${SEPARATE_RS},"nccl_ub":${SYMMETRIC},"num_layers":"${LAYERS_TAG}","attention":"${ATTENTION}","linear_attention_freq":"${LINEAR_ATTENTION_FREQ}","mtp_num_layers":${MTP_TAG},"num_moe_experts":"${EXPERTS_TAG}","force_balance":${FORCE_BALANCE},"cuda_graph":"${CUDA_GRAPH}","cuda_graph_impl":"${GRAPH_IMPL}","cuda_graph_modules":"${GRAPH_MODULES}","cuda_graph_trace":"${GRAPH_TRACE}","seq_length":${SEQ_LENGTH},"tensor_model_parallel_size":${TENSOR_PARALLEL},"sequence_parallel":${SEQUENCE_PARALLEL},"context_parallel_size":${CONTEXT_PARALLEL},"data_parallel_size":${DATA_PARALLEL},"expert_model_parallel_size":${EXPERT_PARALLEL},"dispatcher":"${DISPATCHER}","micro_batch_size":${MICRO_BATCH_SIZE},"global_batch_size":${GLOBAL_BATCH_SIZE},"num_microbatches":${NUM_MICROBATCHES},"gpu_count":${GPU_COUNT},"nnodes":${NNODES},"node_rank":${NODE_RANK},"numa_mode":"${NUMA_MODE}","pytorch_cuda_alloc_conf":"${PYTORCH_CUDA_ALLOC_CONF:-}","nccl_graph_register":"${NCCL_GRAPH_REGISTER:-}","nccl_nvls_enable":"${NCCL_NVLS_ENABLE:-}","nvte_cutedsl_fused_grouped_mlp":"${NVTE_CUTEDSL_FUSED_GROUPED_MLP:-}","run_date":"${RUN_DATE}"}
+{"model":"${MODEL_ID}","recipe":"${RECIPE}","run_name":"${RUN_NAME}","dtype":"${DTYPE}","fsdp":${FSDP_JSON},"fsdp_cpu_offload":${OFFLOAD_JSON},"fsdp_cpu_grad_accumulation":${CPU_GRAD_ACCUMULATION},"fsdp_cpu_optimizer":${CPU_OPTIMIZER},"fsdp_nvme":$([[ -n ${NVME_PATH} ]] && echo true || echo false),"data_parallel":"${DP_TAG}","create_all_gather_group":${OVERLAP},"create_reduce_scatter_group":${SEPARATE_RS},"nccl_ub":${SYMMETRIC},"num_layers":"${LAYERS_TAG}","attention":"${ATTENTION}","linear_attention_freq":"${LINEAR_ATTENTION_FREQ}","mtp_num_layers":${MTP_TAG},"num_moe_experts":"${EXPERTS_TAG}","force_balance":${FORCE_BALANCE},"cuda_graph":"${CUDA_GRAPH}","cuda_graph_impl":"${GRAPH_IMPL}","cuda_graph_modules":"${GRAPH_MODULES}","cuda_graph_trace":"${GRAPH_TRACE}","seq_length":${SEQ_LENGTH},"tensor_model_parallel_size":${TENSOR_PARALLEL},"sequence_parallel":${SEQUENCE_PARALLEL},"context_parallel_size":${CONTEXT_PARALLEL},"data_parallel_size":${DATA_PARALLEL},"expert_model_parallel_size":${EXPERT_PARALLEL},"dispatcher":"${DISPATCHER}","micro_batch_size":${MICRO_BATCH_SIZE},"global_batch_size":${GLOBAL_BATCH_SIZE},"num_microbatches":${NUM_MICROBATCHES},"gpu_count":${GPU_COUNT},"gpu_clocks":"${GPU_CLOCK_MODE}","nnodes":${NNODES},"node_rank":${NODE_RANK},"numa_mode":"${NUMA_MODE}","pytorch_cuda_alloc_conf":"${PYTORCH_CUDA_ALLOC_CONF:-}","nccl_graph_register":"${NCCL_GRAPH_REGISTER:-}","nccl_nvls_enable":"${NCCL_NVLS_ENABLE:-}","nvte_cutedsl_fused_grouped_mlp":"${NVTE_CUTEDSL_FUSED_GROUPED_MLP:-}","run_date":"${RUN_DATE}"}
 JSON
 printf '%s\n' "${INFO[*]}" | tee "${RESULT_DIR}/run_info.txt"
+printf 'gpu_clocks=%s\n' "${GPU_CLOCK_MODE}" >>"${RESULT_DIR}/run_info.txt"
 set +e
 "${COMMAND[@]}" 2>&1 | tee "${RESULT_DIR}/train.log"
 PIPE_STATUSES=("${PIPESTATUS[@]}")

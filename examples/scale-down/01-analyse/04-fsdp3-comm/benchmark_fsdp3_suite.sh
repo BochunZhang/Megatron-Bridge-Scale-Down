@@ -15,11 +15,12 @@ MODE_ARGS=(--resume)
 usage() {
     cat <<'USAGE'
 Usage: benchmark_fsdp3_suite.sh [--items 01,02,...] [--model 27b|2.4t]
-                               [--nvme-path DIR] [--output-dir DIR] [--dry-run]
+                               [--nvme-path DIR] [--output-dir DIR] [--unlock] [--dry-run]
 
 Runs on one 4-GPU GB200 tray. Both cropped models use BF16, full attention,
 GBS=8, MBS=1,2,4 and sequence lengths 4096,8192,16384. MoE uses 64 experts
 and EP=4. Nsight Systems traces CUDA/NVTX at step 7 without GPU metric sampling.
+GPU clocks are locked to TDP by default. Pass --unlock to restore automatic GPU clocks.
 
   01-cuda-graph               FSDP3 eager vs CUDA graph
   02-ddp-cp-tp                DDP graphs at baseline, CP=2/4 and TP=2/4
@@ -55,7 +56,7 @@ while (( $# )); do
                 --output-dir) OUTPUT_DIR="$2";;
             esac
             shift 2;;
-        --dry-run) MODE_ARGS+=(--dry-run); shift;;
+        --unlock|--dry-run) MODE_ARGS+=("$1"); shift;;
         -h|--help) usage; exit 0;;
         *) echo "Unknown option: $1" >&2; usage >&2; exit 2;;
     esac

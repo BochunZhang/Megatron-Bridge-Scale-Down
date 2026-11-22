@@ -21,6 +21,8 @@ Qwen3.8-2.4T-A95B 的 HF 配置是纯文本的 `Qwen3_5MoeForCausalLM`（没有 
 - `benchmark_fsdp3.sh`：对列表选项取笛卡尔积，逐个调用 `run_pretrain_fsdp3.sh`。启动第一个 case 前，所有 case 会先用 `run_pretrain_fsdp3.sh --print-result-dir` 做一遍和真实启动相同的校验；单个 case 失败（例如 OOM）只记录下来，sweep 继续。
 - `benchmark_fsdp3_suite.sh`：原 8 项综合矩阵，使用 GBS=8。
 
+每个实际启动的 case 默认在本节点执行 `nvidia-smi --lock-gpu-clocks=tdp,tdp`。通用启动器、矩阵和编号实验都接受 `--unlock`，在启动前执行 `nvidia-smi --reset-gpu-clocks`。启动账户需具备修改 GPU 频率的权限。设置作用于本节点上 `nvidia-smi` 可见的所有 GPU，并持续到重新设置或重置。结果元数据记录 `gpu_clocks`。对照两种频率模式时，为新的运行指定单独的 `--output-dir`（通用启动器使用 `--results-root`），以免续跑直接复用已完成的 case。
+
 ### FSDP3 offload 专项实验
 
 以下五组在一台 4 卡 GB200 上运行。固定 BF16、full attention、GBS=16、27B 裁剪 8 层、2.4T 裁剪 4 层和 64 experts。默认 MBS=1，只有 `02_mbs.sh` 扫描 1、2、4。TP=CP=1 用 seq=4096，CP=4 或 TP=4 用 seq=16384。编号脚本默认采集 Nsight Systems CUDA/NVTX trace，`03_fsdp3.sh` 额外运行无 profiler 和 PyTorch Profiler 对照。Nsight 轮关闭 GPU metrics。

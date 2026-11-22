@@ -52,6 +52,7 @@ OFFLOAD=""
 OFFLOAD_ARGS=()
 DDP_OVERLAP=false
 MERGE_GRAPHS=false
+UNLOCK_GPU_CLOCKS=false
 DRY_RUN=false
 RESUME=false
 
@@ -126,6 +127,7 @@ Options:
   --output-dir PATH             Result root
   --resume                      Reuse --run-date: skip completed cases and rerun
                                 failed or incomplete ones
+  --unlock                      Restore automatic GPU clocks (TDP lock by default)
   --dry-run                     Print cases and commands without running
 USAGE
 }
@@ -184,6 +186,7 @@ while [[ $# -gt 0 ]]; do
         --run-date) need_value "$@"; RUN_DATE="$2"; shift 2;;
         --output-dir) need_value "$@"; OUTPUT_DIR="$2"; shift 2;;
         --resume) RESUME=true; shift;;
+        --unlock) UNLOCK_GPU_CLOCKS=true; shift;;
         --dry-run) DRY_RUN=true; shift;;
         -h|--help) usage; exit 0;;
         *) echo "Unknown option: $1" >&2; usage >&2; exit 2;;
@@ -238,6 +241,7 @@ case_args() {
     [[ -n "${METRIC_ARG}" ]] && ARGS+=("${METRIC_ARG}")
     [[ "${MERGE_GRAPHS}" == true ]] && ARGS+=(--merge)
     [[ "${RESUME}" == true ]] && ARGS+=(--resume)
+    [[ "${UNLOCK_GPU_CLOCKS}" == true ]] && ARGS+=(--unlock)
     [[ "${DRY_RUN}" == true ]] && ARGS+=(--dry-run)
     return 0
 }

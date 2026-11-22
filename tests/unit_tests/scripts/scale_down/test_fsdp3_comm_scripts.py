@@ -622,6 +622,9 @@ def fake_nsys_env(tmp_path: Path) -> dict[str, str]:
     fake_ip = tmp_path / "ip"
     fake_ip.write_text("#!/bin/sh\nprintf '%s\\n' '2: eth0 inet 192.0.2.1/24'\n")
     fake_ip.chmod(0o755)
+    fake_smi = tmp_path / "nvidia-smi"
+    fake_smi.write_text('#!/bin/sh\nprintf "%s\\n" "$@" >> "$TEST_SMI_LOG"\n')
+    fake_smi.chmod(0o755)
     fake_nsys = tmp_path / "nsys"
     fake_nsys.write_text(
         '#!/bin/sh\nfor arg; do\n  case "$arg" in\n'
@@ -632,15 +635,28 @@ def fake_nsys_env(tmp_path: Path) -> dict[str, str]:
         "  esac\ndone\nexit 1\n"
     )
     fake_nsys.chmod(0o755)
-    return {"PATH": f"{tmp_path}:{os.environ['PATH']}", "GLOO_SOCKET_IFNAME": "eth0"}
+    return {
+        "PATH": f"{tmp_path}:{os.environ['PATH']}",
+        "GLOO_SOCKET_IFNAME": "eth0",
+        "TEST_SMI_LOG": str(tmp_path / "nvidia-smi.log"),
+    }
 
 
 @pytest.mark.unit
-def test_numbered_study_launches_missing_case_next_to_existing_one(tmp_path: Path, fake_nsys_env: dict[str, str]):
+@pytest.mark.parametrize(
+    ("options", "clock_flag", "clock_mode"),
+    [((), "--lock-gpu-clocks=tdp,tdp", "tdp,tdp"), (("--unlock",), "--reset-gpu-clocks", "unlocked")],
+)
+def test_numbered_study_launches_missing_case_next_to_existing_one(
+    tmp_path: Path, fake_nsys_env: dict[str, str], options: tuple[str, ...], clock_flag: str, clock_mode: str
+):
     script = EXAMPLE / "01-baseline/01_cuda_graph.sh"
-    args = ("--model", "27b", "--output-dir", str(tmp_path))
-    dry_run = _run(script, *args, "--dry-run")
+    args = ("--model", "27b", "--output-dir", str(tmp_path), *options)
+    smi_log = Path(fake_nsys_env["TEST_SMI_LOG"])
+    dry_run = _run(script, *args, "--dry-run", **fake_nsys_env)
     assert dry_run.returncode == 0, dry_run.stderr
+    assert f"gpu_clocks={clock_mode}" in dry_run.stderr
+    assert not smi_log.exists()
     existing, missing = map(_report_base, _commands(dry_run.stderr))
     existing.parent.parent.mkdir(parents=True)
     legacy_name = missing.parent.parent.name.removesuffix("-forward-ag")
@@ -649,10 +665,13 @@ def test_numbered_study_launches_missing_case_next_to_existing_one(tmp_path: Pat
 
     result = _run(script, *args, **fake_nsys_env)
     assert result.returncode == 0, result.stderr
+    assert smi_log.read_text().splitlines() == [clock_flag]
     assert f"skip existing case: {existing.parent.parent}" in result.stderr
     assert not existing.parent.exists()
     assert not any(legacy_case_dir.iterdir())
-    assert (missing.parent / "run_info.txt").read_text().splitlines()[-1] == "status=0"
+    run_info = (missing.parent / "run_info.txt").read_text()
+    assert f"gpu_clocks={clock_mode}" in run_info.splitlines()
+    assert run_info.splitlines()[-1] == "status=0"
     assert missing.with_suffix(".nsys-rep").stat().st_size > 0
 
 

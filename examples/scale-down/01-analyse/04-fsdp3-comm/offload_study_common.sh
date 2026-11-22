@@ -14,6 +14,7 @@ OUTPUT_DIR="${OUTPUT_DIR:-${REPO_ROOT}/results/01-analyse/04-fsdp3-comm}"
 MODELS=(27b 2.4t)
 if [[ "${GROUP}" == 05-nccl ]]; then MODELS=(27b); fi
 LAUNCHER=("${BENCHMARK_DIR}/run_pretrain_fsdp3.sh")
+UNLOCK_GPU_CLOCKS=false
 DRY_RUN=false
 PRINT_CASE_DIRS=false
 RESUME_CASES=false
@@ -52,10 +53,12 @@ while (( $# )); do
                     NCCL_LIB="$2";;
             esac
             shift 2;;
+        --unlock) UNLOCK_GPU_CLOCKS=true; shift;;
         --dry-run) DRY_RUN=true; shift;;
         --print-case-dirs) PRINT_CASE_DIRS=true; shift;;
         -h|--help)
-            printf 'Usage: %s [--model 27b|2.4t] [--output-dir DIR] [--dry-run | --print-case-dirs]\n' "$0"
+            printf 'Usage: %s [--model 27b|2.4t] [--output-dir DIR] [--unlock] [--dry-run | --print-case-dirs]\n' "$0"
+            echo '  --unlock    Restore automatic GPU clocks (TDP lock by default)'
             if [[ "${STUDY_SCRIPT}" == 02_mbs.sh ]]; then
                 echo '  --fsdp 1|3    MBS sweep sharding level (default: 1, synchronous parameter AG in optimizer step)'
             fi
@@ -94,6 +97,7 @@ run_case() {
         --gbs 16 --mbs "${mbs}" --seq "${seq}" --tp "${tp}" --cp "${cp}" --fsdp "${fsdp}" --cuda-graph "${graph}"
         --profile "${STUDY_PROFILE}" --train-iters 10 --profile-start 7 --profile-end 8
         --results-root "${OUTPUT_DIR}/${result_group}" "${result_args[@]}" "$@")
+    [[ "${UNLOCK_GPU_CLOCKS}" == true ]] && args+=(--unlock)
     local label="${result_group}${name:+/${name}} model=${model} fsdp=${fsdp} graph=${graph} tp=${tp} cp=${cp} mbs=${mbs} seq=${seq} profile=${STUDY_PROFILE}"
     local case_dir=""
     local claim_dir=""
