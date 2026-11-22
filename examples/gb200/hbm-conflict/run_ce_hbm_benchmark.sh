@@ -26,9 +26,9 @@ Usage: bash run_ce_hbm_benchmark.sh [options]
   -h, --help          Show this help
 
 task1 GEMM, task2 GEMM+H2D, task3 GEMM+HBM-source CE multicast AG,
-task4 GEMM+host-source CE multicast AG, task6 GEMM+CE D2H AllGather.
+task4 GEMM+host-source CE multicast AG, task5 GEMM+CE D2H AllGather.
 Baselines 1–4 run H2D, HBM-source AG, host-source AG, and CE D2H AG, respectively.
-Select task6 or baseline4 explicitly. Multi-GPU cases run on one Linux host.
+Select task5 or baseline4 explicitly. Multi-GPU cases run on one Linux host.
 Multicast AG requires at least three GPUs in one NVLink multicast clique and NCCL 2.32.2 or newer.
 CE D2H AG requires at least two GPUs and page-locked host receive buffers.
 An explicit --cases list takes precedence over --baseline.
@@ -117,7 +117,7 @@ for gpu in "${gpus[@]}"; do
     seen_gpus+="$gpu,"
 done
 
-case_re='(task[1-46]|baseline[1-4])'
+case_re='(task[1-5]|baseline[1-4])'
 [[ "$case_ids" =~ ^${case_re}(,${case_re})*$ ]] || die "invalid case list $case_ids"
 IFS=, read -r -a cases <<< "$case_ids"
 lock_gpus="${gpus[0]}"
@@ -126,8 +126,8 @@ for case_id in "${cases[@]}"; do
     [[ "$seen_cases" != *",$case_id,"* ]] || die "duplicate case $case_id"
     seen_cases+="$case_id,"
     case "$case_id" in
-        task[346]|baseline[234])
-            if [[ "$case_id" == task6 || "$case_id" == baseline4 ]]; then
+        task[345]|baseline[234])
+            if [[ "$case_id" == task5 || "$case_id" == baseline4 ]]; then
                 (( ${#gpus[@]} >= 2 )) || die "$case_id needs at least two GPUs for CE D2H AllGather"
             else
                 (( ${#gpus[@]} >= 3 )) || die "$case_id needs at least three GPUs for NCCL multicast"
@@ -322,7 +322,7 @@ for case_id in "${cases[@]}"; do
         task2) mode=gemm-h2d ;;
         task3) mode=gemm-ag-hbm ;;
         task4) mode=gemm-ag-host ;;
-        task6) mode=gemm-ag-d2h ;;
+        task5) mode=gemm-ag-d2h ;;
         baseline1) mode=h2d ;;
         baseline2) mode=ag-hbm ;;
         baseline3) mode=ag-host ;;

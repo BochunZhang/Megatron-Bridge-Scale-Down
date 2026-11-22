@@ -36,7 +36,8 @@ from analyse_hbm_conflict import Sample, export_sqlite, merge_intervals, overlap
 
 LOGGER = logging.getLogger(__name__)
 _RANGE = re.compile(r"(gemm|comm)(\d+)")
-# Older suites used task5 for the host-source multicast case.
+# Keep historical results readable. Older runs used task5 for host-source multicast
+# and task6 for host-destination D2H. The worker's mode determines the analysis.
 _CASE_DIR = re.compile(r"(?:task[1-6]|baseline[1-4])-.+")
 _REQUIRED_METRICS = {
     "DRAM read": re.compile(r"dram.*read|read.*dram", re.I),

@@ -25,7 +25,7 @@ bash examples/gb200/hbm-conflict/run_ce_hbm_benchmark.sh \
 | `task2` | 1 | GEMM | CPU pinned → HBM |
 | `task3` | ≥3 | GEMM | HBM → multicast HBM |
 | `task4` | ≥3 | GEMM | CPU pinned → multicast HBM |
-| `task6` | ≥2 | GEMM | HBM → 各 rank 的 pinned Host 接收区 |
+| `task5` | ≥2 | GEMM | HBM → 各 rank 的 pinned Host 接收区 |
 | `baseline1` | 1 | — | CPU pinned → HBM |
 | `baseline2` | ≥3 | — | HBM → multicast HBM |
 | `baseline3` | ≥3 | — | CPU pinned → multicast HBM |
@@ -80,7 +80,7 @@ HBM 和链路指标是设备级采样，可对照独跑与并跑窗口。采样�
 
 ### AllGather 直接写入 Host
 
-`task6` 和 `baseline4` 按需运行。每张 GPU 用 Copy Engine 将自己的 HBM shard 直接写到每个 rank 的
+`task5` 和 `baseline4` 按需运行。每张 GPU 用 Copy Engine 将自己的 HBM shard 直接写到每个 rank 的
 共享 pinned Host 接收缓冲区，包括自己的缓冲区。四卡、`--size-mib 1024` 时，每 rank 每轮发出四次
 256 MiB D2H，最终每个 Host 接收区有 1 GiB 数据。worker 在计时前清空各自的接收区，采集结束后在
 CPU 上逐 shard 校验。该测试走 D2H 单播，原 NCCL multicast case 走 NVLink multicast，两者的发送流量
@@ -91,7 +91,7 @@ CPU 上逐 shard 校验。该测试走 D2H 单播，原 NCCL multicast case 走 
 
 ```bash
 bash examples/gb200/hbm-conflict/run_ce_hbm_benchmark.sh \
-  --gpus 0,1,2,3 --cases task1,task3,task6,baseline4 --mc-self-import 1 \
+  --gpus 0,1,2,3 --cases task1,task3,task5,baseline4 --mc-self-import 1 \
   --gemm '[2,8192,7168],[4,8192,7168],[8,8192,7168],[16,8192,7168],[32,8192,7168],[64,8192,7168]'
 ```
 

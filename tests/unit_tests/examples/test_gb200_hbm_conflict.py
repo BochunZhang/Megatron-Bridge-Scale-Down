@@ -267,11 +267,11 @@ def test_the_pause_patch_slows_the_unicast_allgather():
 @pytest.mark.parametrize(
     ("case", "mode", "copies", "copy_kind", "dst_kind", "c2c_tx", "expected_error"),
     [
-        ("task6-gemm-ag-d2h", "gemm-ag-d2h", 4, "2 (Device-to-Host)", "1 (Pinned)", 32, None),
+        ("task5-gemm-ag-d2h", "gemm-ag-d2h", 4, "2 (Device-to-Host)", "1 (Pinned)", 32, None),
         ("baseline4-ag-d2h", "ag-d2h", 4, "2 (Device-to-Host)", "1 (Pinned)", 32, None),
-        ("task6-gemm-ag-d2h", "gemm-ag-d2h", 3, "2 (Device-to-Host)", "1 (Pinned)", 32, "bytes of D2H fan-out"),
-        ("task6-gemm-ag-d2h", "gemm-ag-d2h", 4, "8 (Device-to-Device)", "2 (Device)", 32, "device-to-pinned-host"),
-        ("task6-gemm-ag-d2h", "gemm-ag-d2h", 4, "2 (Device-to-Host)", "1 (Pinned)", 0, "no positive C2C user TX"),
+        ("task5-gemm-ag-d2h", "gemm-ag-d2h", 3, "2 (Device-to-Host)", "1 (Pinned)", 32, "bytes of D2H fan-out"),
+        ("task5-gemm-ag-d2h", "gemm-ag-d2h", 4, "8 (Device-to-Device)", "2 (Device)", 32, "device-to-pinned-host"),
+        ("task5-gemm-ag-d2h", "gemm-ag-d2h", 4, "2 (Device-to-Host)", "1 (Pinned)", 0, "no positive C2C user TX"),
     ],
 )
 def test_ce_host_destination_requires_direct_d2h_fan_out(
