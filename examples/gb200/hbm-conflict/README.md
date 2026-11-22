@@ -15,7 +15,8 @@ bash examples/gb200/hbm-conflict/run_ce_hbm_benchmark.sh \
 `--gemm` 顺序为 `[M,N,K]`。默认只测 `[8192,8192,7168]`，GEMM 使用 BF16 和预分配输出。
 `--size-mib` 默认 1024，表示单次 H2D 或每张 GPU 的完整 AG 输出大小，AG 输出字节数须按 rank 平分。
 例如三卡时可以用 `--size-mib 1023`。每个 GEMM case 按 shape 各跑一次，通信 baseline 与 shape 无关。
-`--cases task4,baseline3` 可只测 CPU 源 multicast AG。
+常规运行省略 `--cases` 时，默认运行 `task1` 至 `task4`，加 `--baseline` 会追加 `baseline1` 至 `baseline3`。
+显式指定 `--cases` 时按给出的列表运行，可以直接列出 baseline。用 `--cases task4,baseline3` 可只测 CPU 源 multicast AG。
 `--dry-run` 展开所有命令。
 
 | Case | GPU 数 | 计算 | 搬运 |
@@ -87,12 +88,13 @@ bash install/install-nccl-2.32.3-ce-multicast-handler.sh \
   --cuda-home "${CUDA_HOME:-/usr/local/cuda-13.0}"
 
 bash examples/gb200/hbm-conflict/run_ce_hbm_benchmark.sh \
-  --gpus 0,1,2,3 --mc-self-import ab
+  --gpus 0,1,2,3 --mc-self-import ab --baseline
 ```
 
-`--mc-self-import ab` 会自动为 AG 作业预加载独立安装脚本默认生成的 `libnccl.so.2`，依次运行
-`task3,baseline2` 的关闭组和启用组，结果存入同一目录下的 `self-import-0` 和 `self-import-1`。
-单跑一组用 `--mc-self-import 0` 或 `1`。自定义安装路径可用 `--nccl-lib PATH` 覆盖。
+`--mc-self-import ab` 会自动为 AG 作业预加载独立安装脚本默认生成的 `libnccl.so.2`，依次运行关闭组和启用组，
+结果存入同一目录下的 `self-import-0` 和 `self-import-1`。省略 `--cases` 时，两组默认各运行 `task3`，
+加 `--baseline` 后各追加 `baseline2`。单跑本例的一组用 `--mc-self-import 0` 或 `1`，并指定
+`--cases task3,baseline2`。自定义安装路径可用 `--nccl-lib PATH` 覆盖。
 PyTorch 需要动态链接到单一 `libnccl.so.2`，worker 会检查实际加载路径。每组记录库的 SHA256，
 启动器检查开关、NCCL 构建标识和 multicast 路径，并要求启用组的 rank 0 日志出现
 `CE multicast rank 0 self-imported FABRIC handle`。

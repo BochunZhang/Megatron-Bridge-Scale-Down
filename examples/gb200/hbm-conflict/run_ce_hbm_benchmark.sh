@@ -11,7 +11,8 @@ Profile GB200 BF16 GEMM and copy-engine traffic with Nsight Systems 2026.6.1.
 Usage: bash run_ce_hbm_benchmark.sh [options]
   --gemm SHAPES       '[M,N,K]' or '[M,N,K],[M,N,K]' (default: '[8192,8192,7168]')
   --gpus IDS          Ordered GPU IDs (default: 0,1,2,3 or the first four visible GPUs)
-  --cases IDS         Comma-separated case IDs (default: all cases, or task3,baseline2 with --mc-self-import)
+  --cases IDS         Comma-separated case IDs (default: task1..task4, or task3 for --mc-self-import ab)
+  --baseline         Add baseline1..baseline3 to the defaults (only baseline2 for A/B)
   --size-mib N        H2D size and full AG output size per rank (default: 1024)
   --warmup N          Standalone warmup iterations per active lane (default: 5)
   --gemm-rounds N     GEMMs per rank and shape (default: 20)
@@ -28,6 +29,7 @@ task1 GEMM, task2 GEMM+H2D, task3 GEMM+HBM-source CE multicast AG,
 task4 GEMM+host-source CE multicast AG. Baselines run H2D, HBM-source AG,
 and host-source AG alone, respectively. Multi-GPU cases run on one host.
 AG requires at least three GPUs in one NVLink multicast clique and NCCL 2.32.2 or newer.
+An explicit --cases list takes precedence over --baseline.
 The launcher saves one raw Nsight report per case. Run analyse_ce_hbm.py separately for SQLite export and analysis.
 EOF
 }
@@ -41,7 +43,7 @@ NSYS_BIN="${NSYS_BIN:-NsightSystems-2026.6.1/bin/nsys}"
 gpu_ids="${CUDA_VISIBLE_DEVICES:-0,1,2,3}"
 IFS=, read -r -a default_gpus <<< "$gpu_ids"
 gpu_ids="$(IFS=,; printf '%s' "${default_gpus[*]:0:4}")"
-case_ids=""
+case_ids="" include_baseline=false
 gemms='[8192,8192,7168]'
 size_mib=1024 warmup=5 gemm_rounds=20 comm_rounds=25 nsys_freq=10000
 ce_multicast_threshold=4611686018427387904
@@ -67,6 +69,7 @@ while (( $# )); do
                 --output-dir) output_dir="$2" ;;
             esac
             shift 2 ;;
+        --baseline) include_baseline=true; shift ;;
         --dry-run) dry_run=true; shift ;;
         -h|--help) usage; exit 0 ;;
         *) die "unknown argument $1" ;;
@@ -77,9 +80,19 @@ if [[ -n "$mc_self_import" ]]; then
     [[ "$mc_self_import" == 0 || "$mc_self_import" == 1 || "$mc_self_import" == ab ]] \
         || die "--mc-self-import must be 0, 1, or ab"
     nccl_lib="${nccl_lib:-$repo_root/nccl/nccl-2.32.3-ce-mc-self-import/build/lib/libnccl.so.2}"
-    case_ids="${case_ids:-task3,baseline2}"
 fi
-case_ids="${case_ids:-task1,task2,task3,task4,baseline1,baseline2,baseline3}"
+if [[ -z "$case_ids" ]]; then
+    if [[ "$mc_self_import" == ab ]]; then
+        case_ids=task3
+        baseline_ids=baseline2
+    else
+        case_ids=task1,task2,task3,task4
+        baseline_ids=baseline1,baseline2,baseline3
+    fi
+    if $include_baseline; then
+        case_ids+=",$baseline_ids"
+    fi
+fi
 if [[ -n "$nccl_lib" ]]; then
     [[ "$nccl_lib" = /* ]] || nccl_lib="$PWD/$nccl_lib"
     if ! $dry_run && [[ ! -f "$nccl_lib" ]]; then
@@ -137,7 +150,7 @@ output_dir="${output_dir:-$repo_root/results/gb200/hbm-conflict/gpu-num-${#gpus[
 if [[ "$mc_self_import" == ab ]]; then
     for setting in 0 1; do
         bash "$script_dir/run_ce_hbm_benchmark.sh" "${original_args[@]}" \
-            --mc-self-import "$setting" --output-dir "$output_dir/self-import-$setting"
+            --cases "$case_ids" --mc-self-import "$setting" --output-dir "$output_dir/self-import-$setting"
     done
     printf 'A/B results directory: %s\n' "$output_dir"
     exit 0
