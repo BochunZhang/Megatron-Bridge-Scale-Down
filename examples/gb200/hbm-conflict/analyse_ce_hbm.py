@@ -25,7 +25,7 @@ import re
 import sqlite3
 import statistics
 import subprocess
-from collections import defaultdict
+from collections import Counter, defaultdict
 from collections.abc import Sequence
 from contextlib import closing
 from pathlib import Path
@@ -62,22 +62,30 @@ class Activity(NamedTuple):
     dst_kind: str
 
 
+class Capture(NamedTuple):
+    """Rank labels, launch-attributed activities, and counters in one SQLite export."""
+
+    worker_processes: dict[str, list[int]]
+    activities: dict[str, dict[str, list[Activity]]]
+    samples: dict[int, list[Sample]]
+
+
 def _enum_name(values: dict[int, str], value: int | None) -> str:
     if value is None:
         return "unavailable"
     return f"{value} ({values[value]})" if value in values else str(value)
 
 
-def _read_capture(sqlite_path: Path, *, case: str) -> tuple[dict[str, list[Activity]], dict[int, list[Sample]]]:
+def _read_trace(sqlite_path: Path, *, labels: Sequence[str], physical_gpus: set[int] | None = None) -> Capture:
     with closing(sqlite3.connect(f"{sqlite_path.resolve().as_uri()}?mode=ro", uri=True)) as conn:
         tables = {row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
-        labels = conn.execute(
-            """SELECT DISTINCT COALESCE(n.text, s.value) FROM NVTX_EVENTS n
+        worker_processes = defaultdict(list)
+        for label, process in conn.execute(
+            """SELECT COALESCE(n.text, s.value), n.globalTid >> 24 FROM NVTX_EVENTS n
                LEFT JOIN StringIds s ON s.id = n.textId
                WHERE n.end IS NOT NULL AND COALESCE(n.text, s.value) LIKE 'hbm-ce/%'"""
-        ).fetchall()
-        if labels != [(f"hbm-ce/{case}",)]:
-            raise ValueError(f"expected NVTX case hbm-ce/{case}, found {labels}")
+        ):
+            worker_processes[label].append(process)
 
         api_tables = [
             f"CUPTI_ACTIVITY_KIND_{kind}" for kind in ("RUNTIME", "DRIVER") if f"CUPTI_ACTIVITY_KIND_{kind}" in tables
@@ -85,7 +93,8 @@ def _read_capture(sqlite_path: Path, *, case: str) -> tuple[dict[str, list[Activ
         if not api_tables:
             raise ValueError("capture has no CUDA runtime or driver API activity")
         api_calls = " UNION ALL ".join(f"SELECT start, globalTid, correlationId FROM {table}" for table in api_tables)
-        activities = defaultdict(list)
+        activities = {label: defaultdict(list) for label in labels}
+        label_params = ", ".join("?" for _ in labels)
         seen_copies = set()
         copy_enum, memory_enum = (
             dict(conn.execute(f"SELECT id, COALESCE(label, name) FROM {table}")) if table in tables else {}
@@ -112,30 +121,41 @@ def _read_capture(sqlite_path: Path, *, case: str) -> tuple[dict[str, list[Activ
                     FROM NVTX_EVENTS n LEFT JOIN StringIds s ON s.id = n.textId
                     WHERE n.end IS NOT NULL
                 )
-                SELECT DISTINCT n.label, g.start, g.end, g.deviceId, {name}, {bytes_copied},
+                SELECT DISTINCT c.label, n.label, g.start, g.end, g.deviceId, {name}, {bytes_copied},
                                 g.correlationId, g.streamId, {kind_fields}
                 FROM {table} g
                 JOIN api a ON a.correlationId = g.correlationId
-                    AND ((a.globalTid >> 24) & 16777215) = ((g.globalPid >> 24) & 16777215)
+                    AND (a.globalTid >> 24) = (g.globalPid >> 24)
                 JOIN ranges n ON n.globalTid = a.globalTid AND a.start >= n.start AND a.start < n.end
                 JOIN ranges c ON (c.globalTid >> 24) = (n.globalTid >> 24)
-                    AND c.label = ? AND n.start >= c.start AND n.end <= c.end
+                    AND c.label IN ({label_params}) AND n.start >= c.start AND n.end <= c.end
                 {kernel_names}
                 WHERE (n.label GLOB 'gemm[0-9]*' OR n.label GLOB 'comm[0-9]*')
                       AND g.end > g.start {payload_filter}
                 ORDER BY g.start
             """
-            for label, start, end, device, activity_name, size, correlation, stream, copy, src, dst in conn.execute(
-                query, (f"hbm-ce/{case}",)
-            ):
+            for (
+                worker,
+                label,
+                start,
+                end,
+                device,
+                activity_name,
+                size,
+                correlation,
+                stream,
+                copy,
+                src,
+                dst,
+            ) in conn.execute(query, labels):
                 if not _RANGE.fullmatch(label):
                     continue
                 if is_copy:
-                    key = (label, start, end, device, size, correlation, stream)
+                    key = (worker, label, start, end, device, size, correlation, stream)
                     if key in seen_copies:
                         continue
                     seen_copies.add(key)
-                activities[label].append(
+                activities[worker][label].append(
                     Activity(
                         start,
                         end,
@@ -154,12 +174,33 @@ def _read_capture(sqlite_path: Path, *, case: str) -> tuple[dict[str, list[Activ
                 SELECT DISTINCT g.timestamp, g.typeId & 255, n.metricName, g.value
                 FROM GPU_METRICS g
                 JOIN TARGET_INFO_GPU_METRICS n ON (g.typeId & 255) = (n.typeId & 255) AND g.metricId = n.metricId
-                ORDER BY g.timestamp
             """
-            for timestamp, device, metric, value in conn.execute(query):
+            params = ()
+            if physical_gpus is not None:
+                # Combined reports can contain a long host rendezvous before the first GPU work.
+                # Read only the requested devices and the time range used by the GPU metric windows.
+                bounds = [
+                    (min(op.start for op in group), max(op.end for op in group))
+                    for worker in activities.values()
+                    for group in worker.values()
+                ]
+                if not bounds or not physical_gpus:
+                    return Capture(dict(worker_processes), activities, {})
+                gpu_params = ", ".join("?" for _ in physical_gpus)
+                query += f" WHERE g.timestamp BETWEEN ? AND ? AND (g.typeId & 255) IN ({gpu_params})"
+                params = (min(start for start, _ in bounds), max(end for _, end in bounds), *sorted(physical_gpus))
+            for timestamp, device, metric, value in conn.execute(query, params):
                 if value is not None and math.isfinite(value):
                     samples[device].append(Sample(timestamp, metric, value))
-        return dict(activities), dict(samples)
+        return Capture(dict(worker_processes), activities, dict(samples))
+
+
+def _read_capture(sqlite_path: Path, *, case: str) -> tuple[dict[str, list[Activity]], dict[int, list[Sample]]]:
+    label = f"hbm-ce/{case}"
+    capture = _read_trace(sqlite_path, labels=(label,))
+    if set(capture.worker_processes) != {label}:
+        raise ValueError(f"expected NVTX case {label}, found {sorted(capture.worker_processes)}")
+    return capture.activities[label], capture.samples
 
 
 def _event_intervals(record: dict, kind: str) -> list[tuple[int, int]]:
@@ -339,6 +380,34 @@ def _analyse_rank(record: dict, activities: dict[str, list[Activity]], samples: 
     }
 
 
+def _read_combined(
+    sqlite_path: Path, *, case: str, records: dict[int, dict], errors: list[str]
+) -> dict[int, tuple[dict[str, list[Activity]], dict[int, list[Sample]]]]:
+    labels = {rank: f"hbm-ce/{case}/rank-{rank}" for rank in records}
+    gpu_counts = Counter(
+        gpu for record in records.values() if type(gpu := record.get("physical_gpu")) is int and gpu >= 0
+    )
+    capture = _read_trace(sqlite_path, labels=tuple(labels.values()), physical_gpus=set(gpu_counts))
+    unexpected_labels = set(capture.worker_processes) - set(labels.values())
+    if unexpected_labels:
+        errors.append(f"unexpected combined report NVTX labels {sorted(unexpected_labels)}")
+    worker_counts = Counter(process for workers in capture.worker_processes.values() for process in workers)
+    rank_captures = {}
+    for rank, label in labels.items():
+        workers = capture.worker_processes.get(label, [])
+        if len(workers) != 1 or worker_counts[workers[0]] != 1:
+            errors.append(f"rank {rank}: expected one distinct worker process in NVTX range {label}, found {workers}")
+            continue
+        gpu = records[rank].get("physical_gpu")
+        if type(gpu) is not int or gpu_counts[gpu] != 1:
+            errors.append(f"rank {rank}: expected a unique physical_gpu in worker events, found {gpu!r}")
+            samples = {}
+        else:
+            samples = {gpu: capture.samples[gpu]} if gpu in capture.samples else {}
+        rank_captures[rank] = capture.activities[label], samples
+    return rank_captures
+
+
 def _analyse_case(case_dir: Path, *, reports_dir: Path, nsys_bin: str) -> dict:
     case = case_dir.name
     records = {}
@@ -360,27 +429,39 @@ def _analyse_case(case_dir: Path, *, reports_dir: Path, nsys_bin: str) -> dict:
     if any(any(record.get(key) != val for key, val in config.items()) for record in records.values()):
         raise ValueError("worker case configuration differs between ranks")
 
-    reports = {}
+    combined_reports = [
+        directory / f"{case}.nsys-rep"
+        for directory in (case_dir / "nsys", reports_dir)
+        if (directory / f"{case}.nsys-rep").is_file()
+    ]
     paths = [*reports_dir.glob(f"{case}.rank_*.nsys-rep"), *(case_dir / "nsys").glob(f"{case}.rank_*.nsys-rep")]
-    for path in sorted(paths):
-        rank = report_rank(path)
-        if rank in reports:
-            raise ValueError(f"duplicate nsys report for rank {rank}")
-        reports[rank] = path
     errors = []
-    if set(reports) != expected_ranks:
-        errors.append(f"expected nsys reports for {sorted(expected_ranks)}, got {sorted(reports)}")
-
-    ranks = []
-    for rank, record in sorted(records.items()):
+    rank_captures = {}
+    capture_errors = (OSError, ValueError, subprocess.CalledProcessError, sqlite3.Error)
+    if combined_reports:
+        if len(combined_reports) != 1 or paths:
+            raise ValueError("expected one combined nsys report or per-rank reports, found duplicate inputs")
         try:
-            report = reports[rank]
-            capture = _read_capture(export_sqlite(report, nsys_bin=nsys_bin), case=case)
-        except (KeyError, OSError, ValueError, subprocess.CalledProcessError, sqlite3.Error) as error:
-            errors.append(f"rank {rank}: capture unavailable or invalid: {error}")
-            capture = {}, {}
-        ranks.append(_analyse_rank(record, *capture))
+            sqlite_path = export_sqlite(combined_reports[0], nsys_bin=nsys_bin)
+            rank_captures = _read_combined(sqlite_path, case=case, records=records, errors=errors)
+        except capture_errors as error:
+            errors.append(f"combined capture unavailable or invalid: {error}")
+    else:
+        reports = {}
+        for path in sorted(paths):
+            rank = report_rank(path)
+            if rank in reports:
+                raise ValueError(f"duplicate nsys report for rank {rank}")
+            reports[rank] = path
+        if set(reports) != expected_ranks:
+            errors.append(f"expected nsys reports for {sorted(expected_ranks)}, got {sorted(reports)}")
+        for rank in sorted(expected_ranks & reports.keys()):
+            try:
+                rank_captures[rank] = _read_capture(export_sqlite(reports[rank], nsys_bin=nsys_bin), case=case)
+            except capture_errors as error:
+                errors.append(f"rank {rank}: capture unavailable or invalid: {error}")
 
+    ranks = [_analyse_rank(record, *rank_captures.get(rank, ({}, {}))) for rank, record in sorted(records.items())]
     return {"case": case, "config": config, "ranks": ranks, "errors": errors}
 
 
@@ -395,7 +476,7 @@ def _render(cases: Sequence[dict], *, root: Path) -> str:
         "",
         "GEMM throughput is 2MNK divided by the union of launch-attributed GPU kernel intervals.",
         "Coverage is the fraction of those intervals overlapping this rank's traced payload copies, excluding signal writes.",
-        "Copies issued by peer ranks are absent from the rank-local trace. GPU counters are device-wide.",
+        "Coverage uses this rank's outgoing copies. GPU counters are device-wide.",
         "CUDA-event coverage uses the stream-ordered interval between the operation's start and end events.",
         "Source GB/s uses the size of one outgoing shard or H2D transfer and its CUDA-event duration.",
         "NCCL AG event durations include stream-ordered peer synchronization. Earlier direct multicast runs timed only copy.",

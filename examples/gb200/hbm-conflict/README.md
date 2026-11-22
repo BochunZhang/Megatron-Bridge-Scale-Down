@@ -48,8 +48,13 @@ AG case 独立设置 `NCCL_CTA_POLICY=ZERO`、`NCCL_WIN_ENABLE=1`、`NCCL_NVLS_E
 copy 队列，用同一个 CUDA 起点发出预提交的 GEMM 和 copy。只测通信的 case 执行指定的 `--comm-rounds`。
 手动生成的 `report.md` 单独报告实际重叠覆盖率。
 
+每个 case 用一个 `nsys profile` 采集整个 `torch.distributed.run` 进程树。rank 0 在所有 rank 完成预热后打开
+采集窗口，并在各 rank 的计时 CUDA 工作完成后关闭。多卡 case 把各 rank 的活动和指定 GPU 的 metrics 放到
+同一条时间轴上，默认采集四张卡。单卡 case 只采集选定的第一张 GPU。GPU metrics 每张卡默认以 10 kHz 采样，
+可用 `--nsys-freq` 调整。
+
 结果保存在 `results/gb200/hbm-conflict/gpu-num-N/<timestamp>-ce/`。每个 case 保留 `torchrun.log`、CUDA event
-记录和每 rank 的 `nsys/*.nsys-rep`。启动器默认停在采集阶段。
+记录和一份 `<case>/nsys/<case>.nsys-rep`。启动器默认停在采集阶段。
 
 用下面的命令提取 `.nsys` 和 `.nsys-rep`。它保留相对路径，把 `path/aaa/bbb/ccc.nsys` 复制到
 `path-nsys/aaa/bbb/ccc.nsys`。

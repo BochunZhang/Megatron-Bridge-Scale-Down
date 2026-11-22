@@ -17,7 +17,7 @@ Usage: bash run_ce_hbm_benchmark.sh [options]
   --gemm-rounds N     GEMMs per rank and shape (default: 20)
   --comm-rounds N     Standalone transfers, or minimum transfers when overlapped (default: 25)
   --nsys PATH         Nsight Systems 2026.6.1 executable (also NSYS_BIN)
-  --nsys-freq HZ      GPU metrics sampling rate (default: 50000)
+  --nsys-freq HZ      GPU metrics sampling rate (default: 10000)
   --output-dir DIR    Results directory (default: results/gb200/hbm-conflict/gpu-num-N/<timestamp>-ce)
   --dry-run           Show commands without starting jobs or changing GPU clocks
   -h, --help          Show this help
@@ -26,7 +26,7 @@ task1 GEMM, task2 GEMM+H2D, task3 GEMM+HBM-source CE multicast AG,
 task4 GEMM+host-source CE multicast AG. Baselines run H2D, HBM-source AG,
 and host-source AG alone, respectively. Multi-GPU cases run on one host.
 AG requires at least three GPUs in one NVLink multicast clique and NCCL 2.32.2 or newer.
-The launcher saves raw Nsight reports. Run analyse_ce_hbm.py separately for SQLite export and analysis.
+The launcher saves one raw Nsight report per case. Run analyse_ce_hbm.py separately for SQLite export and analysis.
 EOF
 }
 
@@ -41,7 +41,7 @@ IFS=, read -r -a default_gpus <<< "$gpu_ids"
 gpu_ids="$(IFS=,; printf '%s' "${default_gpus[*]:0:4}")"
 case_ids=task1,task2,task3,task4,baseline1,baseline2,baseline3
 gemms='[8192,8192,7168]'
-size_mib=1024 warmup=5 gemm_rounds=20 comm_rounds=25 nsys_freq=50000
+size_mib=1024 warmup=5 gemm_rounds=20 comm_rounds=25 nsys_freq=10000
 ce_multicast_threshold=4611686018427387904
 output_dir="" dry_run=false
 
@@ -113,7 +113,7 @@ done
 output_dir="${output_dir:-$repo_root/results/gb200/hbm-conflict/gpu-num-${#gpus[@]}/$(date +%Y%m%d-%H%M%S)-ce}"
 [[ "$output_dir" = /* ]] || output_dir="$PWD/$output_dir"
 [[ "$NSYS_BIN" = /* ]] || NSYS_BIN="$PWD/$NSYS_BIN"
-export NSYS_BIN CUDA_DEVICE_ORDER=PCI_BUS_ID
+export CUDA_DEVICE_ORDER=PCI_BUS_ID
 lock_command=(nvidia-smi -i "$lock_gpus" --lock-gpu-clocks=tdp,tdp)
 clock_query=(nvidia-smi -i "$lock_gpus" --query-gpu=index,pci.bus_id,name,uuid,clocks.current.sm,clocks.current.memory,power.limit --format=csv)
 
@@ -146,14 +146,6 @@ else
     "$NSYS_BIN" profile --gpu-metrics-devices="$lock_gpus" --gpu-metrics-set=help \
         >"$output_dir/nsys-gpu-metrics.txt" 2>&1 || true
 fi
-
-# The outer uv process places its PyTorch environment on PATH for every worker.
-# Each nsys process samples only its rank's physical GPU.
-profile_worker='
-set -euo pipefail
-IFS=, read -r -a devices <<< "$CUDA_VISIBLE_DEVICES"
-exec "$NSYS_BIN" profile --gpu-metrics-devices="${devices[$LOCAL_RANK]}" "$@"
-'
 
 validate_nccl_ce_ag() {
     local case_dir="$1" ranks="$2" log rank_zero=""
@@ -192,14 +184,16 @@ validate_nccl_ce_ag() {
 
 run_case() {
     local name="$1" mode="$2" devices="$3" ranks="$4" shape="${5:-}"
-    local case_dir="$output_dir/$name" rank trace=cuda,nvtx
+    local case_dir="$output_dir/$name" trace=cuda,nvtx
+    local report="$case_dir/nsys/$name"
     [[ "$mode" != *ag-* ]] || trace+=,nccl
-    local -a command=(uv run --active --no-sync python -m torch.distributed.run --standalone --nnodes=1
-        --nproc_per_node="$ranks" --no-python bash -c "$profile_worker" hbm-ce
-        --trace="$trace" --cuda-trace-all-apis=true --sample=none --cpuctxsw=none
+    # One Nsight session puts all workers and selected GPU metrics on the same timeline.
+    local -a command=("$NSYS_BIN" profile
+        --trace="$trace" --cuda-trace-scope=process-tree --cuda-trace-all-apis=true --sample=none --cpuctxsw=none
         --capture-range=cudaProfilerApi --capture-range-end=stop
-        --gpu-metrics-set=gb10x-ct --gpu-metrics-frequency="$nsys_freq" --output="$case_dir/nsys/$name.rank_%q{RANK}"
-        python "$script_dir/ce_hbm_benchmark.py" --case "$name" --mode "$mode" --output-dir "$case_dir"
+        --gpu-metrics-devices="$devices" --gpu-metrics-set=gb10x-ct --gpu-metrics-frequency="$nsys_freq" --output="$report"
+        uv run --active --no-sync python -m torch.distributed.run --standalone --nnodes=1 --nproc_per_node="$ranks"
+        "$script_dir/ce_hbm_benchmark.py" --case "$name" --mode "$mode" --output-dir "$case_dir"
         --size-mib "$size_mib" --warmup "$warmup" --gemm-rounds "$gemm_rounds" --comm-rounds "$comm_rounds")
     if [[ -n "$shape" ]]; then command+=(--gemm "$shape"); fi
 
@@ -224,7 +218,7 @@ run_case() {
     fi
     run_env+=("CUDA_VISIBLE_DEVICES=$devices" "CUDA_DEVICE_ORDER=$CUDA_DEVICE_ORDER"
         "GLOO_SOCKET_IFNAME=${GLOO_SOCKET_IFNAME:-${GLOO_SOCKET_NAME:-}}"
-        "NSYS_BIN=$NSYS_BIN" "NSYS_TMPDIR=$case_dir/nsys/.tmp")
+        "NSYS_TMPDIR=$case_dir/nsys/.tmp")
     if $dry_run; then
         show_command "${run_env[@]}" "${command[@]}"
         return
@@ -233,12 +227,10 @@ run_case() {
     show_command "${run_env[@]}" "${command[@]}" >"$case_dir/command.txt" || return
     printf 'Running %s on GPUs %s\n' "$name" "$devices"
     "${run_env[@]}" "${command[@]}" 2>&1 | tee "$case_dir/torchrun.log" || return
-    for ((rank = 0; rank < ranks; rank++)); do
-        [[ -s "$case_dir/nsys/$name.rank_$rank.nsys-rep" ]] || {
-            printf 'error: %s has no nsys report for rank %d\n' "$name" "$rank" >&2
-            return 1
-        }
-    done
+    if [[ ! -s "$report.nsys-rep" ]]; then
+        printf 'error: %s has no Nsight report at %s.nsys-rep\n' "$name" "$report" >&2
+        return 1
+    fi
     if [[ "$mode" == *ag-* ]]; then
         validate_nccl_ce_ag "$case_dir" "$ranks"
     fi

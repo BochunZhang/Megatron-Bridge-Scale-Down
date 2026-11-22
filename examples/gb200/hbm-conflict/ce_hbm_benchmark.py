@@ -196,13 +196,17 @@ def _run_case(args: argparse.Namespace, device: torch.device, *, cleanup: ExitSt
         start.record()
         end.record()
     torch.cuda.synchronize(device)
-    dist.barrier()
 
     gate = LaunchGate(timeout_s=30.0)
     try:
-        torch.cuda.profiler.start()
+        dist.barrier()
+        if rank == 0:
+            torch.cuda.profiler.start()
         try:
-            with nvtx.range(f"hbm-ce/{args.case}"):
+            # One Nsight session covers the process tree. Keep rank labels in
+            # the common timeline and wait for rank 0 to open the capture.
+            dist.barrier()
+            with nvtx.range(f"hbm-ce/{args.case}/rank-{rank}"):
                 gate.arm(control_stream)
                 try:
                     origin.record(control_stream)
@@ -219,8 +223,11 @@ def _run_case(args: argparse.Namespace, device: torch.device, *, cleanup: ExitSt
                 finally:
                     gate.release()
                 torch.cuda.synchronize(device)
+            # Rank 0 can stop the shared capture after every GPU has finished.
+            dist.barrier()
         finally:
-            torch.cuda.profiler.stop()
+            if rank == 0:
+                torch.cuda.profiler.stop()
         watchdog = torch.tensor(int(gate.watchdog_fired()))
         dist.all_reduce(watchdog, op=dist.ReduceOp.MAX)
         if watchdog.item():
@@ -228,8 +235,6 @@ def _run_case(args: argparse.Namespace, device: torch.device, *, cleanup: ExitSt
     finally:
         gate.close()
 
-    # Finish the measured stream on every rank before inspecting the outputs.
-    dist.barrier()
     comm_correct = True
     if validate_comm is not None:
         try:
