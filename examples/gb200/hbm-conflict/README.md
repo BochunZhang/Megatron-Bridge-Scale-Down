@@ -28,7 +28,7 @@ bash examples/gb200/hbm-conflict/run_ce_hbm_benchmark.sh \
 AG 用 PyTorch symmetric memory 建立 multicast 输出。每个 rank 提交一次 `cuMemcpyBatchAsync`，将自己的 shard
 直接写入 multicast 地址的对应槽位。`multimem.st` 是 SM kernel 的 PTX 指令，CE case 测的是写同类 multicast
 地址的 DMA 路径。CPU 源 case 将 pinned tensor 直接传给 CUDA API。该入口使用 CUDA 13.0 的 driver ABI，
-需要支持 multicast copy 的驱动和 PyTorch build。脚本验证每个 rank 的接收槽位，并检查 nsys 的 memcpy 记录。
+需要支持 multicast copy 的驱动和 PyTorch build。测试脚本验证每个 rank 的接收槽位，手动分析会检查 nsys 的 memcpy 记录。
 单轮区间只测该 rank 自己发出的 copy。所有 rank 在测量结束后同步，再读取完整 AG 输出。[CUDA Driver API](https://docs.nvidia.com/cuda/cuda-driver-api/group__CUDA__MEM.html)
 
 启动器用 `nvidia-smi --lock-gpu-clocks=tdp,tdp` 设置参与测试的 GPU，需要锁频和 GPU metrics 权限。实际
@@ -37,12 +37,28 @@ AG 用 PyTorch symmetric memory 建立 multicast 输出。每个 rank 提交一�
 
 每个活动 stream 先独立 warmup，初始化、校准和输出验证都在捕获窗口外。并发 case 根据预热时间延长背景
 copy 队列，用同一个 CUDA 起点发出预提交的 GEMM 和 copy。只测通信的 case 执行指定的 `--comm-rounds`。
-`report.md` 单独报告实际重叠覆盖率。
+手动生成的 `report.md` 单独报告实际重叠覆盖率。
 
 结果保存在 `results/gb200/hbm-conflict/gpu-num-N/<timestamp>-ce/`。每个 case 保留 `torchrun.log`、CUDA event
-记录和每 rank 的 `nsys/*.nsys-rep` / `.sqlite`。根目录的 `report.md`、`summary.json` 和 `gpu_metrics.csv`
-包含 GEMM TFLOPS、payload 吞吐、重叠覆盖率及窗口化 DRAM、NVLink、C2C 指标。HBM 和链路指标是设备级采样，
-可对照独跑与并跑窗口。采样值保留 nsys 的计数器含义，payload GB/s 则由传输大小和时间计算。
+记录和每 rank 的 `nsys/*.nsys-rep`。启动器默认停在采集阶段。
+
+用下面的命令提取 `.nsys` 和 `.nsys-rep`。它保留相对路径，把 `path/aaa/bbb/ccc.nsys` 复制到
+`path-nsys/aaa/bbb/ccc.nsys`。
+
+```bash
+uv run --active --no-sync python examples/gb200/hbm-conflict/extract_nsys_reports.py "$path"
+```
+
+需要汇总时，对原结果目录手动运行分析器。它会导出 SQLite，并写入 `report.md`、`summary.json` 和
+`gpu_metrics.csv`，包含 GEMM TFLOPS、payload 吞吐、重叠覆盖率及窗口化 DRAM、NVLink、C2C 指标。
+
+```bash
+uv run --active --no-sync python examples/gb200/hbm-conflict/analyse_ce_hbm.py \
+  --output-dir "$path" --nsys "${NSYS_BIN:-NsightSystems-2026.6.1/bin/nsys}"
+```
+
+HBM 和链路指标是设备级采样，可对照独跑与并跑窗口。采样值保留 nsys 的计数器含义，payload GB/s 则由
+传输大小和时间计算。
 [Nsight Systems GPU Metrics](https://docs.nvidia.com/nsight-systems/UserGuide/index.html#gpu-metrics)
 
 ## 回答的问题

@@ -25,6 +25,7 @@ Usage: bash run_ce_hbm_benchmark.sh [options]
 task1 GEMM, task2 GEMM+H2D, task3 GEMM+HBM-source CE multicast AG,
 task4 GEMM+host-source CE multicast AG. Baselines run H2D, HBM-source AG,
 and host-source AG alone, respectively. Multi-GPU cases run on one host.
+The launcher saves raw Nsight reports. Run analyse_ce_hbm.py separately for SQLite export and analysis.
 EOF
 }
 
@@ -207,12 +208,8 @@ for case_id in "${cases[@]}"; do
     fi
 done
 
-analyse=(uv run --active --no-sync python "$script_dir/analyse_ce_hbm.py" --output-dir "$output_dir" --nsys "$NSYS_BIN")
-if $dry_run; then
-    show_command "${analyse[@]}"
-else
+if ! $dry_run; then
     "${clock_query[@]}" >"$output_dir/gpu_clocks.after.csv" || failed=1
-    "${analyse[@]}" || failed=1
 fi
 printf 'Results directory: %s\n' "$output_dir"
 exit "$failed"
