@@ -1,5 +1,50 @@
 # GB200：AllGather 背景流量下的 GEMM 完成时间（HBM 争用）
 
+## Copy Engine 和 HBM 争用测试
+
+在 GB200 节点的工作目录准备 `NsightSystems-2026.6.1/bin/nsys`，并启用已安装 CUDA PyTorch 的虚拟环境。也可用
+`NSYS_BIN` 指定同版本的安装路径。多卡测试使用同一台主机、同一 NVLink multicast 域内的 GPU。
+
+```bash
+bash examples/gb200/hbm-conflict/run_ce_hbm_benchmark.sh \
+  --gpus 0,1,2,3 --gemm '[8192,8192,7168],[16384,8192,8192]'
+```
+
+`--gemm` 顺序为 `[M,N,K]`。默认只测 `[8192,8192,7168]`，GEMM 使用 BF16 和预分配输出。
+`--size-mib` 默认 1024，表示单次 H2D 或每张 GPU 的完整 AG 输出大小。每个 GEMM case 按 shape
+各跑一次，通信 baseline 与 shape 无关。`--cases task5,baseline3` 可只测 CPU 源 multicast AG。
+`--dry-run` 展开所有命令。
+
+| Case | GPU 数 | 计算 | 搬运 |
+| --- | --- | --- | --- |
+| `task1` | 1 | GEMM | — |
+| `task2` | 1 | GEMM | CPU pinned → HBM |
+| `task3`、`task4` | ≥2 | GEMM | HBM → multicast HBM，独立重复两次 |
+| `task5` | ≥2 | GEMM | CPU pinned → multicast HBM |
+| `baseline1` | 1 | — | CPU pinned → HBM |
+| `baseline2` | ≥2 | — | HBM → multicast HBM |
+| `baseline3` | ≥2 | — | CPU pinned → multicast HBM |
+
+AG 用 PyTorch symmetric memory 建立 multicast 输出。每个 rank 提交一次 `cuMemcpyBatchAsync`，将自己的 shard
+直接写入 multicast 地址的对应槽位。`multimem.st` 是 SM kernel 的 PTX 指令，CE case 测的是写同类 multicast
+地址的 DMA 路径。CPU 源 case 将 pinned tensor 直接传给 CUDA API。该入口使用 CUDA 13.0 的 driver ABI，
+需要支持 multicast copy 的驱动和 PyTorch build。脚本验证每个 rank 的接收槽位，并检查 nsys 的 memcpy 记录。
+单轮区间只测该 rank 自己发出的 copy。所有 rank 在测量结束后同步，再读取完整 AG 输出。[CUDA Driver API](https://docs.nvidia.com/cuda/cuda-driver-api/group__CUDA__MEM.html)
+
+启动器用 `nvidia-smi --lock-gpu-clocks=tdp,tdp` 设置参与测试的 GPU，需要锁频和 GPU metrics 权限。实际
+时钟轨道会随报告保留。Gloo 启动使用 `GLOO_SOCKET_IFNAME`，优先选有效的已有设置，其次 `eth0`、`bond1`，
+单机环境下可用 `lo`。也接受 `GLOO_SOCKET_NAME` 作为输入别名。
+
+每个活动 stream 先独立 warmup，初始化、校准和输出验证都在捕获窗口外。并发 case 根据预热时间延长背景
+copy 队列，用同一个 CUDA 起点发出预提交的 GEMM 和 copy。只测通信的 case 执行指定的 `--comm-rounds`。
+`report.md` 单独报告实际重叠覆盖率。
+
+结果保存在 `results/gb200/hbm-conflict/gpu-num-N/<timestamp>-ce/`。每个 case 保留 `torchrun.log`、CUDA event
+记录和每 rank 的 `nsys/*.nsys-rep` / `.sqlite`。根目录的 `report.md`、`summary.json` 和 `gpu_metrics.csv`
+包含 GEMM TFLOPS、payload 吞吐、重叠覆盖率及窗口化 DRAM、NVLink、C2C 指标。HBM 和链路指标是设备级采样，
+可对照独跑与并跑窗口。采样值保留 nsys 的计数器含义，payload GB/s 则由传输大小和时间计算。
+[Nsight Systems GPU Metrics](https://docs.nvidia.com/nsight-systems/UserGuide/index.html#gpu-metrics)
+
 ## 回答的问题
 
 GPU 0–3 做 GEMM 时，如果分出几个 SM 在这 4 张卡之间搬数据（AllGather），对端写进本卡 HBM 的流量和
