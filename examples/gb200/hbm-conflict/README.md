@@ -12,15 +12,15 @@ bash examples/gb200/hbm-conflict/run_ce_hbm_benchmark.sh \
 
 `--gemm` 顺序为 `[M,N,K]`。默认只测 `[8192,8192,7168]`，GEMM 使用 BF16 和预分配输出。
 `--size-mib` 默认 1024，表示单次 H2D 或每张 GPU 的完整 AG 输出大小。每个 GEMM case 按 shape
-各跑一次，通信 baseline 与 shape 无关。`--cases task5,baseline3` 可只测 CPU 源 multicast AG。
+各跑一次，通信 baseline 与 shape 无关。`--cases task4,baseline3` 可只测 CPU 源 multicast AG。
 `--dry-run` 展开所有命令。
 
 | Case | GPU 数 | 计算 | 搬运 |
 | --- | --- | --- | --- |
 | `task1` | 1 | GEMM | — |
 | `task2` | 1 | GEMM | CPU pinned → HBM |
-| `task3`、`task4` | ≥2 | GEMM | HBM → multicast HBM，独立重复两次 |
-| `task5` | ≥2 | GEMM | CPU pinned → multicast HBM |
+| `task3` | ≥2 | GEMM | HBM → multicast HBM |
+| `task4` | ≥2 | GEMM | CPU pinned → multicast HBM |
 | `baseline1` | 1 | — | CPU pinned → HBM |
 | `baseline2` | ≥2 | — | HBM → multicast HBM |
 | `baseline3` | ≥2 | — | CPU pinned → multicast HBM |

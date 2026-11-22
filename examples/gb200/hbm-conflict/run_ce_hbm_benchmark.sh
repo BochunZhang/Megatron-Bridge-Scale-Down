@@ -11,7 +11,7 @@ Profile GB200 BF16 GEMM and copy-engine traffic with Nsight Systems 2026.6.1.
 Usage: bash run_ce_hbm_benchmark.sh [options]
   --gemm SHAPES       '[M,N,K]' or '[M,N,K],[M,N,K]' (default: '[8192,8192,7168]')
   --gpus IDS          Ordered GPU IDs (default: 0,1,2,3 or the first four visible GPUs)
-  --cases IDS         Comma-separated case IDs (default: task1,task2,task3,task4,task5,baseline1,baseline2,baseline3)
+  --cases IDS         Comma-separated case IDs (default: task1,task2,task3,task4,baseline1,baseline2,baseline3)
   --size-mib N        H2D size and full AG output size per rank (default: 1024)
   --warmup N          Standalone warmup iterations per active lane (default: 5)
   --gemm-rounds N     GEMMs per rank and shape (default: 20)
@@ -22,8 +22,8 @@ Usage: bash run_ce_hbm_benchmark.sh [options]
   --dry-run           Show commands without starting jobs or changing GPU clocks
   -h, --help          Show this help
 
-task1 GEMM, task2 GEMM+H2D, task3/task4 GEMM+HBM-source CE multicast AG,
-task5 GEMM+host-source CE multicast AG. Baselines run H2D, HBM-source AG,
+task1 GEMM, task2 GEMM+H2D, task3 GEMM+HBM-source CE multicast AG,
+task4 GEMM+host-source CE multicast AG. Baselines run H2D, HBM-source AG,
 and host-source AG alone, respectively. Multi-GPU cases run on one host.
 EOF
 }
@@ -37,7 +37,7 @@ NSYS_BIN="${NSYS_BIN:-NsightSystems-2026.6.1/bin/nsys}"
 gpu_ids="${CUDA_VISIBLE_DEVICES:-0,1,2,3}"
 IFS=, read -r -a default_gpus <<< "$gpu_ids"
 gpu_ids="$(IFS=,; printf '%s' "${default_gpus[*]:0:4}")"
-case_ids=task1,task2,task3,task4,task5,baseline1,baseline2,baseline3
+case_ids=task1,task2,task3,task4,baseline1,baseline2,baseline3
 gemms='[8192,8192,7168]'
 size_mib=1024 warmup=5 gemm_rounds=20 comm_rounds=25 nsys_freq=50000
 output_dir="" dry_run=false
@@ -77,7 +77,7 @@ for gpu in "${gpus[@]}"; do
     seen_gpus+="$gpu,"
 done
 
-case_re='(task[1-5]|baseline[1-3])'
+case_re='(task[1-4]|baseline[1-3])'
 [[ "$case_ids" =~ ^${case_re}(,${case_re})*$ ]] || die "invalid case list $case_ids"
 IFS=, read -r -a cases <<< "$case_ids"
 lock_gpus="${gpus[0]}"
@@ -86,7 +86,7 @@ for case_id in "${cases[@]}"; do
     [[ "$seen_cases" != *",$case_id,"* ]] || die "duplicate case $case_id"
     seen_cases+="$case_id,"
     case "$case_id" in
-        task[345]|baseline[23])
+        task[34]|baseline[23])
             (( ${#gpus[@]} >= 2 )) || die "$case_id needs at least two GPUs"
             lock_gpus="$gpu_ids"
             ;;
@@ -188,8 +188,8 @@ for case_id in "${cases[@]}"; do
     case "$case_id" in
         task1) mode=gemm ;;
         task2) mode=gemm-h2d ;;
-        task3|task4) mode=gemm-ag-hbm ;;
-        task5) mode=gemm-ag-host ;;
+        task3) mode=gemm-ag-hbm ;;
+        task4) mode=gemm-ag-host ;;
         baseline1) mode=h2d ;;
         baseline2) mode=ag-hbm ;;
         baseline3) mode=ag-host ;;
