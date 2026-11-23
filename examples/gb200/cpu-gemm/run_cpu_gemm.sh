@@ -14,7 +14,7 @@ Usage: bash run_cpu_gemm.sh [options]
   --warmup N         Warmup GEMMs per case (default: 16)
   --iters N          Profiled GEMMs per case (default: 100)
   --slots N          Rotate this many sets of buffers (default: 8)
-  --frequency HZ     Nsight Systems GPU Metrics frequency (default: 50000)
+  --frequency HZ     Nsight Systems GPU Metrics frequency (default: 10000)
   --metrics-set SET  Choose a metric set explicitly (default: bundled, then gb10x-ct if rejected)
   --output-dir DIR   Result directory (default: results/gb200/cpu-gemm/<timestamp>)
   --analyse          Export SQLite and generate CSVs on this host (default: capture only)
@@ -41,7 +41,7 @@ is_uint() { [[ $1 =~ ^(0|[1-9][0-9]{0,9})$ ]] && (( $1 <= 2147483647 )); }
 script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 repo_root="$(cd -- "$script_dir/../../.." && pwd)"
 m=4096 n=2048 k=8192 batches=1,2,4,8,16 gpu=0 numa_node=auto
-warmup=16 iters=100 slots=8 frequency=50000 output_dir="" analyse=false dry_run=false
+warmup=16 iters=100 slots=8 frequency=10000 output_dir="" analyse=false dry_run=false
 metrics_set="file:$script_dir/gb200-gemm-metrics.config"
 retry_with_stock=true
 nvcc_bin="${NVCC:-nvcc}" nsys_bin="${NSYS_BIN:-nsys}" python_bin="${PYTHON:-python3}"
