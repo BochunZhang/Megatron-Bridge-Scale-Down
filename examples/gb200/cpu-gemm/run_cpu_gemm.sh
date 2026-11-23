@@ -15,7 +15,7 @@ Usage: bash run_cpu_gemm.sh [options]
   --iters N          Profiled GEMMs per case (default: 100)
   --slots N          Rotate this many sets of buffers (default: 8)
   --frequency HZ     Nsight Systems GPU Metrics frequency (default: 50000)
-  --metrics-set SET  Override the bundled Nsight Systems metric set
+  --metrics-set SET  Choose a metric set explicitly (default: bundled, then gb10x-ct if rejected)
   --output-dir DIR   Result directory (default: results/gb200/cpu-gemm/<timestamp>)
   --dry-run          Show commands without running them
   -h, --help         Show this help
@@ -42,6 +42,7 @@ repo_root="$(cd -- "$script_dir/../../.." && pwd)"
 m=4096 n=2048 k=8192 batches=1,2,4,8,16 gpu=0 numa_node=auto
 warmup=16 iters=100 slots=8 frequency=50000 output_dir="" dry_run=false
 metrics_set="file:$script_dir/gb200-gemm-metrics.config"
+retry_with_stock=true
 nvcc_bin="${NVCC:-nvcc}" nsys_bin="${NSYS_BIN:-nsys}" python_bin="${PYTHON:-python3}"
 
 while (( $# )); do
@@ -61,7 +62,7 @@ while (( $# )); do
                 --iters) iters="$2" ;;
                 --slots) slots="$2" ;;
                 --frequency) frequency="$2" ;;
-                --metrics-set) metrics_set="$2" ;;
+                --metrics-set) metrics_set="$2"; retry_with_stock=false ;;
                 --output-dir) output_dir="$2" ;;
             esac
             shift 2 ;;
@@ -133,21 +134,50 @@ if [[ $numa_node != none ]]; then
     binding=(numactl "--cpunodebind=$numa_node" "--membind=$numa_node")
 fi
 
+profile_case() {
+    local case_dir="$1" case_id="$2" batch="$3"
+    local -a cmd=("$nsys_bin" profile --trace=cuda --sample=none --cpuctxsw=none
+        --capture-range=cudaProfilerApi --capture-range-end=stop
+        "--gpu-metrics-devices=$gpu" "--gpu-metrics-set=$metrics_set" "--gpu-metrics-frequency=$frequency"
+        "--output=$case_dir/profile" env "CUDA_VISIBLE_DEVICES=$gpu_uuid"
+        ${binding[@]+"${binding[@]}"} "$binary" "$case_id" "$m" "$n" "$k" "$batch" "$warmup" "$iters" "$slots")
+    if $dry_run; then
+        show_command "${cmd[@]}"
+    else
+        show_command "${cmd[@]}" > "$case_dir/command.txt" || return
+        "${cmd[@]}" 2>&1 | tee "$case_dir/profile.log"
+    fi
+}
+
+metric_set_rejected() {
+    grep -Fq -e 'Illegal --gpu-metrics-set argument' -e "Metric set alias doesn't match the config file name" "$1"
+}
+
 status=0
 for batch in "${batch_list[@]}"; do
     for case_id in 1 2 3; do
         case_dir="$output_dir/case$case_id-b$batch"
-        cmd=("$nsys_bin" profile --trace=cuda --sample=none --cpuctxsw=none
-            --capture-range=cudaProfilerApi --capture-range-end=stop
-            "--gpu-metrics-devices=$gpu" "--gpu-metrics-set=$metrics_set" "--gpu-metrics-frequency=$frequency"
-            "--output=$case_dir/profile" env "CUDA_VISIBLE_DEVICES=$gpu_uuid"
-            ${binding[@]+"${binding[@]}"} "$binary" "$case_id" "$m" "$n" "$k" "$batch" "$warmup" "$iters" "$slots")
-        if $dry_run; then
-            show_command "${cmd[@]}"
-        else
-            mkdir -- "$case_dir"
-            show_command "${cmd[@]}" > "$case_dir/command.txt"
-            if ! "${cmd[@]}" 2>&1 | tee "$case_dir/profile.log" ||
+        if ! $dry_run; then mkdir -- "$case_dir"; fi
+        profiled=false
+        if profile_case "$case_dir" "$case_id" "$batch"; then
+            profiled=true
+            retry_with_stock=false
+        elif $retry_with_stock && [[ ! -e $case_dir/profile.nsys-rep ]] && metric_set_rejected "$case_dir/profile.log"; then
+            mv -- "$case_dir/profile.log" "$case_dir/profile-custom.log"
+            mv -- "$case_dir/command.txt" "$case_dir/command-custom.txt"
+            metrics_set=gb10x-ct
+            retry_with_stock=false
+            printf 'metrics_set_fallback=%s\n' "$metrics_set" >> "$output_dir/config.txt"
+            printf 'nsys rejected the bundled metric set. Retrying with gb10x-ct (DRAM active cycles %%, C2C GB/s).\n' >&2
+            if profile_case "$case_dir" "$case_id" "$batch"; then profiled=true; fi
+        fi
+        if ! $dry_run; then
+            if ! $profiled && metric_set_rejected "$case_dir/profile.log"; then
+                "$nsys_bin" profile "--gpu-metrics-devices=$gpu" --gpu-metrics-set=help \
+                    > "$output_dir/nsys-gpu-metrics.txt" 2>&1 || true
+                die "nsys rejected $metrics_set. See $case_dir/profile.log and $output_dir/nsys-gpu-metrics.txt"
+            fi
+            if ! $profiled ||
                 ! grep -Fq 'validation=passed' "$case_dir/profile.log" ||
                 [[ ! -s $case_dir/profile.nsys-rep ]]; then
                 printf 'error: capture or validation failed, see %s/profile.log\n' "$case_dir" >&2

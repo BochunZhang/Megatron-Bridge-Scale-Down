@@ -10,7 +10,7 @@ Run `C = A @ B` on one GB200 GPU. `A` has shape `[b,M,K]`, `B` has shape `[K,N]`
 
 ## Run
 
-On a GB200 host with CUDA Toolkit, cuBLAS, Nsight Systems, `numactl`, and Python 3, run from the repository root. The account needs permission to lock the selected GPU's clocks and sample its hardware counters.
+On a GB200 host with CUDA Toolkit, cuBLAS, Nsight Systems, `numactl`, and Python 3, run from the repository root. The account needs permission to lock the selected GPU's clocks and sample its hardware counters. Set `NSYS_BIN` to the path of your Nsight Systems executable if the system `nsys` lacks GB200 metric sets.
 
 ```bash
 bash examples/gb200/cpu-gemm/run_cpu_gemm.sh
@@ -26,5 +26,7 @@ The capture contains only the GEMM loop and its final stream synchronization. In
 Results go under `results/gb200/cpu-gemm/<timestamp>` or `--output-dir DIR`. Each case has a `.nsys-rep`, SQLite export, and log. The analyzer writes `kernels.csv` with individual kernel durations and `summary.csv` with timing and DRAM read/write and C2C RX/TX bandwidth. RX and TX are relative to the GPU. The expected traffic directions are RX in case 2 and TX in case 3.
 
 The bundled GB200 metric set samples DRAM sectors and C2C user bytes. The DRAM counters use 32 bytes per sector. Bandwidth is in decimal GB/s and reflects device-wide sampling during the profiled kernel sequence. Keep other GPU work off the selected GPU during the run. Short kernels can share a sample interval, so use the case-level bandwidth for comparisons. If the profiler or driver cannot collect a counter, inspect `profile.log` and the metric status in `summary.csv`.
+
+If `nsys` rejects the bundled file, the launcher saves that attempt as `profile-custom.log` and retries with the built-in `gb10x-ct` for the sweep. That set reports DRAM read/write as `% active cycles` and C2C RX/TX in GB/s. Use `--metrics-set gb10x-ct --frequency 10000` to select that path directly. If the chosen set is rejected, the launcher saves the supported metric-set list in `nsys-gpu-metrics.txt`.
 
 References [Nsight Systems GPU Metrics](https://docs.nvidia.com/nsight-systems/UserGuide/index.html#gpu-metrics) and [CUDA mapped host memory](https://docs.nvidia.com/cuda/cuda-programming-guide/02-basics/understanding-memory.html#mapped-memory).
