@@ -17,6 +17,7 @@ Usage: bash run_cpu_gemm.sh [options]
   --frequency HZ     Nsight Systems GPU Metrics frequency (default: 50000)
   --metrics-set SET  Choose a metric set explicitly (default: bundled, then gb10x-ct if rejected)
   --output-dir DIR   Result directory (default: results/gb200/cpu-gemm/<timestamp>)
+  --analyse          Export SQLite and generate CSVs on this host (default: capture only)
   --dry-run          Show commands without running them
   -h, --help         Show this help
 
@@ -40,7 +41,7 @@ is_uint() { [[ $1 =~ ^(0|[1-9][0-9]{0,9})$ ]] && (( $1 <= 2147483647 )); }
 script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 repo_root="$(cd -- "$script_dir/../../.." && pwd)"
 m=4096 n=2048 k=8192 batches=1,2,4,8,16 gpu=0 numa_node=auto
-warmup=16 iters=100 slots=8 frequency=50000 output_dir="" dry_run=false
+warmup=16 iters=100 slots=8 frequency=50000 output_dir="" analyse=false dry_run=false
 metrics_set="file:$script_dir/gb200-gemm-metrics.config"
 retry_with_stock=true
 nvcc_bin="${NVCC:-nvcc}" nsys_bin="${NSYS_BIN:-nsys}" python_bin="${PYTHON:-python3}"
@@ -48,6 +49,7 @@ nvcc_bin="${NVCC:-nvcc}" nsys_bin="${NSYS_BIN:-nsys}" python_bin="${PYTHON:-pyth
 while (( $# )); do
     case "$1" in
         -h|--help) usage; exit 0 ;;
+        --analyse) analyse=true; shift ;;
         --dry-run) dry_run=true; shift ;;
         --m|--n|--k|--batches|--gpu|--numa-node|--warmup|--iters|--slots|--frequency|--metrics-set|--output-dir)
             [[ -n ${2:-} && $2 != --* ]] || die "$1 requires a value"
@@ -98,9 +100,12 @@ if $dry_run; then
     show_command "${lock[@]}"
     [[ $numa_node != auto ]] || numa_node='<local Grace NUMA node>'
 else
-    for tool in "$nvcc_bin" "$nsys_bin" "$python_bin" nvidia-smi; do
+    for tool in "$nvcc_bin" "$nsys_bin" nvidia-smi; do
         command -v "$tool" >/dev/null || die "required tool not found: $tool"
     done
+    if $analyse; then
+        command -v "$python_bin" >/dev/null || die "required tool not found: $python_bin"
+    fi
     if [[ $metrics_set == file:* ]]; then
         [[ -r ${metrics_set#file:} ]] || die "metric config is unreadable: ${metrics_set#file:}"
     fi
@@ -185,12 +190,11 @@ for batch in "${batch_list[@]}"; do
                 continue
             fi
         fi
-        if ! run "$nsys_bin" export --type=sqlite "--output=$case_dir/profile.sqlite" "$case_dir/profile.nsys-rep"; then
-            status=1
-        fi
     done
 done
 
-run "$python_bin" "$script_dir/analyse_nsys.py" "$output_dir" --gpu "$gpu" --frequency "$frequency" --iters "$iters" || status=1
+if $analyse; then
+    run "$python_bin" "$script_dir/analyse_nsys.py" "$output_dir" --nsys "$nsys_bin" || status=1
+fi
 printf 'Results directory: %s\n' "$output_dir"
 exit "$status"

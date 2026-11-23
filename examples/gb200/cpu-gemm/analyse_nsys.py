@@ -11,7 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Summarize timed GEMM kernels and GPU metrics from Nsight Systems SQLite exports."""
+"""Summarize timed GEMM kernels and GPU metrics from Nsight Systems captures."""
 
 from __future__ import annotations
 
@@ -22,6 +22,8 @@ import math
 import re
 import sqlite3
 import statistics
+import subprocess
+import tempfile
 from collections import defaultdict
 from contextlib import closing
 from itertools import pairwise
@@ -30,6 +32,7 @@ from pathlib import Path
 
 G_LOGGER = logging.getLogger(__name__)
 CASE_DIR = re.compile(r"case([123])-b([1-9][0-9]*)")
+RUN_SETTING = re.compile(r"(?:^|\s)(gpu|frequency_hz|iters)=([0-9]+)(?=\s|$)")
 METRICS = {
     "dram_read": "DRAM Read Bandwidth",
     "dram_write": "DRAM Write Bandwidth",
@@ -48,6 +51,47 @@ SUMMARY_FIELDS = [
     "error",
 ]
 KERNEL_FIELDS = ["case", "b", "index", "kernel", "start_ns", "duration_us"]
+
+
+def _run_settings(output_dir: Path) -> dict[str, int]:
+    config = output_dir / "config.txt"
+    if not config.is_file():
+        return {}
+    for line in config.read_text(encoding="utf-8", errors="replace").splitlines():
+        if line.startswith("m="):
+            return {name: int(value) for name, value in RUN_SETTING.findall(line)}
+    return {}
+
+
+def _capture_database(case_dir: Path, *, nsys: str | None) -> Path:
+    database = case_dir / "profile.sqlite"
+    if database.is_file() and database.stat().st_size:
+        return database
+    if nsys is None:
+        raise ValueError("profile.sqlite is missing or empty; pass --nsys to export the raw capture")
+    report = case_dir / "profile.nsys-rep"
+    if not report.is_file() or not report.stat().st_size:
+        raise ValueError("profile.nsys-rep is missing or empty")
+    log = case_dir / "profile.log"
+    if not log.is_file() or "validation=passed" not in log.read_text(encoding="utf-8", errors="replace"):
+        raise ValueError("profile.log does not confirm GEMM validation")
+
+    with tempfile.TemporaryDirectory(prefix=".nsys-export-", dir=case_dir) as directory:
+        staged = Path(directory) / database.name
+        result = subprocess.run(
+            [nsys, "export", "--type=sqlite", f"--output={staged}", str(report)],
+            capture_output=True,
+            text=True,
+            errors="replace",
+            check=False,
+        )
+        if result.returncode:
+            detail = result.stderr.strip() or result.stdout.strip()
+            raise ValueError(f"nsys export failed (exit {result.returncode}): {detail}")
+        if not staged.is_file() or not staged.stat().st_size:
+            raise ValueError("nsys export did not produce a SQLite file")
+        staged.replace(database)
+    return database
 
 
 def _bandwidth(
@@ -152,14 +196,21 @@ def main() -> int:
     """Write per-case summaries and kernel durations alongside the captures."""
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("output_dir", type=Path)
-    parser.add_argument("--gpu", type=int, required=True, help="physical Nsight Systems metric device index")
-    parser.add_argument("--frequency", type=int, default=50_000, help="GPU metric sample frequency in Hz")
+    parser.add_argument("--gpu", type=int, help="physical Nsight Systems metric device index")
+    parser.add_argument("--frequency", type=int, help="GPU metric sample frequency in Hz")
     parser.add_argument("--iters", type=int, help="number of timed GEMM calls")
+    parser.add_argument("--nsys", metavar="PATH", help="Nsight Systems executable to export missing SQLite files")
     args = parser.parse_args()
-    if args.gpu < 0 or args.frequency <= 0 or not args.output_dir.is_dir():
-        parser.error("expected a results directory, non-negative GPU index and positive sampling frequency")
-    if args.iters is not None and args.iters <= 0:
-        parser.error("--iters must be positive")
+    if not args.output_dir.is_dir():
+        parser.error("expected a results directory")
+    settings = _run_settings(args.output_dir)
+    gpu = args.gpu if args.gpu is not None else settings.get("gpu")
+    frequency = args.frequency if args.frequency is not None else settings.get("frequency_hz", 50_000)
+    iters = args.iters if args.iters is not None else settings.get("iters")
+    if gpu is None or gpu < 0:
+        parser.error("a non-negative --gpu is required when config.txt has no GPU index")
+    if frequency <= 0 or (iters is not None and iters <= 0):
+        parser.error("sample frequency and iteration count must be positive")
     cases = sorted(
         (int(match[1]), int(match[2]), path)
         for path in args.output_dir.iterdir()
@@ -181,14 +232,14 @@ def main() -> int:
         for case, batch, path in cases:
             try:
                 summary, kernels = _analyse(
-                    path / "profile.sqlite",
+                    _capture_database(path, nsys=args.nsys),
                     case=case,
                     batch=batch,
-                    gpu=args.gpu,
-                    period_ns=1e9 / args.frequency,
-                    iters=args.iters,
+                    gpu=gpu,
+                    period_ns=1e9 / frequency,
+                    iters=iters,
                 )
-            except (sqlite3.Error, ValueError) as exc:
+            except (OSError, sqlite3.Error, ValueError) as exc:
                 summary, kernels = {"case": case, "b": batch, "error": str(exc)}, []
             if summary["error"]:
                 G_LOGGER.error("%s: %s", path.name, summary["error"])
