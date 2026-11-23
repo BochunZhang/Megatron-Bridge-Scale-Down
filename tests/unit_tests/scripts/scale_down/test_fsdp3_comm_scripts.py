@@ -2,6 +2,7 @@
 
 """Dry-run tests for 01-analyse/04-fsdp3-comm."""
 
+import json
 import os
 import shlex
 import subprocess
@@ -14,6 +15,7 @@ import pytest
 REPO_ROOT = Path(__file__).resolve().parents[4]
 EXAMPLE = REPO_ROOT / "examples/scale-down/01-analyse/04-fsdp3-comm"
 BENCHMARK = EXAMPLE / "benchmark_fsdp3.sh"
+SUITE = EXAMPLE / "benchmark_fsdp3_suite.sh"
 ALL_STUDIES = EXAMPLE / "benchmark_fsdp3_all.sh"
 RUN_ONE = EXAMPLE / "run_pretrain_fsdp3.sh"
 FSDP_STUDY = EXAMPLE / "01-baseline/03_fsdp3.sh"
@@ -1081,6 +1083,94 @@ def test_cpu_grad_accumulation_and_cpu_adamw_launch(tmp_path: Path):
     assert "ddp.fsdp_cpu_optimizer=true" in adam_args
     assert "ddp.data_parallel_sharding_strategy=optim_grads_params" in adam_args
     assert "-cpu_grad_accum-cpu_adamw" in adam_command
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("value", [(), ("",), ("0",), ("-2",), ("01",), ("1.5",)])
+def test_torch_thread_rejects_invalid_counts(value: tuple[str, ...]) -> None:
+    result = _run(RUN_ONE, "--model", "27b", "--seq", "256", "--dry-run", "--torch-thread", *value)
+    assert result.returncode == 2
+    assert "--torch-thread" in result.stderr
+    assert not _commands(result.stderr)
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    ("script", "options"),
+    [
+        (BENCHMARK, ("--model", "27b", "--fsdp", "3", "--seq", "256")),
+        (EXAMPLE / "03-cpu-offload/02_cpu_grad_optimizer.sh", ("--model", "27b")),
+        (EXAMPLE / "04-nvme/01_dram_vs_nvme.sh", ("--model", "27b")),
+        (SUITE, ("--model", "27b", "--items", "07,08", "--nvme-path", "/scratch/torch-thread-test")),
+        (ALL_STUDIES, ()),
+    ],
+    ids=["benchmark", "cpu-optimizer", "nvme", "suite", "all"],
+)
+def test_torch_thread_forwards_through_benchmarks(tmp_path: Path, script: Path, options: tuple[str, ...]) -> None:
+    result = _run(
+        script, "--dry-run", "--torch-thread", "12", "--output-dir", str(tmp_path), *options, NVME_PATH="", NCCL_LIB=""
+    )
+    assert result.returncode == 0, result.stderr
+    commands = _commands(result.stderr)
+    assert commands
+    for command in commands:
+        args = shlex.split(command)
+        worker_args = args[args.index("--no-python") + 1 :]
+        assert "OMP_NUM_THREADS=12" in worker_args
+        assert "MKL_NUM_THREADS=12" in worker_args
+        assert "-torch_thread_12" in _node_dir(command).parent.name
+        if any(arg.startswith("--output=") for arg in args):
+            assert "-torch_thread_12" in _report_base(command).name
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("threads", [None, 12])
+def test_torch_thread_applies_after_numarun(
+    tmp_path: Path, fake_nsys_env: dict[str, str], threads: int | None
+) -> None:
+    fake_numarun = tmp_path / "numarun"
+    fake_numarun.write_text('#!/bin/sh\nexport OMP_NUM_THREADS=9 MKL_NUM_THREADS=10\nexec "$@"\n')
+    fake_numarun.chmod(0o755)
+    fake_uv = tmp_path / "uv"
+    fake_uv.write_text(
+        "#!/bin/sh\n"
+        '[ "$1 $2 $3" = "run --no-sync python" ] || exit 2\n'
+        "shift 3\n"
+        'if [ "$1 $2" = "-m torch.distributed.run" ]; then\n'
+        '  while [ "$#" -gt 0 ] && [ "$1" != --no-python ]; do shift; done\n'
+        '  [ "$#" -gt 1 ] || exit 2\n'
+        "  shift\n"
+        '  exec "$@"\n'
+        "fi\n"
+        'printf "%s,%s\\n" "$OMP_NUM_THREADS" "$MKL_NUM_THREADS"\n'
+    )
+    fake_uv.chmod(0o755)
+    thread_options = () if threads is None else ("--torch-thread", str(threads))
+    results = tmp_path / "results"
+    result = _run(
+        RUN_ONE,
+        "--model",
+        "27b",
+        "--seq",
+        "256",
+        "--profile",
+        "none",
+        "--results-root",
+        str(results),
+        *thread_options,
+        **fake_nsys_env,
+    )
+    assert result.returncode == 0, result.stderr
+    (manifest,) = results.glob("*/node0/launch.json")
+    assert json.loads(manifest.read_text())["torch_thread"] == threads
+    node = manifest.parent
+    if threads is None:
+        assert "-torch_thread_" not in node.parent.name
+        assert (node / "train.log").read_text() == "9,10\n"
+    else:
+        assert "-torch_thread_12" in node.parent.name
+        assert "torch_thread=12" in (node / "run_info.txt").read_text().split()
+        assert (node / "train.log").read_text() == "12,12\n"
 
 
 def test_nvme_offload_preserves_the_path_and_enables_nvtx(tmp_path: Path):

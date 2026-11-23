@@ -50,6 +50,7 @@ TP_COMM_OVERLAP=false
 SYMMETRIC=false
 OFFLOAD=""
 OFFLOAD_ARGS=()
+TORCH_THREAD=""
 DDP_OVERLAP=false
 MERGE_GRAPHS=false
 UNLOCK_GPU_CLOCKS=false
@@ -108,6 +109,7 @@ Options:
   --offload MODULE[,MODULE...]  CPU offload for optimizer, weight, and/or gradient in each case
   --cpu-grad-accumulation       Accumulate reduced gradient shards on CPU in each case
   --cpu-optimizer               CPU AdamW and host gradient accumulation in each case
+  --torch-thread N              PyTorch CPU intra-op threads per rank in each case
   --nvme-path DIR               Native NVMe AIO offload in each case (requires FSDP3)
   --profile none|nsys|pytorch   Profiling mode (default: nsys); --nsys is an alias
   --metric [HZ]                 Enable nsys GPU metrics on all GPUs on node 0
@@ -143,6 +145,11 @@ while [[ $# -gt 0 ]]; do
         --separate-rs) SEPARATE_RS=true; shift;;
         --symmetric) SYMMETRIC=true; shift;;
         --cpu-grad-accumulation|--cpu-optimizer) OFFLOAD_ARGS+=("$1"); shift;;
+        --torch-thread)
+            need_value "$@"
+            [[ "$2" =~ ^[1-9][0-9]*$ ]] || { echo "--torch-thread must be a positive integer" >&2; exit 2; }
+            TORCH_THREAD="$2"
+            shift 2;;
         --nvme-path) need_value "$@"; OFFLOAD_ARGS+=("$1" "$2"); shift 2;;
         --offload) need_value "$@"; OFFLOAD="$2"; [[ -n "${OFFLOAD}" ]] || { echo "--offload requires a module list" >&2; exit 2; }; shift 2;;
         --tp) need_value "$@"; parse_csv "$2" TP_SIZES; shift 2;;
@@ -237,6 +244,7 @@ case_args() {
     [[ "${SYMMETRIC}" == true && "${fsdp}" != ddp ]] && ARGS+=(--symmetric)
     [[ -n "${OFFLOAD}" ]] && ARGS+=(--offload "${OFFLOAD}")
     if (( ${#OFFLOAD_ARGS[@]} )); then ARGS+=("${OFFLOAD_ARGS[@]}"); fi
+    [[ -n "${TORCH_THREAD}" ]] && ARGS+=(--torch-thread "${TORCH_THREAD}")
     [[ "${DDP_OVERLAP}" == true && "${fsdp}" == ddp ]] && ARGS+=(--ddp-overlap)
     [[ -n "${METRIC_ARG}" ]] && ARGS+=("${METRIC_ARG}")
     [[ "${MERGE_GRAPHS}" == true ]] && ARGS+=(--merge)

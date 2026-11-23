@@ -15,6 +15,7 @@ MODELS=(27b 2.4t)
 if [[ "${GROUP}" == 05-nccl ]]; then MODELS=(27b); fi
 LAUNCHER=("${BENCHMARK_DIR}/run_pretrain_fsdp3.sh")
 UNLOCK_GPU_CLOCKS=false
+TORCH_THREADS=""
 DRY_RUN=false
 PRINT_CASE_DIRS=false
 RESUME_CASES=false
@@ -28,7 +29,7 @@ fail() { echo "$*" >&2; exit 2; }
 
 while (( $# )); do
     case "$1" in
-        --model|--output-dir|--nvme-path|--nccl-lib|--fsdp|--profile)
+        --model|--output-dir|--nvme-path|--nccl-lib|--fsdp|--profile|--torch-thread)
             [[ -n "${2:-}" && "$2" != --* ]] || fail "Missing value for $1"
             case "$1" in
                 --model)
@@ -36,6 +37,9 @@ while (( $# )); do
                     [[ "${GROUP}" != 05-nccl || "$2" == 27b ]] || fail "05-nccl uses only the 27b model"
                     MODELS=("$2");;
                 --output-dir) OUTPUT_DIR="$2";;
+                --torch-thread)
+                    [[ "$2" =~ ^[1-9][0-9]*$ ]] || fail "--torch-thread must be a positive integer"
+                    TORCH_THREADS="$2";;
                 --profile)
                     [[ "${GROUP}" == 02-comm-overlap ]] || fail "--profile applies to 02-comm-overlap"
                     [[ "$2" == nsys || "$2" == pytorch ]] || fail "--profile must be nsys or pytorch"
@@ -57,8 +61,9 @@ while (( $# )); do
         --dry-run) DRY_RUN=true; shift;;
         --print-case-dirs) PRINT_CASE_DIRS=true; shift;;
         -h|--help)
-            printf 'Usage: %s [--model 27b|2.4t] [--output-dir DIR] [--unlock] [--dry-run | --print-case-dirs]\n' "$0"
+            printf 'Usage: %s [--model 27b|2.4t] [--output-dir DIR] [--torch-thread N] [--unlock] [--dry-run | --print-case-dirs]\n' "$0"
             echo '  --unlock    Restore automatic GPU clocks (TDP lock by default)'
+            echo '  --torch-thread N    Set PyTorch intra-op threads per rank for every case'
             if [[ "${STUDY_SCRIPT}" == 02_mbs.sh ]]; then
                 echo '  --fsdp 1|3    MBS sweep sharding level (default: 1, synchronous parameter AG in optimizer step)'
             fi
@@ -98,6 +103,7 @@ run_case() {
         --profile "${STUDY_PROFILE}" --train-iters 10 --profile-start 7 --profile-end 8
         --results-root "${OUTPUT_DIR}/${result_group}" "${result_args[@]}" "$@")
     [[ "${UNLOCK_GPU_CLOCKS}" == true ]] && args+=(--unlock)
+    [[ -n "${TORCH_THREADS}" ]] && args+=(--torch-thread "${TORCH_THREADS}")
     local label="${result_group}${name:+/${name}} model=${model} fsdp=${fsdp} graph=${graph} tp=${tp} cp=${cp} mbs=${mbs} seq=${seq} profile=${STUDY_PROFILE}"
     local case_dir=""
     local claim_dir=""

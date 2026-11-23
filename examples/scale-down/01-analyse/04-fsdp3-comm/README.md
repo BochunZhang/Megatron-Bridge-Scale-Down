@@ -218,13 +218,15 @@ common=(--model 27b --fsdp 3 --num-layers 4 --seq 256 --num-microbatches 4 --pro
 bash "$launcher" "${common[@]}" --offload optimizer,weight,gradient
 
 # 同一组卸载组件，改在 CPU 累加和更新
-bash "$launcher" "${common[@]}" --cpu-optimizer --offload weight
+bash "$launcher" "${common[@]}" --cpu-optimizer --offload weight --torch-thread 8
 
 # 同一组 CPU 运算，使用本机 NVMe 保存 shard
 bash "$launcher" "${common[@]}" --nvme-path /mnt/local-nvme/megatron-swap
 ```
 
 单独使用 `--cpu-grad-accumulation` 可保留 GPU optimizer，用于比较梯度累加的位置。CPU 端按通信 dtype 的最大 shard 尺寸分配两个 pinned 槽位，D2H 完成后由 CPU worker 累加到 main grad，两个操作完成后才复用该槽位。梯度同步、unscale、范数和裁剪沿用 Megatron 的 GPU 路径。每步结束会回载梯度到 GPU，CPU AdamW 再按 bucket 收取裁剪后的 shard。CPU AdamW 和 NVMe 用 eager BF16 FSDP3，单独的 CPU 梯度累加也支持 eager FSDP2。
+
+`--torch-thread N` 设置每个训练 rank 的 PyTorch CPU 算子内线程数，适用于梯度累加的 `copy_` / `add_` 和 CPU AdamW，也作用于该进程内的其他 PyTorch CPU 算子。启动器在 NUMA 包装器之后设置 `OMP_NUM_THREADS` 和 `MKL_NUM_THREADS`。省略参数时继承训练进程原有的环境。显式设置的值记在 `launch.json` 和 `run_info.txt`，结果目录和报告名带 `-torch_thread_N`，可分别续跑不同线程数的实验。单个 case、sweep、编号实验脚本和聚合入口都接受此参数。
 
 NVMe 模式需要 Linux、已编译的 Megatron-LM `megatron_nvme_aio` 扩展及支持 direct I/O 的本地 NVMe 目录。每个 rank 在该目录内创建独立的临时 swap 子目录。计算权重、FP32 master、累加梯度和 Adam 一阶/二阶矩分别按 bucket 交换，Adam 的步数留在 CPU。读取权重时复用 FSDP 的 all-gather 预取顺序，梯度最终回载也提前提交下一 bucket 的磁盘读取。正常进程退出会清理临时目录。
 

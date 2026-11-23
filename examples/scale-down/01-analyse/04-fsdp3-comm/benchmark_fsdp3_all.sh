@@ -8,24 +8,31 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/../../../.." && pwd)"
 CLOCK_MODE=tdp
 DRY_RUN=false
+TORCH_THREADS=""
 
 usage() {
     cat <<'USAGE'
-Usage: benchmark_fsdp3_all.sh [--output-dir DIR] [--unlock] [--dry-run]
+Usage: benchmark_fsdp3_all.sh [--output-dir DIR] [--torch-thread N] [--unlock] [--dry-run]
 
 Run all numbered FSDP3 communication studies in order on one 4-GPU GB200 node.
 Each new case locks GPU clocks to TDP by default. Use --unlock for automatic clocks.
 Defaults to results/01-analyse/04-fsdp3-comm-tdp (-unlocked with --unlock).
 Use NVME_PATH and NCCL_LIB to override the NVMe scratch path and patched NCCL library.
+Pass --torch-thread N to set PyTorch intra-op threads per rank for every case.
 Use --dry-run to preview every case without launching training or changing clocks.
 USAGE
 }
 
 while (( $# )); do
     case "$1" in
-        --output-dir)
+        --output-dir|--torch-thread)
             [[ -n "${2:-}" && "$2" != --* ]] || { echo "Missing value for $1" >&2; exit 2; }
-            OUTPUT_DIR="$2"
+            case "$1" in
+                --output-dir) OUTPUT_DIR="$2";;
+                --torch-thread)
+                    [[ "$2" =~ ^[1-9][0-9]*$ ]] || { echo "--torch-thread must be a positive integer" >&2; exit 2; }
+                    TORCH_THREADS="$2";;
+            esac
             shift 2;;
         --unlock) CLOCK_MODE=unlocked; shift;;
         --dry-run) DRY_RUN=true; shift;;
@@ -36,6 +43,7 @@ done
 
 OUTPUT_DIR="${OUTPUT_DIR:-${REPO_ROOT}/results/01-analyse/04-fsdp3-comm-${CLOCK_MODE}}"
 ARGS=(--output-dir "${OUTPUT_DIR}")
+if [[ -n "${TORCH_THREADS}" ]]; then ARGS+=(--torch-thread "${TORCH_THREADS}"); fi
 if [[ "${CLOCK_MODE}" == unlocked ]]; then ARGS+=(--unlock); fi
 if [[ "${DRY_RUN}" == true ]]; then ARGS+=(--dry-run); fi
 

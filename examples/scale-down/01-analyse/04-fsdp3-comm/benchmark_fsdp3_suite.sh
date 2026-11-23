@@ -11,16 +11,19 @@ NVME_PATH="${NVME_PATH:-}"
 ITEMS=01,02,03,04,05,06,07,08
 MODELS=(27b 2.4t)
 MODE_ARGS=(--resume)
+TORCH_THREADS=""
 
 usage() {
     cat <<'USAGE'
 Usage: benchmark_fsdp3_suite.sh [--items 01,02,...] [--model 27b|2.4t]
-                               [--nvme-path DIR] [--output-dir DIR] [--unlock] [--dry-run]
+                               [--nvme-path DIR] [--output-dir DIR] [--torch-thread N]
+                               [--unlock] [--dry-run]
 
 Runs on one 4-GPU GB200 tray. Both cropped models use BF16, full attention,
 GBS=8, MBS=1,2,4 and sequence lengths 4096,8192,16384. MoE uses 64 experts
 and EP=4. Nsight Systems traces CUDA/NVTX at step 7 without GPU metric sampling.
 GPU clocks are locked to TDP by default. Pass --unlock to restore automatic GPU clocks.
+Pass --torch-thread N to set PyTorch intra-op threads per rank for every case.
 
   01-cuda-graph               FSDP3 eager vs CUDA graph
   02-ddp-cp-tp                DDP graphs at baseline, CP=2/4 and TP=2/4
@@ -45,7 +48,7 @@ USAGE
 
 while (( $# )); do
     case "$1" in
-        --items|--model|--nvme-path|--output-dir)
+        --items|--model|--nvme-path|--output-dir|--torch-thread)
             [[ -n "${2:-}" && "$2" != --* ]] || { echo "Missing value for $1" >&2; exit 2; }
             case "$1" in
                 --items) ITEMS="$2";;
@@ -54,6 +57,9 @@ while (( $# )); do
                     MODELS=("$2");;
                 --nvme-path) NVME_PATH="$2";;
                 --output-dir) OUTPUT_DIR="$2";;
+                --torch-thread)
+                    [[ "$2" =~ ^[1-9][0-9]*$ ]] || { echo "--torch-thread must be a positive integer" >&2; exit 2; }
+                    TORCH_THREADS="$2";;
             esac
             shift 2;;
         --unlock|--dry-run) MODE_ARGS+=("$1"); shift;;
@@ -62,6 +68,7 @@ while (( $# )); do
     esac
 done
 [[ "${ITEMS}" =~ ^0[1-8](,0[1-8])*$ ]] || { echo "--items expects a comma-separated list of 01 through 08" >&2; exit 2; }
+if [[ -n "${TORCH_THREADS}" ]]; then MODE_ARGS+=(--torch-thread "${TORCH_THREADS}"); fi
 
 NORMAL_PRIORITY=(--override 'dist.high_priority_stream_groups=[]')
 HIGH_PRIORITY=(--override 'dist.high_priority_stream_groups=[dp_cp,ep_dp]')

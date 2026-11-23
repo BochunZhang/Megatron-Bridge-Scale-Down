@@ -46,6 +46,7 @@ SYMMETRIC=false
 OFFLOAD=""
 CPU_GRAD_ACCUMULATION=false
 CPU_OPTIMIZER=false
+TORCH_THREAD=""
 NVME_PATH=""
 DDP_OVERLAP=false
 HYBRIDEP_NUM_SMS="${HYBRIDEP_NUM_SMS:-32}"
@@ -149,6 +150,8 @@ Options:
   --master-port N                Multi-node rendezvous port (default: 29501)
   --cpu-grad-accumulation        Stage reduced shards in pinned MaxPool double buffers and accumulate on CPU
   --cpu-optimizer                Run AdamW on CPU; implies optimizer and gradient offload
+  --torch-thread N               PyTorch CPU intra-op threads per rank, including CPU
+                                 gradient accumulation and AdamW (default: inherit)
   --local-attention-graph        Use native attention-only graphs with --cuda-graph on,
                                  BF16 FSDP1 or FSDP3 and TP=1 (including on dense models)
   --label-dtype-and-dp            Label BF16 explicitly, add DP size to the report name
@@ -216,6 +219,11 @@ while [[ $# -gt 0 ]]; do
         --symmetric) SYMMETRIC=true; shift;;
         --cpu-grad-accumulation) CPU_GRAD_ACCUMULATION=true; shift;;
         --cpu-optimizer) CPU_OPTIMIZER=true; shift;;
+        --torch-thread)
+            need_value "$@"
+            [[ "$2" =~ ^[1-9][0-9]*$ ]] || { echo "--torch-thread must be a positive integer" >&2; exit 2; }
+            TORCH_THREAD="$2"
+            shift 2;;
         --nvme-path) need_value "$@"; NVME_PATH="$2"; [[ -n "${NVME_PATH}" ]] || { echo "--nvme-path requires a directory" >&2; exit 2; }; shift 2;;
         --offload) need_value "$@"; OFFLOAD="$2"; [[ -n "${OFFLOAD}" ]] || { echo "--offload requires a module list" >&2; exit 2; }; shift 2;;
         --local-attention-graph) LOCAL_ATTENTION_GRAPH=true; shift;;
@@ -494,6 +502,7 @@ CG_TAG="${CUDA_GRAPH}"
 [[ "${GRAPH_IMPL}" == local && "${GRAPH_MODULES}" == *moe_router* ]] && CG_TAG+="-moe"
 [[ "${GRAPH_TRACE}" == graph ]] && CG_TAG+="-merge"
 METRIC_TAG="${METRIC_FREQUENCY:+-metric_${METRIC_FREQUENCY}}"
+TORCH_THREAD_TAG="${TORCH_THREAD:+-torch_thread_${TORCH_THREAD}}"
 CASE_TAG="-date_${RUN_DATE}"
 if [[ "${STABLE_RESULT_DIR}" == true ]]; then
     [[ -z "${RUN_NAME}" || "${RUN_NAME}" =~ ^[a-zA-Z0-9_-]+$ ]] || {
@@ -502,7 +511,7 @@ if [[ "${STABLE_RESULT_DIR}" == true ]]; then
     }
     CASE_TAG="${RUN_NAME:+-${RUN_NAME}}"
 fi
-CASE_NAME="model_${MODEL}-${DP_TAG}${OVERLAP_TAG}${DTYPE_TAG}-layers_${LAYERS_TAG}${ATTN_TAG}-mtp_${MTP_TAG}-experts_${EXPERTS_TAG}-cg_${CG_TAG}-mbs_${MICRO_BATCH_SIZE}-seq_${SEQ_LENGTH}${TP_TAG}-cp_${CONTEXT_PARALLEL}-ep_${EXPERT_PARALLEL}-disp_${DISPATCHER}-gbs_${GLOBAL_BATCH_SIZE}-gpus_${GPU_COUNT}-profile_${PROFILE}${CASE_TAG}${OFFLOAD_TAG}${METRIC_TAG}"
+CASE_NAME="model_${MODEL}-${DP_TAG}${OVERLAP_TAG}${DTYPE_TAG}-layers_${LAYERS_TAG}${ATTN_TAG}-mtp_${MTP_TAG}-experts_${EXPERTS_TAG}-cg_${CG_TAG}-mbs_${MICRO_BATCH_SIZE}-seq_${SEQ_LENGTH}${TP_TAG}-cp_${CONTEXT_PARALLEL}-ep_${EXPERT_PARALLEL}-disp_${DISPATCHER}-gbs_${GLOBAL_BATCH_SIZE}-gpus_${GPU_COUNT}-profile_${PROFILE}${CASE_TAG}${OFFLOAD_TAG}${TORCH_THREAD_TAG}${METRIC_TAG}"
 RESULT_DIR="${RESULTS_ROOT}/${CASE_NAME}/node${NODE_RANK}"
 if [[ "${PRINT_RESULT_DIR}" == true ]]; then
     printf '%s\n' "${RESULT_DIR}"
@@ -510,7 +519,7 @@ if [[ "${PRINT_RESULT_DIR}" == true ]]; then
 fi
 # nsys report name, e.g. qwen35_27b-fsdp_3-mxfp8-experts_0-cg_off-tp_2-cp_1-ep_1-mbs_1-gbs_8-seq_4k.
 if (( SEQ_LENGTH % 1024 == 0 )); then SEQ_TAG="$((SEQ_LENGTH / 1024))k"; else SEQ_TAG="${SEQ_LENGTH}"; fi
-NSYS_NAME="${MODEL_TAG}-${DP_TAG}${OVERLAP_TAG}${DTYPE_TAG}${ATTN_TAG}-experts_${EXPERTS_TAG}-cg_${CG_TAG}${TP_TAG}-cp_${CONTEXT_PARALLEL}-ep_${EXPERT_PARALLEL}-mbs_${MICRO_BATCH_SIZE}-gbs_${GLOBAL_BATCH_SIZE}-seq_${SEQ_TAG}${OFFLOAD_TAG}${METRIC_TAG}"
+NSYS_NAME="${MODEL_TAG}-${DP_TAG}${OVERLAP_TAG}${DTYPE_TAG}${ATTN_TAG}-experts_${EXPERTS_TAG}-cg_${CG_TAG}${TP_TAG}-cp_${CONTEXT_PARALLEL}-ep_${EXPERT_PARALLEL}-mbs_${MICRO_BATCH_SIZE}-gbs_${GLOBAL_BATCH_SIZE}-seq_${SEQ_TAG}${OFFLOAD_TAG}${TORCH_THREAD_TAG}${METRIC_TAG}"
 if [[ "${LABEL_DTYPE_AND_DP}" == true ]]; then
     NSYS_NAME+="-dp_${DATA_PARALLEL}"
 fi
@@ -746,12 +755,20 @@ COMMAND+=(uv run --no-sync python -m torch.distributed.run "${DIST_ARGS[@]}" --n
 if (( ${#NUMA_WRAPPER[@]} > 0 )); then
     COMMAND+=("${NUMA_WRAPPER[@]}")
 fi
+WORKER_ENV=()
 if [[ -n "${MEGATRON_LM_DIR:-}" ]]; then
     [[ -d "${MEGATRON_LM_DIR}/megatron/core" ]] || {
         echo "MEGATRON_LM_DIR does not contain megatron/core" >&2; exit 2
     }
     MLM_SOURCE="$(cd "${MEGATRON_LM_DIR}" && pwd)"
-    COMMAND+=(env "PYTHONPATH=${MLM_SOURCE}${PYTHONPATH:+:${PYTHONPATH}}")
+    WORKER_ENV+=("PYTHONPATH=${MLM_SOURCE}${PYTHONPATH:+:${PYTHONPATH}}")
+fi
+if [[ -n "${TORCH_THREAD}" ]]; then
+    # numarun may set its own thread defaults. Apply the override inside each bound rank.
+    WORKER_ENV+=("OMP_NUM_THREADS=${TORCH_THREAD}" "MKL_NUM_THREADS=${TORCH_THREAD}")
+fi
+if (( ${#WORKER_ENV[@]} > 0 )); then
+    COMMAND+=(env "${WORKER_ENV[@]}")
 fi
 COMMAND+=(uv run --no-sync python "${TRAIN_ARGS[@]}")
 GPU_CLOCK_MODE=$(gpu_clock_mode "${UNLOCK_GPU_CLOCKS}")
@@ -766,6 +783,7 @@ INFO=(
     "num_microbatches=${NUM_MICROBATCHES}" "numa=${NUMA_MODE}" "offload=${OFFLOAD:-none}"
     "cpu_grad_accumulation=${CPU_GRAD_ACCUMULATION}" "cpu_optimizer=${CPU_OPTIMIZER}" "nvme=$([[ -n ${NVME_PATH} ]] && echo true || echo false)"
 )
+[[ -n "${TORCH_THREAD}" ]] && INFO+=("torch_thread=${TORCH_THREAD}")
 if [[ "${DRY_RUN}" == true ]]; then
     printf '%s\n' "${INFO[*]}" >&2
     printf 'gpu_clocks=%s\n' "${GPU_CLOCK_MODE}" >&2
@@ -801,7 +819,7 @@ printf 'command:' >"${RESULT_DIR}/command.txt"
 printf ' %q' "${COMMAND[@]}" >>"${RESULT_DIR}/command.txt"
 printf '\n' >>"${RESULT_DIR}/command.txt"
 cat >"${RESULT_DIR}/launch.json" <<JSON
-{"model":"${MODEL_ID}","recipe":"${RECIPE}","run_name":"${RUN_NAME}","dtype":"${DTYPE}","fsdp":${FSDP_JSON},"fsdp_cpu_offload":${OFFLOAD_JSON},"fsdp_cpu_grad_accumulation":${CPU_GRAD_ACCUMULATION},"fsdp_cpu_optimizer":${CPU_OPTIMIZER},"fsdp_nvme":$([[ -n ${NVME_PATH} ]] && echo true || echo false),"data_parallel":"${DP_TAG}","create_all_gather_group":${OVERLAP},"create_reduce_scatter_group":${SEPARATE_RS},"nccl_ub":${SYMMETRIC},"num_layers":"${LAYERS_TAG}","attention":"${ATTENTION}","linear_attention_freq":"${LINEAR_ATTENTION_FREQ}","mtp_num_layers":${MTP_TAG},"num_moe_experts":"${EXPERTS_TAG}","force_balance":${FORCE_BALANCE},"cuda_graph":"${CUDA_GRAPH}","cuda_graph_impl":"${GRAPH_IMPL}","cuda_graph_modules":"${GRAPH_MODULES}","cuda_graph_trace":"${GRAPH_TRACE}","seq_length":${SEQ_LENGTH},"tensor_model_parallel_size":${TENSOR_PARALLEL},"sequence_parallel":${SEQUENCE_PARALLEL},"context_parallel_size":${CONTEXT_PARALLEL},"data_parallel_size":${DATA_PARALLEL},"expert_model_parallel_size":${EXPERT_PARALLEL},"dispatcher":"${DISPATCHER}","micro_batch_size":${MICRO_BATCH_SIZE},"global_batch_size":${GLOBAL_BATCH_SIZE},"num_microbatches":${NUM_MICROBATCHES},"gpu_count":${GPU_COUNT},"gpu_clocks":"${GPU_CLOCK_MODE}","nnodes":${NNODES},"node_rank":${NODE_RANK},"numa_mode":"${NUMA_MODE}","pytorch_cuda_alloc_conf":"${PYTORCH_CUDA_ALLOC_CONF:-}","nccl_graph_register":"${NCCL_GRAPH_REGISTER:-}","nccl_nvls_enable":"${NCCL_NVLS_ENABLE:-}","nvte_cutedsl_fused_grouped_mlp":"${NVTE_CUTEDSL_FUSED_GROUPED_MLP:-}","run_date":"${RUN_DATE}"}
+{"torch_thread":${TORCH_THREAD:-null},"model":"${MODEL_ID}","recipe":"${RECIPE}","run_name":"${RUN_NAME}","dtype":"${DTYPE}","fsdp":${FSDP_JSON},"fsdp_cpu_offload":${OFFLOAD_JSON},"fsdp_cpu_grad_accumulation":${CPU_GRAD_ACCUMULATION},"fsdp_cpu_optimizer":${CPU_OPTIMIZER},"fsdp_nvme":$([[ -n ${NVME_PATH} ]] && echo true || echo false),"data_parallel":"${DP_TAG}","create_all_gather_group":${OVERLAP},"create_reduce_scatter_group":${SEPARATE_RS},"nccl_ub":${SYMMETRIC},"num_layers":"${LAYERS_TAG}","attention":"${ATTENTION}","linear_attention_freq":"${LINEAR_ATTENTION_FREQ}","mtp_num_layers":${MTP_TAG},"num_moe_experts":"${EXPERTS_TAG}","force_balance":${FORCE_BALANCE},"cuda_graph":"${CUDA_GRAPH}","cuda_graph_impl":"${GRAPH_IMPL}","cuda_graph_modules":"${GRAPH_MODULES}","cuda_graph_trace":"${GRAPH_TRACE}","seq_length":${SEQ_LENGTH},"tensor_model_parallel_size":${TENSOR_PARALLEL},"sequence_parallel":${SEQUENCE_PARALLEL},"context_parallel_size":${CONTEXT_PARALLEL},"data_parallel_size":${DATA_PARALLEL},"expert_model_parallel_size":${EXPERT_PARALLEL},"dispatcher":"${DISPATCHER}","micro_batch_size":${MICRO_BATCH_SIZE},"global_batch_size":${GLOBAL_BATCH_SIZE},"num_microbatches":${NUM_MICROBATCHES},"gpu_count":${GPU_COUNT},"gpu_clocks":"${GPU_CLOCK_MODE}","nnodes":${NNODES},"node_rank":${NODE_RANK},"numa_mode":"${NUMA_MODE}","pytorch_cuda_alloc_conf":"${PYTORCH_CUDA_ALLOC_CONF:-}","nccl_graph_register":"${NCCL_GRAPH_REGISTER:-}","nccl_nvls_enable":"${NCCL_NVLS_ENABLE:-}","nvte_cutedsl_fused_grouped_mlp":"${NVTE_CUTEDSL_FUSED_GROUPED_MLP:-}","run_date":"${RUN_DATE}"}
 JSON
 printf '%s\n' "${INFO[*]}" | tee "${RESULT_DIR}/run_info.txt"
 printf 'gpu_clocks=%s\n' "${GPU_CLOCK_MODE}" >>"${RESULT_DIR}/run_info.txt"
