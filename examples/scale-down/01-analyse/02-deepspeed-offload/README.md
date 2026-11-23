@@ -107,6 +107,14 @@ bash examples/scale-down/01-analyse/02-deepspeed-offload/pretrain_experiment.sh 
 
 观察 4 卡 ZeRO-3 + SuperOffload 下,backward 期间参数 all-gather(prefetch)与梯度 reduce-scatter 能否被计算掩盖,以及参数卸载到 CPU 后的变化:
 
+在 GB200 的 DeepSpeed 训练环境中，可直接运行下面的脚本采集 dense 对照。脚本校验 Nsight Systems 2026.6.1，按 GPU UUID 把前四张 CUDA 可见卡锁到 TDP，并用同一组卡采集 `param_gpu` 和 `param_cpu`。需要锁频权限，可用 `NSYS_BIN` 指定同版本的安装路径。
+
+```bash
+bash examples/scale-down/01-analyse/02-deepspeed-offload/run_superoffload_nsys.sh
+```
+
+默认输出到 `results/01-analyse/02-deepspeed-nsys/<timestamp>/`，包含两份 `nsys_trace.nsys-rep`、运行配置和锁频日志。`--dry-run` 可预览命令。
+
 ```bash
 # Dense
 bash examples/scale-down/01-analyse/02-deepspeed-offload/pretrain_experiment.sh \

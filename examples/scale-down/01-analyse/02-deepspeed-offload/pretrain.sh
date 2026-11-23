@@ -305,7 +305,11 @@ echo "================================================"
 # stops CUDA capture at the fixed step range supplied by the experiment driver.
 # NUMARUN prefixes deepspeed to bind the process to the correct NUMA node;
 # expand to empty (NUMARUN=) to launch deepspeed directly.
-CMD=(deepspeed "--num_gpus=$NUM_GPUS")
+if [ -n "${DEEPSPEED_LOCAL_GPU_IDS:-}" ]; then
+    CMD=(deepspeed --hostfile /dev/null --include "localhost:$DEEPSPEED_LOCAL_GPU_IDS")
+else
+    CMD=(deepspeed "--num_gpus=$NUM_GPUS")
+fi
 if [ "$bind_cores" = "true" ]; then
     CMD+=(--bind_cores_to_rank)
 fi
@@ -356,7 +360,7 @@ fi
 if [ "$PROFILE_MODE" = "nsys" ]; then
     NSYS_OUTPUT="${RUN_DIR}/nsys_trace"
     CMD=(
-        nsys profile
+        "${NSYS_BIN:-nsys}" profile
         -s none
         -t nvtx,cuda
         -o "$NSYS_OUTPUT"
