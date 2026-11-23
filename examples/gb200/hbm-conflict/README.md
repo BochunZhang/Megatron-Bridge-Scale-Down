@@ -144,7 +144,7 @@ GEMM 覆盖率按实际写入该 GPU 的 payload 时间线计算。
 复用前述 R580 multicast 库。`--m-values 2,4,8` 和 `--cases task7,task8` 可缩小试跑范围。
 
 ```bash
-uv run --active --no-sync python examples/gb200/hbm-conflict/run_ce_hbm_kernel_sweep.py \
+bash examples/gb200/hbm-conflict/run_ce_hbm_kernel_sweep.sh \
   --gpus 0,1,2,3 --mc-self-import 1
 ```
 
@@ -158,7 +158,7 @@ Nsight Systems 采集 CUDA kernel、GPU memcpy 和 NVTX 时间线。每条 AG �
 用以下命令采独跑 GEMM 的流量计数器。在两次采集中选择同一张物理 GPU，保持硬件和锁频一致。
 
 ```bash
-uv run --active --no-sync python examples/gb200/hbm-conflict/run_ncu_hbm_gemm_sweep.py \
+bash examples/gb200/hbm-conflict/run_ncu_hbm_gemm_sweep.sh \
   --gpu 0
 ```
 

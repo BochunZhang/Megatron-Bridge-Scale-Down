@@ -2,7 +2,10 @@
 
 import csv
 import importlib
+import json
+import os
 import shlex
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -14,9 +17,8 @@ _EXPERIMENT = Path(__file__).resolve().parents[3] / "examples" / "gb200" / "hbm-
 
 
 @pytest.fixture
-def sweep(monkeypatch):
+def experiment_modules(monkeypatch):
     monkeypatch.syspath_prepend(str(_EXPERIMENT))
-    return importlib.import_module("run_ce_hbm_kernel_sweep")
 
 
 @pytest.mark.unit
@@ -24,8 +26,8 @@ def test_default_sweep_prints_four_ag_paths_and_one_baseline_per_shape(tmp_path)
     destination = tmp_path / "dry-run"
     result = subprocess.run(
         [
-            sys.executable,
-            str(_EXPERIMENT / "run_ce_hbm_kernel_sweep.py"),
+            "bash",
+            str(_EXPERIMENT / "run_ce_hbm_kernel_sweep.sh"),
             "--gpus",
             "0,1,2,3",
             "--dry-run",
@@ -53,40 +55,94 @@ def test_default_sweep_prints_four_ag_paths_and_one_baseline_per_shape(tmp_path)
 
 
 @pytest.mark.unit
-def test_doubles_only_after_valid_trace_has_too_few_gemms_in_a_round(sweep, monkeypatch, tmp_path):
-    args = sweep._parse_args(["--m-values", "8192", "--max-size-mib", "4096"])
+def test_bash_retries_only_when_trace_has_too_few_gemms_in_a_round(monkeypatch, tmp_path):
+    launcher = tmp_path / "run_ce_hbm_kernel_sweep.sh"
+    shutil.copy2(_EXPERIMENT / launcher.name, launcher)
+    (tmp_path / "run_ce_hbm_benchmark.sh").write_text(
+        """#!/usr/bin/env bash
+while (( $# )); do
+    if [[ "$1" == --output-dir ]]; then mkdir -p "$2"; exit; fi
+    shift
+done
+exit 1
+""",
+        encoding="utf-8",
+    )
+    (tmp_path / "analyse_ce_hbm_kernel_trace.py").write_text(
+        """import json
+import sys
+from pathlib import Path
 
-    def mock_launch(args, *, case, m, size_mib, output_dir):
-        (output_dir / f"{case}-gemm-ag-hbm").mkdir(parents=True)
+action = sys.argv[1]
+opts = dict(zip(sys.argv[2::2], sys.argv[3::2], strict=True))
+out = Path(opts["--output-dir"])
+if action == "report":
+    assert (out / "m8192").is_dir()
+    sys.exit(0)
+assert action == "attempt"
+case, size = opts["--case"], int(opts["--size-mib"])
+status, code = "ok", 0
+if case == "task3" and size == 1024:
+    status, code = "insufficient_overlap", 3
+if case == "task7":
+    status, code = "error", 1
+(out / "attempt.json").write_text(json.dumps({"case": case, "size_mib": size, "status": status}))
+sys.exit(code)
+""",
+        encoding="utf-8",
+    )
+    uv = tmp_path / "uv"
+    uv.write_text(
+        """#!/usr/bin/env bash
+[[ "$1" == run ]] || exit 2
+shift
+while [[ "$1" == --* ]]; do shift; done
+[[ "$1" == python ]] || exit 2
+shift
+exec "$SWEEP_TEST_PYTHON" "$@"
+""",
+        encoding="utf-8",
+    )
+    uv.chmod(0o755)
+    nsys = tmp_path / "nsys"
+    nsys.write_text("#!/usr/bin/env bash\nexit 0\n", encoding="utf-8")
+    nsys.chmod(0o755)
+    monkeypatch.setenv("PATH", os.pathsep.join((str(tmp_path), os.environ["PATH"])))
+    monkeypatch.setenv("SWEEP_TEST_PYTHON", sys.executable)
+    destination = tmp_path / "test-output"
+    result = subprocess.run(
+        [
+            "bash",
+            str(launcher),
+            "--m-values",
+            "8192",
+            "--cases",
+            "task3,task7",
+            "--nsys",
+            str(nsys),
+            "--output-dir",
+            str(destination),
+        ],
+        capture_output=True,
+        text=True,
+    )
 
-    def mock_trace(case_dir, *, nsys_bin):
-        size = int(case_dir.parent.name.removeprefix("size-").removesuffix("mib"))
-        return {
-            "size_bytes": size << 20,
-            "gemm_mnk": [8192, 8192, 7168],
-            "gpu0_gemm_count": 16,
-            "comm_rounds_measured": 25,
-            "gpu0_max_gemms_per_ag_round": 1 if size == 1024 else 2,
-        }
-
-    monkeypatch.setattr(sweep, "_launch", mock_launch)
-    monkeypatch.setattr(sweep, "analyse_kernel_case", mock_trace)
-    result = sweep._run_shape(args, case="task3", m=8192, root=tmp_path)
-    assert [(row["size_mib"], row["status"]) for row in result["attempts"]] == [
-        (1024, "insufficient_overlap"),
-        (2048, "ok"),
+    assert result.returncode == 1, result.stderr
+    attempts = sorted(
+        (attempt["case"], attempt["size_mib"], attempt["status"])
+        for path in destination.rglob("attempt.json")
+        for attempt in [json.loads(path.read_text(encoding="utf-8"))]
+    )
+    assert attempts == [
+        ("task1", 1024, "ok"),
+        ("task3", 1024, "insufficient_overlap"),
+        ("task3", 2048, "ok"),
+        ("task7", 1024, "error"),
     ]
-
-    def missing_trace(case_dir, *, nsys_bin):
-        raise ValueError("incomplete CUDA/NVTX capture")
-
-    monkeypatch.setattr(sweep, "analyse_kernel_case", missing_trace)
-    result = sweep._run_shape(args, case="task7", m=8192, root=tmp_path)
-    assert [(row["size_mib"], row["status"]) for row in result["attempts"]] == [(1024, "error")]
 
 
 @pytest.mark.unit
-def test_touching_ag_rounds_do_not_count_as_one(sweep, monkeypatch, tmp_path):
+def test_touching_ag_rounds_do_not_count_as_one(experiment_modules, monkeypatch, tmp_path):
     analysis = importlib.import_module("analyse_ce_hbm_kernel_trace")
     case_dir = tmp_path / "task7-gemm-ag-hbm-unicast"
     records = {
@@ -127,8 +183,8 @@ def test_touching_ag_rounds_do_not_count_as_one(sweep, monkeypatch, tmp_path):
 
 
 @pytest.mark.unit
-def test_ncu_summary_distinguishes_missing_link_samples_from_zero(sweep, tmp_path):
-    ncu = importlib.import_module("run_ncu_hbm_gemm_sweep")
+def test_ncu_summary_distinguishes_missing_link_samples_from_zero(experiment_modules, tmp_path):
+    ncu = importlib.import_module("analyse_ncu_hbm_gemm")
     count = "dram__sectors_read.sum"
     link = "nvlrx__bytes.sum"
     raw = tmp_path / "gemm-raw.csv"
@@ -156,7 +212,33 @@ def test_ncu_summary_distinguishes_missing_link_samples_from_zero(sweep, tmp_pat
     assert summary["traffic"]["nvlink_rx_wire"]["total_bytes"] == 0
     assert summary["traffic"]["c2c_rx_user"]["total_bytes"] is None
 
-    args = ncu._parse_args(["--m-values", "2"])
-    command = ncu._command(args, case_dir=tmp_path, m=2, metrics=counters)
-    assert "--ncu-gemm" in command
-    assert command[command.index("--pm-sampling-interval") + 1] == "1000"
+
+@pytest.mark.unit
+def test_ncu_bash_launches_torch_distributed_worker(tmp_path):
+    destination = tmp_path / "ncu-dry-run"
+    result = subprocess.run(
+        [
+            "bash",
+            str(_EXPERIMENT / "run_ncu_hbm_gemm_sweep.sh"),
+            "--gpu",
+            "3",
+            "--m-values",
+            "1,8192",
+            "--dry-run",
+            "--output-dir",
+            str(destination),
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    commands = [shlex.split(line) for line in result.stdout.splitlines() if "--nvtx-include" in line]
+    assert len(commands) == 2
+    for command, m in zip(commands, (1, 8192)):
+        assert "CUDA_VISIBLE_DEVICES=3" in command
+        assert "--ncu-gemm" in command
+        assert command[command.index("--pm-sampling-interval") + 1] == "1000"
+        assert command[command.index("--gemm") + 1] == f"[{m},8192,7168]"
+        assert command[command.index("-m") + 1] == "torch.distributed.run"
+        assert "uv" in command
+    assert not destination.exists()

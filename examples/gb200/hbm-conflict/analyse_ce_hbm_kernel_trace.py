@@ -12,15 +12,18 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Read GEMM execution and same-round AllGather overlap from a CUDA trace."""
+"""Read GEMM and same-round AllGather overlap and summarize a kernel sweep."""
 
 from __future__ import annotations
 
+import argparse
 import json
+import logging
 import sqlite3
 import statistics
 import subprocess
 import tempfile
+from collections.abc import Sequence
 from pathlib import Path
 
 from analyse_ce_hbm import Activity, _event_intervals, _iterations, _read_combined
@@ -29,6 +32,14 @@ from analyse_hbm_conflict import merge_intervals, overlap_ns
 
 _AG_MODES = ("gemm-ag-hbm", "gemm-ag-host", "gemm-ag-hbm-unicast", "gemm-ag-host-unicast")
 _TRACE_TABLES = "^CUPTI_ACTIVITY_KIND_.*$,^NVTX_EVENTS$,^StringIds$,^ENUM_CUDA_MEM.*$"
+_CASE_NAMES = {
+    "task1": "GEMM only",
+    "task3": "HBM-source multicast",
+    "task4": "CPU-source multicast",
+    "task7": "HBM-source unicast",
+    "task8": "CPU-source unicast",
+}
+_LOG = logging.getLogger(__name__)
 
 
 def _export_kernel_trace(report: Path, *, nsys_bin: str) -> Path:
@@ -196,3 +207,109 @@ def analyse_kernel_case(case_dir: Path, *, nsys_bin: str) -> dict:
         "gpu0_gemms": gpu0_gemms,
         "ag_rounds": ag_rounds,
     }
+
+
+def _analyse_attempt(args: argparse.Namespace) -> int:
+    attempt = {"output_dir": str(args.output_dir), "size_mib": args.size_mib}
+    try:
+        if args.launch_exit_code:
+            raise ValueError(f"CE benchmark launcher exited with status {args.launch_exit_code}")
+        produced = [path for path in args.output_dir.glob(f"{args.case}-*") if path.is_dir()]
+        if len(produced) != 1:
+            raise ValueError(f"expected one captured case, found {len(produced)}")
+        trace = analyse_kernel_case(produced[0], nsys_bin=args.nsys)
+        if (
+            trace["gpu0_gemm_count"] != args.gemm_rounds
+            or trace["gemm_mnk"] != [args.m, 8192, 7168]
+            or trace["size_bytes"] != args.size_mib << 20
+            or (args.case != "task1" and trace["comm_rounds_measured"] < args.comm_rounds)
+        ):
+            raise ValueError(f"{produced[0]}: captured workload differs from requested shape, size, or rounds")
+        attempt["trace"] = trace
+        accepted = args.case == "task1" or trace["gpu0_max_gemms_per_ag_round"] >= 2
+        attempt["status"] = "ok" if accepted else "insufficient_overlap"
+        result = 0 if accepted else 3
+    except (OSError, ValueError, KeyError, TypeError, sqlite3.Error, subprocess.CalledProcessError) as error:
+        attempt.update(status="error", error=str(error))
+        _LOG.error("%s M=%d, %d MiB. %s", args.case, args.m, args.size_mib, error)
+        result = 1
+
+    args.output_dir.mkdir(parents=True, exist_ok=True)
+    record = {"case_id": args.case, "m": args.m, "attempt": attempt}
+    (args.output_dir / "attempt.json").write_text(json.dumps(record, indent=2) + "\n", encoding="utf-8")
+    return result
+
+
+def _write_sweep_report(root: Path) -> None:
+    cases = {}
+    for path in root.glob("m*/task*/size-*mib/attempt.json"):
+        record = json.loads(path.read_text(encoding="utf-8"))
+        key = (record["m"], record["case_id"])
+        cases.setdefault(key, []).append(record["attempt"])
+    rows = [
+        {"case_id": case, "m": m, "attempts": sorted(attempts, key=lambda attempt: attempt["size_mib"])}
+        for (m, case), attempts in sorted(cases.items())
+    ]
+    baseline_means = {}
+    for row in rows:
+        attempt = row["attempts"][-1]
+        if row["case_id"] == "task1" and attempt["status"] == "ok":
+            baseline_means[row["m"]] = attempt["trace"]["gpu0_gemm_mean_us"]
+    lines = [
+        "# GB200 GEMM and CE AllGather kernel sweep",
+        "",
+        "GPU means use the first selected GPU. Each AG result includes GEMMs fully inside a single AG payload round.",
+        "The reported delta pairs each accepted case with the same-shape GEMM-only baseline.",
+        "",
+        "| M | Case | Status | AG MiB/GPU | AG rounds | GEMMs in mean | Max per AG round | Mean µs | Δ vs solo |",
+        "| ---: | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |",
+    ]
+    for row in rows:
+        attempt = row["attempts"][-1]
+        trace = attempt.get("trace", {})
+        baseline = baseline_means.get(row["m"])
+        solo = row["case_id"] == "task1"
+        duration = trace.get("gpu0_gemm_mean_us") if attempt["status"] == "ok" else None
+        delta = (duration / baseline - 1) * 100 if not solo and duration is not None and baseline else None
+        row["gpu0_slowdown_percent"] = delta
+        cells = [
+            str(row["m"]),
+            _CASE_NAMES[row["case_id"]],
+            attempt["status"],
+            str(attempt["size_mib"]) if not solo else "—",
+            str(trace.get("comm_rounds_measured", "—")),
+            str(trace.get("gpu0_covered_gemm_count" if not solo else "gpu0_gemm_count", "—")),
+            str(trace.get("gpu0_max_gemms_per_ag_round", "—")) if not solo else "—",
+            f"{duration:.3f}" if duration is not None else "—",
+            f"{delta:+.1f}%" if delta is not None else "—",
+        ]
+        lines.append("| " + " | ".join(cells) + " |")
+    (root / "summary.json").write_text(json.dumps(rows, indent=2) + "\n", encoding="utf-8")
+    (root / "report.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    """Analyze a captured sweep attempt or regenerate its run summary."""
+    logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
+    parser = argparse.ArgumentParser(description=__doc__)
+    subparsers = parser.add_subparsers(dest="action", required=True)
+    attempt = subparsers.add_parser("attempt", help="Validate and store one captured attempt")
+    attempt.add_argument("--output-dir", type=Path, required=True)
+    attempt.add_argument("--case", choices=tuple(_CASE_NAMES), required=True)
+    attempt.add_argument("--m", type=int, required=True)
+    attempt.add_argument("--size-mib", type=int, required=True)
+    attempt.add_argument("--gemm-rounds", type=int, required=True)
+    attempt.add_argument("--comm-rounds", type=int, required=True)
+    attempt.add_argument("--nsys", required=True)
+    attempt.add_argument("--launch-exit-code", type=int, default=0)
+    report = subparsers.add_parser("report", help="Summarize all stored attempts")
+    report.add_argument("--output-dir", type=Path, required=True)
+    args = parser.parse_args(argv)
+    if args.action == "attempt":
+        return _analyse_attempt(args)
+    _write_sweep_report(args.output_dir)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
