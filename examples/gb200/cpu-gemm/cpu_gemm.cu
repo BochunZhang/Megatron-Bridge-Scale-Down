@@ -54,13 +54,16 @@ struct Buffer {
     Bf16* cpu = nullptr;
 };
 
-Buffer allocate(size_t elements, bool on_cpu) {
+Buffer allocate(size_t elements, bool on_cpu, bool map_host = true) {
     Buffer buffer;
     const size_t bytes = elements * sizeof(Bf16);
     void* pointer = nullptr;
     if (on_cpu) {
-        CHECK(cudaHostAlloc(&pointer, bytes, cudaHostAllocMapped));
+        CHECK(cudaHostAlloc(&pointer, bytes, map_host ? cudaHostAllocMapped : cudaHostAllocDefault));
         buffer.cpu = static_cast<Bf16*>(pointer);
+        if (!map_host) {
+            return buffer;
+        }
         CHECK(cudaHostGetDevicePointer(&pointer, buffer.cpu, 0));
     } else {
         CHECK(cudaMalloc(&pointer, bytes));
@@ -81,6 +84,18 @@ struct Slot {
     Buffer a;
     Buffer b;
     Buffer c;
+};
+
+struct GemmShape {
+    int rows;
+    int n;
+    int k;
+};
+
+struct PanelWorkspace {
+    int panel_k;
+    Bf16* b = nullptr;
+    float* c = nullptr;
 };
 
 // Binary fractions keep the reference dot products exact at the default K.
@@ -111,13 +126,51 @@ void fill(Buffer buffer, size_t elements, uint64_t seed, cudaStream_t stream) {
     }
 }
 
-void gemm(cublasHandle_t handle, const Slot& slot, int rows, int n, int k) {
+void gemm(cublasHandle_t handle, const Bf16* a, const Bf16* b, void* c, cudaDataType_t c_type,
+          GemmShape shape, int a_stride, float beta) {
     const float alpha = 1.0f;
-    const float beta = 0.0f;
     // Row-major C = A B is column-major C^T = B^T A^T at the same addresses.
-    CHECK(cublasGemmEx(handle, CUBLAS_OP_N, CUBLAS_OP_N, n, rows, k, &alpha,
-                       slot.b.gpu, CUDA_R_16BF, n, slot.a.gpu, CUDA_R_16BF, k, &beta,
-                       slot.c.gpu, CUDA_R_16BF, n, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT));
+    CHECK(cublasGemmEx(handle, CUBLAS_OP_N, CUBLAS_OP_N, shape.n, shape.rows, shape.k, &alpha,
+                       b, CUDA_R_16BF, shape.n, a, CUDA_R_16BF, a_stride, &beta,
+                       c, c_type, shape.n, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT));
+}
+
+__global__ void cast_fp32_to_bf16(Bf16* out, const float* in, size_t elements) {
+    for (size_t i = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x; i < elements;
+         i += static_cast<size_t>(gridDim.x) * blockDim.x) {
+        out[i] = __float2bfloat16_rn(in[i]);
+    }
+}
+
+void run_gemm(cublasHandle_t handle, cudaStream_t stream, const Slot& slot, GemmShape shape,
+              const PanelWorkspace& workspace) {
+    if (workspace.panel_k == 0) {
+        gemm(handle, slot.a.gpu, slot.b.gpu, slot.c.gpu, CUDA_R_16BF, shape, shape.k, 0.0f);
+        return;
+    }
+
+    // Stream ordering protects the reusable B panel and FP32 accumulator.
+    for (int start = 0; start < shape.k;) {
+        const int span = std::min(workspace.panel_k, shape.k - start);
+        const size_t b_offset = static_cast<size_t>(start) * shape.n;
+        const Bf16* b_panel;
+        if (workspace.b) {
+            const size_t panel_bytes = static_cast<size_t>(span) * shape.n * sizeof(Bf16);
+            CHECK(cudaMemcpyAsync(workspace.b, slot.b.cpu + b_offset, panel_bytes, cudaMemcpyHostToDevice, stream));
+            b_panel = workspace.b;
+        } else {
+            b_panel = slot.b.gpu + b_offset;
+        }
+        gemm(handle, slot.a.gpu + start, b_panel, workspace.c, CUDA_R_32F,
+             {shape.rows, shape.n, span}, shape.k, start == 0 ? 0.0f : 1.0f);
+        start += span;
+    }
+
+    const size_t elements = static_cast<size_t>(shape.rows) * shape.n;
+    constexpr int threads = 256;
+    const int blocks = static_cast<int>(std::min<size_t>((elements + threads - 1) / threads, 65535));
+    cast_fp32_to_bf16<<<blocks, threads, 0, stream>>>(slot.c.gpu, workspace.c, elements);
+    CHECK(cudaGetLastError());
 }
 
 struct Sample {
@@ -169,8 +222,8 @@ bool validate(const Slot& slot, int slot_index, const std::array<Sample, 12>& po
 }  // namespace
 
 int main(int argc, char** argv) {
-    if (argc != 9) {
-        std::cerr << "Usage: cpu_gemm CASE M N K BATCH WARMUP ITERS SLOTS\n";
+    if (argc != 9 && argc != 10) {
+        std::cerr << "Usage: cpu_gemm CASE M N K BATCH WARMUP ITERS SLOTS [K_PANEL]\n";
         return EXIT_FAILURE;
     }
     const int placement = parse_int(argv[1], "CASE");
@@ -185,23 +238,35 @@ int main(int argc, char** argv) {
         std::cerr << "CASE must be 1, 2 or 3 and M * BATCH must fit in an int\n";
         return EXIT_FAILURE;
     }
+    const int panel_k = argc == 10 ? parse_int(argv[9], "K_PANEL") : 0;
+    if (panel_k > k) {
+        std::cerr << "K_PANEL must be <= K\n";
+        return EXIT_FAILURE;
+    }
     const int rows = m * batch;
+    const GemmShape shape{rows, n, k};
     const size_t a_elements = static_cast<size_t>(rows) * k;
     const size_t b_elements = static_cast<size_t>(k) * n;
     const size_t c_elements = static_cast<size_t>(rows) * n;
+    const bool stream_b = placement == 2 && panel_k > 0;
+    const bool mapped_b = placement == 2 && !stream_b;
 
     // The launcher exposes the selected physical GPU as CUDA device 0.
     CHECK(cudaSetDeviceFlags(cudaDeviceMapHost));
     cudaDeviceProp device{};
     CHECK(cudaGetDeviceProperties(&device, 0));
     CHECK(cudaSetDevice(0));
-    if (placement != 1 && !device.canMapHostMemory) {
+    if ((mapped_b || placement == 3) && !device.canMapHostMemory) {
         std::cerr << "The selected GPU does not support mapped host memory\n";
         return EXIT_FAILURE;
     }
     std::cout << "gpu=" << device.name << " l2_bytes=" << device.l2CacheSize
               << " case=" << placement << " m=" << m << " n=" << n << " k=" << k << " b=" << batch
-              << " slots=" << slots << " iterations=" << iterations << std::endl;
+              << " slots=" << slots << " iterations=" << iterations;
+    if (panel_k > 0) {
+        std::cout << " k_panel=" << panel_k;
+    }
+    std::cout << std::endl;
 
     cudaStream_t stream;
     cublasHandle_t handle;
@@ -210,11 +275,18 @@ int main(int argc, char** argv) {
     CHECK(cublasSetStream(handle, stream));
     CHECK(cublasSetMathMode(handle, CUBLAS_MATH_DISALLOW_REDUCED_PRECISION_REDUCTION));
 
+    PanelWorkspace workspace{panel_k};
+    if (stream_b) {
+        CHECK(cudaMalloc(&workspace.b, static_cast<size_t>(panel_k) * n * sizeof(Bf16)));
+    }
+    if (panel_k > 0) {
+        CHECK(cudaMalloc(&workspace.c, c_elements * sizeof(float)));
+    }
     std::vector<Slot> buffers(slots);
     for (int i = 0; i < slots; ++i) {
         Slot& slot = buffers[i];
         slot.a = allocate(a_elements, false);
-        slot.b = allocate(b_elements, placement == 2);
+        slot.b = allocate(b_elements, placement == 2, mapped_b);
         slot.c = allocate(c_elements, placement == 3);
         const uint64_t seed_a = 2ULL * i + 1;
         fill(slot.a, a_elements, seed_a, stream);
@@ -224,9 +296,9 @@ int main(int argc, char** argv) {
         }
     }
     // A preflight launch initializes the library even when extra warmup is zero.
-    gemm(handle, buffers.front(), rows, n, k);
+    run_gemm(handle, stream, buffers.front(), shape, workspace);
     for (int i = 0; i < warmup; ++i) {
-        gemm(handle, buffers[i % slots], rows, n, k);
+        run_gemm(handle, stream, buffers[i % slots], shape, workspace);
     }
     CHECK(cudaStreamSynchronize(stream));
 
@@ -248,7 +320,7 @@ int main(int argc, char** argv) {
 
     CHECK(cudaProfilerStart());
     for (int i = 0; i < iterations; ++i) {
-        gemm(handle, buffers[i % slots], rows, n, k);
+        run_gemm(handle, stream, buffers[i % slots], shape, workspace);
     }
     CHECK(cudaStreamSynchronize(stream));
     CHECK(cudaProfilerStop());
@@ -263,6 +335,12 @@ int main(int argc, char** argv) {
         release(slot.a);
         release(slot.b);
         release(slot.c);
+    }
+    if (workspace.b) {
+        CHECK(cudaFree(workspace.b));
+    }
+    if (workspace.c) {
+        CHECK(cudaFree(workspace.c));
     }
     if (valid) {
         std::cout << "validation=passed\n";
