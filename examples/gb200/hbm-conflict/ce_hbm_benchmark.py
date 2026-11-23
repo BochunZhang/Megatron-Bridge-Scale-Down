@@ -36,7 +36,21 @@ from torch.cuda import nvtx
 
 
 logger = logging.getLogger(__name__)
-MODES = ("gemm", "gemm-h2d", "gemm-ag-hbm", "gemm-ag-host", "gemm-ag-d2h", "h2d", "ag-hbm", "ag-host", "ag-d2h")
+MODES = (
+    "gemm",
+    "gemm-h2d",
+    "gemm-ag-hbm",
+    "gemm-ag-host",
+    "gemm-ag-d2h",
+    "gemm-ag-hbm-unicast",
+    "gemm-ag-host-unicast",
+    "h2d",
+    "ag-hbm",
+    "ag-host",
+    "ag-d2h",
+    "ag-hbm-unicast",
+    "ag-host-unicast",
+)
 TimingPair = tuple[torch.cuda.Event, torch.cuda.Event]
 
 
@@ -121,6 +135,7 @@ def _run_case(args: argparse.Namespace, device: torch.device, *, cleanup: ExitSt
     physical_gpu = int(visible_devices[device.index]) if all(value.isdecimal() for value in visible_devices) else None
     do_gemm = args.mode.startswith("gemm")
     comm_kind = args.mode.removeprefix("gemm-") if args.mode != "gemm" else None
+    unicast = comm_kind in ("ag-hbm-unicast", "ag-host-unicast")
     size_bytes = args.size_mib << 20
     comm_payload_bytes = 0
     nccl_version = None
@@ -164,7 +179,14 @@ def _run_case(args: argparse.Namespace, device: torch.device, *, cleanup: ExitSt
         comm, reset_comm, validate_comm = all_gather.run, all_gather.reset_output, all_gather.validate
         comm_payload_bytes = size_bytes - size_bytes // world_size
     elif comm_kind is not None:
-        all_gather = NcclCopyEngineAllGather(device, rank, world_size, size_bytes, comm_kind == "ag-host")
+        all_gather = NcclCopyEngineAllGather(
+            device,
+            rank,
+            world_size,
+            size_bytes,
+            host_input=comm_kind in ("ag-host", "ag-host-unicast"),
+            unicast=unicast,
+        )
         cleanup.callback(all_gather.close)
         comm, reset_comm, validate_comm = all_gather.run, all_gather.reset_output, all_gather.validate
         comm_payload_bytes = size_bytes - size_bytes // world_size
@@ -204,14 +226,15 @@ def _run_case(args: argparse.Namespace, device: torch.device, *, cleanup: ExitSt
         end.record()
     torch.cuda.synchronize(device)
 
+    # Unicast profiles the process tree so the capture includes each worker's NVTX ranges.
+    control_capture = rank == 0 and not unicast
     gate = LaunchGate(timeout_s=30.0)
     try:
         dist.barrier()
-        if rank == 0:
+        if control_capture:
             torch.cuda.profiler.start()
         try:
-            # One Nsight session covers the process tree. Keep rank labels in
-            # the common timeline and wait for rank 0 to open the capture.
+            # Synchronize every worker before entering the timed NVTX ranges.
             dist.barrier()
             with nvtx.range(f"hbm-ce/{args.case}/rank-{rank}"):
                 gate.arm(control_stream)
@@ -230,10 +253,10 @@ def _run_case(args: argparse.Namespace, device: torch.device, *, cleanup: ExitSt
                 finally:
                     gate.release()
                 torch.cuda.synchronize(device)
-            # Rank 0 can stop the shared capture after every GPU has finished.
+            # Wait for every rank before closing the capture and inspecting outputs.
             dist.barrier()
         finally:
-            if rank == 0:
+            if control_capture:
                 torch.cuda.profiler.stop()
         watchdog = torch.tensor(int(gate.watchdog_fired()))
         dist.all_reduce(watchdog, op=dist.ReduceOp.MAX)
@@ -279,6 +302,10 @@ def _run_case(args: argparse.Namespace, device: torch.device, *, cleanup: ExitSt
         "gemm_output_correct": gemm_correct,
         "output_correct": comm_correct and gemm_correct,
     }
+    if unicast:
+        # GPU inputs already occupy the local receive slot. CPU inputs also copy to the local GPU.
+        copied_bytes = size_bytes if comm_kind == "ag-host-unicast" else comm_payload_bytes
+        result.update(comm_source_bytes=copied_bytes, comm_receive_bytes=copied_bytes)
     args.output_dir.mkdir(parents=True, exist_ok=True)
     output = args.output_dir / f"events.rank_{rank:02d}.json"
     output.write_text(json.dumps(result, indent=2) + "\n", encoding="utf-8")

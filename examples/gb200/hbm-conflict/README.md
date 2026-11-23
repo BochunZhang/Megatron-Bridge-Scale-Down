@@ -3,7 +3,7 @@
 ## Copy Engine 和 HBM 争用测试
 
 在 GB200 节点的工作目录准备 `NsightSystems-2026.6.1/bin/nsys`，并启用已安装 CUDA PyTorch 的虚拟环境。也可用
-`NSYS_BIN` 指定同版本的安装路径。多卡测试使用同一台主机、同一 NVLink multicast clique 内至少三张 GPU。
+`NSYS_BIN` 指定同版本的安装路径。multicast 测试使用同一台主机、同一 NVLink multicast clique 内至少三张 GPU。
 AG 使用当前环境中 PyTorch 加载的 NCCL，最低版本为 2.32.2。NCCL 构建和 CUDA 驱动须支持目标为 multicast
 地址的批量拷贝，CPU 源 case 还需要支持从 pinned host memory 向该地址拷贝。
 
@@ -47,7 +47,7 @@ multicast AG case 独立设置 `NCCL_CTA_POLICY=ZERO`、`NCCL_WIN_ENABLE=1`、`N
 时钟轨道会随报告保留。Gloo 启动使用 `GLOO_SOCKET_IFNAME`，优先选有效的已有设置，其次 `eth0`、`bond1`，
 单机环境下可用 `lo`。也接受 `GLOO_SOCKET_NAME` 作为输入别名。
 
-每个活动 stream 先独立 warmup，初始化、校准和输出验证都在捕获窗口外。并发 case 根据预热时间延长背景
+每个活动 stream 先独立 warmup，初始化、校准和输出验证都在计时窗口外。并发 case 根据预热时间延长背景
 copy 队列，用同一个 CUDA 起点发出预提交的 GEMM 和 copy。只测通信的 case 执行指定的 `--comm-rounds`。
 手动生成的 `report.md` 单独报告实际重叠覆盖率。
 
@@ -97,6 +97,45 @@ bash examples/gb200/hbm-conflict/run_ce_hbm_benchmark.sh \
 
 对照 GPU 0 的 GEMM GPU kernel 时间和与 payload 的实际重叠。分析器检查每轮 D2H 字节数、pinned
 目标和 C2C TX 活动。`baseline4` 记录 Host 目标 AllGather 独跑时的搬运速率。
+
+### Copy Engine 单播 AllGather sweep
+
+使用同一 NVLink 域内的 GPU 和 NCCL 2.32.3。以下命令复用此前的六个 BF16 GEMM 形状，
+扫描 `M=2,4,8,16,32,64`，固定 `N=8192`、`K=7168`。
+
+```bash
+bash examples/gb200/hbm-conflict/run_ce_unicast_hbm_sweep.sh \
+  --gpus 0,1,2,3 --output-dir "$path"
+```
+
+| Case | 计算 | 搬运 |
+| --- | --- | --- |
+| `task1` | 第一张 GPU 上的 GEMM | — |
+| `baseline5` / `task7` | 纯通信 / 各 GPU 上的 GEMM | GPU HBM → 每个远端 GPU 的 HBM |
+| `baseline6` / `task8` | 纯通信 / 各 GPU 上的 GEMM | Pinned CPU → 每个 GPU 的 HBM |
+
+默认每张 GPU 的完整输出为 1 GiB。四卡时，每个源 rank 持有一个 256 MiB shard。GPU 源采取 in-place，
+计时前预放本地槽，计时内每个 rank 发出三笔远端拷贝。CPU 源从 pinned host shard 直接向四张 GPU
+各发出一笔拷贝，目标地址是各 GPU 接收缓冲区的最终槽位。CPU 源的每张 GPU 每轮接收 1 GiB payload，
+对应 HBM 写入。GPU 源每张 GPU 每轮发出和接收的 payload 各为 768 MiB。多卡作业的 GEMM 耗时
+按 rank 保留，和 `task1` 比较时使用第一张 GPU。
+
+单播 case 设置 `NCCL_CTA_POLICY=ZERO`、`NCCL_WIN_ENABLE=1`、`NCCL_NVLS_ENABLE=0`、
+`NCCL_CE_COLL_AG_MULTICAST_THRESHOLD=0`。worker 在计时结束后校验各 GPU 的全部接收槽位。
+可先用 `--cases baseline5,baseline6 --comm-rounds 3` 短测纯通信，用 `--gemm` 覆盖默认形状。
+
+单播 case 采集完整进程树，保留各 rank 的 NVTX 标签。分析只使用计时标签内提交的工作。
+采集后，在有 Nsight Systems 2026.6.1 和 `DumpTimeline` 的分析机上运行以下命令。
+
+```bash
+uv run --active --no-sync python examples/gb200/hbm-conflict/analyse_ce_hbm.py \
+  --output-dir "$path" --nsys "$NSYS_BIN" --dump-timeline "$DUMP_TIMELINE"
+```
+
+分析器逐 rank、逐轮核对目标 GPU 和 payload 字节数。CPU 源必须是 `Pinned → Device`，并逐笔确认
+硬件通道为 `Async Memcpy`。GPU 源同样检查硬件通道。Nsight 的 `HtoD` / `PtoP` 标签用于定位，
+P2P 的 source/destination 轨道只计一次。`Compute`、缺少通道证据或缺少预期拷贝时，分析返回非零。
+GEMM 覆盖率按实际写入该 GPU 的 payload 时间线计算。
 
 ### R580 上的 multicast handle self-import 对照
 

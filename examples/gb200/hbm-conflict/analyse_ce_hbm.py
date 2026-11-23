@@ -18,10 +18,13 @@ from __future__ import annotations
 
 import argparse
 import csv
+import html
 import json
 import logging
 import math
+import os
 import re
+import shutil
 import sqlite3
 import statistics
 import subprocess
@@ -38,7 +41,11 @@ LOGGER = logging.getLogger(__name__)
 _RANGE = re.compile(r"(gemm|comm)(\d+)")
 # Keep historical results readable. Older runs used task5 for host-source multicast
 # and task6 for host-destination D2H. The worker's mode determines the analysis.
-_CASE_DIR = re.compile(r"(?:task[1-6]|baseline[1-4])-.+")
+_CASE_DIR = re.compile(r"(?:task[1-8]|baseline[1-6])-.+")
+_UNICAST_MODES = ("ag-hbm-unicast", "ag-host-unicast")
+_MEMCPY_TRACK = re.compile(r"/Processes/(\d+)/CudaDevices/(\d+)/.*/Streams/\d+/Memory/Memcpy/")
+_MEMCPY_BYTES = re.compile(r"\bmemcpy (\d+) bytes\b")
+_MEMCPY_CHANNEL = re.compile(r"\bChannel type: ([^<]+)")
 _REQUIRED_METRICS = {
     "DRAM read": re.compile(r"dram.*read|read.*dram", re.I),
     "DRAM write": re.compile(r"dram.*write|write.*dram", re.I),
@@ -48,6 +55,8 @@ _REQUIRED_METRICS = {
 _C2C_RX = re.compile(r"(?:c2c|ctc).*?(?:rx|receiv|read).*?user", re.I)
 _C2C_TX = re.compile(r"(?:c2c|ctc).*?(?:tx|transmit|write).*?user", re.I)
 _D2H_COPY = re.compile(r"\b(?:dtoh|d2h|device[- ]to[- ]host)\b", re.I)
+_H2D_COPY = re.compile(r"\b(?:htod|h2d|host[- ]to[- ]device)\b", re.I)
+_P2P_COPY = re.compile(r"\b(?:ptop|p2p|peer[- ]to[- ]peer)\b", re.I)
 _GPU_ACTIVITY = ("KERNEL", "MEMCPY", "MEMCPY2")
 _CONFIG_FIELDS = ("case", "mode", "world_size", "gemm_mnk", "size_bytes", "comm_payload_bytes")
 
@@ -63,6 +72,10 @@ class Activity(NamedTuple):
     copy_kind: str
     src_kind: str
     dst_kind: str
+    pid: int | None = None
+    src_device: int | None = None
+    dst_device: int | None = None
+    copy_count: int | None = None
 
 
 class Capture(NamedTuple):
@@ -115,8 +128,11 @@ def _read_trace(sqlite_path: Path, *, labels: Sequence[str], physical_gpus: set[
             payload_filter = "AND g.bytes > 8" if is_copy else ""
             columns = {row[1] for row in conn.execute(f"PRAGMA table_info({table})")} if is_copy else set()
             kind_fields = ", ".join(
-                f"g.{col}" if col in columns else "NULL" for col in ("copyKind", "srcKind", "dstKind")
+                f"g.{col}" if col in columns else "NULL"
+                for col in ("copyKind", "srcKind", "dstKind", "srcDeviceId", "dstDeviceId", "copyCount")
             )
+            # Nsight's serialized global ID packs the OS PID into bits 24–47.
+            # DumpTimeline uses the OS PID in the process path.
             query = f"""
                 WITH api AS ({api_calls}),
                 ranges AS (
@@ -125,7 +141,7 @@ def _read_trace(sqlite_path: Path, *, labels: Sequence[str], physical_gpus: set[
                     WHERE n.end IS NOT NULL
                 )
                 SELECT DISTINCT c.label, n.label, g.start, g.end, g.deviceId, {name}, {bytes_copied},
-                                g.correlationId, g.streamId, {kind_fields}
+                                g.correlationId, g.streamId, (g.globalPid >> 24) & 16777215, {kind_fields}
                 FROM {table} g
                 JOIN api a ON a.correlationId = g.correlationId
                     AND (a.globalTid >> 24) = (g.globalPid >> 24)
@@ -147,14 +163,18 @@ def _read_trace(sqlite_path: Path, *, labels: Sequence[str], physical_gpus: set[
                 size,
                 correlation,
                 stream,
+                pid,
                 copy,
                 src,
                 dst,
+                src_device,
+                dst_device,
+                copy_count,
             ) in conn.execute(query, labels):
                 if not _RANGE.fullmatch(label):
                     continue
                 if is_copy:
-                    key = (worker, label, start, end, device, size, correlation, stream)
+                    key = (worker, label, start, end, device, size, correlation, stream, src_device, dst_device)
                     if key in seen_copies:
                         continue
                     seen_copies.add(key)
@@ -168,6 +188,10 @@ def _read_trace(sqlite_path: Path, *, labels: Sequence[str], physical_gpus: set[
                         _enum_name(copy_enum, copy),
                         _enum_name(memory_enum, src),
                         _enum_name(memory_enum, dst),
+                        pid,
+                        src_device,
+                        dst_device,
+                        copy_count,
                     )
                 )
 
@@ -228,9 +252,144 @@ def _busy(activities: Sequence[Activity]) -> list[tuple[int, int]]:
     return merge_intervals([(activity.start, activity.end) for activity in activities])
 
 
-def _analyse_rank(record: dict, activities: dict[str, list[Activity]], samples: dict[int, list[Sample]]) -> dict:
-    errors = []
+def _hardware_channels(document: dict) -> dict[tuple[int, int, int, int, int], set[str]]:
+    channels = defaultdict(set)
+    for track in document["GenericHierarchyRows"]:
+        match = _MEMCPY_TRACK.search(track.get("Path", ""))
+        if match is None:
+            continue
+        pid, device = map(int, match.groups())
+        for row in track["Rows"]:
+            for item in row["ViewDataElements"]:
+                if item["Text"].endswith(" (destination)"):
+                    continue
+                tooltip = html.unescape(item["Tooltip"]).replace("\xa0", " ")
+                size_match = _MEMCPY_BYTES.search(tooltip)
+                if size_match is None:
+                    continue
+                start = item["Start"]
+                end = start + item["Duration"]
+                channel = _MEMCPY_CHANNEL.search(tooltip)
+                channels[pid, device, start, end, int(size_match[1])].add(
+                    channel[1].strip() if channel is not None else "unavailable"
+                )
+    return dict(channels)
+
+
+def _read_hardware_channels(
+    report: Path, *, nsys_bin: str, dump_timeline: str | None
+) -> dict[tuple[int, int, int, int, int], set[str]]:
+    nsys_path = Path(shutil.which(nsys_bin) or nsys_bin).resolve()
+    sibling = nsys_path.with_name("DumpTimeline")
+    tool = (
+        dump_timeline or os.environ.get("DUMP_TIMELINE") or shutil.which(str(sibling)) or shutil.which("DumpTimeline")
+    )
+    if tool is None:
+        raise ValueError("unicast hardware channel evidence requires --dump-timeline or DUMP_TIMELINE")
+    result = subprocess.run(
+        [tool, "--input", str(report), "--full", "--format=n,d", "--show-all", "--correlation=0"],
+        capture_output=True,
+        text=True,
+        timeout=300,
+        check=False,
+    )
+    if result.returncode:
+        raise ValueError(f"DumpTimeline failed with status {result.returncode}: {result.stderr.strip()}")
+    return _hardware_channels(json.loads(result.stdout))
+
+
+def _validate_unicast_trace(
+    records: dict[int, dict],
+    activities_by_rank: dict[int, dict[str, list[Activity]]],
+    channels: dict[tuple[int, int, int, int, int], set[str]],
+) -> tuple[dict[int, list[str]], dict[int, list[Activity]]]:
+    errors = {rank: [] for rank in records}
+    incoming = {rank: [] for rank in records}
+    ranks_by_device = {}
+    for rank in records:
+        activities = activities_by_rank.get(rank, {})
+        devices = {op.device for group in activities.values() for op in group}
+        if len(devices) == 1:
+            ranks_by_device[next(iter(devices))] = rank
+    if len(ranks_by_device) != len(records):
+        message = "unicast trace needs one distinct issuing CUDA device per rank"
+        return {rank: [message] for rank in records}, incoming
+
+    for device, rank in ranks_by_device.items():
+        record = records[rank]
+        host_source = record["mode"].endswith("ag-host-unicast")
+        count = record["world_size"]
+        shard, remainder = divmod(record["size_bytes"], count)
+        peers = set(ranks_by_device)
+        if not host_source:
+            peers.remove(device)
+        expected_bytes = shard * len(peers)
+        if (
+            remainder
+            or shard <= 8
+            or any(record.get(key) != expected_bytes for key in ("comm_source_bytes", "comm_receive_bytes"))
+        ):
+            errors[rank].append(
+                f"invalid unicast byte contract, expected {expected_bytes} sent and received per round"
+            )
+        rounds = _iterations(activities_by_rank[rank], label_prefix="comm")
+        if set(rounds) != set(range(record["comm_rounds_measured"])):
+            errors[rank].append("unicast payload ranges do not match the measured communication rounds")
+        for index, copies in sorted(rounds.items()):
+            destinations = []
+            matched_activities = set()
+            for op in copies:
+                key = (op.pid, op.device, op.start, op.end, op.size_bytes)
+                observed_channels = channels.get(key, set())
+                if observed_channels != {"Async Memcpy"}:
+                    errors[rank].append(
+                        f"comm{index:02d}: payload hardware channel must be Async Memcpy, "
+                        f"found {', '.join(sorted(observed_channels)) or 'no matching evidence'}"
+                    )
+                if key in matched_activities:
+                    errors[rank].append(f"comm{index:02d}: payloads share the same hardware channel trace activity")
+                matched_activities.add(key)
+                is_h2d = bool(_H2D_COPY.search(op.copy_kind))
+                is_p2p = bool(_P2P_COPY.search(op.copy_kind))
+                destination = op.dst_device
+                if host_source and is_h2d and destination is None:
+                    destination = op.device
+                destinations.append(destination)
+                source_matches = (
+                    "pinned" in op.src_kind.lower() and (is_h2d or is_p2p)
+                    if host_source
+                    else "device" in op.src_kind.lower() and is_p2p and op.src_device == device
+                )
+                if (
+                    not source_matches
+                    or "device" not in op.dst_kind.lower()
+                    or op.size_bytes != shard
+                    or op.copy_count not in (None, 1)
+                ):
+                    errors[rank].append(
+                        f"comm{index:02d}: expected one {shard} B "
+                        f"{'pinned-host' if host_source else 'peer-device'} shard per copy to device memory"
+                    )
+                if destination in ranks_by_device:
+                    incoming[ranks_by_device[destination]].append(op)
+            if Counter(destinations) != Counter(peers):
+                errors[rank].append(
+                    f"comm{index:02d}: expected one payload per destination {sorted(peers)}, found {destinations}"
+                )
+    return errors, incoming
+
+
+def _analyse_rank(
+    record: dict,
+    activities: dict[str, list[Activity]],
+    samples: dict[int, list[Sample]],
+    *,
+    unicast_errors: Sequence[str] = (),
+    incoming: Sequence[Activity] | None = None,
+) -> dict:
+    errors = list(unicast_errors)
     mode = record["mode"]
+    unicast = mode.endswith(_UNICAST_MODES)
     host_destination = mode.endswith("ag-d2h")
     gemm_events = _event_intervals(record, "gemm")
     comm_events = _event_intervals(record, "comm")
@@ -258,9 +417,14 @@ def _analyse_rank(record: dict, activities: dict[str, list[Activity]], samples: 
     source_bytes = record["size_bytes"]
     if "ag-" in mode and not host_destination:
         source_bytes //= record["world_size"]
+    if unicast:
+        source_bytes = record["comm_source_bytes"]
+        copies_complete = copies_complete and not unicast_errors
     native_ag = record.get("nccl_version") is not None
     for index, group in sorted(copies.items()):
         total = sum(op.size_bytes for op in group)
+        if unicast:
+            continue  # The unicast trace checks the byte count at every destination.
         if host_destination and total != source_bytes:
             errors.append(f"comm{index:02d}: traced {total} copy bytes, expected {source_bytes} bytes of D2H fan-out")
             copies_complete = False
@@ -294,10 +458,16 @@ def _analyse_rank(record: dict, activities: dict[str, list[Activity]], samples: 
     if device is not None and any(op.device != device for op in copy_ops):
         errors.append(f"copy activities include a device other than the rank-local GPU {device}")
 
-    comm_union = _busy(copy_ops)
+    destination_ops = copy_ops if incoming is None else incoming
+    comm_union = _busy(destination_ops)
+    outgoing_union = _busy(copy_ops)
     if gemm_events and comm_events and gemm_complete and copies_complete:
         if not any(overlap_ns(start, end, comm_union) for start, end in _busy(compute_ops)):
-            errors.append("no GEMM kernel overlapped a traced local payload copy")
+            errors.append(
+                "no GEMM kernel overlapped a traced local HBM write"
+                if unicast
+                else "no GEMM kernel overlapped a traced local payload copy"
+            )
     event_union = merge_intervals(comm_events)
     m, n, k = record["gemm_mnk"] or (0, 0, 0)
     gemms = []
@@ -308,12 +478,14 @@ def _analyse_rank(record: dict, activities: dict[str, list[Activity]], samples: 
         event_ns = event_end - event_start
         has_trace = bool(gpu_intervals) and copies_complete
         covered_ns = sum(overlap_ns(start, end, comm_union) for start, end in gpu_intervals)
+        outgoing_ns = sum(overlap_ns(start, end, outgoing_union) for start, end in gpu_intervals)
         gemms.append(
             {
                 "index": index,
                 "nsys_kernel_ms": gpu_ns / 1e6 if group else None,
                 "nsys_kernel_tflops": 2 * m * n * k / gpu_ns / 1000 if group else None,
                 "nsys_copy_coverage": covered_ns / gpu_ns if has_trace else None,
+                **({"nsys_outgoing_copy_coverage": outgoing_ns / gpu_ns if has_trace else None} if unicast else {}),
                 "event_ms": event_ns / 1e6,
                 "event_tflops": 2 * m * n * k / event_ns / 1000,
                 "event_copy_coverage": overlap_ns(event_start, event_end, event_union) / event_ns,
@@ -330,7 +502,8 @@ def _analyse_rank(record: dict, activities: dict[str, list[Activity]], samples: 
     elif requested_gpu is not None and metric_device != requested_gpu:
         errors.append(f"requested physical GPU {requested_gpu}, found counters for GPU {metric_device}")
     metrics = []
-    for window, ops in (("gemm_span", compute_ops), ("copy_span", copy_ops)):
+    copy_window = [*copy_ops, *destination_ops] if unicast else copy_ops
+    for window, ops in (("gemm_span", compute_ops), ("copy_span", copy_window)):
         if not ops or metric_device is None:
             continue
         start, end = min(op.start for op in ops), max(op.end for op in ops)
@@ -338,19 +511,22 @@ def _analyse_rank(record: dict, activities: dict[str, list[Activity]], samples: 
         missing = [kind for kind, pattern in _REQUIRED_METRICS.items() if not any(pattern.search(n) for n in counters)]
         if missing:
             errors.append(f"{window}: no sampled {', '.join(missing)} counters on GPU {metric_device}")
-        if window == "copy_span" and mode.endswith(("h2d", "ag-host")):
+        if window == "copy_span" and mode.endswith(("h2d", "ag-host", "ag-host-unicast")):
             if not any(_C2C_RX.search(name) and values["peak"] > 0 for name, values in counters.items()):
                 errors.append(f"{window}: no positive C2C user RX samples for host-sourced copies")
         if window == "copy_span" and host_destination:
             if not any(_C2C_TX.search(name) and values["peak"] > 0 for name, values in counters.items()):
                 errors.append(f"{window}: no positive C2C user TX samples for host-destination copies")
-        if window == "copy_span" and "ag-" in mode and not host_destination:
+        requires_nvlink = ("ag-" in mode and not host_destination and not unicast) or mode.endswith("ag-hbm-unicast")
+        if window == "copy_span" and requires_nvlink:
             for direction in ("NVLink RX", "NVLink TX"):
                 if not any(
                     _REQUIRED_METRICS[direction].search(name) and values["peak"] > 0
                     for name, values in counters.items()
                 ):
-                    errors.append(f"{window}: no positive {direction} samples for multicast AG")
+                    errors.append(
+                        f"{window}: no positive {direction} samples for {'unicast' if unicast else 'multicast'} AG"
+                    )
         metrics.extend(
             {
                 "case": record["case"],
@@ -381,6 +557,7 @@ def _analyse_rank(record: dict, activities: dict[str, list[Activity]], samples: 
                 "event_ms": (end - start) / 1e6,
                 "event_source_GBps": source_bytes / (end - start),
                 "event_receive_payload_proxy_GBps": record["comm_payload_bytes"] / (end - start),
+                **({"event_receive_GBps": record["comm_receive_bytes"] / (end - start)} if unicast else {}),
                 "nsys_payload_copy_bytes": sum(op.size_bytes for op in copies.get(index, [])),
                 "nsys_payload_copy_intervals_ns": _busy(copies.get(index, [])),
                 "nsys_copy_kinds": sorted({(op.copy_kind, op.src_kind, op.dst_kind) for op in copies.get(index, [])}),
@@ -418,7 +595,7 @@ def _read_combined(
     return rank_captures
 
 
-def _analyse_case(case_dir: Path, *, reports_dir: Path, nsys_bin: str) -> dict:
+def _analyse_case(case_dir: Path, *, reports_dir: Path, nsys_bin: str, dump_timeline: str | None = None) -> dict:
     case = case_dir.name
     records = {}
     for path in sorted(case_dir.glob("events.rank_*.json")):
@@ -429,7 +606,12 @@ def _analyse_case(case_dir: Path, *, reports_dir: Path, nsys_bin: str) -> dict:
         records[rank] = record
     if not records:
         raise ValueError("missing events.rank_*.json")
-    config = {key: records[min(records)][key] for key in _CONFIG_FIELDS}
+    first = records[min(records)]
+    unicast = first["mode"].endswith(_UNICAST_MODES)
+    config_fields = _CONFIG_FIELDS
+    if unicast:
+        config_fields += ("comm_source_bytes", "comm_receive_bytes", "comm_rounds_measured")
+    config = {key: first[key] for key in config_fields}
     config["nccl_version"] = records[min(records)].get("nccl_version")
     expected_ranks = set(range(config["world_size"]))
     if config["case"] != case or set(records) != expected_ranks:
@@ -447,6 +629,7 @@ def _analyse_case(case_dir: Path, *, reports_dir: Path, nsys_bin: str) -> dict:
     paths = [*reports_dir.glob(f"{case}.rank_*.nsys-rep"), *(case_dir / "nsys").glob(f"{case}.rank_*.nsys-rep")]
     errors = []
     rank_captures = {}
+    channels = {}
     capture_errors = (OSError, ValueError, subprocess.CalledProcessError, sqlite3.Error)
     if combined_reports:
         if len(combined_reports) != 1 or paths:
@@ -456,7 +639,14 @@ def _analyse_case(case_dir: Path, *, reports_dir: Path, nsys_bin: str) -> dict:
             rank_captures = _read_combined(sqlite_path, case=case, records=records, errors=errors)
         except capture_errors as error:
             errors.append(f"combined capture unavailable or invalid: {error}")
+        if unicast:
+            try:
+                channels = _read_hardware_channels(combined_reports[0], nsys_bin=nsys_bin, dump_timeline=dump_timeline)
+            except (KeyError, OSError, TypeError, ValueError, subprocess.TimeoutExpired) as error:
+                errors.append(f"unicast hardware channel evidence unavailable: {error}")
     else:
+        if unicast:
+            errors.append("unicast validation requires one combined Nsight Systems report")
         reports = {}
         for path in sorted(paths):
             rank = report_rank(path)
@@ -471,7 +661,19 @@ def _analyse_case(case_dir: Path, *, reports_dir: Path, nsys_bin: str) -> dict:
             except capture_errors as error:
                 errors.append(f"rank {rank}: capture unavailable or invalid: {error}")
 
-    ranks = [_analyse_rank(record, *rank_captures.get(rank, ({}, {}))) for rank, record in sorted(records.items())]
+    unicast_errors, incoming = {}, {}
+    if unicast:
+        activities_by_rank = {rank: capture[0] for rank, capture in rank_captures.items()}
+        unicast_errors, incoming = _validate_unicast_trace(records, activities_by_rank, channels)
+    ranks = [
+        _analyse_rank(
+            record,
+            *rank_captures.get(rank, ({}, {})),
+            unicast_errors=unicast_errors.get(rank, ()),
+            incoming=incoming.get(rank),
+        )
+        for rank, record in sorted(records.items())
+    ]
     return {"case": case, "config": config, "ranks": ranks, "errors": errors}
 
 
@@ -485,14 +687,16 @@ def _render(cases: Sequence[dict], *, root: Path) -> str:
         "# GB200 GEMM and copy-engine overlap",
         "",
         "GEMM throughput is 2MNK divided by the union of launch-attributed GPU kernel intervals.",
-        "Coverage is the fraction of those intervals overlapping this rank's traced payload copies, excluding signal writes.",
-        "Coverage uses this rank's outgoing copies. GPU counters are device-wide.",
+        "GPU copy coverage is the fraction of those intervals overlapping traced payload copies.",
+        "Multicast, H2D, and D2H coverage uses rank-local launches. GPU counters are device-wide.",
         "CUDA-event coverage uses the stream-ordered interval between the operation's start and end events.",
         "Source GB/s uses outgoing bytes divided by CUDA-event duration. Multicast sends one shard per rank.",
         "Direct D2H AllGather sends one shard per destination rank, including the local rank.",
+        "Unicast AllGather receive GB/s uses traced destination bytes per rank normalized by its event duration.",
+        "Unicast GPU copy coverage uses inbound HBM writes. Outbound coverage is available in summary.json.",
         "NCCL AG event durations include stream-ordered peer synchronization. Earlier direct multicast runs timed only copy.",
         "Receive payload proxy GB/s normalizes logical receive bytes by the rank's event duration.",
-        "For AllGather the logical receive bytes exclude the local shard.",
+        "The logical receive proxy used for the other AllGather modes excludes the local shard.",
         "CUPTI copy bytes and source/destination enums in summary.json describe outgoing copies as traced.",
         "GPU metric CSV windows span the first to last traced kernel or payload copy and include any intervening gaps.",
         "Counter units and scopes follow Nsight Systems. DRAM bandwidth metrics indicate interface activity and NVLink",
@@ -500,7 +704,7 @@ def _render(cases: Sequence[dict], *, root: Path) -> str:
         "Raw samples are retained in their original units.",
         "",
         "| Case | Status | GPU GEMM TFLOP/s | Event GEMM TFLOP/s | GPU copy coverage | Event coverage "
-        "| Source GB/s | Receive payload proxy GB/s |",
+        "| Source GB/s | Receive GB/s |",
         "| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |",
     ]
     failures = []
@@ -512,6 +716,9 @@ def _render(cases: Sequence[dict], *, root: Path) -> str:
             f"rank {rank['rank']}: {error}" for rank in case["ranks"] for error in rank["errors"]
         ]
         status = "failed" if errors else "ok"
+        show_performance = not errors or not case.get("config", {}).get("mode", "").endswith(_UNICAST_MODES)
+        if not show_performance:
+            gemms, copies = [], []
         cells = [
             case["case"],
             status,
@@ -520,12 +727,12 @@ def _render(cases: Sequence[dict], *, root: Path) -> str:
             _median([g["nsys_copy_coverage"] for g in gemms]),
             _median([g["event_copy_coverage"] for g in gemms]),
             _median([c["event_source_GBps"] for c in copies]),
-            _median([c["event_receive_payload_proxy_GBps"] for c in copies]),
+            _median([c.get("event_receive_GBps", c["event_receive_payload_proxy_GBps"]) for c in copies]),
         ]
         lines.append("| " + " | ".join(cells) + " |")
         failures.extend(f"- {case['case']} / {error}" for error in errors)
         means = defaultdict(list)
-        for rank in case["ranks"]:
+        for rank in case["ranks"] if show_performance else []:
             for metric in rank["metrics"]:
                 name = metric["metric"]
                 if re.search(r"dram|nvlink|nvl[rt]x|c2c|ctc|clock", name, re.I):
@@ -560,6 +767,7 @@ def main(argv: Sequence[str] | None = None) -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output-dir", type=Path, required=True, help="Suite root with cases and nsys reports")
     parser.add_argument("--nsys", required=True, help="Nsight Systems executable used to export SQLite")
+    parser.add_argument("--dump-timeline", help="Nsight Systems DumpTimeline executable for unicast channel checks")
     args = parser.parse_args(argv)
 
     root = args.output_dir
@@ -569,7 +777,9 @@ def main(argv: Sequence[str] | None = None) -> None:
     cases = []
     for path in case_dirs:
         try:
-            cases.append(_analyse_case(path, reports_dir=root / "nsys", nsys_bin=args.nsys))
+            cases.append(
+                _analyse_case(path, reports_dir=root / "nsys", nsys_bin=args.nsys, dump_timeline=args.dump_timeline)
+            )
         except (KeyError, OSError, TypeError, ValueError) as error:
             cases.append({"case": path.name, "ranks": [], "errors": [str(error)]})
 

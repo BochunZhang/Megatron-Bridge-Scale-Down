@@ -63,7 +63,7 @@ def _check_nccl(nccl: ctypes.CDLL, result: int, operation: str) -> None:
         raise RuntimeError(f"{operation} failed with NCCL result {result}: {detail}")
 
 
-def _nccl_version(nccl: ctypes.CDLL) -> str:
+def _nccl_version(nccl: ctypes.CDLL, *, unicast: bool) -> str:
     number = ctypes.c_int()
     _check_nccl(nccl, nccl.ncclGetVersion(ctypes.byref(number)), "ncclGetVersion")
     if number.value < 10000:
@@ -72,8 +72,10 @@ def _nccl_version(nccl: ctypes.CDLL) -> str:
         major, remainder = divmod(number.value, 10000)
     minor, patch = divmod(remainder, 100)
     version = f"{major}.{minor}.{patch}"
-    if (major, minor, patch) < _MIN_NCCL_VERSION:
-        raise RuntimeError(f"Native CE multicast needs NCCL 2.32.2 or newer, found {version}")
+    minimum = (2, 32, 3) if unicast else _MIN_NCCL_VERSION
+    if (major, minor, patch) < minimum:
+        required = ".".join(map(str, minimum))
+        raise RuntimeError(f"Native CE AllGather needs NCCL {required} or newer, found {version}")
     return version
 
 
@@ -104,10 +106,11 @@ class NcclCopyEngineAllGather:
     Args:
         device: This rank's CUDA device.
         rank: This rank's index in the distributed group.
-        world_size: Number of ranks participating in multicast.
+        world_size: Number of ranks participating in AllGather.
         size_bytes: Total bytes of the gathered output on each GPU.
         host_input: Allocate the input shard in pinned CPU memory.
         stage_host_input: Use a separate GPU send buffer filled by ``stage_input``.
+        unicast: Use an in-place GPU input or a direct pinned CPU input for unicast AllGather.
     """
 
     def __init__(
@@ -119,17 +122,22 @@ class NcclCopyEngineAllGather:
         host_input: bool,
         *,
         stage_host_input: bool = False,
+        unicast: bool = False,
     ) -> None:
-        if not 3 <= world_size <= 255 or not 0 <= rank < world_size:
-            raise ValueError(f"CE multicast requires 3–255 ranks, got rank {rank} of {world_size}")
+        min_ranks = 2 if unicast else 3
+        if not min_ranks <= world_size <= 255 or not 0 <= rank < world_size:
+            raise ValueError(f"CE AllGather requires {min_ranks}–255 ranks, got rank {rank} of {world_size}")
         if size_bytes <= 0 or size_bytes % world_size:
             raise ValueError(f"Cannot split {size_bytes} bytes evenly across {world_size} ranks")
         if stage_host_input and not host_input:
             raise ValueError("GPU staging requires a pinned CPU input")
+        if stage_host_input and unicast:
+            raise ValueError("CPU-source CE unicast requires direct transfers from pinned memory")
 
         self._device = device
         self._rank = rank
         self._shard_bytes = size_bytes // world_size
+        self._in_place = unicast and not host_input
         self._staging_source: torch.Tensor | None = None
 
         options = dist.ProcessGroupNCCL.Options()
@@ -143,12 +151,17 @@ class NcclCopyEngineAllGather:
             if not self._comm:
                 raise RuntimeError("PyTorch did not initialize the NCCL communicator for this CUDA device")
             self._nccl = _loaded_nccl()
-            self.version = _nccl_version(self._nccl)
+            self.version = _nccl_version(self._nccl, unicast=unicast)
 
             self._pool = torch.cuda.MemPool(self._backend.mem_allocator)
             with torch.cuda.use_mem_pool(self._pool):
                 self._output = torch.empty(size_bytes, dtype=torch.uint8, device=device)
-                if not host_input or stage_host_input:
+                if self._in_place:
+                    # NCCL skips the self copy when the input aliases its receive slot.
+                    self._input = self._output.narrow(0, rank * self._shard_bytes, self._shard_bytes)
+                    self._input.fill_(rank + 1)
+                    self._source = self._input.data_ptr()
+                elif not host_input or stage_host_input:
                     # A staged send buffer starts invalid so a missing H2D cannot pass validation.
                     initial_value = 0 if stage_host_input else rank + 1
                     self._input = torch.full((self._shard_bytes,), initial_value, dtype=torch.uint8, device=device)
@@ -183,7 +196,7 @@ class NcclCopyEngineAllGather:
             raise RuntimeError("Cannot launch AllGather on a closed communicator")
         stream = torch.cuda.current_stream(self._device).cuda_stream
         if stream == 0:
-            raise RuntimeError("CE multicast requires a non-default CUDA stream")
+            raise RuntimeError("CE AllGather requires a non-default CUDA stream")
         _check_nccl(
             self._nccl,
             self._nccl.ncclAllGather(
@@ -193,8 +206,10 @@ class NcclCopyEngineAllGather:
         )
 
     def reset_output(self) -> None:
-        """Poison the receive buffer and any H2D staging output before measurement."""
+        """Reset the receive buffer and restore any in-place input before measurement."""
         self._output.zero_()
+        if self._in_place:
+            self._input.fill_(self._rank + 1)
         if self._staging_source is not None:
             self._input.zero_()
 
@@ -202,7 +217,7 @@ class NcclCopyEngineAllGather:
         """Check the full local receive buffer after communication completes."""
         for peer, shard in enumerate(self._output.split(self._shard_bytes)):
             if not torch.all(shard.eq(peer + 1)).item():
-                raise RuntimeError(f"CE multicast rank {self._rank} received incorrect bytes for rank {peer}")
+                raise RuntimeError(f"CE AllGather rank {self._rank} received incorrect bytes for rank {peer}")
 
     def close(self) -> None:
         """Drain the current device and release the registered NCCL group."""
