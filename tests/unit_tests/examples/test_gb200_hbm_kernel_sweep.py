@@ -214,8 +214,18 @@ def test_ncu_summary_distinguishes_missing_link_samples_from_zero(experiment_mod
 
 
 @pytest.mark.unit
-def test_ncu_bash_launches_torch_distributed_worker(tmp_path):
+@pytest.mark.parametrize("ncu_source", ["repo", "env", "argument"])
+def test_ncu_bash_launches_torch_distributed_worker(tmp_path, monkeypatch, ncu_source):
     destination = tmp_path / "ncu-dry-run"
+    ncu_options = []
+    ncu_path = _EXPERIMENT.parents[2] / "NVIDIA-Nsight-Compute-2026.4" / "ncu"
+    monkeypatch.delenv("NCU_BIN", raising=False)
+    if ncu_source in ("env", "argument"):
+        ncu_path = tmp_path / "ncu from env"
+        monkeypatch.setenv("NCU_BIN", str(ncu_path))
+    if ncu_source == "argument":
+        ncu_path = tmp_path / "ncu from argument"
+        ncu_options.extend(("--ncu", str(ncu_path)))
     result = subprocess.run(
         [
             "bash",
@@ -227,6 +237,7 @@ def test_ncu_bash_launches_torch_distributed_worker(tmp_path):
             "--dry-run",
             "--output-dir",
             str(destination),
+            *ncu_options,
         ],
         check=True,
         capture_output=True,
@@ -235,6 +246,7 @@ def test_ncu_bash_launches_torch_distributed_worker(tmp_path):
     commands = [shlex.split(line) for line in result.stdout.splitlines() if "--nvtx-include" in line]
     assert len(commands) == 2
     for command, m in zip(commands, (1, 8192)):
+        assert command[command.index("--replay-mode") - 1] == str(ncu_path)
         assert "CUDA_VISIBLE_DEVICES=3" in command
         assert "--ncu-gemm" in command
         assert command[command.index("--pm-sampling-interval") + 1] == "1000"

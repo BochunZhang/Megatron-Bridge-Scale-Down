@@ -162,6 +162,7 @@ bash examples/gb200/hbm-conflict/run_ncu_hbm_gemm_sweep.sh \
   --gpu 0
 ```
 
+NCU 默认为仓库根目录下的 `NVIDIA-Nsight-Compute-2026.4/ncu`，可用 `--ncu` 或 `NCU_BIN` 指定安装路径。
 NCU 在 application replay 中沿用预热和外部锁频。脚本在目标 GPU 查询指标，DRAM 采逐 kernel 的读写字节数，
 也支持将 sector 计数按每 sector 32 B 换算。NVLink RX/TX 采 wire bytes，C2C RX/TX 采 user bytes，使用独跑
 时的整卡 PM 采样，间隔为 1 µs。每个 M 保留 `.ncu-rep` 和 raw CSV。`summary.json` 汇总每次 GEMM 的字节数、各组均值、

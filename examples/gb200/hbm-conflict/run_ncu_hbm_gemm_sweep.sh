@@ -13,7 +13,7 @@ Usage: bash run_ncu_hbm_gemm_sweep.sh [options]
   --m-values LIST   Comma-separated M values (default: 1,2,...,8192 by powers of two)
   --gemm-rounds N   Measured GEMMs per shape (default: 16)
   --warmup N        Warmup GEMMs per shape (default: 5)
-  --ncu PATH        Nsight Compute executable (default: NCU_BIN or ncu)
+  --ncu PATH        Nsight Compute executable (default: NCU_BIN or <repo>/NVIDIA-Nsight-Compute-2026.4/ncu)
   --output-dir DIR  Results directory (default: results/gb200/hbm-conflict/<time>-ncu-gemm)
   --dry-run         Show commands without profiling
   -h, --help
@@ -33,7 +33,7 @@ script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 repo_root="$(cd -- "$script_dir/../../.." && pwd)"
 analyser="$script_dir/analyse_ncu_hbm_gemm.py"
 gpu=0 m_values=1,2,4,8,16,32,64,128,256,512,1024,2048,4096,8192
-gemm_rounds=16 warmup=5 ncu_bin="${NCU_BIN:-ncu}" output_dir="" dry_run=false
+gemm_rounds=16 warmup=5 ncu_bin="${NCU_BIN:-$repo_root/NVIDIA-Nsight-Compute-2026.4/ncu}" output_dir="" dry_run=false
 pm_interval_ns=1000
 
 while (( $# )); do
@@ -81,7 +81,7 @@ if $dry_run; then
         pmsampling:ctc__rx_bytes_data_user.sum pmsampling:ctc__tx_bytes_data_user.sum)
     metrics="$(IFS=,; printf '%s' "${dry_metrics[*]}")"
 else
-    command -v "$ncu_bin" >/dev/null || die "ncu not found; pass --ncu PATH"
+    command -v "$ncu_bin" >/dev/null || die "ncu not found at $ncu_bin; pass --ncu PATH"
     command -v uv >/dev/null || die "uv is required"
     mkdir -p -- "$(dirname -- "$output_dir")"
     mkdir -- "$output_dir" || die "use a new results directory"
