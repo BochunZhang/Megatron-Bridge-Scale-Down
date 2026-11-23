@@ -17,7 +17,7 @@ usage() {
     fi
     cat <<'EOF'
   --m N --n N --k N   GEMM dimensions (default: 4096, 2048, 8192)
-  --batches LIST     Comma-separated batch sizes (default: 1,2,4,8,16)
+  --batches LIST     Comma-separated batch sizes (default: 1,2,4,8,16,32,64)
   --gpu N            Physical GPU index from nvidia-smi (default: 0)
   --numa-node N      Bind to a Grace CPU NUMA node (default: auto; none uses current policy)
   --warmup N         Warmup GEMMs per case (default: 16)
@@ -49,7 +49,7 @@ is_uint() { [[ $1 =~ ^(0|[1-9][0-9]{0,9})$ ]] && (( $1 <= 2147483647 )); }
 
 script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 repo_root="$(cd -- "$script_dir/../../.." && pwd)"
-m=4096 n=2048 k=8192 k_panel="" batches=1,2,4,8,16 gpu=0 numa_node=auto
+m=4096 n=2048 k=8192 k_panel="" batches=1,2,4,8,16,32,64 gpu=0 numa_node=auto
 warmup=16 iters=100 slots=8 frequency=10000 output_dir="" analyse=false dry_run=false
 metrics_set="file:$script_dir/gb200-gemm-metrics.config"
 retry_with_stock=true
