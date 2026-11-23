@@ -125,7 +125,7 @@ run_case() {
         --standalone --nnodes=1 --nproc_per_node="$ranks" "$script_dir/cpu_allgather.py"
         --case "$case_id" --output-dir "$case_dir" --shard-mib "$shard_mib" --warmup "$warmup" --iters "$iters")
     if $profile; then
-        worker=("$nsys_bin" profile --trace=cuda,nvtx --cuda-trace-scope=process-tree
+        worker=("$nsys_bin" profile --trace=cuda,nvtx
             --cuda-trace-all-apis=true --sample=none --cpuctxsw=none
             --capture-range=cudaProfilerApi --capture-range-end=stop --output="$case_dir/$case_id"
             "${worker[@]}" --profile)
