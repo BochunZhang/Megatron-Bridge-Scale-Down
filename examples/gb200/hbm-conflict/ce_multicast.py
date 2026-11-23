@@ -106,18 +106,31 @@ class NcclCopyEngineAllGather:
         rank: This rank's index in the distributed group.
         world_size: Number of ranks participating in multicast.
         size_bytes: Total bytes of the gathered output on each GPU.
-        host_input: Read directly from a pinned CPU tensor instead of GPU memory.
+        host_input: Allocate the input shard in pinned CPU memory.
+        stage_host_input: Use a separate GPU send buffer filled by ``stage_input``.
     """
 
-    def __init__(self, device: torch.device, rank: int, world_size: int, size_bytes: int, host_input: bool) -> None:
+    def __init__(
+        self,
+        device: torch.device,
+        rank: int,
+        world_size: int,
+        size_bytes: int,
+        host_input: bool,
+        *,
+        stage_host_input: bool = False,
+    ) -> None:
         if not 3 <= world_size <= 255 or not 0 <= rank < world_size:
             raise ValueError(f"CE multicast requires 3–255 ranks, got rank {rank} of {world_size}")
         if size_bytes <= 0 or size_bytes % world_size:
             raise ValueError(f"Cannot split {size_bytes} bytes evenly across {world_size} ranks")
+        if stage_host_input and not host_input:
+            raise ValueError("GPU staging requires a pinned CPU input")
 
         self._device = device
         self._rank = rank
         self._shard_bytes = size_bytes // world_size
+        self._staging_source: torch.Tensor | None = None
 
         options = dist.ProcessGroupNCCL.Options()
         # Raw calls have no ProcessGroupNCCL Work object to poll ncclInProgress.
@@ -135,15 +148,20 @@ class NcclCopyEngineAllGather:
             self._pool = torch.cuda.MemPool(self._backend.mem_allocator)
             with torch.cuda.use_mem_pool(self._pool):
                 self._output = torch.empty(size_bytes, dtype=torch.uint8, device=device)
-                if not host_input:
-                    self._input = torch.full((self._shard_bytes,), rank + 1, dtype=torch.uint8, device=device)
+                if not host_input or stage_host_input:
+                    # A staged send buffer starts invalid so a missing H2D cannot pass validation.
+                    initial_value = 0 if stage_host_input else rank + 1
+                    self._input = torch.full((self._shard_bytes,), initial_value, dtype=torch.uint8, device=device)
+                    self._source = self._input.data_ptr()
             if host_input:
                 # Leave the host buffer outside NCCL's window registration.
-                self._input = torch.empty(self._shard_bytes, dtype=torch.uint8, device="cpu", pin_memory=True)
-                self._input.fill_(rank + 1)
-                self._source = _mapped_host_pointer(self._input)
-            else:
-                self._source = self._input.data_ptr()
+                pinned_input = torch.empty(self._shard_bytes, dtype=torch.uint8, device="cpu", pin_memory=True)
+                pinned_input.fill_(rank + 1)
+                if stage_host_input:
+                    self._staging_source = pinned_input
+                else:
+                    self._input = pinned_input
+                    self._source = _mapped_host_pointer(pinned_input)
             self._destination = self._output.data_ptr()
 
             torch.cuda.synchronize(device)
@@ -152,6 +170,12 @@ class NcclCopyEngineAllGather:
         except Exception:
             self.close()
             raise
+
+    def stage_input(self) -> None:
+        """Enqueue the pinned CPU shard's H2D copy on the current CUDA stream."""
+        if self._staging_source is None or self._group is None:
+            raise RuntimeError("H2D staging requires an open collective configured for GPU staging")
+        self._input.copy_(self._staging_source, non_blocking=True)
 
     def run(self) -> None:
         """Enqueue a native NCCL collective on the current CUDA stream."""
@@ -169,8 +193,10 @@ class NcclCopyEngineAllGather:
         )
 
     def reset_output(self) -> None:
-        """Poison this rank's local output before measuring a fresh collective."""
+        """Poison the receive buffer and any H2D staging output before measurement."""
         self._output.zero_()
+        if self._staging_source is not None:
+            self._input.zero_()
 
     def validate(self) -> None:
         """Check the full local receive buffer after communication completes."""
