@@ -74,12 +74,18 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--size-mib", type=int, required=True, help="Full AllGather output or local H2D size in MiB")
     parser.add_argument("--warmup", type=int, required=True, help="Warmup rounds per active stream")
     parser.add_argument("--gemm-rounds", type=int, required=True)
+    parser.add_argument("--kernel-trace-only", action="store_true", help="Use a full process-tree CUDA/NVTX capture")
+    parser.add_argument(
+        "--ncu-gemm", action="store_true", help="Profile standalone GEMM launches without a launch gate"
+    )
     parser.add_argument(
         "--comm-rounds", type=int, required=True, help="Communication rounds, extended if needed in mixed modes"
     )
     args = parser.parse_args(argv)
     if args.mode.startswith("gemm") and args.gemm is None:
         parser.error("--gemm is required in GEMM modes")
+    if args.ncu_gemm and args.mode != "gemm":
+        parser.error("--ncu-gemm requires --mode gemm")
     for name in ("size_mib", "gemm_rounds", "comm_rounds"):
         if getattr(args, name) <= 0:
             parser.error(f"--{name.replace('_', '-')} must be positive")
@@ -226,9 +232,10 @@ def _run_case(args: argparse.Namespace, device: torch.device, *, cleanup: ExitSt
         end.record()
     torch.cuda.synchronize(device)
 
-    # Unicast profiles the process tree so the capture includes each worker's NVTX ranges.
-    control_capture = rank == 0 and not unicast
-    gate = LaunchGate(timeout_s=30.0)
+    # Full process-tree traces already capture each worker's NVTX ranges.
+    control_capture = rank == 0 and not (unicast or args.kernel_trace_only or args.ncu_gemm)
+    # NCU may synchronize a profiled kernel before the host can release the launch gate.
+    gate = None if args.ncu_gemm else LaunchGate(timeout_s=30.0)
     try:
         dist.barrier()
         if control_capture:
@@ -237,7 +244,8 @@ def _run_case(args: argparse.Namespace, device: torch.device, *, cleanup: ExitSt
             # Synchronize every worker before entering the timed NVTX ranges.
             dist.barrier()
             with nvtx.range(f"hbm-ce/{args.case}/rank-{rank}"):
-                gate.arm(control_stream)
+                if gate is not None:
+                    gate.arm(control_stream)
                 try:
                     origin.record(control_stream)
                     if comm is not None:
@@ -251,19 +259,22 @@ def _run_case(args: argparse.Namespace, device: torch.device, *, cleanup: ExitSt
                     # Host rendezvous releases only fully queued streams across all ranks.
                     dist.barrier()
                 finally:
-                    gate.release()
+                    if gate is not None:
+                        gate.release()
                 torch.cuda.synchronize(device)
             # Wait for every rank before closing the capture and inspecting outputs.
             dist.barrier()
         finally:
             if control_capture:
                 torch.cuda.profiler.stop()
-        watchdog = torch.tensor(int(gate.watchdog_fired()))
-        dist.all_reduce(watchdog, op=dist.ReduceOp.MAX)
-        if watchdog.item():
-            raise RuntimeError("CUDA launch gate timed out before all ranks queued the measured batch")
+        if gate is not None:
+            watchdog = torch.tensor(int(gate.watchdog_fired()))
+            dist.all_reduce(watchdog, op=dist.ReduceOp.MAX)
+            if watchdog.item():
+                raise RuntimeError("CUDA launch gate timed out before all ranks queued the measured batch")
     finally:
-        gate.close()
+        if gate is not None:
+            gate.close()
 
     comm_correct = True
     if validate_comm is not None:

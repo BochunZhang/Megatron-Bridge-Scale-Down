@@ -137,6 +137,37 @@ uv run --active --no-sync python examples/gb200/hbm-conflict/analyse_ce_hbm.py \
 P2P 的 source/destination 轨道只计一次。`Compute`、缺少通道证据或缺少预期拷贝时，分析返回非零。
 GEMM 覆盖率按实际写入该 GPU 的 payload 时间线计算。
 
+### 全范围 GEMM 争用 sweep
+
+两条 sweep 都使用 BF16 `[M,8192,7168]`，M 从 1 倍增到 8192，每组默认计时 16 次 GEMM。
+用以下命令在同一张 GPU 上采独跑基线，并在四条 CE AllGather 路径下对比。选项 `--mc-self-import 1`
+复用前述 R580 multicast 库。`--m-values 2,4,8` 和 `--cases task7,task8` 可缩小试跑范围。
+
+```bash
+uv run --active --no-sync python examples/gb200/hbm-conflict/run_ce_hbm_kernel_sweep.py \
+  --gpus 0,1,2,3 --mc-self-import 1
+```
+
+Nsight Systems 采集 CUDA kernel、GPU memcpy 和 NVTX 时间线。每条 AG 路径从每张 GPU **1 GiB 输出**开始，
+默认至少运行 25 轮 AG。在同一轮 payload 中完整覆盖至少两个首卡 GEMM 后接受该样本。有效 trace 的覆盖不足时，
+只对当前 M 和 AG 路径将输出大小翻倍重跑，默认上限为 8192 MiB。每次尝试的 capture 都保留在结果目录。
+每个并跑均值使用所有完整落在单轮 payload 区间内的 GEMM。若一次 GEMM 发起多个 kernel，覆盖判定用该次 GEMM
+的首尾区间，耗时用 kernel 活跃时间。`report.md` 列出 AG 大小、实际轮数、GEMM 入选数量、均值和相对同 M
+独跑的变化。`summary.json` 记录每轮 AG 和每次 GEMM 的覆盖关系。
+
+用以下命令采独跑 GEMM 的流量计数器。在两次采集中选择同一张物理 GPU，保持硬件和锁频一致。
+
+```bash
+uv run --active --no-sync python examples/gb200/hbm-conflict/run_ncu_hbm_gemm_sweep.py \
+  --gpu 0
+```
+
+NCU 在 application replay 中沿用预热和外部锁频。脚本在目标 GPU 查询指标，DRAM 采逐 kernel 的读写字节数，
+也支持将 sector 计数按每 sector 32 B 换算。NVLink RX/TX 采 wire bytes，C2C RX/TX 采 user bytes，使用独跑
+时的整卡 PM 采样，间隔为 1 µs。每个 M 保留 `.ncu-rep` 和 raw CSV。`summary.json` 汇总每次 GEMM 的字节数、各组均值、
+总量及基于 NCU kernel 时长的十进制 GB/s。目标 GPU 或 profiler 未提供的计数器保留为 `null`。
+比较争用耗时时使用 Nsight Systems 的同批 GEMM 独跑和并跑值。两条 sweep 都支持 `--dry-run`。
+
 ### R580 上的 multicast handle self-import 对照
 
 在同一台 R580 GB200 节点，用 NCCL `v2.32.3-1` 构建带 self-import 开关的库。启用时，LSA team

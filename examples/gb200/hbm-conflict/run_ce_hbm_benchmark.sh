@@ -19,6 +19,7 @@ Usage: bash run_ce_hbm_benchmark.sh [options]
   --comm-rounds N     Standalone transfers, or minimum transfers when overlapped (default: 25)
   --nsys PATH         Nsight Systems 2026.6.1 executable (also NSYS_BIN)
   --nsys-freq HZ      GPU metrics sampling rate (default: 10000)
+  --kernel-trace-only Capture CUDA/NVTX across all workers without GPU metrics
   --nccl-lib PATH     Override the libnccl.so.2 preloaded for AG cases
   --mc-self-import M  Use the patched NCCL with 0 (control), 1 (self-import), or ab (both)
   --output-dir DIR    Results directory (default: results/gb200/hbm-conflict/gpu-num-N/<timestamp>-ce)
@@ -50,7 +51,7 @@ IFS=, read -r -a default_gpus <<< "$gpu_ids"
 gpu_ids="$(IFS=,; printf '%s' "${default_gpus[*]:0:4}")"
 case_ids="" include_baseline=false
 gemms='[8192,8192,7168]'
-size_mib=1024 warmup=5 gemm_rounds=20 comm_rounds=25 nsys_freq=10000
+size_mib=1024 warmup=5 gemm_rounds=20 comm_rounds=25 nsys_freq=10000 kernel_trace_only=false
 ce_multicast_threshold=4611686018427387904
 output_dir="" dry_run=false nccl_lib="" mc_self_import=""
 original_args=("$@")
@@ -75,6 +76,7 @@ while (( $# )); do
             esac
             shift 2 ;;
         --baseline) include_baseline=true; shift ;;
+        --kernel-trace-only) kernel_trace_only=true; shift ;;
         --dry-run) dry_run=true; shift ;;
         -h|--help) usage; exit 0 ;;
         *) die "unknown argument $1" ;;
@@ -190,10 +192,15 @@ else
     resolve_gloo_socket_ifname 1
     mkdir -p -- "$(dirname -- "$output_dir")"
     mkdir -- "$output_dir" || die "use a new results directory"
+    report_nsys_freq="$nsys_freq"
+    if $kernel_trace_only; then report_nsys_freq=disabled; fi
     printf '%s\n' "$nsys_version" "GLOO_SOCKET_IFNAME=$GLOO_SOCKET_IFNAME" "CUDA_DEVICE_ORDER=$CUDA_DEVICE_ORDER" \
         "gpu_ids=$gpu_ids" "lock_gpus=$lock_gpus" "gemm=$gemms" "cases=$case_ids" \
         "size_mib=$size_mib" "warmup=$warmup" "gemm_rounds=$gemm_rounds" "comm_rounds=$comm_rounds" \
-        "nsys_freq=$nsys_freq" "cwd=$PWD" >"$output_dir/run_info.txt"
+        "nsys_freq=$report_nsys_freq" "cwd=$PWD" >"$output_dir/run_info.txt"
+    if $kernel_trace_only; then
+        printf '%s\n' 'kernel_trace_only=true' >>"$output_dir/run_info.txt"
+    fi
     if [[ -n "$nccl_lib" ]]; then
         printf '%s\n' "nccl_lib=$nccl_lib" >>"$output_dir/run_info.txt"
         sha256sum -- "$nccl_lib" >>"$output_dir/run_info.txt"
@@ -205,8 +212,10 @@ else
     "${lock_command[@]}" 2>&1 | tee "$output_dir/gpu_clock_lock.log"
     "${clock_query[@]}" >"$output_dir/gpu_clocks.before.csv"
     nvidia-smi topo -m >"$output_dir/gpu_topology.txt"
-    "$NSYS_BIN" profile --gpu-metrics-devices="$lock_gpus" --gpu-metrics-set=help \
-        >"$output_dir/nsys-gpu-metrics.txt" 2>&1 || true
+    if ! $kernel_trace_only; then
+        "$NSYS_BIN" profile --gpu-metrics-devices="$lock_gpus" --gpu-metrics-set=help \
+            >"$output_dir/nsys-gpu-metrics.txt" 2>&1 || true
+    fi
 fi
 
 validate_nccl_ce_ag() {
@@ -274,22 +283,26 @@ run_case() {
         *ag-hbm|*ag-host) nccl_transport=multicast nvls_enable=1 multicast_threshold="$ce_multicast_threshold" ;;
         *ag-hbm-unicast|*ag-host-unicast) nccl_transport=unicast ;;
     esac
-    if [[ -n "$nccl_transport" ]]; then
+    if [[ -n "$nccl_transport" ]] && ! $kernel_trace_only; then
         trace+=,nccl
     fi
     local -a capture_args=(--capture-range=cudaProfilerApi --capture-range-end=stop)
-    if [[ "$nccl_transport" == unicast ]]; then
+    if $kernel_trace_only || [[ "$nccl_transport" == unicast ]]; then
         # Keep every worker's NVTX ranges in the report. Analysis uses the timed ranges.
         capture_args=(--capture-range=none)
     fi
-    # One Nsight session puts all workers and selected GPU metrics on the same timeline.
+    # One Nsight session puts all workers on the same timeline.
     local -a command=("$NSYS_BIN" profile
         --trace="$trace" --cuda-trace-scope=process-tree --cuda-trace-all-apis=true --sample=none --cpuctxsw=none
-        "${capture_args[@]}"
-        --gpu-metrics-devices="$devices" --gpu-metrics-set=gb10x-ct --gpu-metrics-frequency="$nsys_freq" --output="$report"
+        "${capture_args[@]}")
+    if ! $kernel_trace_only; then
+        command+=(--gpu-metrics-devices="$devices" --gpu-metrics-set=gb10x-ct --gpu-metrics-frequency="$nsys_freq")
+    fi
+    command+=(--output="$report"
         uv run --active --no-sync python -m torch.distributed.run --standalone --nnodes=1 --nproc_per_node="$ranks"
         "$script_dir/ce_hbm_benchmark.py" --case "$name" --mode "$mode" --output-dir "$case_dir"
         --size-mib "$size_mib" --warmup "$warmup" --gemm-rounds "$gemm_rounds" --comm-rounds "$comm_rounds")
+    if $kernel_trace_only; then command+=(--kernel-trace-only); fi
     if [[ -n "$shape" ]]; then command+=(--gemm "$shape"); fi
 
     local -a run_env=(env)
