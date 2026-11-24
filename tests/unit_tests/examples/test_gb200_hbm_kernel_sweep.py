@@ -1,8 +1,7 @@
-"""Verify adaptive AG sizing and same-round GEMM coverage on CPU."""
+"""Verify CE sweep planning, launch selection, and trace analysis on CPU."""
 
 import csv
 import importlib
-import json
 import os
 import shlex
 import shutil
@@ -22,7 +21,8 @@ def experiment_modules(monkeypatch):
 
 
 @pytest.mark.unit
-def test_default_sweep_prints_four_ag_paths_and_one_baseline_per_shape(tmp_path):
+@pytest.mark.parametrize("test_only", [False, True])
+def test_sweep_profiles_only_the_selected_shapes_paths_and_gpus(tmp_path, test_only):
     destination = tmp_path / "dry-run"
     result = subprocess.run(
         [
@@ -33,29 +33,36 @@ def test_default_sweep_prints_four_ag_paths_and_one_baseline_per_shape(tmp_path)
             "--dry-run",
             "--output-dir",
             str(destination),
+            *(["--test"] if test_only else []),
         ],
         check=True,
         capture_output=True,
         text=True,
     )
     commands = [shlex.split(line) for line in result.stdout.splitlines() if "--mode " in line]
-    assert len(commands) == 70
-    expected_modes = ["gemm", "gemm-ag-hbm", "gemm-ag-host", "gemm-ag-hbm-unicast", "gemm-ag-host-unicast"]
-    for index, m in enumerate(2**power for power in range(14)):
-        group = commands[5 * index : 5 * index + 5]
+    starts = [shlex.split(line) for line in result.stdout.splitlines() if " --gpu-metrics-frequency=" in line]
+    shapes = [8] if test_only else [2**power for power in range(14)]
+    assert len(commands) == len(starts) == len(shapes) * 6
+    expected_modes = ["gemm", "gemm", "gemm", "gemm-ag-host", "gemm-ag-hbm", "gemm-ag-hbm-unicast"]
+    expected_gpus = ["1", "2", "3", "1,2,3", "1,2,3", "1,2,3"]
+    for index, m in enumerate(shapes):
+        group = commands[6 * index : 6 * index + 6]
+        start_group = starts[6 * index : 6 * index + 6]
         assert [cmd[cmd.index("--mode") + 1] for cmd in group] == expected_modes
-        for cmd in group:
+        for worker_index, (cmd, start) in enumerate(zip(group, start_group, strict=True)):
             assert cmd[cmd.index("--gemm") + 1] == f"[{m},8192,7168]"
-            assert cmd[cmd.index("--size-mib") + 1] == "1024"
-            assert cmd[cmd.index("--gemm-rounds") + 1] == "16"
+            assert cmd[cmd.index("--size-mib") + 1] == ("2048" if m == 8192 and worker_index >= 3 else "1024")
+            assert cmd[cmd.index("--gemm-rounds") + 1] == "8"
             assert "--trace=cuda,nvtx" in cmd
-            assert "--capture-range=none" in cmd
-            assert not any(part.startswith("--gpu-metrics") for part in cmd)
+            assert "--nvtx-domain-exclude=NCCL" in cmd and "--cuda-trace-all-apis=true" not in cmd
+            assert "--profile-sync-dir" in cmd
+            assert f"--gpu-metrics-devices={expected_gpus[worker_index]}" in start
+            assert "--gpu-metrics-frequency=200000" in start
     assert not destination.exists()
 
 
 @pytest.mark.unit
-def test_bash_retries_only_when_trace_has_too_few_gemms_in_a_round(monkeypatch, tmp_path):
+def test_bash_retries_incomplete_overlap_without_retrying_analysis_errors(monkeypatch, tmp_path):
     launcher = tmp_path / "run_ce_hbm_kernel_sweep.sh"
     shutil.copy2(_EXPERIMENT / launcher.name, launcher)
     (tmp_path / "run_ce_hbm_benchmark.sh").write_text(
@@ -68,25 +75,20 @@ exit 1
 """,
         encoding="utf-8",
     )
-    (tmp_path / "analyse_ce_hbm_kernel_trace.py").write_text(
+    (tmp_path / "analyse_ce_hbm_overlap.py").write_text(
         """import json
 import sys
 from pathlib import Path
 
-action = sys.argv[1]
-opts = dict(zip(sys.argv[2::2], sys.argv[3::2], strict=True))
+opts = dict(zip(sys.argv[1::2], sys.argv[2::2], strict=True))
 out = Path(opts["--output-dir"])
-if action == "report":
-    assert (out / "m8192").is_dir()
-    sys.exit(0)
-assert action == "attempt"
-case, size = opts["--case"], int(opts["--size-mib"])
+case = "task1" if out.parent.name.startswith("gpu") else out.parent.name
 status, code = "ok", 0
-if case == "task3" and size == 1024:
+if case == "task3" and "-rounds-" not in out.name:
     status, code = "insufficient_overlap", 3
 if case == "task7":
     status, code = "error", 1
-(out / "attempt.json").write_text(json.dumps({"case": case, "size_mib": size, "status": status}))
+(out / "summary.json").write_text(json.dumps({"case": case, "status": status}))
 sys.exit(code)
 """,
         encoding="utf-8",
@@ -114,8 +116,7 @@ exec "$SWEEP_TEST_PYTHON" "$@"
         [
             "bash",
             str(launcher),
-            "--m-values",
-            "8192",
+            "--test",
             "--cases",
             "task3,task7",
             "--nsys",
@@ -128,16 +129,19 @@ exec "$SWEEP_TEST_PYTHON" "$@"
     )
 
     assert result.returncode == 1, result.stderr
-    attempts = sorted(
-        (attempt["case"], attempt["size_mib"], attempt["status"])
-        for path in destination.rglob("attempt.json")
-        for attempt in [json.loads(path.read_text(encoding="utf-8"))]
-    )
+    with (destination / "status.tsv").open(encoding="utf-8") as handle:
+        attempts = [
+            (row["case"], row["metrics_gpus"], row["size_mib"], row["status"], Path(row["attempt_dir"]).name)
+            for row in csv.DictReader(handle, delimiter="\t")
+        ]
     assert attempts == [
-        ("task1", 1024, "ok"),
-        ("task3", 1024, "insufficient_overlap"),
-        ("task3", 2048, "ok"),
-        ("task7", 1024, "error"),
+        ("task1", "1", "1024", "ok", "size-1024mib"),
+        ("task1", "2", "1024", "ok", "size-1024mib"),
+        ("task1", "3", "1024", "ok", "size-1024mib"),
+        ("task3", "1,2,3", "1024", "insufficient_overlap", "size-1024mib"),
+        ("task3", "1,2,3", "2048", "insufficient_overlap", "size-2048mib"),
+        ("task3", "1,2,3", "2048", "ok", "size-2048mib-rounds-2"),
+        ("task7", "1,2,3", "1024", "analysis_error", "size-1024mib"),
     ]
 
 

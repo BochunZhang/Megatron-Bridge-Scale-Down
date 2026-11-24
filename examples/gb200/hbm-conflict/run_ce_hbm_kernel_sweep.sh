@@ -6,26 +6,26 @@ set -euo pipefail
 
 usage() {
     cat <<'USAGE'
-Measure GEMM-only and CE AllGather overlap from CUDA and NVTX traces.
+Profile 8 BF16 GEMMs alone or overlapped with stock NCCL copy-engine AllGather.
+GPU metrics are sampled at 200 kHz on physical GPUs 1,2,3.
 
 Usage: run_ce_hbm_kernel_sweep.sh [options]
+  --test                Run M=8 only
   --m-values LIST       Subset of powers of two from 1 through 8192
-  --gpus LIST           Ordered GPU IDs (default: first four CUDA_VISIBLE_DEVICES or 0,1,2,3)
-  --cases LIST          task1,task3,task4,task7,task8 (default: all; always includes task1)
-  --gemm-rounds N       Measured GEMMs (default: 16)
-  --comm-rounds N       Minimum measured AG rounds per attempt (default: 25)
-  --warmup N            Warmup rounds (default: 5)
-  --max-size-mib N      Maximum AG output MiB per GPU when retrying (default: 8192)
-  --nsys PATH           Nsight Systems executable (also NSYS_BIN)
-  --nccl-lib PATH       NCCL shared library for AG cases
-  --mc-self-import 0|1  Self-import setting for multicast cases
+  --gpus LIST           Four ordered GPU IDs including 1,2,3 (default: 0,1,2,3)
+  --cases LIST          task1,task4,task3,task7 (default: all; always includes task1)
+  --warmup N            GEMM warmup rounds (default: 5)
+  --nsys PATH           Nsight Systems 2026.6.1 executable (also NSYS_BIN)
+  --nccl-lib PATH       Stock NCCL 2.32.3 or newer (default: PyTorch's loaded library)
   --output-dir DIR      Results directory
-  --dry-run             Show the initial 1 GiB commands
+  --dry-run             Show the archive-derived plan and capture commands
   -h, --help
 
-Each AG case starts at 1 GiB of output per GPU. The sweep increases the size
-when the trace finds fewer than two GEMMs fully inside the same AG round.
-Results include summary.json, report.md, raw traces, and per-attempt metadata.
+Each AllGather uses separate send and receive buffers. One completed lead-in
+runs before collection. The measured AllGather size and rounds come from
+archived timing estimates. Incomplete overlap can retry at 2 GiB, then once
+with a smaller GEMM group per AllGather.
+Results contain plan.tsv, status.tsv, and each attempt's report and metrics.
 USAGE
 }
 
@@ -34,36 +34,34 @@ die() { printf 'error: %s\n' "$*" >&2; exit 2; }
 script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 repo_root="$(cd -- "$script_dir/../../.." && pwd)"
 nsys_bin="${NSYS_BIN:-NsightSystems-2026.6.1/bin/nsys}"
-IFS=, read -r -a default_gpus <<< "${CUDA_VISIBLE_DEVICES:-0,1,2,3}"
-gpus="$(IFS=,; printf '%s' "${default_gpus[*]:0:4}")"
+gpus=0,1,2,3
+report_gpus=1,2,3
 m_values=1,2,4,8,16,32,64,128,256,512,1024,2048,4096,8192
-case_ids=task1,task3,task4,task7,task8
-gemm_rounds=16 comm_rounds=25 warmup=5 max_size_mib=8192
-output_dir="" nccl_lib="" mc_self_import="" dry_run=false
+case_ids=task1,task4,task3,task7
+gemm_rounds=8 warmup=5
+output_dir="" nccl_lib="" dry_run=false test_only=false
 
 while (( $# )); do
     case "$1" in
-        --m-values|--gpus|--cases|--gemm-rounds|--comm-rounds|--warmup|--max-size-mib|--nsys|--nccl-lib|--mc-self-import|--output-dir)
+        --m-values|--gpus|--cases|--warmup|--nsys|--nccl-lib|--output-dir)
             (( $# >= 2 )) && [[ -n "$2" && "$2" != --* ]] || die "$1 requires a value"
             case "$1" in
                 --m-values) m_values="$2" ;;
                 --gpus) gpus="$2" ;;
                 --cases) case_ids="$2" ;;
-                --gemm-rounds) gemm_rounds="$2" ;;
-                --comm-rounds) comm_rounds="$2" ;;
                 --warmup) warmup="$2" ;;
-                --max-size-mib) max_size_mib="$2" ;;
                 --nsys) nsys_bin="$2" ;;
                 --nccl-lib) nccl_lib="$2" ;;
-                --mc-self-import) mc_self_import="$2" ;;
                 --output-dir) output_dir="$2" ;;
             esac
             shift 2 ;;
+        --test) test_only=true; shift ;;
         --dry-run) dry_run=true; shift ;;
         -h|--help) usage; exit 0 ;;
         *) die "unknown argument $1" ;;
     esac
 done
+if $test_only; then m_values=8; fi
 
 [[ "$m_values" =~ ^[1-9][0-9]{0,3}(,[1-9][0-9]{0,3})*$ ]] || die "use distinct powers of two from 1 to 8192"
 IFS=, read -r -a requested_m <<< "$m_values"
@@ -73,79 +71,153 @@ for m in "${requested_m[@]}"; do
         || die "use distinct powers of two from 1 to 8192"
     selected_m+="$m,"
 done
-[[ "$case_ids" =~ ^task[13478](,task[13478])*$ ]] || die "use distinct case IDs from task1,task3,task4,task7,task8"
+[[ "$case_ids" =~ ^task[1347](,task[1347])*$ ]] || die "use distinct case IDs from task1,task4,task3,task7"
 IFS=, read -r -a requested_cases <<< "$case_ids"
 selected_cases=,
 for case_id in "${requested_cases[@]}"; do
     [[ "$selected_cases" != *",$case_id,"* ]] || die "duplicate case $case_id"
     selected_cases+="$case_id,"
 done
-for value in "$gemm_rounds" "$comm_rounds" "$warmup" "$max_size_mib"; do
-    [[ "$value" =~ ^[1-9][0-9]*$ ]] || die "expected a positive integer, got $value"
+[[ "$warmup" =~ ^[1-9][0-9]*$ ]] || die "--warmup needs a positive integer"
+[[ "$gpus" =~ ^(0|[1-9][0-9]*)(,(0|[1-9][0-9]*)){3}$ ]] || die "--gpus needs four physical GPU IDs"
+IFS=, read -r -a requested_gpus <<< "$gpus"
+selected_gpus=,
+for gpu in "${requested_gpus[@]}"; do
+    [[ "$selected_gpus" != *",$gpu,"* ]] || die "duplicate GPU ID $gpu"
+    selected_gpus+="$gpu,"
 done
-(( gemm_rounds >= 2 && max_size_mib >= 1024 )) || die "use at least 2 GEMM rounds and a size limit of 1024 MiB or more"
-[[ -z "$mc_self_import" || "$mc_self_import" == 0 || "$mc_self_import" == 1 ]] || die "--mc-self-import must be 0 or 1"
+for gpu in 1 2 3; do
+    [[ "$selected_gpus" == *",$gpu,"* ]] || die "--gpus must include physical GPUs 1,2,3"
+done
 
 nsys_bin="$(command -v "$nsys_bin" || printf '%s' "$nsys_bin")"
 [[ "$nsys_bin" = /* ]] || nsys_bin="$PWD/$nsys_bin"
-output_dir="${output_dir:-$repo_root/results/gb200/hbm-conflict/$(date +%Y%m%d-%H%M%S)-ce-kernel-sweep}"
+output_dir="${output_dir:-$repo_root/results/gb200/hbm-conflict/$(date +%Y%m%d-%H%M%S)-ce-overlap-sweep}"
 [[ "$output_dir" = /* ]] || output_dir="$PWD/$output_dir"
 if ! $dry_run; then
     [[ -x "$nsys_bin" ]] || die "cannot execute Nsight Systems at $nsys_bin"
     command -v uv >/dev/null || die "uv is required"
     mkdir -p -- "$(dirname -- "$output_dir")"
     mkdir -- "$output_dir" || die "use a new results directory"
+    printf '%s\n' 'Source: ce-kernel-sweep-20261123-222531/summary.json, 1024 MiB attempts, GPU 0' \
+        'Planning uses p90 kernel, p90 within-round gap (solo p90 fallback), and p10 payload duration.' \
+        '200 kHz metrics on physical GPUs 1,2,3. Validated timing is in each attempt summary.' >"$output_dir/run_info.txt"
+    printf 'm\tcase\tmetrics_gpus\tsize_mib\ttimed_ag_rounds\tgemm_p90_us\tgap_p90_us\tpayload_1gib_p10_us\n' \
+        >"$output_dir/plan.tsv"
+    printf 'm\tcase\tmetrics_gpus\tsize_mib\tstatus\tattempt_dir\n' >"$output_dir/status.tsv"
 fi
-analysis=(uv run --active --no-sync python "$script_dir/analyse_ce_hbm_kernel_trace.py")
+analysis=(uv run --active --no-sync python "$script_dir/analyse_ce_hbm_overlap.py")
+
+archived_timing() {
+    local m="$1" case_id="$2" shape cpu_multicast gpu_multicast gpu_unicast
+    # ce-kernel-sweep-20261123-222531/summary.json, 1 GiB attempts, GPU 0.
+    # Entries per path are p90 kernel duration / p90 gap between contained GEMMs
+    # in the same round (or solo p90 gap) / p10 longest continuous payload.
+    while IFS=' ' read -r shape cpu_multicast gpu_multicast gpu_unicast; do
+        [[ "$shape" == "$m" ]] || continue
+        case "$case_id" in
+            task4) printf '%s\n' "$cpu_multicast" ;;
+            task3) printf '%s\n' "$gpu_multicast" ;;
+            task7) printf '%s\n' "$gpu_unicast" ;;
+        esac
+        return
+    done <<'ESTIMATES'
+1     30/50/1521  245/9/1486   30/26/1046
+2     29/48/1526  251/9/1487   30/25/1043
+4     29/46/1527  257/9/1486   31/52/1044
+8     26/49/1533  200/8/1486   27/25/1042
+16    26/46/1526  211/10/1486  28/48/1043
+32    24/9/1527   248/9/1486   29/47/1042
+64    29/45/1534  249/9/1485   29/28/1044
+128   31/45/1530  257/9/1486   31/29/1044
+256   40/46/1540  260/9/1486   40/58/1047
+512   68/46/1532  304/9/1486   71/38/1043
+1024  124/50/1525 358/9/1487   118/62/1044
+2048  224/38/2321 471/10/1485  223/52/1044
+4096  382/49/1526 617/9/1485   390/54/1047
+8192  735/47/1523 980/9/1485   743/9/1047
+ESTIMATES
+    return 1
+}
 
 run_case() {
-    local case_id="$1" m="$2" size_mib=1024
-    local attempt_dir launch_exit analysis_exit
+    local case_id="$1" m="$2" metrics="$3" devices="$4"
+    local size_mib=1024 rounds=0 gemm_us=0 gap_us=0 payload_us=0 fits budget
+    local guard_us=150 group_cap=0 attempt_dir case_path analysis_exit status timing
+    if [[ "$case_id" == task1 ]]; then
+        case_path="$case_id/gpu$metrics"
+    else
+        case_path="$case_id"
+        timing=$(archived_timing "$m" "$case_id") || return
+        IFS=/ read -r gemm_us gap_us payload_us <<< "$timing"
+        # Reserve the 100-us worker settle interval plus 50 us for the tail.
+        # If 1 GiB leaves space for fewer than two GEMMs, try 2 GiB.
+        if (( 2 * gemm_us + gap_us + guard_us > payload_us )); then size_mib=2048; fi
+    fi
+
     while true; do
-        printf -v attempt_dir '%s/m%04d/%s/size-%dmib' "$output_dir" "$m" "$case_id" "$size_mib"
-        local -a command=(bash "$script_dir/run_ce_hbm_benchmark.sh" --kernel-trace-only
-            --gpus "$gpus" --nsys "$nsys_bin" --cases "$case_id" --gemm "[$m,8192,7168]"
-            --size-mib "$size_mib" --gemm-rounds "$gemm_rounds" --comm-rounds "$comm_rounds"
-            --warmup "$warmup" --output-dir "$attempt_dir")
-        if [[ "$case_id" != task1 && -n "$nccl_lib" ]]; then
-            command+=(--nccl-lib "$nccl_lib")
+        if [[ "$case_id" != task1 ]]; then
+            budget=$((payload_us * (size_mib / 1024) - guard_us))
+            fits=$(((budget + gap_us) / (gemm_us + gap_us)))
+            if (( fits < 1 )); then fits=1; fi
+            if (( group_cap )); then fits=$group_cap; fi
+            rounds=$(((gemm_rounds + fits - 1) / fits))
         fi
-        if [[ "$case_id" == task[34] && -n "$mc_self_import" ]]; then
-            command+=(--mc-self-import "$mc_self_import")
-        fi
+        printf -v attempt_dir '%s/m%04d/%s/size-%dmib' "$output_dir" "$m" "$case_path" "$size_mib"
+        if (( group_cap )); then attempt_dir+="-rounds-$rounds"; fi
+        # The standalone worker requires a positive --comm-rounds argument and never enqueues CE.
+        local -a command=(bash "$script_dir/run_ce_hbm_benchmark.sh" --overlap-profile
+            --gpus "$devices" --metrics-gpus "$metrics" --nsys "$nsys_bin" --nsys-freq 200000
+            --cases "$case_id" --gemm "[$m,8192,7168]" --size-mib "$size_mib" --gemm-rounds "$gemm_rounds"
+            --comm-rounds "$((rounds == 0 ? 1 : rounds))" --warmup "$warmup" --output-dir "$attempt_dir")
+        if [[ "$case_id" != task1 && -n "$nccl_lib" ]]; then command+=(--nccl-lib "$nccl_lib"); fi
+        printf 'M=%d %s metrics GPUs=%s size=%d MiB timed AG=%d\n' "$m" "$case_id" "$metrics" "$size_mib" "$rounds"
         if $dry_run; then
             "${command[@]}" --dry-run
             return
         fi
-
-        launch_exit=0
-        # The shared launcher starts nsys profile and the torch.distributed worker.
-        "${command[@]}" || launch_exit=$?
+        printf '%d\t%s\t%s\t%d\t%d\t%d\t%d\t%d\n' \
+            "$m" "$case_id" "$metrics" "$size_mib" "$rounds" "$gemm_us" "$gap_us" "$payload_us" \
+            >>"$output_dir/plan.tsv" || return
         analysis_exit=0
-        "${analysis[@]}" attempt --output-dir "$attempt_dir" --case "$case_id" --m "$m" \
-            --size-mib "$size_mib" --gemm-rounds "$gemm_rounds" --comm-rounds "$comm_rounds" \
-            --nsys "$nsys_bin" --launch-exit-code "$launch_exit" || analysis_exit=$?
-        if (( analysis_exit != 3 )); then
+        if "${command[@]}"; then
+            "${analysis[@]}" --output-dir "$attempt_dir" --nsys "$nsys_bin" --report-gpus "$metrics" || analysis_exit=$?
+            case "$analysis_exit" in
+                0) status=ok ;;
+                3) status=insufficient_overlap ;;
+                *) status=analysis_error ;;
+            esac
+        else
+            status=launch_error
+            analysis_exit=1
+        fi
+        printf '%d\t%s\t%s\t%d\t%s\t%s\n' "$m" "$case_id" "$metrics" "$size_mib" "$status" "$attempt_dir" \
+            >>"$output_dir/status.tsv" || return
+        if (( analysis_exit != 3 )) || [[ "$case_id" == task1 ]]; then
             return "$analysis_exit"
         fi
-        if (( size_mib == max_size_mib )); then
-            printf 'error: %s M=%s reached %s MiB without two fully covered GEMMs in one AG round\n' \
-                "$case_id" "$m" "$size_mib" >&2
-            return 1
+        if (( size_mib == 1024 )); then
+            printf '%s M=%s has insufficient overlap. Retrying at 2048 MiB per GPU\n' "$case_id" "$m" >&2
+            size_mib=2048
+        elif (( group_cap == 0 && rounds < gemm_rounds )); then
+            group_cap=$(((gemm_rounds + rounds - 1) / rounds - 1))
+            printf '%s M=%s has insufficient overlap. Retrying with at most %d GEMMs per AG\n' \
+                "$case_id" "$m" "$group_cap" >&2
+        else
+            return "$analysis_exit"
         fi
-        (( size_mib *= 2 ))
-        if (( size_mib > max_size_mib )); then size_mib=$max_size_mib; fi
-        printf '%s M=%s has insufficient overlap. Retrying with %s MiB per GPU\n' "$case_id" "$m" "$size_mib" >&2
     done
 }
 
 failed=0
 for (( m=1; m<=8192; m*=2 )); do
     [[ "$selected_m" == *",$m,"* ]] || continue
-    for case_id in task1 task3 task4 task7 task8; do
-        [[ "$case_id" == task1 || "$selected_cases" == *",$case_id,"* ]] || continue
-        run_case "$case_id" "$m" || failed=1
-        if ! $dry_run; then "${analysis[@]}" report --output-dir "$output_dir"; fi
+    for gpu in 1 2 3; do
+        run_case task1 "$m" "$gpu" "$gpu" || failed=1
+    done
+    for case_id in task4 task3 task7; do
+        [[ "$selected_cases" == *",$case_id,"* ]] || continue
+        run_case "$case_id" "$m" "$report_gpus" "$gpus" || failed=1
     done
 done
 if ! $dry_run; then printf 'Results directory: %s\n' "$output_dir"; fi

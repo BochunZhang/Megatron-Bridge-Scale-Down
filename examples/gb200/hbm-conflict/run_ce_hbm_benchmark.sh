@@ -19,6 +19,8 @@ Usage: bash run_ce_hbm_benchmark.sh [options]
   --comm-rounds N     Standalone transfers, or minimum transfers when overlapped (default: 25)
   --nsys PATH         Nsight Systems 2026.6.1 executable (also NSYS_BIN)
   --nsys-freq HZ      GPU metrics sampling rate (default: 10000)
+  --overlap-profile   Start/stop Nsight on worker signal; use stock out-of-place CE AG
+  --metrics-gpus IDS  Physical GPU metrics IDs for --overlap-profile (default: case GPUs)
   --kernel-trace-only Capture CUDA/NVTX across all workers without GPU metrics
   --nccl-lib PATH     Override the libnccl.so.2 preloaded for AG cases
   --mc-self-import M  Use the patched NCCL with 0 (control), 1 (self-import), or ab (both)
@@ -52,13 +54,14 @@ gpu_ids="$(IFS=,; printf '%s' "${default_gpus[*]:0:4}")"
 case_ids="" include_baseline=false
 gemms='[8192,8192,7168]'
 size_mib=1024 warmup=5 gemm_rounds=20 comm_rounds=25 nsys_freq=10000 kernel_trace_only=false
+overlap_profile=false metrics_gpus=""
 ce_multicast_threshold=4611686018427387904
 output_dir="" dry_run=false nccl_lib="" mc_self_import=""
 original_args=("$@")
 
 while (( $# )); do
     case "$1" in
-        --gemm|--gpus|--cases|--size-mib|--warmup|--gemm-rounds|--comm-rounds|--nsys|--nsys-freq|--nccl-lib|--mc-self-import|--output-dir)
+        --gemm|--gpus|--cases|--size-mib|--warmup|--gemm-rounds|--comm-rounds|--nsys|--nsys-freq|--metrics-gpus|--nccl-lib|--mc-self-import|--output-dir)
             (( $# >= 2 )) && [[ -n "$2" ]] || die "$1 requires a value"
             case "$1" in
                 --gemm) gemms="$2" ;;
@@ -70,18 +73,27 @@ while (( $# )); do
                 --comm-rounds) comm_rounds="$2" ;;
                 --nsys) NSYS_BIN="$2" ;;
                 --nsys-freq) nsys_freq="$2" ;;
+                --metrics-gpus) metrics_gpus="$2" ;;
                 --nccl-lib) nccl_lib="$2" ;;
                 --mc-self-import) mc_self_import="$2" ;;
                 --output-dir) output_dir="$2" ;;
             esac
             shift 2 ;;
         --baseline) include_baseline=true; shift ;;
+        --overlap-profile) overlap_profile=true; shift ;;
         --kernel-trace-only) kernel_trace_only=true; shift ;;
         --dry-run) dry_run=true; shift ;;
         -h|--help) usage; exit 0 ;;
         *) die "unknown argument $1" ;;
     esac
 done
+
+if $overlap_profile; then
+    ! $kernel_trace_only && [[ -z "$mc_self_import" ]] \
+        || die "--overlap-profile requires unpatched NCCL and GPU metrics"
+elif [[ -n "$metrics_gpus" ]]; then
+    die "--metrics-gpus requires --overlap-profile"
+fi
 
 if [[ -n "$mc_self_import" ]]; then
     [[ "$mc_self_import" == 0 || "$mc_self_import" == 1 || "$mc_self_import" == ab ]] \
@@ -113,6 +125,9 @@ fi
 for value in "$size_mib" "$warmup" "$gemm_rounds" "$comm_rounds" "$nsys_freq"; do
     [[ "$value" =~ ^[1-9][0-9]*$ ]] || die "expected a positive integer, got $value"
 done
+if $overlap_profile; then
+    (( comm_rounds <= gemm_rounds )) || die "--overlap-profile needs at least one GEMM per timed CE round"
+fi
 (( nsys_freq >= 10 && nsys_freq <= 200000 )) || die "--nsys-freq must be in 10..200000"
 [[ "$gpu_ids" =~ ^(0|[1-9][0-9]*)(,(0|[1-9][0-9]*))*$ ]] || die "use comma-separated numeric GPU IDs"
 IFS=, read -r -a gpus <<< "$gpu_ids"
@@ -121,6 +136,16 @@ for gpu in "${gpus[@]}"; do
     [[ "$seen_gpus" != *",$gpu,"* ]] || die "duplicate GPU ID $gpu"
     seen_gpus+="$gpu,"
 done
+if [[ -n "$metrics_gpus" ]]; then
+    [[ "$metrics_gpus" =~ ^(0|[1-9][0-9]*)(,(0|[1-9][0-9]*))*$ ]] || die "invalid --metrics-gpus"
+    IFS=, read -r -a requested_metrics_gpus <<< "$metrics_gpus"
+    selected_metrics_gpus=,
+    for gpu in "${requested_metrics_gpus[@]}"; do
+        [[ "$seen_gpus" == *",$gpu,"* && "$selected_metrics_gpus" != *",$gpu,"* ]] \
+            || die "--metrics-gpus must identify distinct participating physical GPUs"
+        selected_metrics_gpus+="$gpu,"
+    done
+fi
 
 case_re='(task[1234578]|baseline[1-6])'
 [[ "$case_ids" =~ ^${case_re}(,${case_re})*$ ]] || die "invalid case list $case_ids"
@@ -130,6 +155,14 @@ seen_cases=,
 for case_id in "${cases[@]}"; do
     [[ "$seen_cases" != *",$case_id,"* ]] || die "duplicate case $case_id"
     seen_cases+="$case_id,"
+    if $overlap_profile; then
+        case "$case_id" in
+            task1) [[ -z "$metrics_gpus" || "$metrics_gpus" == "${gpus[0]}" ]] \
+                || die "task1 profiles its first GPU only" ;;
+            task3|task4|task7) ;;
+            *) die "--overlap-profile supports task1, task3, task4 and task7" ;;
+        esac
+    fi
     case "$case_id" in
         task[34578]|baseline[2-6])
             case "$case_id" in
@@ -198,7 +231,10 @@ else
         "gpu_ids=$gpu_ids" "lock_gpus=$lock_gpus" "gemm=$gemms" "cases=$case_ids" \
         "size_mib=$size_mib" "warmup=$warmup" "gemm_rounds=$gemm_rounds" "comm_rounds=$comm_rounds" \
         "nsys_freq=$report_nsys_freq" "cwd=$PWD" >"$output_dir/run_info.txt"
-    if $kernel_trace_only; then
+    if $overlap_profile; then
+        printf '%s\n' 'overlap_profile=true' "metrics_gpus=${metrics_gpus:-$lock_gpus}" \
+            'metric_set=gb200-ce-hbm-metrics.config' 'ce_buffer_layout=out-of-place' >>"$output_dir/run_info.txt"
+    elif $kernel_trace_only; then
         printf '%s\n' 'kernel_trace_only=true' >>"$output_dir/run_info.txt"
     fi
     if [[ -n "$nccl_lib" ]]; then
@@ -235,6 +271,17 @@ validate_nccl_ce_ag() {
     done
     if [[ -z "$rank_zero" ]]; then
         printf 'error: no rank 0 NCCL initialization log in %s/nccl-raw\n' "$case_dir" >&2
+        return 1
+    fi
+    if $overlap_profile && ! awk '
+        /NCCL version / {
+            version=$NF
+            if (version !~ /^2\.[0-9]+\.[0-9]+[+]cuda[0-9]+\.[0-9]+$/) next
+            split(version, parts, /[.+]/)
+            if (parts[2] > 32 || (parts[2] == 32 && parts[3] >= 3)) stock=1
+        }
+        END { exit !stock }' "$rank_zero"; then
+        printf 'error: expected a stock NCCL version banner for NCCL 2.32.3 or newer in %s\n' "$rank_zero" >&2
         return 1
     fi
     # NCCL emits collective tuning choices on rank 0. For unicast, verify that
@@ -274,6 +321,72 @@ validate_nccl_ce_ag() {
     printf 'Verified NCCL %s Copy Engine AllGather in %s\n' "$transport" "$rank_zero"
 }
 
+wait_for_profile_signal() {
+    local signal="$1" timeout="$2" delay="$3" deadline
+    deadline=$((SECONDS + timeout))
+    while [[ ! -f "$sync_dir/$signal" ]]; do
+        if { [[ "$signal" != exit && -f "$sync_dir/exit" ]]; } || (( SECONDS >= deadline )) \
+            || { [[ -f "$sync_dir/launch-exit" ]] && [[ "$(<"$sync_dir/launch-exit")" != 0 ]]; }; then
+            printf 'error: %s did not signal %s; see %s/torchrun.log\n' "$name" "$signal" "$case_dir" >&2
+            return 1
+        fi
+        sleep "$delay"
+    done
+}
+
+run_overlap_profile() (
+    local sync_dir="$case_dir/nsys/sync" session="hbm-${BASHPID:-$$}-${RANDOM}"
+    local -a controller=(env "NSYS_TMPDIR=$case_dir/nsys/.tmp" "$NSYS_BIN")
+    local -a launch=("${run_env[@]}" "$NSYS_BIN" launch --session-new="$session" --show-output=true
+        --trace=cuda,nvtx --nvtx-domain-exclude=NCCL --cuda-trace-scope=process-tree --sample=none --cpuctxsw=none
+        bash -c 'sync_dir=$1; shift; status=0; "$@" || status=$?;
+            printf "%s\n" "$status" >"$sync_dir/exit.tmp"; mv "$sync_dir/exit.tmp" "$sync_dir/exit"; exit "$status"' \
+        ce-hbm-worker "$sync_dir" "${worker[@]}" --profile-sync-dir "$sync_dir")
+    local -a start=("${controller[@]}" start --session="$session" --output="$report"
+        --sample=none --cpuctxsw=none --gpu-metrics-devices="${metrics_gpus:-$devices}"
+        --gpu-metrics-set="file:$script_dir/gb200-ce-hbm-metrics.config" --gpu-metrics-frequency="$nsys_freq")
+    local -a stop=("${controller[@]}" stop --session="$session" --defer-report)
+    local -a finalize=("${controller[@]}" finalize --session="$session")
+    if $dry_run; then
+        show_command "${launch[@]}"
+        show_command "${start[@]}"
+        show_command "${stop[@]}"
+        show_command "${finalize[@]}"
+        return 0
+    fi
+    mkdir -- "$sync_dir" || return
+    {
+        show_command "${launch[@]}"
+        show_command "${start[@]}"
+        show_command "${stop[@]}"
+        show_command "${finalize[@]}"
+    } >"$case_dir/command.txt" || return
+
+    trap '"${controller[@]}" shutdown --session="$session" --kill=sigterm >>"$case_dir/nsys-control.log" 2>&1 || true' EXIT
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
+    (
+        launch_status=0
+        "${launch[@]}" >"$case_dir/torchrun.log" 2>&1 || launch_status=$?
+        printf '%s\n' "$launch_status" >"$sync_dir/launch-exit.tmp"
+        mv "$sync_dir/launch-exit.tmp" "$sync_dir/launch-exit"
+    ) &
+    wait_for_profile_signal ready 300 0.01 || return
+    "${start[@]}" >"$case_dir/nsys-control.log" 2>&1 || return
+    touch -- "$sync_dir/start" || return
+    wait_for_profile_signal done 100 0.001 || return
+    "${stop[@]}" >>"$case_dir/nsys-control.log" 2>&1 || return
+    touch -- "$sync_dir/stopped" || return
+    "${finalize[@]}" >>"$case_dir/nsys-control.log" 2>&1 || return
+    wait_for_profile_signal exit 120 0.01 || return
+    local worker_status
+    worker_status=$(<"$sync_dir/exit")
+    if [[ "$worker_status" != 0 ]]; then
+        printf 'error: %s worker exited %s; see %s/torchrun.log\n' "$name" "$worker_status" "$case_dir" >&2
+        return 1
+    fi
+)
+
 run_case() {
     local name="$1" mode="$2" devices="$3" ranks="$4" shape="${5:-}"
     local case_dir="$output_dir/$name" trace=cuda,nvtx
@@ -298,14 +411,15 @@ run_case() {
     if ! $kernel_trace_only; then
         command+=(--gpu-metrics-devices="$devices" --gpu-metrics-set=gb10x-ct --gpu-metrics-frequency="$nsys_freq")
     fi
-    command+=(--output="$report"
-        uv run --active --no-sync python -m torch.distributed.run --standalone --nnodes=1 --nproc_per_node="$ranks"
+    local -a worker=(uv run --active --no-sync python -m torch.distributed.run --standalone --nnodes=1 --nproc_per_node="$ranks"
         "$script_dir/ce_hbm_benchmark.py" --case "$name" --mode "$mode" --output-dir "$case_dir"
         --size-mib "$size_mib" --warmup "$warmup" --gemm-rounds "$gemm_rounds" --comm-rounds "$comm_rounds")
-    if $kernel_trace_only; then command+=(--kernel-trace-only); fi
-    if [[ -n "$shape" ]]; then command+=(--gemm "$shape"); fi
+    if $kernel_trace_only; then worker+=(--kernel-trace-only); fi
+    if [[ -n "$shape" ]]; then worker+=(--gemm "$shape"); fi
+    command+=(--output="$report" "${worker[@]}")
 
     local -a run_env=(env)
+    if $overlap_profile; then run_env+=(-u NCCL_CE_MC_SELF_IMPORT); fi
     if [[ -n "$nccl_transport" ]]; then
         # Keep the configured NCCL library and transport. Scope the CE and log options to this AG case.
         local nccl_raw_dir="$case_dir/nccl-raw"
@@ -334,13 +448,21 @@ run_case() {
         "GLOO_SOCKET_IFNAME=${GLOO_SOCKET_IFNAME:-${GLOO_SOCKET_NAME:-}}"
         "NSYS_TMPDIR=$case_dir/nsys/.tmp")
     if $dry_run; then
-        show_command "${run_env[@]}" "${command[@]}"
+        if $overlap_profile; then
+            run_overlap_profile
+        else
+            show_command "${run_env[@]}" "${command[@]}"
+        fi
         return
     fi
     mkdir -p -- "$case_dir/nsys/.tmp" || return
-    show_command "${run_env[@]}" "${command[@]}" >"$case_dir/command.txt" || return
     printf 'Running %s on GPUs %s\n' "$name" "$devices"
-    "${run_env[@]}" "${command[@]}" 2>&1 | tee "$case_dir/torchrun.log" || return
+    if $overlap_profile; then
+        run_overlap_profile || return
+    else
+        show_command "${run_env[@]}" "${command[@]}" >"$case_dir/command.txt" || return
+        "${run_env[@]}" "${command[@]}" 2>&1 | tee "$case_dir/torchrun.log" || return
+    fi
     if [[ ! -s "$report.nsys-rep" ]]; then
         printf 'error: %s has no Nsight report at %s.nsys-rep\n' "$name" "$report" >&2
         return 1

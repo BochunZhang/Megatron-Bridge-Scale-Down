@@ -110,7 +110,8 @@ class NcclCopyEngineAllGather:
         size_bytes: Total bytes of the gathered output on each GPU.
         host_input: Allocate the input shard in pinned CPU memory.
         stage_host_input: Use a separate GPU send buffer filled by ``stage_input``.
-        unicast: Use an in-place GPU input or a direct pinned CPU input for unicast AllGather.
+        unicast: Use the unicast CE path, with an in-place GPU input by default.
+        out_of_place: Allocate a separate send shard for GPU-source unicast.
     """
 
     def __init__(
@@ -123,6 +124,7 @@ class NcclCopyEngineAllGather:
         *,
         stage_host_input: bool = False,
         unicast: bool = False,
+        out_of_place: bool = False,
     ) -> None:
         min_ranks = 2 if unicast else 3
         if not min_ranks <= world_size <= 255 or not 0 <= rank < world_size:
@@ -137,7 +139,7 @@ class NcclCopyEngineAllGather:
         self._device = device
         self._rank = rank
         self._shard_bytes = size_bytes // world_size
-        self._in_place = unicast and not host_input
+        self._in_place = unicast and not host_input and not out_of_place
         self._staging_source: torch.Tensor | None = None
 
         options = dist.ProcessGroupNCCL.Options()

@@ -26,6 +26,7 @@ import logging
 import math
 import os
 import sys
+import time
 from collections.abc import Callable
 from contextlib import ExitStack
 from pathlib import Path
@@ -52,6 +53,10 @@ MODES = (
     "ag-host-unicast",
 )
 TimingPair = tuple[torch.cuda.Event, torch.cuda.Event]
+_OVERLAP_PROFILE_MODES = ("gemm", "gemm-ag-hbm", "gemm-ag-host", "gemm-ag-hbm-unicast")
+# Leave time for stream-ordered NCCL synchronization before the payload copy.
+_CE_PAYLOAD_LEAD_US = 100
+_PROFILE_SIGNAL_TIMEOUT_S = 120
 
 
 def _parse_shape(value: str) -> tuple[int, int, int]:
@@ -75,6 +80,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--warmup", type=int, required=True, help="Warmup rounds per active stream")
     parser.add_argument("--gemm-rounds", type=int, required=True)
     parser.add_argument("--kernel-trace-only", action="store_true", help="Use a full process-tree CUDA/NVTX capture")
+    parser.add_argument("--profile-sync-dir", type=Path, help="Rendezvous with the timed Nsight Systems sweep")
     parser.add_argument(
         "--ncu-gemm", action="store_true", help="Profile standalone GEMM launches without a launch gate"
     )
@@ -91,6 +97,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             parser.error(f"--{name.replace('_', '-')} must be positive")
     if args.warmup < 0:
         parser.error("--warmup must be nonnegative")
+    if args.profile_sync_dir is not None:
+        if args.mode not in _OVERLAP_PROFILE_MODES or args.kernel_trace_only or args.ncu_gemm:
+            parser.error("--profile-sync-dir requires a timed GEMM/CE sweep case")
+        if args.mode != "gemm" and args.comm_rounds > args.gemm_rounds:
+            parser.error("--comm-rounds must leave at least one GEMM per profiled AllGather")
     return args
 
 
@@ -111,12 +122,38 @@ def _calibrate(op: Callable[[], object], stream: torch.cuda.Stream, *, warmup: i
     return start.elapsed_time(end) / 3
 
 
-def _enqueue(op: Callable[[], object], pairs: list[TimingPair], label: str) -> None:
-    for index, (start, end) in enumerate(pairs):
+def _enqueue(op: Callable[[], object], pairs: list[TimingPair], label: str, *, first: int = 0) -> None:
+    for index, (start, end) in enumerate(pairs, start=first):
         with nvtx.range(f"{label}{index:02d}"):
             start.record()
             op()
             end.record()
+
+
+def _enqueue_overlap_gemms(
+    gemm: Callable[[], object], gemm_events: list[TimingPair], comm_events: list[TimingPair], *, lead_cycles: int
+) -> None:
+    stream = torch.cuda.current_stream()
+    per_round, extra = divmod(len(gemm_events), len(comm_events))
+    first = 0
+    for index, (comm_start, _) in enumerate(comm_events):
+        stream.wait_event(comm_start)
+        torch.cuda._sleep(lead_cycles)
+        stop = first + per_round + (index < extra)
+        _enqueue(gemm, gemm_events[first:stop], "gemm", first=first)
+        first = stop
+
+
+def _profile_rendezvous(directory: Path, *, rank: int, signal: str, acknowledge: str) -> None:
+    if rank == 0:
+        (directory / signal).touch(exist_ok=False)
+        deadline = time.monotonic() + _PROFILE_SIGNAL_TIMEOUT_S
+        acknowledgement = directory / acknowledge
+        while not acknowledgement.exists():
+            if time.monotonic() >= deadline:
+                raise TimeoutError(f"Nsight Systems did not signal {acknowledgement}")
+            time.sleep(0.001)
+    dist.barrier()
 
 
 def _elapsed(origin: torch.cuda.Event, pairs: list[TimingPair]) -> list[list[float]]:
@@ -139,6 +176,7 @@ def _run_case(args: argparse.Namespace, device: torch.device, *, cleanup: ExitSt
     rank, world_size = dist.get_rank(), dist.get_world_size()
     visible_devices = os.environ.get("CUDA_VISIBLE_DEVICES", "").split(",")
     physical_gpu = int(visible_devices[device.index]) if all(value.isdecimal() for value in visible_devices) else None
+    profile_sync = args.profile_sync_dir
     do_gemm = args.mode.startswith("gemm")
     comm_kind = args.mode.removeprefix("gemm-") if args.mode != "gemm" else None
     unicast = comm_kind in ("ag-hbm-unicast", "ag-host-unicast")
@@ -192,6 +230,7 @@ def _run_case(args: argparse.Namespace, device: torch.device, *, cleanup: ExitSt
             size_bytes,
             host_input=comm_kind in ("ag-host", "ag-host-unicast"),
             unicast=unicast,
+            out_of_place=profile_sync is not None,
         )
         cleanup.callback(all_gather.close)
         comm, reset_comm, validate_comm = all_gather.run, all_gather.reset_output, all_gather.validate
@@ -202,12 +241,22 @@ def _run_case(args: argparse.Namespace, device: torch.device, *, cleanup: ExitSt
     dist.barrier()
     gemm_ms = _calibrate(gemm, gemm_stream, warmup=args.warmup) if gemm is not None else 0.0
     dist.barrier()
-    comm_ms = _calibrate(comm, comm_stream, warmup=args.warmup) if comm is not None else 0.0
+    lead_cycles = 0
+    comm_ms = 0.0
+    if comm is not None:
+        if profile_sync is None:
+            comm_ms = _calibrate(comm, comm_stream, warmup=args.warmup)
+        else:
+            from hbm_conflict_benchmark import _calibrate_sleep_cycles_per_us
+
+            lead_cycles = round(_CE_PAYLOAD_LEAD_US * _calibrate_sleep_cycles_per_us())
+            with torch.cuda.stream(comm_stream):
+                comm()
     torch.cuda.synchronize(device)
     dist.barrier()
 
     comm_rounds = args.comm_rounds if comm is not None else 0
-    if gemm is not None and comm is not None:
+    if gemm is not None and comm is not None and profile_sync is None:
         if comm_ms <= 0:
             raise RuntimeError("Copy calibration did not produce a positive duration")
         target = math.ceil(1.5 * args.gemm_rounds * gemm_ms / comm_ms)
@@ -233,16 +282,19 @@ def _run_case(args: argparse.Namespace, device: torch.device, *, cleanup: ExitSt
     torch.cuda.synchronize(device)
 
     # Full process-tree traces already capture each worker's NVTX ranges.
-    control_capture = rank == 0 and not (unicast or args.kernel_trace_only or args.ncu_gemm)
+    control_capture = profile_sync is None and rank == 0 and not (unicast or args.kernel_trace_only or args.ncu_gemm)
     # NCU may synchronize a profiled kernel before the host can release the launch gate.
     gate = None if args.ncu_gemm else LaunchGate(timeout_s=30.0)
     try:
         dist.barrier()
+        if profile_sync is not None:
+            _profile_rendezvous(profile_sync, rank=rank, signal="ready", acknowledge="start")
         if control_capture:
             torch.cuda.profiler.start()
         try:
-            # Synchronize every worker before entering the timed NVTX ranges.
-            dist.barrier()
+            if profile_sync is None:
+                # Wait for rank 0 to open a CUDA-profiler-controlled capture.
+                dist.barrier()
             with nvtx.range(f"hbm-ce/{args.case}/rank-{rank}"):
                 if gate is not None:
                     gate.arm(control_stream)
@@ -255,7 +307,10 @@ def _run_case(args: argparse.Namespace, device: torch.device, *, cleanup: ExitSt
                     if gemm is not None:
                         with torch.cuda.stream(gemm_stream):
                             gemm_stream.wait_event(origin)
-                            _enqueue(gemm, gemm_events, "gemm")
+                            if profile_sync is not None and comm_events:
+                                _enqueue_overlap_gemms(gemm, gemm_events, comm_events, lead_cycles=lead_cycles)
+                            else:
+                                _enqueue(gemm, gemm_events, "gemm")
                     # Host rendezvous releases only fully queued streams across all ranks.
                     dist.barrier()
                 finally:
@@ -267,6 +322,8 @@ def _run_case(args: argparse.Namespace, device: torch.device, *, cleanup: ExitSt
         finally:
             if control_capture:
                 torch.cuda.profiler.stop()
+        if profile_sync is not None:
+            _profile_rendezvous(profile_sync, rank=rank, signal="done", acknowledge="stopped")
         if gate is not None:
             watchdog = torch.tensor(int(gate.watchdog_fired()))
             dist.all_reduce(watchdog, op=dist.ReduceOp.MAX)
@@ -314,9 +371,11 @@ def _run_case(args: argparse.Namespace, device: torch.device, *, cleanup: ExitSt
         "output_correct": comm_correct and gemm_correct,
     }
     if unicast:
-        # GPU inputs already occupy the local receive slot. CPU inputs also copy to the local GPU.
-        copied_bytes = size_bytes if comm_kind == "ag-host-unicast" else comm_payload_bytes
+        # Out-of-place includes the local shard in the payload copy.
+        copied_bytes = size_bytes if profile_sync is not None or comm_kind == "ag-host-unicast" else comm_payload_bytes
         result.update(comm_source_bytes=copied_bytes, comm_receive_bytes=copied_bytes)
+    if profile_sync is not None and comm is not None:
+        result.update(all_gather_out_of_place=True, ce_lead_in_rounds=1, ce_payload_lead_us=_CE_PAYLOAD_LEAD_US)
     args.output_dir.mkdir(parents=True, exist_ok=True)
     output = args.output_dir / f"events.rank_{rank:02d}.json"
     output.write_text(json.dumps(result, indent=2) + "\n", encoding="utf-8")

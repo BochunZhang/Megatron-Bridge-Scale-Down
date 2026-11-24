@@ -137,23 +137,42 @@ uv run --active --no-sync python examples/gb200/hbm-conflict/analyse_ce_hbm.py \
 P2P 的 source/destination 轨道只计一次。`Compute`、缺少通道证据或缺少预期拷贝时，分析返回非零。
 GEMM 覆盖率按实际写入该 GPU 的 payload 时间线计算。
 
-### 全范围 GEMM 争用 sweep
+### 200 kHz GEMM 和 CE AllGather sweep
 
-两条 sweep 都使用 BF16 `[M,8192,7168]`，M 从 1 倍增到 8192，每组默认计时 16 次 GEMM。
-用以下命令在同一张 GPU 上采独跑基线，并在四条 CE AllGather 路径下对比。选项 `--mc-self-import 1`
-复用前述 R580 multicast 库。`--m-values 2,4,8` 和 `--cases task7,task8` 可缩小试跑范围。
+使用标准 NCCL 2.32.3 或更新版本，以及 Nsight Systems 2026.6.1。默认扫描 BF16 `[M,8192,7168]`，
+M 从 1 倍增到 8192，每组测 8 次 GEMM。`--test` 只跑 M=8，`--dry-run` 显示各组命令和通信预算。
 
 ```bash
 bash examples/gb200/hbm-conflict/run_ce_hbm_kernel_sweep.sh \
-  --gpus 0,1,2,3 --mc-self-import 1
+  --gpus 0,1,2,3
+
+bash examples/gb200/hbm-conflict/run_ce_hbm_kernel_sweep.sh --test --dry-run
 ```
 
-Nsight Systems 采集 CUDA kernel、GPU memcpy 和 NVTX 时间线。每条 AG 路径从每张 GPU **1 GiB 输出**开始，
-默认至少运行 25 轮 AG。在同一轮 payload 中完整覆盖至少两个首卡 GEMM 后接受该样本。有效 trace 的覆盖不足时，
-只对当前 M 和 AG 路径将输出大小翻倍重跑，默认上限为 8192 MiB。每次尝试的 capture 都保留在结果目录。
-每个并跑均值使用所有完整落在单轮 payload 区间内的 GEMM。若一次 GEMM 发起多个 kernel，覆盖判定用该次 GEMM
-的首尾区间，耗时用 kernel 活跃时间。`report.md` 列出 AG 大小、实际轮数、GEMM 入选数量、均值和相对同 M
-独跑的变化。`summary.json` 记录每轮 AG 和每次 GEMM 的覆盖关系。
+| Case | 工作负载 |
+| --- | --- |
+| `task1` | 物理 GPU 1、2、3 分别运行独立 GEMM 基线 |
+| `task4` | GEMM + pinned CPU 源 CE multicast AllGather |
+| `task3` | GEMM + GPU HBM 源 CE multicast AllGather |
+| `task7` | GEMM + GPU HBM 源 CE unicast AllGather |
+
+AllGather 使用独立的 send 和 receive 缓冲区。四卡通信时只对物理 GPU **1、2、3** 采 GPU metrics
+并汇报结果。默认每卡 **1 GiB 完整输出**。启动器根据已有 trace 的 payload 时间和 GEMM 时间估计
+覆盖 8 次 GEMM 所需的轮数，单轮余量不足时使用 **2 GiB**。`plan.tsv` 记录每组首选通信大小和轮数。
+
+每个并跑 case 在采集外完成一次 CE AllGather。初始化、预热和缓冲区准备均完成后，Nsight 开始采集，
+然后 worker 提交计时批次。每组 GEMM 等到对应 AG 的 stream 起点，再在 GPU 上留约 100 µs 给 NCCL
+同步和 payload 启动。所有计时 GPU 工作完成后停止采集，再校验输出。实际覆盖仍由 GPU kernel 和 payload
+memcpy 时间戳判定。每次尝试保留原始报告，`status.tsv` 记录尝试是否通过。
+
+Nsight 以 **200,000 Hz** 采样（目标周期 **5 µs**），采集 CUDA/NVTX 及 SM Active、DRAM 读写、C2C RX/TX
+和 NVLink RX/TX。分析使用 GEMM 活动内的采样，并在并跑时要求对应 CE payload 同时活跃。各次尝试的
+`summary.json` 记录逐 GPU 覆盖与计时，`gpu_metrics.csv` 记录采样值。链路带宽使用 user bytes，DRAM
+带宽以 32 B/sector 计算，带宽单位为十进制 GB/s。
+
+有 `DumpTimeline` 时，分析器会核验统计卡上 payload 的 `Async Memcpy` 通道。可通过 `DUMP_TIMELINE`
+指定可执行文件。没有该工具时，分析依据 NCCL 日志和 CUDA memcpy 记录，结果中的
+`hardware_channels_verified` 为 `false`。
 
 用以下命令采独跑 GEMM 的流量计数器。在两次采集中选择同一张物理 GPU，保持硬件和锁频一致。
 

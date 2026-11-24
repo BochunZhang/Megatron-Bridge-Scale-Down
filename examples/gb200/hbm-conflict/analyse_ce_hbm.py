@@ -57,6 +57,7 @@ _C2C_TX = re.compile(r"(?:c2c|ctc).*?(?:tx|transmit|write).*?user", re.I)
 _D2H_COPY = re.compile(r"\b(?:dtoh|d2h|device[- ]to[- ]host)\b", re.I)
 _H2D_COPY = re.compile(r"\b(?:htod|h2d|host[- ]to[- ]device)\b", re.I)
 _P2P_COPY = re.compile(r"\b(?:ptop|p2p|peer[- ]to[- ]peer)\b", re.I)
+_D2D_COPY = re.compile(r"\b(?:dtod|d2d|device[- ]to[- ]device)\b", re.I)
 _GPU_ACTIVITY = ("KERNEL", "MEMCPY", "MEMCPY2")
 _CONFIG_FIELDS = ("case", "mode", "world_size", "gemm_mnk", "size_bytes", "comm_payload_bytes")
 
@@ -301,7 +302,9 @@ def _read_hardware_channels(
 def _validate_unicast_trace(
     records: dict[int, dict],
     activities_by_rank: dict[int, dict[str, list[Activity]]],
-    channels: dict[tuple[int, int, int, int, int], set[str]],
+    channels: dict[tuple[int, int, int, int, int], set[str]] | None,
+    *,
+    channel_devices: set[int] | None = None,
 ) -> tuple[dict[int, list[str]], dict[int, list[Activity]]]:
     errors = {rank: [] for rank in records}
     incoming = {rank: [] for rank in records}
@@ -318,10 +321,11 @@ def _validate_unicast_trace(
     for device, rank in ranks_by_device.items():
         record = records[rank]
         host_source = record["mode"].endswith("ag-host-unicast")
+        out_of_place = record.get("all_gather_out_of_place", False)
         count = record["world_size"]
         shard, remainder = divmod(record["size_bytes"], count)
         peers = set(ranks_by_device)
-        if not host_source:
+        if not host_source and not out_of_place:
             peers.remove(device)
         expected_bytes = shard * len(peers)
         if (
@@ -340,25 +344,34 @@ def _validate_unicast_trace(
             matched_activities = set()
             for op in copies:
                 key = (op.pid, op.device, op.start, op.end, op.size_bytes)
-                observed_channels = channels.get(key, set())
-                if observed_channels != {"Async Memcpy"}:
+                observed_channels = channels.get(key, set()) if channels is not None else None
+                if (
+                    observed_channels is not None
+                    and (channel_devices is None or device in channel_devices)
+                    and observed_channels != {"Async Memcpy"}
+                ):
                     errors[rank].append(
                         f"comm{index:02d}: payload hardware channel must be Async Memcpy, "
                         f"found {', '.join(sorted(observed_channels)) or 'no matching evidence'}"
                     )
-                if key in matched_activities:
+                if channels is not None and key in matched_activities:
                     errors[rank].append(f"comm{index:02d}: payloads share the same hardware channel trace activity")
                 matched_activities.add(key)
                 is_h2d = bool(_H2D_COPY.search(op.copy_kind))
                 is_p2p = bool(_P2P_COPY.search(op.copy_kind))
+                is_self_copy = out_of_place and not host_source and bool(_D2D_COPY.search(op.copy_kind))
                 destination = op.dst_device
-                if host_source and is_h2d and destination is None:
+                if destination is None and ((host_source and is_h2d) or is_self_copy):
                     destination = op.device
                 destinations.append(destination)
                 source_matches = (
                     "pinned" in op.src_kind.lower() and (is_h2d or is_p2p)
                     if host_source
-                    else "device" in op.src_kind.lower() and is_p2p and op.src_device == device
+                    else "device" in op.src_kind.lower()
+                    and (
+                        (is_p2p and op.src_device == device and destination != device)
+                        or (is_self_copy and op.src_device in (None, device) and destination == device)
+                    )
                 )
                 if (
                     not source_matches
