@@ -7,12 +7,12 @@ set -euo pipefail
 usage() {
     cat <<'USAGE'
 Profile 8 BF16 GEMMs alone or overlapped with stock NCCL copy-engine AllGather.
-GPU metrics are sampled at 200 kHz on physical GPUs 1,2,3.
+GPU metrics are sampled at 200 kHz on physical GPU 2 for every case.
 
 Usage: run_ce_hbm_kernel_sweep.sh [options]
   --test                Run M=8 only
   --m-values LIST       Subset of powers of two from 1 through 8192
-  --gpus LIST           Four ordered GPU IDs including 1,2,3 (default: 0,1,2,3)
+  --gpus LIST           Four ordered AllGather GPU IDs including 2 (default: 0,1,2,3)
   --cases LIST          task1,task4,task3,task7 (default: all; always includes task1)
   --warmup N            GEMM warmup rounds (default: 5)
   --nsys PATH           Nsight Systems 2026.6.1 executable (also NSYS_BIN)
@@ -34,7 +34,7 @@ script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 repo_root="$(cd -- "$script_dir/../../.." && pwd)"
 nsys_bin="${NSYS_BIN:-NsightSystems-2026.6.1/bin/nsys}"
 gpus=0,1,2,3
-report_gpus=1,2,3
+metrics_gpu=2
 m_values=1,2,4,8,16,32,64,128,256,512,1024,2048,4096,8192
 case_ids=task1,task4,task3,task7
 gemm_rounds=8 warmup=5
@@ -85,9 +85,7 @@ for gpu in "${requested_gpus[@]}"; do
     [[ "$selected_gpus" != *",$gpu,"* ]] || die "duplicate GPU ID $gpu"
     selected_gpus+="$gpu,"
 done
-for gpu in 1 2 3; do
-    [[ "$selected_gpus" == *",$gpu,"* ]] || die "--gpus must include physical GPUs 1,2,3"
-done
+[[ "$selected_gpus" == *",$metrics_gpu,"* ]] || die "--gpus must include physical GPU $metrics_gpu"
 
 nsys_bin="$(command -v "$nsys_bin" || printf '%s' "$nsys_bin")"
 [[ "$nsys_bin" = /* ]] || nsys_bin="$PWD/$nsys_bin"
@@ -100,7 +98,8 @@ if ! $dry_run; then
     mkdir -- "$output_dir" || die "use a new results directory"
     printf '%s\n' 'Source: ce-kernel-sweep-20261123-222531/summary.json, 1024 MiB attempts, GPU 0' \
         'Planning uses p90 kernel, p90 within-round gap (solo p90 fallback), and p10 payload duration.' \
-        '200 kHz metrics on physical GPUs 1,2,3. Analyse the downloaded sweep to verify coverage.' >"$output_dir/run_info.txt"
+        "200 kHz metrics on physical GPU $metrics_gpu for every case." \
+        'Analyse the downloaded sweep to verify coverage.' >"$output_dir/run_info.txt"
     printf 'm\tcase\tmetrics_gpus\tsize_mib\ttimed_ag_rounds\tgemm_p90_us\tgap_p90_us\tpayload_1gib_p10_us\n' \
         >"$output_dir/plan.tsv"
     printf 'm\tcase\tmetrics_gpus\tsize_mib\tstatus\tattempt_dir\n' >"$output_dir/status.tsv"
@@ -182,12 +181,10 @@ run_case() {
 failed=0
 for (( m=1; m<=8192; m*=2 )); do
     [[ "$selected_m" == *",$m,"* ]] || continue
-    for gpu in 1 2 3; do
-        run_case task1 "$m" "$gpu" "$gpu" || failed=1
-    done
+    run_case task1 "$m" "$metrics_gpu" "$metrics_gpu" || failed=1
     for case_id in task4 task3 task7; do
         [[ "$selected_cases" == *",$case_id,"* ]] || continue
-        run_case "$case_id" "$m" "$report_gpus" "$gpus" || failed=1
+        run_case "$case_id" "$m" "$metrics_gpu" "$gpus" || failed=1
     done
 done
 if ! $dry_run; then printf 'Results directory: %s\n' "$output_dir"; fi

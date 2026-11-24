@@ -219,12 +219,7 @@ def _analyse(
     else:
         # One multicast shard from each source writes to every rank's receive window.
         # Nsight exposes the source DMA interval rather than separate destination intervals.
-        multicast = [
-            op
-            for rank, copies in copies_by_rank.items()
-            if records[rank]["physical_gpu"] in report_gpus
-            for op in copies
-        ]
+        multicast = [op for copies in copies_by_rank.values() for op in copies]
         if channels is not None:
             for op in multicast:
                 channel = _copy_channel(op, channels=channels)
@@ -305,7 +300,7 @@ def _analyse(
         "sampling_period_ns": _PERIOD_NS,
         "metric_units": {metric: "%" if metric == "sm_active_pct" else "GB/s" for metric in _METRIC_COLUMNS},
         "payload_timing": "none" if solo else "destination memcpy" if unicast else "multicast source DMA",
-        "multicast_coverage_source_gpus": sorted(report_gpus) if not solo and not unicast else [],
+        "multicast_coverage_source_gpus": sorted(gpus) if not solo and not unicast else [],
         "hardware_channels_verified": channels is not None,
         "gpus": summaries,
     }, rows

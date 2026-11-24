@@ -20,8 +20,8 @@ def experiment_modules(monkeypatch):
 
 
 @pytest.mark.unit
-@pytest.mark.parametrize("test_only", [False, True])
-def test_sweep_profiles_only_the_selected_shapes_paths_and_gpus(monkeypatch, tmp_path, test_only):
+@pytest.mark.parametrize(("test_only", "allgather_gpus"), [(False, "0,1,2,3"), (True, "4,2,5,6")])
+def test_sweep_profiles_only_the_selected_shapes_paths_and_gpus(monkeypatch, tmp_path, test_only, allgather_gpus):
     destination = tmp_path / "dry-run"
     nsys_tmp = tmp_path / "local-nsys"
     monkeypatch.setenv("NSYS_TMPDIR", str(nsys_tmp))
@@ -30,7 +30,7 @@ def test_sweep_profiles_only_the_selected_shapes_paths_and_gpus(monkeypatch, tmp
             "bash",
             str(_EXPERIMENT / "run_ce_hbm_kernel_sweep.sh"),
             "--gpus",
-            "0,1,2,3",
+            allgather_gpus,
             "--dry-run",
             "--output-dir",
             str(destination),
@@ -43,16 +43,20 @@ def test_sweep_profiles_only_the_selected_shapes_paths_and_gpus(monkeypatch, tmp
     commands = [shlex.split(line) for line in result.stdout.splitlines() if "--mode " in line]
     starts = [shlex.split(line) for line in result.stdout.splitlines() if " --gpu-metrics-frequency=" in line]
     shapes = [8] if test_only else [2**power for power in range(14)]
-    assert len(commands) == len(starts) == len(shapes) * 6
-    expected_modes = ["gemm", "gemm", "gemm", "gemm-ag-host", "gemm-ag-hbm", "gemm-ag-hbm-unicast"]
-    expected_gpus = ["1", "2", "3", "1,2,3", "1,2,3", "1,2,3"]
+    expected_modes = ["gemm", "gemm-ag-host", "gemm-ag-hbm", "gemm-ag-hbm-unicast"]
+    cases_per_shape = len(expected_modes)
+    assert len(commands) == len(starts) == len(shapes) * cases_per_shape
     for index, m in enumerate(shapes):
-        group = commands[6 * index : 6 * index + 6]
-        start_group = starts[6 * index : 6 * index + 6]
+        offset = index * cases_per_shape
+        group = commands[offset : offset + cases_per_shape]
+        start_group = starts[offset : offset + cases_per_shape]
         assert [cmd[cmd.index("--mode") + 1] for cmd in group] == expected_modes
         for worker_index, (cmd, start) in enumerate(zip(group, start_group, strict=True)):
+            overlap = worker_index != 0
             assert cmd[cmd.index("--gemm") + 1] == f"[{m},8192,7168]"
-            assert cmd[cmd.index("--size-mib") + 1] == ("2048" if m == 8192 and worker_index >= 3 else "1024")
+            assert cmd[cmd.index("--size-mib") + 1] == ("2048" if m == 8192 and overlap else "1024")
+            assert f"CUDA_VISIBLE_DEVICES={allgather_gpus if overlap else '2'}" in cmd
+            assert f"--nproc_per_node={4 if overlap else 1}" in cmd
             assert cmd[cmd.index("--gemm-rounds") + 1] == "8"
             assert "--trace=cuda,nvtx" in cmd
             assert "--nvtx-domain-exclude=NCCL" in cmd and "--cuda-trace-all-apis=true" not in cmd
@@ -61,7 +65,7 @@ def test_sweep_profiles_only_the_selected_shapes_paths_and_gpus(monkeypatch, tmp
             scratch = next(arg for arg in cmd if arg.startswith("NSYS_TMPDIR="))
             assert Path(scratch.split("=", 1)[1]).parent == nsys_tmp and scratch in start
             assert "--profile-sync-dir" in cmd
-            assert f"--gpu-metrics-devices={expected_gpus[worker_index]}" in start
+            assert "--gpu-metrics-devices=2" in start
             assert "--gpu-metrics-frequency=200000" in start
     assert not destination.exists()
 
@@ -120,13 +124,11 @@ touch "$output/mock.nsys-rep"
             for row in csv.DictReader(handle, delimiter="\t")
         ]
     assert attempts == [
-        ("task1", "1", "1024", "captured", "m0008/task1/gpu1/size-1024mib"),
         ("task1", "2", "1024", "captured", "m0008/task1/gpu2/size-1024mib"),
-        ("task1", "3", "1024", "captured", "m0008/task1/gpu3/size-1024mib"),
-        ("task3", "1,2,3", "1024", "captured", "m0008/task3/size-1024mib"),
-        ("task7", "1,2,3", "1024", "launch_error", "m0008/task7/size-1024mib"),
+        ("task3", "2", "1024", "captured", "m0008/task3/size-1024mib"),
+        ("task7", "2", "1024", "launch_error", "m0008/task7/size-1024mib"),
     ]
-    assert len(list(destination.rglob("*.nsys-rep"))) == 4
+    assert len(list(destination.rglob("*.nsys-rep"))) == 2
     assert not analysis_called.exists()
     assert not list(destination.rglob("*.sqlite"))
 
@@ -192,6 +194,55 @@ def test_local_overlap_export_is_temporary_on_failure(experiment_modules, monkey
     assert len(exports) == 1 and not exports[0].parent.exists()
     assert not exports[0].resolve().is_relative_to(tmp_path.resolve())
     assert not list(tmp_path.rglob("*.sqlite"))
+
+
+@pytest.mark.unit
+def test_multicast_uses_all_dma_sources_with_one_sampled_gpu(experiment_modules, monkeypatch, tmp_path):
+    analysis = importlib.import_module("analyse_ce_hbm_overlap")
+    shard_bytes = 256
+    source_windows = [(15_000, 30_000), (25_000, 45_000), (50_000, 65_000), (50_000, 65_000)]
+    gpu2_samples = {
+        2: [
+            analysis.Sample(time, metric, 1.0)
+            for time in range(15_000, 45_001, 5_000)
+            for metric in analysis._RAW_METRICS
+        ]
+    }
+    records = {}
+    captures = {}
+    channels = {}
+    for rank, (start, end) in enumerate(source_windows):
+        records[rank] = {
+            "rank": rank,
+            "physical_gpu": rank,
+            "mode": "gemm-ag-hbm",
+            "size_bytes": shard_bytes * len(source_windows),
+            "comm_rounds_measured": 1,
+            "all_gather_out_of_place": True,
+            "ce_lead_in_rounds": 1,
+            "gemm_mnk": [8, 8192, 7168],
+            "gemm_ms": [[0.02, 0.04]],
+            "comm_ms": [[start / 1e6, end / 1e6]],
+        }
+        gemm = analysis.Activity(20_000, 40_000, rank, "GEMM", 0, "", "", "")
+        copy = analysis.Activity(start, end, rank, "MEMCPY", shard_bytes, "Device-to-Device", "Device", "Device", rank)
+        captures[rank] = {"gemm00": [gemm], "comm00": [copy]}, gpu2_samples if rank == 2 else {}
+        channels[(copy.pid, copy.device, copy.start, copy.end, copy.size_bytes)] = {"Async Memcpy"}
+    monkeypatch.setattr(analysis, "_read_records", lambda path: records)
+    monkeypatch.setattr(analysis, "_export", lambda report, **kwargs: None)
+    monkeypatch.setattr(analysis, "_read_combined", lambda database, **kwargs: captures)
+    monkeypatch.setattr(analysis, "_read_hardware_channels", lambda report, **kwargs: channels)
+
+    summary, rows = analysis._analyse(
+        case_dir=tmp_path, nsys_bin="nsys", report_gpus={2}, dump_timeline="DumpTimeline"
+    )
+
+    assert summary["status"] == "ok"
+    assert summary["multicast_coverage_source_gpus"] == [0, 1, 2, 3]
+    assert summary["hardware_channels_verified"] is True
+    assert {gpu["gpu"] for gpu in summary["gpus"]} == {2}
+    assert summary["gpus"][0]["gemms"][0]["coverage"] == 1.0
+    assert len(rows) == 4 and {row["gpu"] for row in rows} == {2}
 
 
 @pytest.mark.unit

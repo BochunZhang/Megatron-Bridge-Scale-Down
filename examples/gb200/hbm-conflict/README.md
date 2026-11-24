@@ -151,13 +151,13 @@ bash examples/gb200/hbm-conflict/run_ce_hbm_kernel_sweep.sh --test --dry-run
 
 | Case | 工作负载 |
 | --- | --- |
-| `task1` | 物理 GPU 1、2、3 分别运行独立 GEMM 基线 |
+| `task1` | 只在物理 GPU 2 运行并采集独立 GEMM 基线 |
 | `task4` | GEMM + pinned CPU 源 CE multicast AllGather |
 | `task3` | GEMM + GPU HBM 源 CE multicast AllGather |
 | `task7` | GEMM + GPU HBM 源 CE unicast AllGather |
 
-AllGather 使用独立的 send 和 receive 缓冲区。四卡通信时只对物理 GPU **1、2、3** 采 GPU metrics
-并汇报结果。默认每卡 **1 GiB 完整输出**。启动器根据已有 trace 的 payload 时间和 GEMM 时间估计
+AllGather 使用独立的 send 和 receive 缓冲区。四卡通信时保留所有 rank 的 CUDA/NVTX trace，GPU metrics
+只采并汇报物理 GPU **2**。默认每卡 **1 GiB 完整输出**。启动器根据已有 trace 的 payload 时间和 GEMM 时间估计
 覆盖 8 次 GEMM 所需的轮数，单轮余量不足时使用 **2 GiB**。`plan.tsv` 记录每组首选通信大小和轮数。
 
 每个并跑 case 在采集外完成一次 CE AllGather。初始化、预热和缓冲区准备均完成后，Nsight 开始采集，
@@ -174,14 +174,16 @@ python3 examples/gb200/hbm-conflict/analyse_ce_hbm_overlap.py \
 ```
 
 Nsight 以 **200,000 Hz** 采样（目标周期 **5 µs**），采集 CUDA/NVTX 及 SM Active、DRAM 读写、C2C RX/TX
-和 NVLink RX/TX。分析使用 GEMM 活动内的采样，并在并跑时要求对应 CE payload 同时活跃。各次尝试的
+和 NVLink RX/TX。分析使用 GPU 2 的 GEMM 活动内的采样，并在并跑时要求写入 GPU 2 的 CE payload 同时活跃。
+Multicast shard 从任一 rank 发起都会写入 GPU 2，因此计算覆盖率时用所有源 rank 的 payload 时间。各次尝试的
 `summary.json` 记录逐 GPU 覆盖与计时，`gpu_metrics.csv` 记录采样值。链路带宽使用 user bytes，DRAM
 带宽以 32 B/sector 计算，带宽单位为十进制 GB/s。
 遇到 `insufficient_overlap` 时，可通过 `run_ce_hbm_benchmark.sh --overlap-profile` 定向补采。保留原先的
-case、GEMM 形状、`--gemm-rounds 8`、`--metrics-gpus 1,2,3` 和 `--nsys-freq 200000`，用 `--size-mib`
-及 `--comm-rounds` 调整通信预算。单组分析时将 `--output-dir` 指向该组的外层目录，并传入 `--report-gpus 1,2,3`。
+case、GEMM 形状、`--gemm-rounds 8`、`--metrics-gpus 2` 和 `--nsys-freq 200000`，用 `--size-mib`
+及 `--comm-rounds` 调整通信预算。单组分析时将 `--output-dir` 指向该组的外层目录，并传入 `--report-gpus 2`。
 
-有 `DumpTimeline` 时，分析器会核验统计卡上 payload 的 `Async Memcpy` 通道。可通过 `DUMP_TIMELINE`
+有 `DumpTimeline` 时，分析器会核验用于 multicast 覆盖计算的源 payload 及统计卡发起的 unicast payload 的
+`Async Memcpy` 通道。可通过 `DUMP_TIMELINE`
 指定可执行文件。没有该工具时，分析依据 NCCL 日志和 CUDA memcpy 记录，结果中的
 `hardware_channels_verified` 为 `false`。
 
@@ -189,7 +191,7 @@ case、GEMM 形状、`--gemm-rounds 8`、`--metrics-gpus 1,2,3` 和 `--nsys-freq
 
 ```bash
 bash examples/gb200/hbm-conflict/run_ncu_hbm_gemm_sweep.sh \
-  --gpu 0
+  --gpu 2
 ```
 
 NCU 默认为仓库根目录下的 `NVIDIA-Nsight-Compute-2026.4/ncu`，可用 `--ncu` 或 `NCU_BIN` 指定安装路径。
