@@ -175,9 +175,11 @@ python3 examples/gb200/hbm-conflict/analyse_ce_hbm_overlap.py \
 
 Nsight 以 **200,000 Hz** 采样（目标周期 **5 µs**），采集 CUDA/NVTX 及 SM Active、DRAM 读写、C2C RX/TX
 和 NVLink RX/TX。分析使用 GPU 2 的 GEMM 活动内的采样，并在并跑时要求写入 GPU 2 的 CE payload 同时活跃。
-Multicast shard 从任一 rank 发起都会写入 GPU 2，因此计算覆盖率时用所有源 rank 的 payload 时间。各次尝试的
-`summary.json` 记录逐 GPU 覆盖与计时，`gpu_metrics.csv` 记录采样值。链路带宽使用 user bytes，DRAM
-带宽以 32 B/sector 计算，带宽单位为十进制 GB/s。
+Multicast shard 从任一 rank 发起都会写入 GPU 2，因此计算覆盖率时用所有源 rank 的 payload 时间。
+`gpu_metrics.csv` 记录每个有效采样间隔的 Bytes、十进制 GB/s 和标称带宽占比。`summary.json` 按 GEMM 和 GPU
+汇总字节数，以累计采样时间计算平均带宽，并记录归一化分母。DRAM 用 32 B/sector 换算，读、写及合计共用
+8,000 GB/s 标称带宽。NVLink 和 C2C 统计用户字节，分别用单向 900 和 225 GB/s 计算 RX、TX 占比，
+双向合计分母分别为 1,800 和 450 GB/s。
 遇到 `insufficient_overlap` 时，可通过 `run_ce_hbm_benchmark.sh --overlap-profile` 定向补采。保留原先的
 case、GEMM 形状、`--gemm-rounds 8`、`--metrics-gpus 2` 和 `--nsys-freq 200000`，用 `--size-mib`
 及 `--comm-rounds` 调整通信预算。单组分析时将 `--output-dir` 指向该组的外层目录，并传入 `--report-gpus 2`。

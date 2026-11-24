@@ -246,6 +246,62 @@ def test_multicast_uses_all_dma_sources_with_one_sampled_gpu(experiment_modules,
 
 
 @pytest.mark.unit
+def test_overlap_reports_traffic_bytes_rates_and_utilization(experiment_modules):
+    analysis = importlib.import_module("analyse_ce_hbm_overlap")
+    counters = {
+        "SM Active": 20,
+        "DRAM Read": 62_500,
+        "DRAM Write": 31_250,
+        "C2C RX User Data": 200_000,
+        "C2C TX User Data": 100_000,
+        "NVLink RX Requests User Data": 110_000,
+        "NVLink RX Responses User Data": 190_000,
+        "NVLink TX Requests User Data": 70_000,
+        "NVLink TX Responses User Data": 180_000,
+    }
+    readings = {
+        20_000: counters,
+        24_000: {name: 2 * value for name, value in counters.items()} | {"SM Active": 80},
+        30_000: counters,
+    }
+    windows = [(20_000, 30_000)]
+    rows = analysis._gemm_samples(readings, gpu=2, gemm=0, windows=windows)
+    assert [(row["start_ns"], row["end_ns"]) for row in rows] == [(20_000, 24_000), (24_000, 30_000)]
+    assert [row["sm_active_pct"] for row in rows] == [20, 80]
+
+    summary = analysis._weighted_metrics(rows)
+    assert summary["sm_active_pct"] == pytest.approx(56)
+    expected_traffic = {
+        "dram_read": (2_000_000, 8_000),
+        "dram_write": (1_000_000, 8_000),
+        "dram_total": (3_000_000, 8_000),
+        "c2c_rx_user": (200_000, 225),
+        "c2c_tx_user": (100_000, 225),
+        "c2c_total_user": (300_000, 450),
+        "nvlink_rx_user": (300_000, 900),
+        "nvlink_tx_user": (250_000, 900),
+        "nvlink_total_user": (550_000, 1_800),
+    }
+    for metrics, duration_ns, count_multiplier in [(rows[0], 4_000, 1), (rows[1], 6_000, 2), (summary, 10_000, 3)]:
+        for stem, (first_sample_bytes, nominal_gbps) in expected_traffic.items():
+            count_bytes = first_sample_bytes * count_multiplier
+            expected_gbps = count_bytes / duration_ns
+            assert metrics[f"{stem}_bytes"] == count_bytes
+            assert metrics[f"{stem}_gbps"] == pytest.approx(expected_gbps)
+            assert metrics[f"{stem}_pct_of_nominal"] == pytest.approx(100 * expected_gbps / nominal_gbps)
+    assert rows[0].keys() <= set(analysis._CSV_COLUMNS)
+
+    no_samples = analysis._gemm_samples(readings, gpu=2, gemm=0, windows=[(20_001, 29_999)])
+    assert no_samples == []
+    assert analysis._weighted_metrics(no_samples) == {}
+
+    incomplete = dict(readings)
+    incomplete[20_000] = {name: value for name, value in counters.items() if name != "NVLink TX Responses User Data"}
+    with pytest.raises(ValueError, match="incomplete GPU metrics"):
+        analysis._gemm_samples(incomplete, gpu=2, gemm=0, windows=windows)
+
+
+@pytest.mark.unit
 def test_touching_ag_rounds_do_not_count_as_one(experiment_modules, monkeypatch, tmp_path):
     analysis = importlib.import_module("analyse_ce_hbm_kernel_trace")
     case_dir = tmp_path / "task7-gemm-ag-hbm-unicast"

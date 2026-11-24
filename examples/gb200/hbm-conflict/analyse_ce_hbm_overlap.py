@@ -50,17 +50,42 @@ _TRACE_TABLES = (
     "^CUPTI_ACTIVITY_KIND_MEMCPY$,^CUPTI_ACTIVITY_KIND_MEMCPY2$,"
     "^NVTX_EVENTS$,^StringIds$,^ENUM_CUDA_MEM.*$,^GPU_METRICS$,^TARGET_INFO_GPU_METRICS$"
 )
-_METRIC_COLUMNS = {
-    "sm_active_pct": ("SM Active",),
-    "dram_read_gbps": ("DRAM Read",),
-    "dram_write_gbps": ("DRAM Write",),
-    "c2c_rx_user_gbps": ("C2C RX User Data",),
-    "c2c_tx_user_gbps": ("C2C TX User Data",),
-    "nvlink_rx_user_gbps": ("NVLink RX Requests User Data", "NVLink RX Responses User Data"),
-    "nvlink_tx_user_gbps": ("NVLink TX Requests User Data", "NVLink TX Responses User Data"),
+_TRAFFIC_COUNTERS = {
+    "dram_read": ("DRAM Read",),
+    "dram_write": ("DRAM Write",),
+    "c2c_rx_user": ("C2C RX User Data",),
+    "c2c_tx_user": ("C2C TX User Data",),
+    "nvlink_rx_user": ("NVLink RX Requests User Data", "NVLink RX Responses User Data"),
+    "nvlink_tx_user": ("NVLink TX Requests User Data", "NVLink TX Responses User Data"),
 }
-_RAW_METRICS = {name for names in _METRIC_COLUMNS.values() for name in names}
-_CSV_COLUMNS = ("gpu", "gemm", "start_ns", "end_ns", *_METRIC_COLUMNS)
+_TRAFFIC_TOTALS = {
+    "dram_total": ("dram_read", "dram_write"),
+    "c2c_total_user": ("c2c_rx_user", "c2c_tx_user"),
+    "nvlink_total_user": ("nvlink_rx_user", "nvlink_tx_user"),
+}
+# Per GPU. DRAM shares its peak across read and write, while each link is full duplex.
+_NOMINAL_BANDWIDTH_GBPS = {
+    "dram_read": 8_000,
+    "dram_write": 8_000,
+    "c2c_rx_user": 225,
+    "c2c_tx_user": 225,
+    "nvlink_rx_user": 900,
+    "nvlink_tx_user": 900,
+    "dram_total": 8_000,
+    "c2c_total_user": 450,
+    "nvlink_total_user": 1_800,
+}
+_METRIC_UNITS = {
+    "sm_active_pct": "%",
+    **{f"{metric}_gbps": "GB/s" for metric in _NOMINAL_BANDWIDTH_GBPS},
+    **{
+        f"{metric}_{suffix}": unit
+        for metric in _NOMINAL_BANDWIDTH_GBPS
+        for suffix, unit in (("bytes", "B"), ("pct_of_nominal", "%"))
+    },
+}
+_RAW_METRICS = {"SM Active", *(name for names in _TRAFFIC_COUNTERS.values() for name in names)}
+_CSV_COLUMNS = ("gpu", "gemm", "start_ns", "end_ns", *_METRIC_UNITS)
 _STATUS_COLUMNS = ("m", "case", "metrics_gpus", "size_mib", "status", "attempt_dir")
 _CAPTURE_STATUSES = {"captured", "ok", "analysis_error", "insufficient_overlap", "launch_error"}
 _EXIT_CODES = {"ok": 0, "analysis_error": 1, "launch_error": 1, "insufficient_overlap": 3}
@@ -88,6 +113,18 @@ def _sample_values(samples: Sequence[Sample]) -> dict[int, dict[str, float]]:
     return readings
 
 
+def _traffic_metrics(byte_counts: dict[str, float], duration_ns: int) -> dict[str, float]:
+    totals = {metric: sum(byte_counts[part] for part in parts) for metric, parts in _TRAFFIC_TOTALS.items()}
+    values = {}
+    for metric, count in (byte_counts | totals).items():
+        # Bytes/ns equals decimal GB/s.
+        rate = count / duration_ns
+        values[f"{metric}_bytes"] = count
+        values[f"{metric}_gbps"] = rate
+        values[f"{metric}_pct_of_nominal"] = 100 * rate / _NOMINAL_BANDWIDTH_GBPS[metric]
+    return values
+
+
 def _gemm_samples(
     readings: dict[int, dict[str, float]],
     *,
@@ -107,27 +144,35 @@ def _gemm_samples(
         raw = readings[start]
         if raw.keys() != _RAW_METRICS or any(not math.isfinite(v) or v < 0 for v in raw.values()):
             raise ValueError(f"GPU {gpu} GEMM {gemm}: incomplete GPU metrics at {start} ns")
-        result: dict[str, int | float] = {"gpu": gpu, "gemm": gemm, "start_ns": start, "end_ns": end}
-        for metric, names in _METRIC_COLUMNS.items():
-            count = sum(raw[name] for name in names)
-            if metric == "sm_active_pct":
-                result[metric] = count
-            else:
-                # DRAM counters count 32-byte sectors. Bytes/ns equals decimal GB/s.
-                multiplier = 32 if metric.startswith("dram_") else 1
-                result[metric] = count * multiplier / (end - start)
-        rows.append(result)
+        byte_counts = {
+            metric: sum(raw[name] for name in names) * (32 if metric.startswith("dram_") else 1)
+            for metric, names in _TRAFFIC_COUNTERS.items()
+        }
+        rows.append(
+            {
+                "gpu": gpu,
+                "gemm": gemm,
+                "start_ns": start,
+                "end_ns": end,
+                "sm_active_pct": raw["SM Active"],
+                **_traffic_metrics(byte_counts, end - start),
+            }
+        )
     return rows
 
 
 def _weighted_metrics(rows: Sequence[dict[str, int | float]]) -> dict[str, float]:
-    durations = [row["end_ns"] - row["start_ns"] for row in rows]
+    durations = [int(row["end_ns"]) - int(row["start_ns"]) for row in rows]
     total = sum(durations)
     if not total:
         return {}
+    byte_counts = {metric: math.fsum(row[f"{metric}_bytes"] for row in rows) for metric in _TRAFFIC_COUNTERS}
     return {
-        metric: math.fsum(row[metric] * duration for row, duration in zip(rows, durations, strict=True)) / total
-        for metric in _METRIC_COLUMNS
+        "sm_active_pct": math.fsum(
+            row["sm_active_pct"] * duration for row, duration in zip(rows, durations, strict=True)
+        )
+        / total,
+        **_traffic_metrics(byte_counts, total),
     }
 
 
@@ -298,7 +343,8 @@ def _analyse(
         "ce_lead_in_rounds": first.get("ce_lead_in_rounds", 0),
         "status": status,
         "sampling_period_ns": _PERIOD_NS,
-        "metric_units": {metric: "%" if metric == "sm_active_pct" else "GB/s" for metric in _METRIC_COLUMNS},
+        "metric_units": _METRIC_UNITS,
+        "nominal_bandwidth_gbps": _NOMINAL_BANDWIDTH_GBPS,
         "payload_timing": "none" if solo else "destination memcpy" if unicast else "multicast source DMA",
         "multicast_coverage_source_gpus": sorted(gpus) if not solo and not unicast else [],
         "hardware_channels_verified": channels is not None,
