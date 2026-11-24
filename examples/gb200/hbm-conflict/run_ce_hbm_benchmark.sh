@@ -345,9 +345,9 @@ run_overlap_profile() (
         trap 'rm -rf -- "$nsys_tmp"' EXIT
     fi
     local -a controller=(env "NSYS_TMPDIR=$nsys_tmp" "$NSYS_BIN")
-    # Nsight Systems 2026.6.1 uses the default process tree for interactive launch.
+    # Launch sets up tracing for the default process tree. Configure sampling on start.
     local -a launch=("${run_env[@]}" "NSYS_TMPDIR=$nsys_tmp" "$NSYS_BIN" launch --session-new="$session" --show-output=true
-        --trace=cuda,nvtx --nvtx-domain-exclude=NCCL --sample=none --cpuctxsw=none
+        --trace=cuda,nvtx --nvtx-domain-exclude=NCCL
         bash -c 'sync_dir=$1; shift; status=0; "$@" || status=$?;
             printf "%s\n" "$status" >"$sync_dir/exit.tmp"; mv "$sync_dir/exit.tmp" "$sync_dir/exit"; exit "$status"' \
         ce-hbm-worker "$sync_dir" "${worker[@]}" --profile-sync-dir "$sync_dir")

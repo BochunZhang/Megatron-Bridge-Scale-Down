@@ -57,7 +57,8 @@ def test_sweep_profiles_only_the_selected_shapes_paths_and_gpus(monkeypatch, tmp
             assert cmd[cmd.index("--gemm-rounds") + 1] == "8"
             assert "--trace=cuda,nvtx" in cmd
             assert "--nvtx-domain-exclude=NCCL" in cmd and "--cuda-trace-all-apis=true" not in cmd
-            assert not any(arg.startswith("--cuda-trace-scope") for arg in cmd)
+            assert {"--cuda-trace-scope", "--sample", "--cpuctxsw"}.isdisjoint(arg.split("=", 1)[0] for arg in cmd)
+            assert {"--sample=none", "--cpuctxsw=none"} <= set(start)
             scratch = next(arg for arg in cmd if arg.startswith("NSYS_TMPDIR="))
             assert Path(scratch.split("=", 1)[1]).parent == nsys_tmp and scratch in start
             assert "--profile-sync-dir" in cmd
