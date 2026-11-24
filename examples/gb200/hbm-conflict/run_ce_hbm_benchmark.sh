@@ -336,9 +336,18 @@ wait_for_profile_signal() {
 
 run_overlap_profile() (
     local sync_dir="$case_dir/nsys/sync" session="hbm-${BASHPID:-$$}-${RANDOM}"
-    local -a controller=(env "NSYS_TMPDIR=$case_dir/nsys/.tmp" "$NSYS_BIN")
-    local -a launch=("${run_env[@]}" "$NSYS_BIN" launch --session-new="$session" --show-output=true
-        --trace=cuda,nvtx --nvtx-domain-exclude=NCCL --cuda-trace-scope=process-tree --sample=none --cpuctxsw=none
+    # Keep the interactive session files local even when results are stored on CPFS.
+    local nsys_tmp="${NSYS_TMPDIR:-/tmp}"
+    if $dry_run; then
+        nsys_tmp="$nsys_tmp/$session"
+    else
+        nsys_tmp=$(mktemp -d "$nsys_tmp/ce-hbm.XXXXXX") || return
+        trap 'rm -rf -- "$nsys_tmp"' EXIT
+    fi
+    local -a controller=(env "NSYS_TMPDIR=$nsys_tmp" "$NSYS_BIN")
+    # Nsight Systems 2026.6.1 uses the default process tree for interactive launch.
+    local -a launch=("${run_env[@]}" "NSYS_TMPDIR=$nsys_tmp" "$NSYS_BIN" launch --session-new="$session" --show-output=true
+        --trace=cuda,nvtx --nvtx-domain-exclude=NCCL --sample=none --cpuctxsw=none
         bash -c 'sync_dir=$1; shift; status=0; "$@" || status=$?;
             printf "%s\n" "$status" >"$sync_dir/exit.tmp"; mv "$sync_dir/exit.tmp" "$sync_dir/exit"; exit "$status"' \
         ce-hbm-worker "$sync_dir" "${worker[@]}" --profile-sync-dir "$sync_dir")
@@ -362,7 +371,7 @@ run_overlap_profile() (
         show_command "${finalize[@]}"
     } >"$case_dir/command.txt" || return
 
-    trap '"${controller[@]}" shutdown --session="$session" --kill=sigterm >>"$case_dir/nsys-control.log" 2>&1 || true' EXIT
+    trap '"${controller[@]}" shutdown --session="$session" --kill=sigterm >>"$case_dir/nsys-control.log" 2>&1 || true; rm -rf -- "$nsys_tmp"' EXIT
     trap 'exit 130' INT
     trap 'exit 143' TERM
     (
@@ -445,8 +454,12 @@ run_case() {
         $dry_run || mkdir -p -- "$nccl_raw_dir" || return
     fi
     run_env+=("CUDA_VISIBLE_DEVICES=$devices" "CUDA_DEVICE_ORDER=$CUDA_DEVICE_ORDER"
-        "GLOO_SOCKET_IFNAME=${GLOO_SOCKET_IFNAME:-${GLOO_SOCKET_NAME:-}}"
-        "NSYS_TMPDIR=$case_dir/nsys/.tmp")
+        "GLOO_SOCKET_IFNAME=${GLOO_SOCKET_IFNAME:-${GLOO_SOCKET_NAME:-}}")
+    local nsys_dir="$case_dir/nsys"
+    if ! $overlap_profile; then
+        nsys_dir+=/.tmp
+        run_env+=("NSYS_TMPDIR=$nsys_dir")
+    fi
     if $dry_run; then
         if $overlap_profile; then
             run_overlap_profile
@@ -455,7 +468,7 @@ run_case() {
         fi
         return
     fi
-    mkdir -p -- "$case_dir/nsys/.tmp" || return
+    mkdir -p -- "$nsys_dir" || return
     printf 'Running %s on GPUs %s\n' "$name" "$devices"
     if $overlap_profile; then
         run_overlap_profile || return

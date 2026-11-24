@@ -22,8 +22,10 @@ def experiment_modules(monkeypatch):
 
 @pytest.mark.unit
 @pytest.mark.parametrize("test_only", [False, True])
-def test_sweep_profiles_only_the_selected_shapes_paths_and_gpus(tmp_path, test_only):
+def test_sweep_profiles_only_the_selected_shapes_paths_and_gpus(monkeypatch, tmp_path, test_only):
     destination = tmp_path / "dry-run"
+    nsys_tmp = tmp_path / "local-nsys"
+    monkeypatch.setenv("NSYS_TMPDIR", str(nsys_tmp))
     result = subprocess.run(
         [
             "bash",
@@ -55,6 +57,9 @@ def test_sweep_profiles_only_the_selected_shapes_paths_and_gpus(tmp_path, test_o
             assert cmd[cmd.index("--gemm-rounds") + 1] == "8"
             assert "--trace=cuda,nvtx" in cmd
             assert "--nvtx-domain-exclude=NCCL" in cmd and "--cuda-trace-all-apis=true" not in cmd
+            assert not any(arg.startswith("--cuda-trace-scope") for arg in cmd)
+            scratch = next(arg for arg in cmd if arg.startswith("NSYS_TMPDIR="))
+            assert Path(scratch.split("=", 1)[1]).parent == nsys_tmp and scratch in start
             assert "--profile-sync-dir" in cmd
             assert f"--gpu-metrics-devices={expected_gpus[worker_index]}" in start
             assert "--gpu-metrics-frequency=200000" in start
