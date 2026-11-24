@@ -162,13 +162,24 @@ AllGather 使用独立的 send 和 receive 缓冲区。四卡通信时只对物�
 
 每个并跑 case 在采集外完成一次 CE AllGather。初始化、预热和缓冲区准备均完成后，Nsight 开始采集，
 然后 worker 提交计时批次。每组 GEMM 等到对应 AG 的 stream 起点，再在 GPU 上留约 100 µs 给 NCCL
-同步和 payload 启动。所有计时 GPU 工作完成后停止采集，再校验输出。实际覆盖仍由 GPU kernel 和 payload
-memcpy 时间戳判定。每次尝试保留原始报告，`status.tsv` 记录尝试是否通过。
+同步和 payload 启动。所有计时 GPU 工作完成后停止采集，再校验输出。服务器保留原始 `.nsys-rep`、
+worker 记录和日志。`status.tsv` 中的 `captured` 表示采集完成，覆盖率由本机分析判定。
+
+下载完整 sweep 目录后，在本机指定可执行的 Nsight Systems CLI 路径 `NSYS_BIN` 并运行以下命令。分析实现
+使用本机临时目录里的 SQLite 导出，读取后自动清理。`analysis-status.tsv` 记录整个 sweep 的分析结果。
+
+```bash
+python3 examples/gb200/hbm-conflict/analyse_ce_hbm_overlap.py \
+  --output-dir "$sweep_dir" --nsys "$NSYS_BIN"
+```
 
 Nsight 以 **200,000 Hz** 采样（目标周期 **5 µs**），采集 CUDA/NVTX 及 SM Active、DRAM 读写、C2C RX/TX
 和 NVLink RX/TX。分析使用 GEMM 活动内的采样，并在并跑时要求对应 CE payload 同时活跃。各次尝试的
 `summary.json` 记录逐 GPU 覆盖与计时，`gpu_metrics.csv` 记录采样值。链路带宽使用 user bytes，DRAM
 带宽以 32 B/sector 计算，带宽单位为十进制 GB/s。
+遇到 `insufficient_overlap` 时，可通过 `run_ce_hbm_benchmark.sh --overlap-profile` 定向补采。保留原先的
+case、GEMM 形状、`--gemm-rounds 8`、`--metrics-gpus 1,2,3` 和 `--nsys-freq 200000`，用 `--size-mib`
+及 `--comm-rounds` 调整通信预算。单组分析时将 `--output-dir` 指向该组的外层目录，并传入 `--report-gpus 1,2,3`。
 
 有 `DumpTimeline` 时，分析器会核验统计卡上 payload 的 `Async Memcpy` 通道。可通过 `DUMP_TIMELINE`
 指定可执行文件。没有该工具时，分析依据 NCCL 日志和 CUDA memcpy 记录，结果中的

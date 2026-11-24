@@ -61,21 +61,17 @@ _METRIC_COLUMNS = {
 }
 _RAW_METRICS = {name for names in _METRIC_COLUMNS.values() for name in names}
 _CSV_COLUMNS = ("gpu", "gemm", "start_ns", "end_ns", *_METRIC_COLUMNS)
+_STATUS_COLUMNS = ("m", "case", "metrics_gpus", "size_mib", "status", "attempt_dir")
+_CAPTURE_STATUSES = {"captured", "ok", "analysis_error", "insufficient_overlap", "launch_error"}
+_EXIT_CODES = {"ok": 0, "analysis_error": 1, "launch_error": 1, "insufficient_overlap": 3}
 
 
-def _export(report: Path, *, nsys_bin: str) -> Path:
-    target = report.with_suffix(".overlap.sqlite")
-    if target.is_file() and target.stat().st_mtime_ns >= report.stat().st_mtime_ns:
-        return target
-    with tempfile.TemporaryDirectory(prefix=".overlap-", dir=target.parent) as temp:
-        staged = Path(temp) / target.name
-        subprocess.run(
-            [nsys_bin, "export", "--type=sqlite", f"--tables={_TRACE_TABLES}", f"--output={staged}", str(report)],
-            check=True,
-            stdout=subprocess.DEVNULL,
-        )
-        staged.replace(target)
-    return target
+def _export(report: Path, *, nsys_bin: str, target: Path) -> None:
+    subprocess.run(
+        [nsys_bin, "export", "--type=sqlite", f"--tables={_TRACE_TABLES}", f"--output={target}", str(report)],
+        check=True,
+        stdout=subprocess.DEVNULL,
+    )
 
 
 def _sample_values(samples: Sequence[Sample]) -> dict[int, dict[str, float]]:
@@ -182,7 +178,10 @@ def _analyse(
         raise ValueError(f"requested physical GPUs {sorted(report_gpus)} missing from {sorted(gpus)}")
     report = case_dir / "nsys" / f"{case_dir.name}.nsys-rep"
     errors: list[str] = []
-    captures = _read_combined(_export(report, nsys_bin=nsys_bin), case=case_dir.name, records=records, errors=errors)
+    with tempfile.TemporaryDirectory(prefix="ce-hbm-overlap-") as temp:
+        database = Path(temp) / "trace.sqlite"
+        _export(report, nsys_bin=nsys_bin, target=database)
+        captures = _read_combined(database, case=case_dir.name, records=records, errors=errors)
     if errors or set(captures) != set(records):
         raise ValueError(f"incomplete CUDA/NVTX capture {', '.join(errors)}")
 
@@ -312,44 +311,109 @@ def _analyse(
     }, rows
 
 
+def _analyse_attempt(attempt_dir: Path, *, nsys_bin: str, report_gpus: str, dump_timeline: str | None) -> str:
+    try:
+        gpu_ids = report_gpus.split(",")
+        if not all(gpu.isdecimal() for gpu in gpu_ids):
+            raise ValueError("expected distinct physical GPU IDs")
+        gpu_set = {int(gpu) for gpu in gpu_ids}
+        if len(gpu_set) != len(gpu_ids):
+            raise ValueError("expected distinct physical GPU IDs")
+        cases = [path for path in attempt_dir.iterdir() if path.is_dir() and path.name.startswith("task")]
+        if len(cases) != 1:
+            raise ValueError(f"expected one captured case directory, found {len(cases)}")
+        summary, rows = _analyse(
+            case_dir=cases[0],
+            nsys_bin=nsys_bin,
+            report_gpus=gpu_set,
+            dump_timeline=dump_timeline,
+        )
+    except (OSError, KeyError, TypeError, ValueError, sqlite3.Error, subprocess.SubprocessError) as error:
+        _LOG.error("%s: %s", attempt_dir, error)
+        if attempt_dir.is_dir():
+            (attempt_dir / "summary.json").write_text(
+                json.dumps({"status": "error", "error": str(error)}, indent=2) + "\n", encoding="utf-8"
+            )
+        return "analysis_error"
+    (attempt_dir / "summary.json").write_text(json.dumps(summary, indent=2) + "\n", encoding="utf-8")
+    with (attempt_dir / "gpu_metrics.csv").open("w", encoding="utf-8", newline="") as output:
+        writer = csv.DictWriter(output, fieldnames=_CSV_COLUMNS)
+        writer.writeheader()
+        writer.writerows(rows)
+    _LOG.info("%s: %s on physical GPUs %s", attempt_dir, summary["status"], report_gpus)
+    return summary["status"]
+
+
+def _attempt_path(sweep_dir: Path, *, attempt_dir: str, m: str) -> Path:
+    attempt = Path(attempt_dir)
+    if attempt.is_absolute():
+        # Older manifests store the capture host's absolute path.
+        shape_dir = f"m{int(m):04d}"
+        _, marker, suffix = attempt.as_posix().rpartition(f"/{shape_dir}/")
+        if not marker:
+            raise ValueError(f"cannot relocate attempt without {shape_dir}: {attempt}")
+        attempt = Path(shape_dir) / suffix
+    resolved = (sweep_dir / attempt).resolve()
+    if resolved == sweep_dir or not resolved.is_relative_to(sweep_dir):
+        raise ValueError(f"attempt directory must be within the sweep: {attempt_dir}")
+    return resolved
+
+
+def _analyse_sweep(sweep_dir: Path, *, nsys_bin: str, dump_timeline: str | None) -> int:
+    with (sweep_dir / "status.tsv").open(encoding="utf-8", newline="") as source:
+        reader = csv.DictReader(source, delimiter="\t")
+        if not set(_STATUS_COLUMNS).issubset(reader.fieldnames or ()):
+            raise ValueError("status.tsv is missing required columns")
+        attempts = list(reader)
+    if not attempts:
+        raise ValueError("status.tsv contains no attempts")
+    codes = []
+    for row in attempts:
+        if not all(row[name] for name in _STATUS_COLUMNS) or row["status"] not in _CAPTURE_STATUSES:
+            raise ValueError(f"invalid attempt in status.tsv: {row}")
+        attempt_dir = _attempt_path(sweep_dir, attempt_dir=row["attempt_dir"], m=row["m"])
+        if row["status"] != "launch_error":
+            row["status"] = _analyse_attempt(
+                attempt_dir,
+                nsys_bin=nsys_bin,
+                report_gpus=row["metrics_gpus"],
+                dump_timeline=dump_timeline,
+            )
+        row["attempt_dir"] = attempt_dir.relative_to(sweep_dir).as_posix()
+        codes.append(_EXIT_CODES[row["status"]])
+    with (sweep_dir / "analysis-status.tsv").open("w", encoding="utf-8", newline="") as output:
+        writer = csv.DictWriter(output, fieldnames=_STATUS_COLUMNS, delimiter="\t", extrasaction="ignore")
+        writer.writeheader()
+        writer.writerows(attempts)
+    return 1 if 1 in codes else max(codes)
+
+
 def main(argv: Sequence[str] | None = None) -> int:
-    """Write metrics for one sweep attempt and return its validation status."""
+    """Analyse a downloaded sweep or one attempt and return its validation status."""
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--output-dir", type=Path, required=True)
+    parser.add_argument("--output-dir", type=Path, required=True, help="Downloaded sweep or single attempt directory.")
     parser.add_argument("--nsys", required=True)
-    parser.add_argument("--report-gpus", required=True, help="Physical GPU IDs, comma-separated.")
+    parser.add_argument("--report-gpus", help="Physical GPU IDs, comma-separated, for a single attempt.")
     parser.add_argument(
         "--dump-timeline", help="Optional DumpTimeline executable to verify payload hardware channels."
     )
     args = parser.parse_args(argv)
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
+    output_dir = args.output_dir.resolve()
     try:
-        gpu_ids = args.report_gpus.split(",")
-        if not all(gpu.isdecimal() for gpu in gpu_ids) or len(set(gpu_ids)) != len(gpu_ids):
-            raise ValueError("expected distinct physical GPU IDs")
-        cases = [path for path in args.output_dir.iterdir() if path.is_dir() and path.name.startswith("task")]
-        if len(cases) != 1:
-            raise ValueError(f"expected one captured case directory, found {len(cases)}")
-        summary, rows = _analyse(
-            case_dir=cases[0],
-            nsys_bin=args.nsys,
-            report_gpus={int(gpu) for gpu in gpu_ids},
-            dump_timeline=args.dump_timeline,
+        if (output_dir / "status.tsv").is_file():
+            if args.report_gpus is not None:
+                parser.error("omit --report-gpus for a sweep; GPUs come from status.tsv")
+            return _analyse_sweep(output_dir, nsys_bin=args.nsys, dump_timeline=args.dump_timeline)
+        if args.report_gpus is None:
+            parser.error("--report-gpus is required for a single attempt")
+        status = _analyse_attempt(
+            output_dir, nsys_bin=args.nsys, report_gpus=args.report_gpus, dump_timeline=args.dump_timeline
         )
-    except (OSError, KeyError, TypeError, ValueError, sqlite3.Error, subprocess.SubprocessError) as error:
-        _LOG.error("%s: %s", args.output_dir, error)
-        if args.output_dir.is_dir():
-            (args.output_dir / "summary.json").write_text(
-                json.dumps({"status": "error", "error": str(error)}, indent=2) + "\n", encoding="utf-8"
-            )
+        return _EXIT_CODES[status]
+    except (OSError, ValueError, csv.Error) as error:
+        _LOG.error("%s: %s", output_dir, error)
         return 1
-    (args.output_dir / "summary.json").write_text(json.dumps(summary, indent=2) + "\n", encoding="utf-8")
-    with (args.output_dir / "gpu_metrics.csv").open("w", encoding="utf-8", newline="") as output:
-        writer = csv.DictWriter(output, fieldnames=_CSV_COLUMNS)
-        writer.writeheader()
-        writer.writerows(rows)
-    _LOG.info("%s: %s on physical GPUs %s", args.output_dir, summary["status"], args.report_gpus)
-    return 0 if summary["status"] == "ok" else 3
 
 
 if __name__ == "__main__":

@@ -23,9 +23,8 @@ Usage: run_ce_hbm_kernel_sweep.sh [options]
 
 Each AllGather uses separate send and receive buffers. One completed lead-in
 runs before collection. The measured AllGather size and rounds come from
-archived timing estimates. Incomplete overlap can retry at 2 GiB, then once
-with a smaller GEMM group per AllGather.
-Results contain plan.tsv, status.tsv, and each attempt's report and metrics.
+archived timing estimates. Results contain raw reports, worker records, logs,
+plan.tsv and status.tsv. Analyse the downloaded sweep with analyse_ce_hbm_overlap.py.
 USAGE
 }
 
@@ -101,12 +100,11 @@ if ! $dry_run; then
     mkdir -- "$output_dir" || die "use a new results directory"
     printf '%s\n' 'Source: ce-kernel-sweep-20261123-222531/summary.json, 1024 MiB attempts, GPU 0' \
         'Planning uses p90 kernel, p90 within-round gap (solo p90 fallback), and p10 payload duration.' \
-        '200 kHz metrics on physical GPUs 1,2,3. Validated timing is in each attempt summary.' >"$output_dir/run_info.txt"
+        '200 kHz metrics on physical GPUs 1,2,3. Analyse the downloaded sweep to verify coverage.' >"$output_dir/run_info.txt"
     printf 'm\tcase\tmetrics_gpus\tsize_mib\ttimed_ag_rounds\tgemm_p90_us\tgap_p90_us\tpayload_1gib_p10_us\n' \
         >"$output_dir/plan.tsv"
     printf 'm\tcase\tmetrics_gpus\tsize_mib\tstatus\tattempt_dir\n' >"$output_dir/status.tsv"
 fi
-analysis=(uv run --active --no-sync python "$script_dir/analyse_ce_hbm_overlap.py")
 
 archived_timing() {
     local m="$1" case_id="$2" shape cpu_multicast gpu_multicast gpu_unicast
@@ -143,7 +141,7 @@ ESTIMATES
 run_case() {
     local case_id="$1" m="$2" metrics="$3" devices="$4"
     local size_mib=1024 rounds=0 gemm_us=0 gap_us=0 payload_us=0 fits budget
-    local guard_us=150 group_cap=0 attempt_dir case_path analysis_exit status timing
+    local guard_us=150 attempt_path case_path launch_exit=0 status=captured timing
     if [[ "$case_id" == task1 ]]; then
         case_path="$case_id/gpu$metrics"
     else
@@ -153,60 +151,32 @@ run_case() {
         # Reserve the 100-us worker settle interval plus 50 us for the tail.
         # If 1 GiB leaves space for fewer than two GEMMs, try 2 GiB.
         if (( 2 * gemm_us + gap_us + guard_us > payload_us )); then size_mib=2048; fi
+        budget=$((payload_us * (size_mib / 1024) - guard_us))
+        fits=$(((budget + gap_us) / (gemm_us + gap_us)))
+        if (( fits < 1 )); then fits=1; fi
+        rounds=$(((gemm_rounds + fits - 1) / fits))
     fi
 
-    while true; do
-        if [[ "$case_id" != task1 ]]; then
-            budget=$((payload_us * (size_mib / 1024) - guard_us))
-            fits=$(((budget + gap_us) / (gemm_us + gap_us)))
-            if (( fits < 1 )); then fits=1; fi
-            if (( group_cap )); then fits=$group_cap; fi
-            rounds=$(((gemm_rounds + fits - 1) / fits))
-        fi
-        printf -v attempt_dir '%s/m%04d/%s/size-%dmib' "$output_dir" "$m" "$case_path" "$size_mib"
-        if (( group_cap )); then attempt_dir+="-rounds-$rounds"; fi
-        # The standalone worker requires a positive --comm-rounds argument and never enqueues CE.
-        local -a command=(bash "$script_dir/run_ce_hbm_benchmark.sh" --overlap-profile
-            --gpus "$devices" --metrics-gpus "$metrics" --nsys "$nsys_bin" --nsys-freq 200000
-            --cases "$case_id" --gemm "[$m,8192,7168]" --size-mib "$size_mib" --gemm-rounds "$gemm_rounds"
-            --comm-rounds "$((rounds == 0 ? 1 : rounds))" --warmup "$warmup" --output-dir "$attempt_dir")
-        if [[ "$case_id" != task1 && -n "$nccl_lib" ]]; then command+=(--nccl-lib "$nccl_lib"); fi
-        printf 'M=%d %s metrics GPUs=%s size=%d MiB timed AG=%d\n' "$m" "$case_id" "$metrics" "$size_mib" "$rounds"
-        if $dry_run; then
-            "${command[@]}" --dry-run
-            return
-        fi
-        printf '%d\t%s\t%s\t%d\t%d\t%d\t%d\t%d\n' \
-            "$m" "$case_id" "$metrics" "$size_mib" "$rounds" "$gemm_us" "$gap_us" "$payload_us" \
-            >>"$output_dir/plan.tsv" || return
-        analysis_exit=0
-        if "${command[@]}"; then
-            "${analysis[@]}" --output-dir "$attempt_dir" --nsys "$nsys_bin" --report-gpus "$metrics" || analysis_exit=$?
-            case "$analysis_exit" in
-                0) status=ok ;;
-                3) status=insufficient_overlap ;;
-                *) status=analysis_error ;;
-            esac
-        else
-            status=launch_error
-            analysis_exit=1
-        fi
-        printf '%d\t%s\t%s\t%d\t%s\t%s\n' "$m" "$case_id" "$metrics" "$size_mib" "$status" "$attempt_dir" \
-            >>"$output_dir/status.tsv" || return
-        if (( analysis_exit != 3 )) || [[ "$case_id" == task1 ]]; then
-            return "$analysis_exit"
-        fi
-        if (( size_mib == 1024 )); then
-            printf '%s M=%s has insufficient overlap. Retrying at 2048 MiB per GPU\n' "$case_id" "$m" >&2
-            size_mib=2048
-        elif (( group_cap == 0 && rounds < gemm_rounds )); then
-            group_cap=$(((gemm_rounds + rounds - 1) / rounds - 1))
-            printf '%s M=%s has insufficient overlap. Retrying with at most %d GEMMs per AG\n' \
-                "$case_id" "$m" "$group_cap" >&2
-        else
-            return "$analysis_exit"
-        fi
-    done
+    printf -v attempt_path 'm%04d/%s/size-%dmib' "$m" "$case_path" "$size_mib"
+    # The standalone worker requires a positive --comm-rounds argument and never enqueues CE.
+    local -a command=(bash "$script_dir/run_ce_hbm_benchmark.sh" --overlap-profile
+        --gpus "$devices" --metrics-gpus "$metrics" --nsys "$nsys_bin" --nsys-freq 200000
+        --cases "$case_id" --gemm "[$m,8192,7168]" --size-mib "$size_mib" --gemm-rounds "$gemm_rounds"
+        --comm-rounds "$((rounds == 0 ? 1 : rounds))" --warmup "$warmup" --output-dir "$output_dir/$attempt_path")
+    if [[ "$case_id" != task1 && -n "$nccl_lib" ]]; then command+=(--nccl-lib "$nccl_lib"); fi
+    printf 'M=%d %s metrics GPUs=%s size=%d MiB timed AG=%d\n' "$m" "$case_id" "$metrics" "$size_mib" "$rounds"
+    if $dry_run; then
+        "${command[@]}" --dry-run
+        return
+    fi
+    printf '%d\t%s\t%s\t%d\t%d\t%d\t%d\t%d\n' \
+        "$m" "$case_id" "$metrics" "$size_mib" "$rounds" "$gemm_us" "$gap_us" "$payload_us" \
+        >>"$output_dir/plan.tsv" || return
+    "${command[@]}" || launch_exit=$?
+    if (( launch_exit )); then status=launch_error; fi
+    printf '%d\t%s\t%s\t%d\t%s\t%s\n' "$m" "$case_id" "$metrics" "$size_mib" "$status" "$attempt_path" \
+        >>"$output_dir/status.tsv" || return
+    return "$launch_exit"
 }
 
 failed=0

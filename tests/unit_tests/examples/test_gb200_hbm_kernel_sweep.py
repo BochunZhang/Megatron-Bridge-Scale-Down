@@ -6,7 +6,6 @@ import os
 import shlex
 import shutil
 import subprocess
-import sys
 from pathlib import Path
 
 import pytest
@@ -68,55 +67,35 @@ def test_sweep_profiles_only_the_selected_shapes_paths_and_gpus(monkeypatch, tmp
 
 
 @pytest.mark.unit
-def test_bash_retries_incomplete_overlap_without_retrying_analysis_errors(monkeypatch, tmp_path):
+def test_sweep_records_capture_status_without_running_analysis(monkeypatch, tmp_path):
     launcher = tmp_path / "run_ce_hbm_kernel_sweep.sh"
     shutil.copy2(_EXPERIMENT / launcher.name, launcher)
     (tmp_path / "run_ce_hbm_benchmark.sh").write_text(
         """#!/usr/bin/env bash
+case_id= output=
 while (( $# )); do
-    if [[ "$1" == --output-dir ]]; then mkdir -p "$2"; exit; fi
+    case "$1" in
+        --cases) case_id=$2; shift ;;
+        --output-dir) output=$2; shift ;;
+    esac
     shift
 done
-exit 1
+[[ -n "$output" ]] || exit 2
+mkdir -p "$output"
+[[ "$case_id" != task7 ]] || exit 1
+touch "$output/mock.nsys-rep"
 """,
         encoding="utf-8",
     )
-    (tmp_path / "analyse_ce_hbm_overlap.py").write_text(
-        """import json
-import sys
-from pathlib import Path
-
-opts = dict(zip(sys.argv[1::2], sys.argv[2::2], strict=True))
-out = Path(opts["--output-dir"])
-case = "task1" if out.parent.name.startswith("gpu") else out.parent.name
-status, code = "ok", 0
-if case == "task3" and "-rounds-" not in out.name:
-    status, code = "insufficient_overlap", 3
-if case == "task7":
-    status, code = "error", 1
-(out / "summary.json").write_text(json.dumps({"case": case, "status": status}))
-sys.exit(code)
-""",
-        encoding="utf-8",
-    )
+    analysis_called = tmp_path / "analysis-called"
     uv = tmp_path / "uv"
-    uv.write_text(
-        """#!/usr/bin/env bash
-[[ "$1" == run ]] || exit 2
-shift
-while [[ "$1" == --* ]]; do shift; done
-[[ "$1" == python ]] || exit 2
-shift
-exec "$SWEEP_TEST_PYTHON" "$@"
-""",
-        encoding="utf-8",
-    )
+    uv.write_text('#!/usr/bin/env bash\ntouch "$SWEEP_ANALYSIS_CALLED"\nexit 2\n', encoding="utf-8")
     uv.chmod(0o755)
     nsys = tmp_path / "nsys"
     nsys.write_text("#!/usr/bin/env bash\nexit 0\n", encoding="utf-8")
     nsys.chmod(0o755)
     monkeypatch.setenv("PATH", os.pathsep.join((str(tmp_path), os.environ["PATH"])))
-    monkeypatch.setenv("SWEEP_TEST_PYTHON", sys.executable)
+    monkeypatch.setenv("SWEEP_ANALYSIS_CALLED", str(analysis_called))
     destination = tmp_path / "test-output"
     result = subprocess.run(
         [
@@ -137,18 +116,82 @@ exec "$SWEEP_TEST_PYTHON" "$@"
     assert result.returncode == 1, result.stderr
     with (destination / "status.tsv").open(encoding="utf-8") as handle:
         attempts = [
-            (row["case"], row["metrics_gpus"], row["size_mib"], row["status"], Path(row["attempt_dir"]).name)
+            (row["case"], row["metrics_gpus"], row["size_mib"], row["status"], row["attempt_dir"])
             for row in csv.DictReader(handle, delimiter="\t")
         ]
     assert attempts == [
-        ("task1", "1", "1024", "ok", "size-1024mib"),
-        ("task1", "2", "1024", "ok", "size-1024mib"),
-        ("task1", "3", "1024", "ok", "size-1024mib"),
-        ("task3", "1,2,3", "1024", "insufficient_overlap", "size-1024mib"),
-        ("task3", "1,2,3", "2048", "insufficient_overlap", "size-2048mib"),
-        ("task3", "1,2,3", "2048", "ok", "size-2048mib-rounds-2"),
-        ("task7", "1,2,3", "1024", "analysis_error", "size-1024mib"),
+        ("task1", "1", "1024", "captured", "m0008/task1/gpu1/size-1024mib"),
+        ("task1", "2", "1024", "captured", "m0008/task1/gpu2/size-1024mib"),
+        ("task1", "3", "1024", "captured", "m0008/task1/gpu3/size-1024mib"),
+        ("task3", "1,2,3", "1024", "captured", "m0008/task3/size-1024mib"),
+        ("task7", "1,2,3", "1024", "launch_error", "m0008/task7/size-1024mib"),
     ]
+    assert len(list(destination.rglob("*.nsys-rep"))) == 4
+    assert not analysis_called.exists()
+    assert not list(destination.rglob("*.sqlite"))
+
+
+@pytest.mark.unit
+def test_local_overlap_analysis_uses_downloaded_attempt_paths(experiment_modules, monkeypatch, tmp_path):
+    analysis = importlib.import_module("analyse_ce_hbm_overlap")
+    first = "m0008/task1/gpu1/size-1024mib"
+    second = "m0008/task3/size-2048mib"
+    failed = "m0008/task7/size-1024mib"
+    for path, name in ((first, "task1-gemm"), (second, "task3-gemm-ag-hbm")):
+        (tmp_path / path / name).mkdir(parents=True)
+    status = tmp_path / "status.tsv"
+    capture_status = (
+        "m\tcase\tmetrics_gpus\tsize_mib\tstatus\tattempt_dir\n"
+        f"8\ttask1\t1\t1024\tcaptured\t{first}\n"
+        f"8\ttask3\t1,2,3\t2048\tok\t/remote/results/sweep/{second}\n"
+        f"8\ttask7\t1,2,3\t1024\tlaunch_error\t{failed}\n"
+    )
+    status.write_text(capture_status, encoding="utf-8")
+    analyzed = []
+
+    def analyse(*, case_dir, report_gpus, **kwargs):
+        analyzed.append((case_dir.parent.relative_to(tmp_path).as_posix(), report_gpus))
+        return {"status": "ok" if case_dir.name == "task1-gemm" else "insufficient_overlap"}, []
+
+    monkeypatch.setattr(analysis, "_analyse", analyse)
+
+    assert analysis.main(["--output-dir", str(tmp_path), "--nsys", "nsys"]) == 1
+    assert analyzed == [(first, {1}), (second, {1, 2, 3})]
+    assert status.read_text(encoding="utf-8") == capture_status
+    with (tmp_path / "analysis-status.tsv").open(encoding="utf-8") as handle:
+        rows = [(row["attempt_dir"], row["status"]) for row in csv.DictReader(handle, delimiter="\t")]
+    assert rows == [(first, "ok"), (second, "insufficient_overlap"), (failed, "launch_error")]
+
+
+@pytest.mark.unit
+def test_local_overlap_export_is_temporary_on_failure(experiment_modules, monkeypatch, tmp_path):
+    analysis = importlib.import_module("analyse_ce_hbm_overlap")
+    case = tmp_path / "task1-gemm"
+    case.mkdir()
+    records = {
+        0: {
+            "mode": "gemm",
+            "size_bytes": 64,
+            "comm_rounds_measured": 0,
+            "gemm_mnk": [8, 8192, 7168],
+            "gemm_ms": [[0, 1]],
+            "physical_gpu": 1,
+        }
+    }
+    monkeypatch.setattr(analysis, "_read_records", lambda _: records)
+    exports = []
+
+    def export(report, *, target, **kwargs):
+        exports.append(target)
+        target.touch()
+        raise subprocess.CalledProcessError(1, "nsys export")
+
+    monkeypatch.setattr(analysis, "_export", export)
+
+    assert analysis.main(["--output-dir", str(tmp_path), "--nsys", "nsys", "--report-gpus", "1"]) == 1
+    assert len(exports) == 1 and not exports[0].parent.exists()
+    assert not exports[0].resolve().is_relative_to(tmp_path.resolve())
+    assert not list(tmp_path.rglob("*.sqlite"))
 
 
 @pytest.mark.unit
