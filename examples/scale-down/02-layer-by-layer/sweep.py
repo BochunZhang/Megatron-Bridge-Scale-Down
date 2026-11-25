@@ -234,7 +234,13 @@ def _numa_worker() -> tuple[str, list[str]]:
     return "unbound", []
 
 
-def _command(args: argparse.Namespace, layers: int, scratch: Path, report: Path) -> list[str]:
+def _command(
+    args: argparse.Namespace,
+    layers: int,
+    scratch: Path,
+    report: Path,
+    worker_overrides: dict[str, str] | None = None,
+) -> list[str]:
     python = (
         [sys.executable] if os.environ.get("PYTHON") else ["uv", "run", "--project", str(_REPO), "--no-sync", "python"]
     )
@@ -295,7 +301,17 @@ def _command(args: argparse.Namespace, layers: int, scratch: Path, report: Path)
             f"--gpu-metrics-frequency={_GPU_METRICS_HZ}",
             *command,
         ]
-    return command
+    return [
+        "env",
+        "-u",
+        "NCCL_DEBUG_SUBSYS",
+        "-u",
+        "NCCL_DEBUG_FILE",
+        "NCCL_DEBUG=WARN",
+        "PYTHONUNBUFFERED=1",
+        *(f"{key}={value}" for key, value in (worker_overrides or {}).items()),
+        *command,
+    ]
 
 
 def _read_result(
@@ -423,12 +439,7 @@ def _case_command(
         else (f"layers-{layers}.log", f"layers-{layers}.command.txt")
     )
     log_path = results / log_name
-    command = [
-        "env",
-        "PYTHONUNBUFFERED=1",
-        *(f"{key}={value}" for key, value in worker_overrides.items()),
-        *_command(args, layers, scratch, _profile_report(args, layers, results)),
-    ]
+    command = _command(args, layers, scratch, _profile_report(args, layers, results), worker_overrides)
     (results / command_name).write_text(shlex.join(command) + "\n", encoding="utf-8")
     _LOG.info("Running %d layers. Log at %s", layers, log_path)
     return log_path, command
