@@ -10,6 +10,7 @@ import ctypes
 import json
 import logging
 import os
+import time
 from collections.abc import Callable
 from contextlib import ExitStack, nullcontext
 from pathlib import Path
@@ -133,9 +134,12 @@ def _args() -> argparse.Namespace:
     parser.add_argument("--shim", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--profile", action="store_true")
+    parser.add_argument("--profile-frequency", type=int, default=50_000, help="Nsight GPU metrics sampling rate in Hz")
     args = parser.parse_args()
     if min(args.ag_mib, args.rs_mib, args.warmup, args.iters) < 1 or not 1 <= args.ctas <= 64:
         parser.error("sizes and iteration counts must be positive, and CTAs must be 1–64")
+    if not 10 <= args.profile_frequency <= 200_000:
+        parser.error("profile frequency must be 10–200000 Hz")
     return args
 
 
@@ -216,12 +220,17 @@ def main() -> None:
         dist.barrier()
         if args.profile and rank == 0:
             torch.cuda.profiler.start()
+            # Byte counters describe sampling intervals. Collect boundary samples outside the kernels.
+            time.sleep(2 / args.profile_frequency)
         dist.barrier()
         with torch.cuda.nvtx.range(f"fused_ag_rs/{args.mode}/timed") if args.profile else nullcontext():
             local_us = _run_pairs(control, operations, args.iters)
         dist.barrier()
-        if args.profile and rank == 0:
-            torch.cuda.profiler.stop()
+        if args.profile:
+            if rank == 0:
+                time.sleep(2 / args.profile_frequency)
+                torch.cuda.profiler.stop()
+            dist.barrier()
         validate(2)
         all_rank_us: list[list[float]] = [[] for _ in range(world)]
         dist.all_gather_object(all_rank_us, local_us)

@@ -7,7 +7,8 @@ set -euo pipefail
 usage() {
     cat <<'USAGE'
 Compare one fused AG+RS kernel with two concurrent symmetric NCCL kernels.
-Run both paths with CUDA event timing, then capture CUDA and NVTX with Nsight Systems 2026.6.1.
+Run both paths with CUDA event timing, then capture CUDA, NVTX and GB100 NVLink metrics
+with Nsight Systems 2026.6.1.
 
   --gpus LIST        GPU indices (default: CUDA_VISIBLE_DEVICES or 0,1,2,3)
   --ag-mib N         Full AllGather output per rank (default: 256)
@@ -18,6 +19,7 @@ Run both paths with CUDA event timing, then capture CUDA and NVTX with Nsight Sy
   --nccl-build DIR   NCCL build from install-nccl-2.32.3-fused-ag-rs.sh
   --cuda-home DIR    Toolkit used for the NCCL host shim (default: CUDA_HOME or /usr/local/cuda)
   --nsys PATH        Override NSYS_BIN or the repo default NsightSystems-2026.6.1/bin/nsys
+  --nsys-freq HZ     GPU metrics sampling frequency (10..200000, default: 50000)
   --output-dir DIR   Default: results/gb200/nvls-fused-ag-rs/<timestamp>
   --dry-run          Print commands without creating outputs or starting workers
   -h, --help
@@ -30,6 +32,8 @@ script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 repo_root="$(cd -- "${script_dir}/../../.." && pwd)"
 nsys_release=2026.6.1
 nsys_bin="${NSYS_BIN:-${repo_root}/NsightSystems-${nsys_release}/bin/nsys}"
+nsys_metrics_file="${script_dir}/gb200-nvlink-bytes.config"
+nsys_freq=50000
 gpus="${CUDA_VISIBLE_DEVICES:-0,1,2,3}"
 ag_mib=256 rs_mib=256 warmup=5 iters=20 ctas=4
 nccl_build="${repo_root}/nccl/nccl-2.32.3-fused-ag-rs/build"
@@ -41,7 +45,7 @@ while (( $# )); do
     case "$1" in
         -h|--help) usage; exit 0 ;;
         --dry-run) dry_run=true; shift ;;
-        --gpus|--ag-mib|--rs-mib|--warmup|--iters|--ctas|--nccl-build|--cuda-home|--nsys|--output-dir)
+        --gpus|--ag-mib|--rs-mib|--warmup|--iters|--ctas|--nccl-build|--cuda-home|--nsys|--nsys-freq|--output-dir)
             [[ -n "${2:-}" && "$2" != --* ]] || die "$1 needs a value"
             case "$1" in
                 --gpus) gpus="$2" ;;
@@ -53,6 +57,7 @@ while (( $# )); do
                 --nccl-build) nccl_build="$2" ;;
                 --cuda-home) cuda_home="$2" ;;
                 --nsys) nsys_bin="$2" ;;
+                --nsys-freq) nsys_freq="$2" ;;
                 --output-dir) output_dir="$2" ;;
             esac
             shift 2
@@ -69,6 +74,8 @@ for value in "$ag_mib" "$rs_mib" "$warmup" "$iters" "$ctas"; do
     [[ "$value" =~ ^[1-9][0-9]*$ ]] || die "message sizes, iteration counts and CTA count must be positive integers"
 done
 (( ctas <= 64 )) || die "--ctas cannot exceed 64"
+[[ "$nsys_freq" =~ ^[1-9][0-9]{0,5}$ ]] && (( nsys_freq >= 10 && nsys_freq <= 200000 )) \
+    || die "--nsys-freq must be in 10..200000 Hz"
 
 output_dir="${output_dir:-${repo_root}/results/gb200/nvls-fused-ag-rs/$(date +%Y%m%d-%H%M%S)}"
 [[ "$output_dir" = /* ]] || output_dir="$PWD/$output_dir"
@@ -77,24 +84,35 @@ output_dir="${output_dir:-${repo_root}/results/gb200/nvls-fused-ag-rs/$(date +%Y
 [[ "$nsys_bin" != */* || "$nsys_bin" = /* ]] || nsys_bin="$PWD/$nsys_bin"
 nccl_lib="${nccl_build}/lib/libnccl.so.2"
 shim="${output_dir}/libfused_ag_rs_shim.so"
-if ! $dry_run; then
+if $dry_run; then
+    gloo_ifname="${GLOO_SOCKET_IFNAME:-<auto>}"
+    printf '# GLOO_SOCKET_IFNAME will be resolved and validated against IPv4 interfaces on the target.\n'
+else
     nsys_path="$(command -v "$nsys_bin")" || die "Nsight Systems not found at $nsys_bin (use --nsys PATH)"
     nsys_bin="$nsys_path"
     [[ "$nsys_bin" = /* ]] || nsys_bin="$PWD/$nsys_bin"
     nsys_version="$("$nsys_bin" --version)"
     [[ "$nsys_version" =~ (^|[[:space:]])${nsys_release//./\\.}([.-]|[[:space:]]|$) ]] \
         || die "expected Nsight Systems ${nsys_release}, found: ${nsys_version}"
+    [[ -r "$nsys_metrics_file" ]] || die "NVLink metric set not found at ${nsys_metrics_file}"
     command -v uv >/dev/null || die "uv is required"
     [[ -x "${cuda_home}/bin/nvcc" ]] || die "CUDA toolkit not found (use --cuda-home DIR)"
     [[ -f "$nccl_lib" && -f "${nccl_build}/include/nccl_device.h" ]] &&
         LC_ALL=C grep -aFq 'NCCL version 2.32.3-fused-ag-rs+cuda' "$nccl_lib" \
         || die "use --nccl-build with the patched NCCL from install/install-nccl-2.32.3-fused-ag-rs.sh"
+    # shellcheck source=../../../scripts/scale-down/common/gloo_socket_ifname.sh
+    source "${repo_root}/scripts/scale-down/common/gloo_socket_ifname.sh"
+    resolve_gloo_socket_ifname 1
+    gloo_ifname="$GLOO_SOCKET_IFNAME"
     mkdir -p -- "$output_dir"
     [[ -z "$(ls -A "$output_dir")" ]] || die "use an empty output directory: ${output_dir}"
     {
         echo "$nsys_version"
         echo "gpus=$gpus ag_mib=$ag_mib rs_mib=$rs_mib warmup=$warmup iters=$iters fused_ctas=$ctas dtype=bf16"
         echo "nccl_lib=$nccl_lib"
+        echo "GLOO_SOCKET_IFNAME=$gloo_ifname"
+        echo "nsys_gpu_metrics_devices=$gpus nsys_gpu_metrics_alias=gb200-nvlink-bytes nsys_gpu_metrics_frequency_hz=$nsys_freq"
+        echo "nsys_gpu_metrics_set=file:$nsys_metrics_file"
     } >"${output_dir}/config.txt"
 fi
 
@@ -115,6 +133,7 @@ run "${cuda_home}/bin/nvcc" -std=c++17 -shared -Xcompiler=-fPIC \
 worker_env=(
     env -u NCCL_ALGO -u NCCL_PROTO -u NCCL_CTA_POLICY -u NCCL_SYM_CTAS
     "CUDA_DEVICE_ORDER=PCI_BUS_ID" "CUDA_VISIBLE_DEVICES=$gpus"
+    "GLOO_SOCKET_IFNAME=$gloo_ifname"
     "NCCL_NVLS_ENABLE=1" "NCCL_WIN_ENABLE=1" "NCCL_SYM_TMA_ENABLE=0"
     "NCCL_SYM_CE_THRESHOLD=9223372036854775807" "NCCL_LAUNCH_ORDER_IMPLICIT=1"
     "NCCL_SYM_KERNEL=allgather:AllGather_STMC;reducescatter:ReduceScatter_LDMC"
@@ -133,8 +152,9 @@ for mode in fused split; do
     timed=("${worker[@]}" --output "${mode_dir}/timing.json")
     profiled=(
         "$nsys_bin" profile --trace=cuda,nvtx --sample=none --cpuctxsw=none
+        --gpu-metrics-devices="$gpus" --gpu-metrics-set="file:$nsys_metrics_file" --gpu-metrics-frequency="$nsys_freq"
         --capture-range=cudaProfilerApi --capture-range-end=stop --output="${mode_dir}/profile"
-        "${worker[@]}" --profile --output "${mode_dir}/profile-timing.json"
+        "${worker[@]}" --profile --profile-frequency "$nsys_freq" --output "${mode_dir}/profile-timing.json"
     )
     if $dry_run; then
         run "${timed[@]}"
@@ -155,4 +175,4 @@ done
 
 run uv run --active --no-sync python "${script_dir}/analyse_nsys.py" \
     --fused "${output_dir}/fused/profile.sqlite" --split "${output_dir}/split/profile.sqlite" \
-    --iters "$iters" --ranks "$nranks" --output "${output_dir}/summary.json"
+    --iters "$iters" --ranks "$nranks" --gpus "$gpus" --frequency "$nsys_freq" --output "${output_dir}/summary.json"

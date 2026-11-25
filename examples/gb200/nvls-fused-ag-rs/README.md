@@ -17,10 +17,14 @@ bash examples/gb200/nvls-fused-ag-rs/run_nsys_fused_ag_rs.sh \
 
 脚本默认使用仓库根目录下的 `NsightSystems-2026.6.1/bin/nsys`，也可通过 `NSYS_BIN` 或 `--nsys` 指定同版本的其他安装位置。每个模式先做无 profiler 的 CUDA event 计时，再单独采集 CUDA 和 NVTX。两轮均验证每个 rank 的两项输出。结果写到 `results/gb200/nvls-fused-ag-rs/<timestamp>/`。
 
+Gloo 网卡由仓库的 [单节点选择脚本](../../../scripts/scale-down/common/gloo_socket_ifname.sh) 解析。已有 `GLOO_SOCKET_IFNAME` 且网卡已启用并有 IPv4 地址时沿用该值，否则优先选 `eth0`，其次选 `bond1`。`config.txt` 记录生效网卡和采样设置。
+
+Nsight 对 `--gpus` 中的每张卡采集 NVLink RX/TX，区分请求、响应、用户数据和协议数据。指标集提供 Bytes、GB/s 和 Nsight 原生 Throughput %。默认 `--nsys-freq 50000`，采样周期约 20 µs。汇总用 Bytes 计算每张物理 GPU 的吞吐，窗口为每对操作从首个 kernel 开始到最后一个结束。采样区间和 kernel 边界相交时按时间比例分摊。汇总的 `percent_of_nominal` 用 RX、TX 各自的总吞吐除以 GB200 单向标称 900 GB/s。短于几个采样周期的窗口只适合看量级。
+
 | 文件 | 内容 |
 | --- | --- |
 | `fused/timing.json`、`split/timing.json` | 无 profiler，每次从共同 GPU event 到两项输出都可用的时间，汇总取每次最慢 rank，再取中位数。 |
-| 各模式的 `profile.nsys-rep`、`profile.sqlite` | 每卡 CUDA/NVTX 时间线。 |
-| `summary.json` | 两种模式的 kernel 跨度，独立版的 AG/RS 各自耗时和同时执行时间，以及实际 grid、block 和寄存器数。分析器检查每张 GPU 的 kernel 类型与次数。 |
+| 各模式的 `profile.nsys-rep`、`profile.sqlite` | 每卡 CUDA/NVTX 时间线和原始 NVLink GPU Metrics。 |
+| `summary.json` | 两种模式的 kernel 跨度、独立版的 AG/RS 各自耗时和实际重叠、grid、block、寄存器数，以及每张 GPU 的 NVLink RX/TX 吞吐和占比。 |
 
-评估总耗时优先用 `timing.json`。GPU 时间线可用来解释是哪一项结束得晚、独立版是否真正并发，以及融合版实际发了多少 CTA。实验没有采样 SM 驻留或 NVLink/HBM 计数器。
+评估总耗时优先用 `timing.json`。GPU 时间线可用来解释是哪一项结束得晚、独立版是否真正并发，以及融合期间各卡的 NVLink 流量。
