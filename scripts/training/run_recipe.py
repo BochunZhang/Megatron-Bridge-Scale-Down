@@ -451,128 +451,6 @@ def parse_args(argv: list[str] | None = None) -> tuple[argparse.Namespace, list[
     return args, cli_overrides
 
 
-def _run_layer_by_layer(config: ConfigContainer, args: argparse.Namespace) -> None:
-    """Dispatch the resolved Bridge recipe to the Megatron-LM whole-step schedule."""
-    import torch
-    from recipe_runner import dump_env_rank0, save_config
-
-    from megatron.bridge.models.gpt_provider import GPTModelProvider
-    from megatron.bridge.training.config import MockGPTDatasetConfig
-
-    if args.mode != "pretrain" or args.dataset not in (None, "mock") or config.peft is not None:
-        raise ValueError("Layer-by-layer training supports mock-data pretraining only.")
-    if args.step_func is not None:
-        raise ValueError("Layer-by-layer training owns its whole step and does not accept --step-func.")
-    if not isinstance(config.dataset, MockGPTDatasetConfig) or config.dataset.blend or config.dataset.blend_per_split:
-        raise ValueError("Layer-by-layer training requires a mock dataset without data blends.")
-    if any((config.checkpoint.load, config.checkpoint.save, config.checkpoint.pretrained_checkpoint)):
-        raise ValueError("Layer-by-layer training does not support loading or saving checkpoints.")
-    if config.validation.eval_iters:
-        raise ValueError("Layer-by-layer training does not support validation iterations.")
-
-    model = config.model
-    if not isinstance(model, GPTModelProvider) or model.num_moe_experts:
-        raise ValueError("Layer-by-layer training requires a dense GPT model provider.")
-    if (
-        (
-            model.tensor_model_parallel_size,
-            model.pipeline_model_parallel_size,
-            model.context_parallel_size,
-            model.expert_model_parallel_size,
-            model.expert_tensor_parallel_size,
-        )
-        != (1, 1, 1, 1, 1)
-        or model.virtual_pipeline_model_parallel_size is not None
-        or model.pipeline_model_parallel_layout is not None
-        or model.sequence_parallel
-    ):
-        raise ValueError("Layer-by-layer training requires TP=PP=CP=EP=ETP=1 without sequence or virtual parallelism.")
-    if model.position_embedding_type != "rope" or model.share_embeddings_and_output_weights:
-        raise ValueError("Layer-by-layer training requires rotary embeddings and untied output weights.")
-    if model.cuda_graph_impl != "none" or config.ddp.use_megatron_fsdp or config.dist.use_megatron_fsdp:
-        raise ValueError("Layer-by-layer training owns sharding and requires CUDA graphs to be disabled.")
-    if config.rng.data_parallel_random_init:
-        raise ValueError("Layer-by-layer training requires the same parameter initialization on every data rank.")
-
-    training = config.train
-    world_size = int(os.environ.get("WORLD_SIZE", "4" if args.dryrun else "0"))
-    local_world_size = int(os.environ.get("LOCAL_WORLD_SIZE", str(world_size) if args.dryrun else "0"))
-    if world_size != 4 or local_world_size != world_size:
-        raise ValueError("Layer-by-layer training requires one torchrun node with four GPU ranks.")
-    if training.train_iters is None or min(training.train_iters, config.dataset.seq_length, model.num_layers) < 1:
-        raise ValueError("Layer-by-layer training requires positive iterations, sequence length, and layer count.")
-    samples_per_microbatch = training.micro_batch_size * world_size
-    if (
-        samples_per_microbatch < 1
-        or training.global_batch_size < samples_per_microbatch
-        or training.global_batch_size % samples_per_microbatch
-    ):
-        raise ValueError(
-            "Layer-by-layer global batch size must be a positive multiple of four times micro batch size."
-        )
-
-    optimizer = config.optimizer
-    if optimizer.optimizer != "adam" or not optimizer.decoupled_weight_decay or optimizer.clip_grad:
-        raise ValueError("Layer-by-layer training requires AdamW without gradient clipping.")
-    if config.scheduler.lr_decay_style != "constant" or config.scheduler.lr_warmup_iters:
-        raise ValueError("Layer-by-layer training requires a constant learning rate without warmup.")
-    profiling = config.profiling
-    if profiling.use_pytorch_profiler or profiling.record_memory_history:
-        raise ValueError("Layer-by-layer training supports only Nsight Systems profiling.")
-    profile_start = profiling.profile_step_start if profiling.use_nsys_profiler else None
-    profile_end = profiling.profile_step_end if profiling.use_nsys_profiler else None
-    if profiling.use_nsys_profiler and (
-        sorted(profiling.profile_ranks) != list(range(world_size))
-        or not 0 <= profile_start < profile_end <= training.train_iters
-    ):
-        raise ValueError("Layer-by-layer profiling requires all ranks and 0 <= start < end <= train_iters.")
-
-    model.finalize()
-    if not model.bf16 or model.params_dtype != torch.bfloat16 or model.fp16 or model.fp8 or model.fp4:
-        raise ValueError("Layer-by-layer training requires BF16 model parameters and compute.")
-    if args.dump_env:
-        dump_env_rank0()
-    if int(os.environ.get("RANK", "0")) == 0:
-        config_path = config.logger.save_config_filepath
-        if config_path or args.dryrun:
-            save_config(config, config_path or "ConfigContainer.yaml")
-    if args.dryrun:
-        return
-
-    try:
-        from megatron.training.layer_by_layer import LayerByLayerConfig, run_layer_by_layer
-    except ImportError as exc:
-        raise RuntimeError("The installed Megatron-LM must expose the layer-by-layer training API.") from exc
-
-    offload = config.layer_by_layer
-    assert offload is not None
-    run_layer_by_layer(
-        LayerByLayerConfig(
-            num_layers=model.num_layers,
-            seq_length=config.dataset.seq_length,
-            micro_batch_size=training.micro_batch_size,
-            microbatches=training.global_batch_size // samples_per_microbatch,
-            steps=training.train_iters,
-            parameter_tier=offload.parameter_tier,
-            activation_tier=offload.activation_tier,
-            nvme_dir=Path(offload.nvme_dir),
-            learning_rate=optimizer.lr,
-            cpu_threads=offload.cpu_threads,
-            seed=config.rng.seed,
-            tiny=offload.tiny,
-            profile_start=profile_start,
-            profile_end=profile_end,
-            betas=(optimizer.adam_beta1, optimizer.adam_beta2),
-            eps=optimizer.adam_eps,
-            weight_decay=optimizer.weight_decay,
-            model_config=None if offload.tiny else model,
-            vocab_size=None if offload.tiny else model.vocab_size,
-            rotary_base=None if offload.tiny else model.rotary_base,
-            rotary_percent=None if offload.tiny else model.rotary_percent,
-        )
-    )
-
-
 def main(argv: list[str] | None = None) -> None:
     """Load, configure, and execute one library or benchmark recipe."""
     # NeMo-Run executes container tasks from its private /nemo_run/code
@@ -636,11 +514,17 @@ def main(argv: list[str] | None = None) -> None:
     recipe = sync_model_dataset_sequence_length(recipe)
 
     if getattr(recipe, "layer_by_layer", None) is not None:
-        _run_layer_by_layer(recipe, args)
-        return
+        if args.mode != "pretrain" or args.dataset not in (None, "mock"):
+            raise ValueError("Layer-by-layer training supports mock-data pretraining only.")
+        if args.step_func is not None:
+            raise ValueError("Layer-by-layer training owns its whole step and does not accept --step-func.")
+        forward_step = None
+        if args.dryrun:
+            benchmark_world_size = 4
+    else:
+        step_func_name = args.step_func or recipe_step(recipe_name)
+        forward_step = load_forward_step(step_func_name, mode=step_mode)
 
-    step_func_name = args.step_func or recipe_step(recipe_name)
-    forward_step = load_forward_step(step_func_name, mode=step_mode)
     run_config(
         config=recipe,
         mode=execution_mode,

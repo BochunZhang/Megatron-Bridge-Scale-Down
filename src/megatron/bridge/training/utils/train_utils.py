@@ -1302,7 +1302,7 @@ def training_log(
         print_rank_last(log_string)
         if report_memory_flag:
             # Report memory after optimizer state has been initialized.
-            if torch.distributed.get_rank() == 0:
+            if model and torch.distributed.get_rank() == 0:
                 num_microbatches = get_num_microbatches()
                 report_theoretical_memory(config, num_microbatches=num_microbatches, verbose=True)
             memory_string = f"(after {iteration} iterations) memory (GB)"
@@ -1571,7 +1571,7 @@ def report_throughput(
         elapsed_batches = len(history_samples) - 1
         elapsed_samples = int(history_samples[-1]) - int(history_samples[0])
         elapsed_tokens = int(history_tokens[-1]) - int(history_tokens[0])
-        elapsed_wct = history_wct[-1] - history_wct[0]
+        elapsed_wct = history_wct[-1] - history_wct[-window_size]
 
         # Skip throughput calculation if elapsed_wct is zero or negative
         # This can happen during checkpoint resumption when history_wct is reinitialized

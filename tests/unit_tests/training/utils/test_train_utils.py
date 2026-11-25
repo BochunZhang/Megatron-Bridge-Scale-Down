@@ -1853,6 +1853,21 @@ class TestTrainingLog:
         assert throughput_report["throughput/micro_batch_size"] == 4
         assert throughput_report["throughput/device/samples_per_sec"] == 51.2
 
+    def test_report_throughput_uses_only_the_timestamps_in_its_window(self):
+        """Exclude the older timestamp retained by the training loop's deque."""
+        train_config = MockTrainConfig(global_batch_size=64, micro_batch_size=4)
+
+        throughput_report = report_throughput(
+            train_config=train_config,
+            iteration=3,
+            seq_length=4096,
+            history_wct=[0.5, 2.0, 4.0],
+            window_size=2,
+        )
+
+        assert throughput_report["throughput/batches_per_sec"] == 0.5
+        assert throughput_report["throughput/tokens_per_sec"] == 131072
+
     @mock.patch("megatron.bridge.training.utils.train_utils.print_rank_0")
     def test_report_throughput_zero_elapsed_wct(self, mock_print_rank_0):
         """Test throughput metrics when elapsed_wct is zero (identical timestamps).

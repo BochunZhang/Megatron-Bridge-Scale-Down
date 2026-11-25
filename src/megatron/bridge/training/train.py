@@ -123,10 +123,10 @@ except ImportError:
 
 
 def train(
-    forward_step_func: ForwardStepCallable,
+    forward_step_func: ForwardStepCallable | None,
     model: list[MegatronModule],
-    optimizer: MegatronOptimizer,
-    scheduler: OptimizerParamScheduler,
+    optimizer: MegatronOptimizer | None,
+    scheduler: OptimizerParamScheduler | None,
     train_data_iterator: Optional[Union[RerunDataIterator, list[RerunDataIterator]]],
     valid_data_iterator: Optional[Union[RerunDataIterator, list[RerunDataIterator]]],
     global_state: GlobalState,
@@ -135,6 +135,8 @@ def train(
     process_non_loss_data_func: Optional[Callable] = None,
     non_loss_data_func: Optional[Callable] = None,
     callback_manager: CallbackManager | None = None,
+    *,
+    whole_step: Callable[[int, int], dict[str, torch.Tensor]] | None = None,
 ) -> None:
     """Main training loop.
 
@@ -153,13 +155,14 @@ def train(
         process_non_loss_data_func: Optional function to process non-loss data during evaluation.
         non_loss_data_func: Optional function to compute non-loss data during evaluation.
         callback_manager: Optional CallbackManager for custom callback execution.
+        whole_step: Backend that owns the full optimizer step for the given iteration and microbatch count.
 
     Warnings:
         This is an experimental API and is subject to change in backwards
         incompatible ways without notice.
     """
     config: ConfigContainer = global_state.cfg
-    model_config = get_model_config(model[0])
+    model_config = config.model if whole_step is not None else get_model_config(model[0])
     train_config = config.train
     val_config = config.validation
     timers = global_state.timers
@@ -177,7 +180,10 @@ def train(
     # For functors (classes with __call__ defined):
     # - For functors: partial(functor_instance, state) still allows functor's internal state to work
     # - inspect.signature() properly inspects the __call__ method of functors
-    wrapped_forward_step_func = prepare_forward_step_func(forward_step_func, global_state)
+    wrapped_forward_step_func = None
+    if whole_step is None:
+        assert forward_step_func is not None and optimizer is not None and scheduler is not None
+        wrapped_forward_step_func = prepare_forward_step_func(forward_step_func, global_state)
 
     # Turn on training mode which enables dropout.
     for model_module in model:
@@ -308,10 +314,12 @@ def train(
         history_wct = deque(maxlen=config.logger.throughput_window_size + 1)
 
     # Wrap forward_backward_func for Full iteration CUDA graph
-    forward_backward_func = get_forward_backward_func(
-        pp_size=pg_collection.pp.size(),
-        vp_size=config.model.virtual_pipeline_model_parallel_size,
-    )
+    forward_backward_func = None
+    if whole_step is None:
+        forward_backward_func = get_forward_backward_func(
+            pp_size=pg_collection.pp.size(),
+            vp_size=config.model.virtual_pipeline_model_parallel_size,
+        )
     if is_full_iteration_cuda_graph(config.model):
         forward_backward_func = FullCudaGraphWrapper(
             forward_backward_func,
@@ -335,7 +343,9 @@ def train(
 
     start_iteration = global_state.train_state.step
     print_rank_0(f"Starting training loop at iteration {start_iteration}")
-    p2p_communicator = P2PCommunicator(pp_group=pg_collection.pp, config=model_config)
+    p2p_communicator = (
+        None if whole_step is not None else P2PCommunicator(pp_group=pg_collection.pp, config=model_config)
+    )
     dp_size = pg_collection.dp.size()
     # Anchor for interval-average throughput logging: training_log reports the FLOPS
     # performed over each logging interval as the delta of
@@ -471,26 +481,31 @@ def train(
         global_state._flops_cross_seqlen_product_sum = 0
         global_state._flops_requires_global_reduce = False
 
-        (
-            loss_dict,
-            skipped_iter,
-            should_checkpoint,
-            should_exit,
-            exit_code,
-            grad_norm,
-            num_zeros_in_grad,
-            log_max_attention_logit,
-        ) = wrapped_train_step(
-            wrapped_forward_step_func,
-            train_data_iterator,
-            model,
-            optimizer,
-            scheduler,
-            global_state,
-            pg_collection,
-            forward_backward_func,
-            p2p_communicator,
-        )
+        if whole_step is not None:
+            loss_dict = whole_step(global_state.train_state.step, num_microbatches)
+            skipped_iter, should_checkpoint, should_exit, exit_code = 0, False, False, 0
+            grad_norm = num_zeros_in_grad = log_max_attention_logit = None
+        else:
+            (
+                loss_dict,
+                skipped_iter,
+                should_checkpoint,
+                should_exit,
+                exit_code,
+                grad_norm,
+                num_zeros_in_grad,
+                log_max_attention_logit,
+            ) = wrapped_train_step(
+                wrapped_forward_step_func,
+                train_data_iterator,
+                model,
+                optimizer,
+                scheduler,
+                global_state,
+                pg_collection,
+                forward_backward_func,
+                p2p_communicator,
+            )
 
         fault_tolerance.on_training_step_end(global_state)
 
@@ -620,9 +635,9 @@ def train(
             if config.logger.log_params_norm:
                 params_norm = calc_params_l2_norm(model, model_config, use_megatron_fsdp=config.dist.use_megatron_fsdp)
 
-            learning_rate = None
+            learning_rate = config.optimizer.lr if whole_step is not None else None
             decoupled_learning_rate = None
-            for param_group in optimizer.param_groups:
+            for param_group in optimizer.param_groups if optimizer is not None else ():
                 if len(param_group) == 0:
                     continue
                 if param_group["is_decoupled_lr"]:

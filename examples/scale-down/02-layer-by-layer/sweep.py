@@ -40,11 +40,17 @@ _BRIDGE_SOURCE_FILES = (
     "src/megatron/bridge/recipes/qwen/gb200/qwen35.py",
     "src/megatron/bridge/recipes/qwen/qwen35.py",
     "src/megatron/bridge/training/config.py",
+    "src/megatron/bridge/training/layer_by_layer.py",
+    "src/megatron/bridge/training/pretrain.py",
+    "src/megatron/bridge/training/profiling.py",
+    "src/megatron/bridge/training/setup.py",
+    "src/megatron/bridge/training/train.py",
+    "src/megatron/bridge/training/utils/flop_utils.py",
+    "src/megatron/bridge/training/utils/train_utils.py",
 )
 _LM_SOURCE_FILES = (
     "megatron/core/distributed/layer_by_layer.py",
     "megatron/core/distributed/layer_by_layer_storage.py",
-    "megatron/training/layer_by_layer.py",
     "megatron/training/layer_by_layer_workload.py",
 )
 _CASE_SCRIPTS = tuple(
@@ -106,15 +112,15 @@ def _module_source(module: str) -> Path | None:
 
 
 def _installed_megatron_lm() -> Path:
-    driver = _module_source("megatron.training.layer_by_layer")
+    workload = _module_source("megatron.training.layer_by_layer_workload")
     trainer = _module_source("megatron.core.distributed.layer_by_layer")
-    if driver is not None and trainer is not None:
-        root = driver.parents[2]
+    if workload is not None and trainer is not None:
+        root = workload.parents[2]
         if trainer == root / _LM_SOURCE_FILES[0] and all(
             (root / source).is_file() for source in _LM_SOURCE_FILES
         ):
             return root
-    training_source = driver or _module_source("megatron.training")
+    training_source = workload or _module_source("megatron.training")
     core_source = trainer or _module_source("megatron.core")
     raise RuntimeError(
         "The Bridge Python environment does not expose the complete layer-by-layer trainer.\n"
@@ -244,6 +250,7 @@ def _command(
         [sys.executable] if os.environ.get("PYTHON") else ["uv", "run", "--project", str(_REPO), "--no-sync", "python"]
     )
     config_path = report.parent / "config.yaml" if args.single_case_layout else report.with_suffix(".config.yaml")
+    tensorboard_dir = report.parent / "tensorboard" if args.single_case_layout else report.with_suffix(".tensorboard")
     _, numa_wrapper = _numa_worker()
     command = [
         *python,
@@ -270,6 +277,11 @@ def _command(
         f"layer_by_layer.parameter_tier={args.parameter_tier}",
         f"layer_by_layer.activation_tier={args.activation_tier}",
         f"layer_by_layer.nvme_dir={json.dumps(str(scratch))}",
+        "logger.log_interval=1",
+        "logger.log_throughput=true",
+        "logger.log_throughput_to_tensorboard=true",
+        "logger.throughput_window_size=2",
+        f"logger.tensorboard_dir={json.dumps(str(tensorboard_dir))}",
         f"logger.save_config_filepath={json.dumps(str(config_path))}",
     ]
     if args.tiny:

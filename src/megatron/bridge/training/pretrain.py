@@ -14,13 +14,14 @@
 
 import logging
 import os
+from contextlib import ExitStack
 
 import torch.distributed as dist
 from nvidia_resiliency_ext.inprocess import CallWrapper
 
 from megatron.bridge.data.utils import get_dataset_provider
 from megatron.bridge.training.callbacks import Callback, CallbackManager, normalize_callbacks
-from megatron.bridge.training.config import ConfigContainer, runtime_config_update
+from megatron.bridge.training.config import ConfigContainer, LayerByLayerRecipeConfig, runtime_config_update
 from megatron.bridge.training.eval import evaluate_and_print_results
 from megatron.bridge.training.forward_step_func_types import ForwardStepCallable
 from megatron.bridge.training.initialize import destroy_global_state
@@ -38,7 +39,7 @@ logger = logging.getLogger(__name__)
 @experimental_fn
 def pretrain(
     config: ConfigContainer,
-    forward_step_func: ForwardStepCallable,
+    forward_step_func: ForwardStepCallable | None,
     callbacks: list[Callback] | CallbackManager | None = None,
 ) -> None:
     """Main function to run the training pipeline.
@@ -51,7 +52,8 @@ def pretrain(
         config: The main configuration container holding all necessary parameters.
         forward_step_func: A callable (function or functor) that performs a single
                           forward and backward step, returning the loss and any computed
-                          metrics. Supports the following signatures:
+                          metrics. Use None for a layer-by-layer recipe, whose backend owns the whole step.
+                          Supports the following signatures:
                           - 2 args: (data_iterator, model)
                           - 3 args: (data_iterator, model, return_schedule_plan=False)
                                    OR (state: GlobalState, data_iterator, model)
@@ -107,7 +109,7 @@ def pretrain(
 
 def _pretrain(
     state: GlobalState,
-    forward_step_func: ForwardStepCallable,
+    forward_step_func: ForwardStepCallable | None,
     callback_manager: CallbackManager | None = None,
     store: dist.Store | None = None,
     inprocess_call_wrapper: CallWrapper | None = None,
@@ -147,18 +149,25 @@ def _pretrain(
         # TRAINING
         if not config.validation.skip_train:
             if state.train_state.do_train and config.train.train_iters > 0:
-                train(
-                    forward_step_func,
-                    model,
-                    optimizer,
-                    scheduler,
-                    train_data_iterator,
-                    valid_data_iterator,
-                    state,
-                    checkpoint_manager,
-                    pg_collection,
-                    callback_manager=callback_manager,
-                )
+                with ExitStack() as stack:
+                    step_kwargs = {}
+                    if isinstance(getattr(config, "layer_by_layer", None), LayerByLayerRecipeConfig):
+                        from megatron.bridge.training.layer_by_layer import layer_by_layer_step
+
+                        step_kwargs["whole_step"] = stack.enter_context(layer_by_layer_step(state, pg_collection))
+                    train(
+                        forward_step_func,
+                        model,
+                        optimizer,
+                        scheduler,
+                        train_data_iterator,
+                        valid_data_iterator,
+                        state,
+                        checkpoint_manager,
+                        pg_collection,
+                        callback_manager=callback_manager,
+                        **step_kwargs,
+                    )
 
             barrier_and_log("after training is done")
 

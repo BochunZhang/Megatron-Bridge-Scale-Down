@@ -226,25 +226,55 @@ def test_full_recipe_uses_library_recipe_and_default_llm_step():
     handles.recipe_runner.load_forward_step.assert_called_once_with("llm_step", mode="pretrain")
 
 
-def test_layer_by_layer_recipe_dispatches_the_resolved_whole_step(monkeypatch):
+@pytest.mark.parametrize("dryrun", [False, True])
+def test_layer_by_layer_recipe_uses_standard_run_config(dryrun):
     module, handles = _load_module()
     recipe_name = "qwen35_text_27b_pretrain_4gpu_gb200_bf16_layer_by_layer_config"
     config = SimpleNamespace(layer_by_layer=object())
     handles.recipe_runner.load_recipe.return_value = config
-    dispatch = Mock()
-    monkeypatch.setattr(module, "_run_layer_by_layer", dispatch)
-
-    module.main(
-        ["--recipe", recipe_name, "--mode", "pretrain", "--dataset", "mock", "layer_by_layer.activation_tier=nvme_act"]
-    )
+    args = [
+        "--recipe",
+        recipe_name,
+        "--mode",
+        "pretrain",
+        "--dataset",
+        "mock",
+        "layer_by_layer.activation_tier=nvme_act",
+    ]
+    if dryrun:
+        args.append("--dry-run")
+    module.main(args)
 
     handles.recipe_runner.apply_cli_overrides.assert_called_once_with(
         config, ["layer_by_layer.activation_tier=nvme_act"]
     )
-    dispatch.assert_called_once()
-    assert dispatch.call_args.args[0] is config
-    assert dispatch.call_args.args[1].dataset == "mock"
+    assert config.dataset.dataset_name == "mock"
     handles.recipe_runner.load_forward_step.assert_not_called()
+    handles.recipe_runner.run_config.assert_called_once_with(
+        config=config,
+        mode="pretrain",
+        step_func=None,
+        dryrun=dryrun,
+        dryrun_world_size=4 if dryrun else None,
+        dump_environment=False,
+    )
+
+
+@pytest.mark.parametrize(
+    ("args", "error_match"),
+    [
+        (["--dataset", "megatron-indexed"], "Layer-by-layer.*mock"),
+        (["--step-func", "llm_step"], "Layer-by-layer.*--step-func"),
+    ],
+)
+def test_layer_by_layer_recipe_rejects_alternative_workload(args, error_match):
+    module, handles = _load_module()
+    recipe_name = "qwen35_text_27b_pretrain_4gpu_gb200_bf16_layer_by_layer_config"
+    handles.recipe_runner.load_recipe.return_value = SimpleNamespace(layer_by_layer=object())
+
+    with pytest.raises(ValueError, match=error_match):
+        module.main(["--recipe", recipe_name, "--mode", "pretrain", *args])
+
     handles.recipe_runner.run_config.assert_not_called()
 
 

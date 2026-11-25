@@ -470,7 +470,7 @@ def run_config(
     *,
     config: ConfigContainer,
     mode: str,
-    step_func: Callable,
+    step_func: Callable | None,
     dryrun: bool = False,
     save_config_filepath: str | None = None,
     dryrun_world_size: int | None = None,

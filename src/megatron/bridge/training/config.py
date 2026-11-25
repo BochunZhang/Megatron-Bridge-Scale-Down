@@ -1936,6 +1936,11 @@ def runtime_config_update(cfg: ConfigContainer) -> None:
         cfg.comm_overlap.finalize()
         cfg.comm_overlap.setup(cfg.model, cfg.optimizer, cfg.ddp)
 
+    if isinstance(getattr(cfg, "layer_by_layer", None), LayerByLayerRecipeConfig):
+        from megatron.bridge.training.layer_by_layer import configure_layer_by_layer
+
+        configure_layer_by_layer(cfg)
+
     # Validate configuration after all modifications
     cfg.validate()
 

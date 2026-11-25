@@ -11,6 +11,7 @@ fi
 
 state_dir="$(mktemp -d "${TMPDIR:-/tmp}/layer-by-layer-state.XXXXXX")"
 case_pid=""
+tee_pid=""
 
 cleanup() {
     local scratch
@@ -32,7 +33,11 @@ terminate() {
     if [[ -n "${case_pid}" ]]; then
         kill -TERM -- "-${case_pid}" 2>/dev/null || kill -TERM "${case_pid}" 2>/dev/null || true
         wait "${case_pid}" || child_status=$?
+        wait "${tee_pid}" || true
         finish_case "${child_status}" || true
+    elif [[ -n "${tee_pid}" ]]; then
+        kill -TERM "${tee_pid}" 2>/dev/null || true
+        wait "${tee_pid}" || true
     fi
     exit "${signal_status}"
 }
@@ -63,16 +68,26 @@ fi
     done
 } < "${state_dir}/command"
 
-# Give the launcher and its ranks a process group for signal delivery.
+# Keep tee outside the launcher's process group so it drains the log on termination.
+output_pipe="${state_dir}/train-output"
+mkfifo "${output_pipe}"
 set -m
+tee "${train_log}" < "${output_pipe}" &
+tee_pid=$!
 (
     cd "${repo_root}"
     exec "${command[@]}"
-) > "${train_log}" 2>&1 &
+) > "${output_pipe}" 2>&1 &
 case_pid=$!
 set +m
 
 child_status=0
 wait "${case_pid}" || child_status=$?
+tee_status=0
+wait "${tee_pid}" || tee_status=$?
+if (( child_status == 0 )); then
+    child_status="${tee_status}"
+fi
 case_pid=""
+tee_pid=""
 finish_case "${child_status}"
