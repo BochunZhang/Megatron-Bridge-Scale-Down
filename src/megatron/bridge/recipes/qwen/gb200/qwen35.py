@@ -459,18 +459,18 @@ def qwen35_text_27b_pretrain_4gpu_gb200_bf16_fsdp1_config() -> ConfigContainer:
 
 
 def qwen35_text_27b_pretrain_4gpu_gb200_bf16_layer_by_layer_config() -> ConfigContainer:
-    """Return the offline 32-layer Qwen3.5 GB200 mock pretraining recipe."""
+    """Return the offline eight-layer Qwen3.5 GB200 full-attention mock recipe."""
     cfg = _pretrain_common()
     cfg.model = GPTModelProvider(
         hf_model_id=_QWEN35_27B_BASE,
-        num_layers=32,
+        num_layers=8,
         hidden_size=5120,
         ffn_hidden_size=17408,
         num_attention_heads=24,
         num_query_groups=4,
         kv_channels=256,
         experimental_attention_variant="gated_delta_net",
-        linear_attention_freq=4,
+        linear_attention_freq=1,
         linear_conv_kernel_dim=4,
         linear_key_head_dim=128,
         linear_value_head_dim=128,

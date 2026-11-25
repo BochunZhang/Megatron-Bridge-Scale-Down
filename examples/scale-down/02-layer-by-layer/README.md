@@ -1,6 +1,6 @@
 # Qwen3.5-27B layer-by-layer capacity test
 
-Run on one GB200 node with four GPUs available to the same CUDA/NCCL environment. The sweep uses four-way full sharding with TP, PP and CP each set to 1. It keeps the Qwen3.5-27B dense text-model widths and varies decoder depth. The full model has 64 decoder layers. Training uses BF16, randomly initialized weights, and synthetic token batches.
+Run on one GB200 node with four GPUs available to the same CUDA/NCCL environment. The sweep uses four-way full sharding with TP, PP and CP each set to 1. It keeps the Qwen3.5-27B dense text-model widths and uses gated full attention in every decoder layer. Training uses BF16, randomly initialized weights, and synthetic token batches.
 
 ## Prepare the training environment
 
@@ -20,9 +20,9 @@ git pull --ff-only origin v0.6.0-scale-down
 
 The launcher uses Bridge's configured CUDA environment through `uv run --no-sync`. Bridge's layer-by-layer step uses the workload builder and sharded trainer from the installed Megatron-LM checkout. Set `PYTHON` to use an explicit interpreter with that same environment configuration.
 
-## 32-layer all-GPU baseline
+## 8-layer all-GPU baseline
 
-Run the baseline from the Bridge repository root. It uses the Qwen3.5-27B text attention mix, 32 decoder layers, sequence length 4096, MBS 1, GBS 16, four micro-batches per rank, and 10 optimizer steps.
+Run the baseline from the Bridge repository root. It uses eight full-attention decoder layers, sequence length 4096, MBS 1, GBS 16, four micro-batches per rank, and 10 optimizer steps.
 
 ```bash
 study=examples/scale-down/02-layer-by-layer/01-baseline
@@ -38,7 +38,7 @@ The cases use Nsight Systems **2026.6.1** to capture the CUDA and NVTX execution
 
 On each node the launcher checks IPv4 addresses on up interfaces. It honors valid `GLOO_SOCKET_IFNAME` and `NCCL_SOCKET_IFNAME` values. Automatic selection tries `eth0`, then `bond1`, then an IPv4 default-route interface. NCCL uses an exact interface name. The selected interfaces and Nsight version are recorded in `run_info.txt`.
 
-The all-GPU baseline writes to `results/02-layer-by-layer/01-baseline/01-param-gpu-act-gpu-opt-gpu/model_.../node0/` in Bridge. The Nsight report is named `qwen35_27b-layer_by_layer-layers_32-attn_hybrid-bf16-cg_off-tp_1-cp_1-pp_1-dp_4-mbs_1-gbs_16-seq_4k-iters_10-param_gpu-act_gpu-opt_gpu.nsys-rep`. `launch.json` records its filename. The same directory contains `command.txt`, `config.yaml`, `run_info.txt`, `train.log`, `summary.csv`, `tensorboard/`, and the source revisions and hashes. Use `--print-result-dir` to resolve the path or `--output-dir` for a fresh repeat.
+The all-GPU baseline writes to `results/02-layer-by-layer/01-baseline/01-param-gpu-act-gpu-opt-gpu/model_.../node0/` in Bridge. The Nsight report is named `qwen35_27b-lby-layers_8-attn_full-bf16-cg_off-tp_1-cp_1-pp_1-dp_4-mbs_1-gbs_16-seq_4k-iters_10-param_gpu-act_gpu-opt_gpu.nsys-rep`. `launch.json` records its filename. The same directory contains `command.txt`, `config.yaml`, `run_info.txt`, `train.log`, `summary.csv`, `tensorboard/`, and the source revisions and hashes. Use `--print-result-dir` to resolve the path or `--output-dir` for a fresh repeat.
 
 Bridge prints iteration time and model TFLOP/s per GPU to the terminal and `train.log` as the numbered cases run. TensorBoard records `throughput/tflops/device` and, from the second iteration, `throughput/tokens_per_sec`. Use `--profile none` for throughput measurements without Nsight Systems capture overhead.
 
@@ -51,7 +51,7 @@ bash examples/scale-down/02-layer-by-layer/run_sweep.sh \
   --nvme-dir /path/to/local/nvme --layers 16 32 64
 ```
 
-Defaults are sequence length 4096, micro-batch size 1, four micro-batches per rank per step, three optimizer steps, and `nvme` for each tier. Use an already configured Megatron CUDA environment with Transformer Engine and the Gated DeltaNet kernels. Set `PYTHON` to the interpreter in that environment if needed.
+Defaults are eight decoder layers, sequence length 4096, micro-batch size 1, four micro-batches per rank per step, three optimizer steps, and `nvme` for each tier. Use an already configured Megatron CUDA environment with Transformer Engine. Set `PYTHON` to the interpreter in that environment if needed.
 
 Select `--parameter-tier`, `--activation-tier`, and `--optimizer-tier` independently.
 

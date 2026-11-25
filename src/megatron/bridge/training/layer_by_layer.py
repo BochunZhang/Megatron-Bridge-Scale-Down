@@ -176,6 +176,7 @@ def configure_layer_by_layer(config: ConfigContainer) -> None:
     # Standard FLOP accounting and saved config must reflect the actual cropped workload.
     if offload.tiny:
         tiny_model = build_qwen35_layer_by_layer_config(model.num_layers, tiny=True)
+        tiny_model.linear_attention_freq = model.linear_attention_freq
         for field in fields(tiny_model):
             if field.init:
                 setattr(model, field.name, getattr(tiny_model, field.name))

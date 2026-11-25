@@ -11,6 +11,7 @@ optimizer_tier="$4"
 shift 4
 nvme_path="${NVME_PATH:-/tmp}"
 output_dir="${OUTPUT_DIR:-${repo_root}/results/02-layer-by-layer}"
+layers=8
 train_iters=10
 profile=nsys
 dry_run=false
@@ -37,7 +38,7 @@ while (( $# )); do
         --print-result-dir) print_result_dir=true; shift;;
         -h|--help)
             cat <<'HELP'
-Run a 32-layer Qwen3.5-27B offload case on one four-GPU node.
+Run an 8-layer Qwen3.5-27B full-attention case on one four-GPU node.
 
   --nvme DIR            Local NVMe scratch directory (default: /tmp, or set NVME_PATH)
   --output-dir DIR      Result root (default: results/02-layer-by-layer)
@@ -52,7 +53,7 @@ HELP
 done
 
 [[ "${output_dir}" == /* ]] || output_dir="${PWD}/${output_dir}"
-model_name="model_27b-layers_32-cg_off-mbs_1-seq_4096-tp_1-cp_1-gbs_16-gpus_4"
+model_name="model_27b-lby-layers_${layers}-attn_full-cg_off-mbs_1-seq_4096-tp_1-cp_1-gbs_16-gpus_4"
 model_name+="-param_${parameter_tier}-act_${activation_tier}-opt_${optimizer_tier}-iters_${train_iters}-profile_${profile}"
 result_dir="${output_dir%/}/01-baseline/${case_name}/${model_name}/node0"
 if [[ "${print_result_dir}" == true ]]; then
@@ -61,7 +62,7 @@ if [[ "${print_result_dir}" == true ]]; then
 fi
 
 args=(--single-case-layout --results-dir "${result_dir}"
-    --layers 32 --seq-length 4096 --micro-batch-size 1 --microbatches 4
+    --layers "${layers}" --seq-length 4096 --micro-batch-size 1 --microbatches 4
     --steps "${train_iters}" --parameter-tier "${parameter_tier}" --activation-tier "${activation_tier}"
     --optimizer-tier "${optimizer_tier}"
     --profile "${profile}")

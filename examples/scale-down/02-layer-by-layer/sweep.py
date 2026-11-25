@@ -160,7 +160,7 @@ def _arguments() -> argparse.Namespace:
         help="new output directory (default: unique directory under ./results)",
     )
     parser.add_argument(
-        "--layers", type=_positive, nargs="+", default=[16, 32, 64], help="depths to attempt"
+        "--layers", type=_positive, nargs="+", default=[8], help="depths to attempt"
     )
     parser.add_argument("--seq-length", type=_positive, default=4096)
     parser.add_argument("--micro-batch-size", type=_positive, default=1)
@@ -233,7 +233,7 @@ def _profile_report(args: argparse.Namespace, layers: int, results: Path) -> Pat
     seq = f"{args.seq_length // 1024}k" if args.seq_length % 1024 == 0 else str(args.seq_length)
     gbs = args.micro_batch_size * args.microbatches * _WORLD_SIZE
     return results / (
-        f"{model}-layer_by_layer-layers_{layers}-attn_hybrid-bf16-cg_off-tp_1-cp_1-pp_1-dp_{_WORLD_SIZE}"
+        f"{model}-lby-layers_{layers}-attn_full-bf16-cg_off-tp_1-cp_1-pp_1-dp_{_WORLD_SIZE}"
         f"-mbs_{args.micro_batch_size}-gbs_{gbs}-seq_{seq}-iters_{args.steps}"
         f"-param_{args.parameter_tier}-act_{args.activation_tier}-opt_{args.optimizer_tier}.nsys-rep"
     )
@@ -281,6 +281,7 @@ def _command(
         "--dataset",
         "mock",
         f"model.num_layers={layers}",
+        "model.linear_attention_freq=1",
         f"dataset.seq_length={args.seq_length}",
         f"train.micro_batch_size={args.micro_batch_size}",
         f"train.global_batch_size={args.micro_batch_size * args.microbatches * _WORLD_SIZE}",
@@ -422,6 +423,8 @@ def _write_launch(
         "recipe": _RECIPE,
         "dtype": "bf16",
         "num_layers": args.layers[0],
+        "attention": "full",
+        "linear_attention_freq": 1,
         "tiny": args.tiny,
         "fully_sharded": True,
         "data_parallel_size": _WORLD_SIZE,
