@@ -65,4 +65,4 @@ args=(--single-case-layout --results-dir "${result_dir}"
     --profile "${profile}")
 [[ "${dry_run}" == true ]] && args+=(--dry-run)
 
-exec bash "${script_dir}/../run_sweep.sh" --nvme-dir "${nvme_path}" "${args[@]}"
+exec bash "${script_dir}/../run_pretrain_layer_by_layer.sh" --nvme-dir "${nvme_path}" "${args[@]}"

@@ -983,6 +983,17 @@ class InProcessRestartConfig:
 
 # ---------------- Container config (standalone top-level config) ----------------
 @dataclass(kw_only=True)
+class LayerByLayerRecipeConfig:
+    """Offload controls for the layer-by-layer pretraining schedule."""
+
+    parameter_tier: Literal["cpu_param", "nvme_param"] = "cpu_param"
+    activation_tier: Literal["gpu_act", "cpu_act", "nvme_act"] = "cpu_act"
+    nvme_dir: str = "/tmp"
+    cpu_threads: int = 8
+    tiny: bool = False
+
+
+@dataclass(kw_only=True)
 class ConfigContainer(Container):
     """Top-level container holding all configuration objects."""
 
@@ -1027,6 +1038,7 @@ class ConfigContainer(Container):
     straggler: Optional[StragglerDetectionConfig] = None
     nvrx_straggler: Optional[NVRxStragglerDetectionConfig] = None
     profiling: ProfilingConfig = field(default_factory=ProfilingConfig)
+    layer_by_layer: LayerByLayerRecipeConfig | None = None
     peft: Optional[PEFT] = None
     comm_overlap: Optional[CommOverlapConfig] = None
     mixed_precision: Optional[Union[MixedPrecisionConfig, str]] = None

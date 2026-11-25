@@ -11,6 +11,7 @@ import math
 import os
 import re
 import shlex
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -19,16 +20,27 @@ from pathlib import Path
 
 from launch_network import resolve_network
 
+
 _LOG = logging.getLogger(__name__)
 _REPO = Path(__file__).resolve().parents[3]
 _WORLD_SIZE = 4
 _NSYS_VERSION = "2026.6.1"
 _GPU_METRICS_HZ = 20000
 _EXAMPLE_DIR = "examples/scale-down/02-layer-by-layer"
+_RECIPE = "qwen35_text_27b_pretrain_4gpu_gb200_bf16_layer_by_layer_config"
+_RECIPE_RUNNER = "scripts/training/run_recipe.py"
 _BRIDGE_SOURCE_FILES = (
     f"{_EXAMPLE_DIR}/run_sweep.sh",
+    f"{_EXAMPLE_DIR}/run_pretrain_layer_by_layer.sh",
     f"{_EXAMPLE_DIR}/sweep.py",
     f"{_EXAMPLE_DIR}/launch_network.py",
+    _RECIPE_RUNNER,
+    "scripts/training/recipe_runner.py",
+    "src/megatron/bridge/recipes/qwen/__init__.py",
+    "src/megatron/bridge/recipes/qwen/gb200/__init__.py",
+    "src/megatron/bridge/recipes/qwen/gb200/qwen35.py",
+    "src/megatron/bridge/recipes/qwen/qwen35.py",
+    "src/megatron/bridge/training/config.py",
 )
 _LM_SOURCE_FILES = (
     "megatron/core/distributed/layer_by_layer.py",
@@ -163,6 +175,7 @@ def _arguments() -> argparse.Namespace:
     parser.add_argument(
         "--single-case-layout", action="store_true", help="use node-level files for one depth"
     )
+    parser.add_argument("--prepare-case", type=Path, help=argparse.SUPPRESS)
     parser.add_argument(
         "--dry-run", action="store_true", help="show commands without writing or launching"
     )
@@ -171,6 +184,8 @@ def _arguments() -> argparse.Namespace:
         parser.error("--layers must contain distinct values")
     if args.single_case_layout and (len(args.layers) != 1 or args.results_dir is None):
         parser.error("--single-case-layout requires exactly one depth and --results-dir")
+    if args.prepare_case and not args.single_case_layout:
+        parser.error("--prepare-case requires --single-case-layout")
     if args.profile == "nsys":
         if args.profile_start is None:
             args.profile_start = min(7, args.steps - 1)
@@ -208,42 +223,63 @@ def _profile_report(args: argparse.Namespace, layers: int, results: Path) -> Pat
     return results / ("train.nsys-rep" if args.single_case_layout else f"layers-{layers}.nsys-rep")
 
 
+def _numa_worker() -> tuple[str, list[str]]:
+    if shutil.which("numarun"):
+        return "numarun", ["numarun"]
+    if shutil.which("numactl"):
+        local_wrapper = _REPO / ".cache/numarun"
+        if local_wrapper.is_file() and os.access(local_wrapper, os.R_OK):
+            return "repo-numarun", ["bash", str(local_wrapper)]
+        return "numactl", ["numactl", "--localalloc"]
+    return "unbound", []
+
+
 def _command(args: argparse.Namespace, layers: int, scratch: Path, report: Path) -> list[str]:
+    python = (
+        [sys.executable] if os.environ.get("PYTHON") else ["uv", "run", "--project", str(_REPO), "--no-sync", "python"]
+    )
+    config_path = report.parent / "config.yaml" if args.single_case_layout else report.with_suffix(".config.yaml")
+    _, numa_wrapper = _numa_worker()
     command = [
-        sys.executable,
+        *python,
         "-m",
         "torch.distributed.run",
         "--standalone",
         "--nnodes=1",
         f"--nproc-per-node={_WORLD_SIZE}",
-        "-m",
-        "megatron.training.layer_by_layer",
-        "--num-layers",
-        str(layers),
-        "--seq-length",
-        str(args.seq_length),
-        "--micro-batch-size",
-        str(args.micro_batch_size),
-        "--microbatches",
-        str(args.microbatches),
-        "--steps",
-        str(args.steps),
-        "--parameter-tier",
-        args.parameter_tier,
-        "--activation-tier",
-        args.activation_tier,
-        "--nvme-dir",
-        str(scratch),
+        "--no-python",
+        *numa_wrapper,
+        *python,
+        str(_REPO / _RECIPE_RUNNER),
+        "--recipe",
+        _RECIPE,
+        "--mode",
+        "pretrain",
+        "--dataset",
+        "mock",
+        f"model.num_layers={layers}",
+        f"dataset.seq_length={args.seq_length}",
+        f"train.micro_batch_size={args.micro_batch_size}",
+        f"train.global_batch_size={args.micro_batch_size * args.microbatches * _WORLD_SIZE}",
+        f"train.train_iters={args.steps}",
+        f"layer_by_layer.parameter_tier={args.parameter_tier}",
+        f"layer_by_layer.activation_tier={args.activation_tier}",
+        f"layer_by_layer.nvme_dir={json.dumps(str(scratch))}",
+        f"logger.save_config_filepath={json.dumps(str(config_path))}",
     ]
     if args.tiny:
-        command.append("--tiny")
+        command.append("layer_by_layer.tiny=true")
     if args.learning_rate is not None:
-        command.extend(("--learning-rate", str(args.learning_rate)))
+        command.append(f"optimizer.lr={args.learning_rate}")
     if args.cpu_threads is not None:
-        command.extend(("--cpu-threads", str(args.cpu_threads)))
+        command.append(f"layer_by_layer.cpu_threads={args.cpu_threads}")
     if args.profile == "nsys":
         command.extend(
-            ("--profile-start", str(args.profile_start), "--profile-end", str(args.profile_end))
+            (
+                "profiling.use_nsys_profiler=true",
+                f"profiling.profile_step_start={args.profile_start}",
+                f"profiling.profile_step_end={args.profile_end}",
+            )
         )
         devices = "cuda-visible" if "CUDA_VISIBLE_DEVICES" in os.environ else "all"
         command = [
@@ -282,9 +318,10 @@ def _read_result(
     records = []
     with log_path.open(encoding="utf-8") as log:
         for line in log:
-            if line.startswith(_RESULT_PREFIX):
+            _, marker, payload = line.partition(_RESULT_PREFIX)
+            if marker:
                 try:
-                    records.append(json.loads(line[len(_RESULT_PREFIX) :]))
+                    records.append(json.loads(payload))
                 except ValueError:
                     records.append(None)
             resource_errors.update(
@@ -339,6 +376,7 @@ def _write_launch(
 ) -> None:
     launch = {
         "model": "Qwen/Qwen3.5-27B",
+        "recipe": _RECIPE,
         "dtype": "bf16",
         "num_layers": args.layers[0],
         "tiny": args.tiny,
@@ -355,6 +393,7 @@ def _write_launch(
         "gpu_count": _WORLD_SIZE,
         "nnodes": 1,
         "node_rank": 0,
+        "numa_mode": _numa_worker()[0],
         "parameter_tier": args.parameter_tier,
         "activation_tier": args.activation_tier,
         "nvme_path": str(nvme_dir),
@@ -371,6 +410,30 @@ def _write_launch(
     (results / "launch.json").write_text(json.dumps(launch, indent=2) + "\n", encoding="utf-8")
 
 
+def _case_command(
+    args: argparse.Namespace,
+    layers: int,
+    results: Path,
+    scratch: Path,
+    worker_overrides: dict[str, str],
+) -> tuple[Path, list[str]]:
+    log_name, command_name = (
+        ("train.log", "command.txt")
+        if args.single_case_layout
+        else (f"layers-{layers}.log", f"layers-{layers}.command.txt")
+    )
+    log_path = results / log_name
+    command = [
+        "env",
+        "PYTHONUNBUFFERED=1",
+        *(f"{key}={value}" for key, value in worker_overrides.items()),
+        *_command(args, layers, scratch, _profile_report(args, layers, results)),
+    ]
+    (results / command_name).write_text(shlex.join(command) + "\n", encoding="utf-8")
+    _LOG.info("Running %d layers. Log at %s", layers, log_path)
+    return log_path, command
+
+
 def _run_case(
     args: argparse.Namespace,
     layers: int,
@@ -378,33 +441,20 @@ def _run_case(
     nvme_dir: Path,
     worker_overrides: dict[str, str],
 ) -> dict:
-    log_name, command_name = (
-        ("train.log", "command.txt")
-        if args.single_case_layout
-        else (f"layers-{layers}.log", f"layers-{layers}.command.txt")
-    )
-    log_path = results / log_name
-    report = _profile_report(args, layers, results)
     with tempfile.TemporaryDirectory(prefix=f"layer-by-layer-{layers}-", dir=nvme_dir) as scratch:
-        command = _command(args, layers, Path(scratch), report)
-        rendered = command
-        if worker_overrides:
-            rendered = [
-                "env",
-                *(f"{key}={value}" for key, value in worker_overrides.items()),
-                *command,
-            ]
-        (results / command_name).write_text(shlex.join(rendered) + "\n", encoding="utf-8")
-        _LOG.info("Running %d layers. Log at %s", layers, log_path)
+        log_path, command = _case_command(args, layers, results, Path(scratch), worker_overrides)
         with log_path.open("w", encoding="utf-8") as log:
             returncode = subprocess.run(
                 command,
                 cwd=_REPO,
                 stdout=log,
                 stderr=subprocess.STDOUT,
-                env=dict(os.environ, PYTHONUNBUFFERED="1", **worker_overrides),
                 check=False,
             ).returncode
+    return _collect_case(args, layers, results, log_path, returncode)
+
+
+def _collect_case(args: argparse.Namespace, layers: int, results: Path, log_path: Path, returncode: int) -> dict:
     case = _read_result(
         log_path,
         returncode,
@@ -414,15 +464,78 @@ def _run_case(
         activation_tier=args.activation_tier,
     )
     if args.profile == "nsys" and case["status"] == "passed":
+        report = _profile_report(args, layers, results)
         if not report.is_file() or report.stat().st_size == 0:
             _LOG.error("Missing or empty Nsight Systems report: %s", report)
             case["status"] = "invalid_profile"
     return case
 
 
+def _write_run_info(results: Path, case: dict, worker_overrides: dict[str, str], nsys_version: str | None) -> None:
+    status = 0 if case["status"] == "passed" else case["returncode"] or 1
+    info = [
+        f"case_status={case['status']}",
+        f"returncode={case['returncode']}",
+        f"gloo_socket_ifname={worker_overrides['GLOO_SOCKET_IFNAME']}",
+        f"nccl_socket_ifname={worker_overrides['NCCL_SOCKET_IFNAME']}",
+    ]
+    if nsys_version:
+        info.append(f"nsys_version={nsys_version}")
+    info.append(f"status={status}")
+    (results / "run_info.txt").write_text("\n".join(info) + "\n", encoding="utf-8")
+
+
+def _prepare_case(
+    args: argparse.Namespace,
+    results: Path,
+    nvme_dir: Path,
+    worker_overrides: dict[str, str],
+    nsys_version: str | None,
+) -> None:
+    """Hand one validated launch command to the test's Bash launcher."""
+    layers = args.layers[0]
+    state_dir = args.prepare_case
+    scratch = Path(tempfile.mkdtemp(prefix=f"layer-by-layer-{layers}-", dir=nvme_dir))
+    try:
+        (state_dir / "scratch").write_text(f"{scratch}\n", encoding="utf-8")
+    except OSError:
+        scratch.rmdir()
+        raise
+    log_path, command = _case_command(args, layers, results, scratch, worker_overrides)
+    state = {
+        "results": str(results),
+        "layers": layers,
+        "steps": args.steps,
+        "microbatches": args.microbatches,
+        "activation_tier": args.activation_tier,
+        "profile": args.profile,
+        "worker_overrides": worker_overrides,
+        "nsys_version": nsys_version,
+    }
+    (state_dir / "case.json").write_text(json.dumps(state), encoding="utf-8")
+    (state_dir / "command").write_bytes(b"".join(os.fsencode(word) + b"\0" for word in (str(log_path), *command)))
+
+
+def _finish_case(state_dir: Path, returncode: int) -> int:
+    """Validate the worker's output and write the numbered case's summary."""
+    state = json.loads((state_dir / "case.json").read_text(encoding="utf-8"))
+    args = argparse.Namespace(single_case_layout=True, **state)
+    results = Path(args.results)
+    case = _collect_case(args, args.layers, results, results / "train.log", returncode)
+    with (results / "summary.csv").open("w", encoding="utf-8", newline="") as summary:
+        writer = csv.DictWriter(summary, fieldnames=_RESULT_COLUMNS)
+        writer.writeheader()
+        writer.writerow(case)
+    _write_run_info(results, case, args.worker_overrides, args.nsys_version)
+    _LOG.info("%d layers: %s. Results at %s", args.layers, case["status"], results)
+    return int(case["status"] != "passed")
+
+
 def main() -> int:
     """Run selected depths and report the largest completed case."""
     logging.basicConfig(level=logging.INFO, format="%(message)s")
+    if sys.argv[1:2] == ["--finish-case"]:
+        return _finish_case(Path(sys.argv[2]), int(sys.argv[3]))
     args = _arguments()
     nvme_dir = args.nvme_dir.absolute()
     if args.dry_run:
@@ -497,6 +610,9 @@ def main() -> int:
     (results / "source_sha256.json").write_text(
         json.dumps(source_hashes, indent=2, sort_keys=True) + "\n", encoding="utf-8"
     )
+    if args.prepare_case:
+        _prepare_case(args, results, nvme_dir, worker_overrides, nsys_version)
+        return 0
     largest = None
     had_error = False
     with (results / "summary.csv").open("w", encoding="utf-8", newline="") as summary:
@@ -507,17 +623,7 @@ def main() -> int:
             writer.writerow(case)
             summary.flush()
             if args.single_case_layout:
-                status = 0 if case["status"] == "passed" else case["returncode"] or 1
-                info = [
-                    f"case_status={case['status']}",
-                    f"returncode={case['returncode']}",
-                    f"gloo_socket_ifname={worker_overrides['GLOO_SOCKET_IFNAME']}",
-                    f"nccl_socket_ifname={worker_overrides['NCCL_SOCKET_IFNAME']}",
-                ]
-                if nsys_version:
-                    info.append(f"nsys_version={nsys_version}")
-                info.append(f"status={status}")
-                (results / "run_info.txt").write_text("\n".join(info) + "\n", encoding="utf-8")
+                _write_run_info(results, case, worker_overrides, nsys_version)
             _LOG.info("%d layers: %s", layers, case["status"])
             if case["status"] == "passed":
                 largest = layers if largest is None else max(largest, layers)

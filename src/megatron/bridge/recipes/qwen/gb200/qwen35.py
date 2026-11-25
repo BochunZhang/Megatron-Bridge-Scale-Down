@@ -17,12 +17,15 @@
 from __future__ import annotations
 
 import torch
+from torch.nn import functional as F
 from transformers import AutoConfig
 
 from megatron.bridge import AutoBridge
+from megatron.bridge.models.gpt_provider import GPTModelProvider
 from megatron.bridge.recipes.common import _pretrain_common
+from megatron.bridge.recipes.utils.dataset_utils import build_dataset_config
 from megatron.bridge.training.comm_overlap import CommOverlapConfig
-from megatron.bridge.training.config import ConfigContainer
+from megatron.bridge.training.config import ConfigContainer, LayerByLayerRecipeConfig
 from megatron.bridge.training.mixed_precision import bf16_mixed, bf16_with_mxfp8_mixed
 
 
@@ -453,6 +456,84 @@ def qwen35_text_35b_a3b_pretrain_4gpu_gb200_fp8mx_fsdp1_config() -> ConfigContai
 def qwen35_text_27b_pretrain_4gpu_gb200_bf16_fsdp1_config() -> ConfigContainer:
     """Return a 4-GPU GB200 Qwen3.5 27B dense model FSDP1 config."""
     return _qwen35_text_4gpu_gb200_fsdp1_config(_QWEN35_27B_BASE, "Qwen3_5ForCausalLM", is_moe=False)
+
+
+def qwen35_text_27b_pretrain_4gpu_gb200_bf16_layer_by_layer_config() -> ConfigContainer:
+    """Return the offline 32-layer Qwen3.5 GB200 mock pretraining recipe."""
+    cfg = _pretrain_common()
+    cfg.model = GPTModelProvider(
+        hf_model_id=_QWEN35_27B_BASE,
+        num_layers=32,
+        hidden_size=5120,
+        ffn_hidden_size=17408,
+        num_attention_heads=24,
+        num_query_groups=4,
+        kv_channels=256,
+        experimental_attention_variant="gated_delta_net",
+        linear_attention_freq=4,
+        linear_conv_kernel_dim=4,
+        linear_key_head_dim=128,
+        linear_value_head_dim=128,
+        linear_num_key_heads=16,
+        linear_num_value_heads=48,
+        attention_output_gate=True,
+        qk_layernorm=True,
+        apply_rope_fusion=True,
+        normalization="RMSNorm",
+        layernorm_zero_centered_gamma=True,
+        layernorm_epsilon=1e-6,
+        add_bias_linear=False,
+        add_qkv_bias=False,
+        attention_dropout=0.0,
+        hidden_dropout=0.0,
+        gated_linear_unit=True,
+        activation_func=F.silu,
+        bias_activation_fusion=True,
+        init_method_std=0.02,
+        transformer_impl="transformer_engine",
+        bf16=True,
+        params_dtype=torch.bfloat16,
+        use_cpu_initialization=False,
+        gradient_accumulation_fusion=False,
+        disable_parameter_transpose_cache=True,
+        tensor_model_parallel_size=1,
+        pipeline_model_parallel_size=1,
+        context_parallel_size=1,
+        expert_model_parallel_size=1,
+        expert_tensor_parallel_size=1,
+        vocab_size=248320,
+        share_embeddings_and_output_weights=False,
+        position_embedding_type="rope",
+        rotary_base=10_000_000,
+        rotary_percent=0.25,
+        seq_length=4096,
+    )
+    cfg.dataset = build_dataset_config(cfg, "mock")
+    cfg.train.train_iters = 10
+    cfg.train.global_batch_size = 16
+    cfg.train.micro_batch_size = 1
+    cfg.validation.eval_iters = 0
+    cfg.validation.eval_interval = None
+    cfg.optimizer.lr = 1e-4
+    cfg.optimizer.min_lr = 0.0
+    cfg.optimizer.adam_beta1 = 0.9
+    cfg.optimizer.adam_beta2 = 0.95
+    cfg.optimizer.adam_eps = 1e-8
+    cfg.optimizer.weight_decay = 0.1
+    cfg.optimizer.clip_grad = 0.0
+    cfg.optimizer.use_distributed_optimizer = False
+    cfg.scheduler.lr_decay_style = "constant"
+    cfg.scheduler.lr_warmup_iters = 0
+    cfg.ddp.use_distributed_optimizer = False
+    cfg.ddp.overlap_grad_reduce = False
+    cfg.ddp.overlap_param_gather = False
+    cfg.checkpoint.load = None
+    cfg.checkpoint.save = None
+    cfg.profiling.profile_step_start = 7
+    cfg.profiling.profile_step_end = 8
+    cfg.profiling.profile_ranks = [0, 1, 2, 3]
+    cfg.layer_by_layer = LayerByLayerRecipeConfig()
+    return cfg
 
 
 def qwen35_text_27b_pretrain_4gpu_gb200_fp8mx_fsdp1_config() -> ConfigContainer:

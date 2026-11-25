@@ -226,6 +226,28 @@ def test_full_recipe_uses_library_recipe_and_default_llm_step():
     handles.recipe_runner.load_forward_step.assert_called_once_with("llm_step", mode="pretrain")
 
 
+def test_layer_by_layer_recipe_dispatches_the_resolved_whole_step(monkeypatch):
+    module, handles = _load_module()
+    recipe_name = "qwen35_text_27b_pretrain_4gpu_gb200_bf16_layer_by_layer_config"
+    config = SimpleNamespace(layer_by_layer=object())
+    handles.recipe_runner.load_recipe.return_value = config
+    dispatch = Mock()
+    monkeypatch.setattr(module, "_run_layer_by_layer", dispatch)
+
+    module.main(
+        ["--recipe", recipe_name, "--mode", "pretrain", "--dataset", "mock", "layer_by_layer.activation_tier=nvme_act"]
+    )
+
+    handles.recipe_runner.apply_cli_overrides.assert_called_once_with(
+        config, ["layer_by_layer.activation_tier=nvme_act"]
+    )
+    dispatch.assert_called_once()
+    assert dispatch.call_args.args[0] is config
+    assert dispatch.call_args.args[1].dataset == "mock"
+    handles.recipe_runner.load_forward_step.assert_not_called()
+    handles.recipe_runner.run_config.assert_not_called()
+
+
 def test_kimi_supported_pp_vp_override_refreshes_pipeline_layout():
     module, handles = _load_module()
     default_layout = [[f"stage-{index}"] for index in range(16)]

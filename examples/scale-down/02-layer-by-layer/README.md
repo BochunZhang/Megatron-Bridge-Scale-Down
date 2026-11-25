@@ -18,7 +18,7 @@ git switch v0.6.0-scale-down
 git pull --ff-only origin v0.6.0-scale-down
 ```
 
-The launcher uses Bridge's configured CUDA environment through `uv run --no-sync`, and Python resolves the installed Megatron-LM training entry point. Set `PYTHON` to use an explicit interpreter with that same environment configuration.
+The launcher uses Bridge's configured CUDA environment through `uv run --no-sync`. The recipe runner resolves the layer-by-layer trainer from the installed Megatron-LM checkout. Set `PYTHON` to use an explicit interpreter with that same environment configuration.
 
 ## 32-layer offload cases
 
@@ -33,11 +33,13 @@ bash "$study/02_nvme_offload.sh" --nvme /tmp
 
 `01_cpu_offload.sh` uses `cpu_param + cpu_act`. `02_nvme_offload.sh` uses `nvme_param + nvme_act`. Both create private scratch directories under `/tmp` by default. Set `--nvme DIR` or `NVME_PATH` if the node's local NVMe is mounted elsewhere.
 
+The numbered scripts select the experiment settings and call `run_pretrain_layer_by_layer.sh`. That Bash launcher wraps four torchrun workers in Nsight Systems and runs Bridge's `scripts/training/run_recipe.py --recipe qwen35_text_27b_pretrain_4gpu_gb200_bf16_layer_by_layer_config --mode pretrain --dataset mock` on each rank. Bridge resolves the recipe and its overrides before invoking the Megatron-LM layer-by-layer trainer. The launcher uses the same NUMA selection order as the FSDP3 study.
+
 Both cases use Nsight Systems **2026.6.1** to capture CUDA, NVTX, and GPU metrics at 20 kHz. The default window is iteration 8 (step 7, zero-based). With `--train-iters 3`, capture covers iteration 3. The launcher checks the version at `NsightSystems-2026.6.1/bin/nsys` under the Bridge repository root, or at the executable set through `NSYS_BIN`. Use `--profile none` for an unprofiled run. [Nsight Systems CLI reference](https://docs.nvidia.com/nsight-systems/UserGuide/)
 
 On each node the launcher checks IPv4 addresses on up interfaces. It honors valid `GLOO_SOCKET_IFNAME` and `NCCL_SOCKET_IFNAME` values. Automatic selection tries `eth0`, then `bond1`, then an IPv4 default-route interface. NCCL uses an exact interface name. The selected interfaces and Nsight version are recorded in `run_info.txt`.
 
-Results land under `results/02-layer-by-layer/01-baseline/<case>/model_.../node0/` in Bridge. The directory contains `launch.json`, `command.txt`, `run_info.txt`, `train.log`, `summary.csv`, and `train.nsys-rep` when profiling is enabled. `revision.txt` records Bridge's commit, `megatron_lm_revision.txt` records the installed checkout's commit when available, and `source_sha256.json` identifies the actual sources from both repositories. Use `--print-result-dir` to resolve the path or `--output-dir` for a fresh repeat.
+Results land under `results/02-layer-by-layer/01-baseline/<case>/model_.../node0/` in Bridge. The directory contains `launch.json`, `command.txt`, `config.yaml`, `run_info.txt`, `train.log`, `summary.csv`, and `train.nsys-rep` when profiling is enabled. `revision.txt` records Bridge's commit, `megatron_lm_revision.txt` records the installed checkout's commit when available, and `source_sha256.json` identifies the actual sources from both repositories. Use `--print-result-dir` to resolve the path or `--output-dir` for a fresh repeat.
 
 A pass requires `status=0`, a nonempty report when profiling, and **1320 D2H / 2640 H2D** transfers per rank for 10 steps. A three-step run expects 396 and 792 copies per rank.
 
