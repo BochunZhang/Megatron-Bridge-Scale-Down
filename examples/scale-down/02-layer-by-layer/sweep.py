@@ -64,8 +64,10 @@ _LM_SOURCE_FILES = (
     "megatron/core/optimizer/cpu_offloading/fsdp_adam.py",
     "megatron/core/optimizer/distrib_optimizer.py",
     "megatron/core/optimizer/optimizer_config.py",
+    "megatron/core/pipeline_parallel/fine_grained_activation_offload.py",
     "megatron/core/pipeline_parallel/schedules.py",
     "megatron/core/tensor_parallel/random.py",
+    "megatron/core/transformer/transformer_config.py",
     "megatron/training/layer_by_layer_workload.py",
 )
 _CASE_SCRIPTS = tuple(
@@ -73,6 +75,7 @@ _CASE_SCRIPTS = tuple(
     for name in (
         "01_param_gpu_act_gpu_opt_gpu.sh",
         "02_param_cpu_act_gpu_opt_gpu.sh",
+        "03_param_cpu_act_cpu_opt_gpu.sh",
         "offload_common.sh",
     )
 )
@@ -197,7 +200,7 @@ def _arguments() -> argparse.Namespace:
         "--parameter-tier", type=lambda tier: tier.removesuffix("_param"), choices=_PLACEMENTS, default="gpu"
     )
     parser.add_argument(
-        "--activation-tier", type=lambda tier: tier.removesuffix("_act"), choices=("gpu",), default="gpu"
+        "--activation-tier", type=lambda tier: tier.removesuffix("_act"), choices=("gpu", "cpu"), default="gpu"
     )
     parser.add_argument("--optimizer-tier", choices=_PLACEMENTS, default="gpu")
     parser.add_argument("--cpu-optimizer", choices=("torch", "grace_adam"), default="torch")

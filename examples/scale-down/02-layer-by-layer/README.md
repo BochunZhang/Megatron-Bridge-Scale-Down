@@ -65,6 +65,18 @@ Megatron-FSDP stores each rank's BF16 decoder compute-weight shards in pinned ho
 
 Results go under `results/02-layer-by-layer/01-baseline/02-param-cpu-act-gpu-opt-gpu/`. A pass records `weight` as the only FSDP CPU-offload component, alongside the scheduler, FSDP sharding strategy, optimizer backend, final loss, and peak GPU allocation and reservation across ranks. Use the Nsight trace to inspect actual weight transfers or collectives.
 
+## 8-layer CPU parameter and boundary activation offload
+
+Case 03 uses the same model, batches, FSDP weight offload, and GPU AdamW as case 02. It reuses Megatron's selective activation offload copy routines to save checkpoint inputs in pinned CPU memory, from the embedding output through the final decoder output. The layer-by-layer scheduler manages its own per-layer transfer order using checkpoint tags that identify the microbatch, layer group, and tensor index. Reloads follow microbatch order within each layer. Grouped decoder checkpointing restores that layer's saved inputs before replaying any of its microbatches. Activation gradients and optimizer state stay on the GPU.
+
+```bash
+study=examples/scale-down/02-layer-by-layer/01-baseline
+bash "$study/03_param_cpu_act_cpu_opt_gpu.sh" --dry-run
+bash "$study/03_param_cpu_act_cpu_opt_gpu.sh"
+```
+
+Results go under `results/02-layer-by-layer/01-baseline/03-param-cpu-act-cpu-opt-gpu/`. The result records `activation_tier=cpu` and `fsdp_cpu_offload=["weight"]`. In the same capture window, compare case 03 with case 02 using the `activation offloading {stage} microbatch={mb}` and `activation reloading {stage} microbatch={mb}` NVTX ranges. Use `--profile none` for matched training time and peak GPU memory measurements.
+
 ## Running and profiling the numbered cases
 
 The numbered scripts select the experiment settings and call `run_pretrain_layer_by_layer.sh`. That Bash launcher wraps four torchrun workers in Nsight Systems and runs Bridge's `scripts/training/run_recipe.py --recipe qwen35_text_27b_pretrain_4gpu_gb200_bf16_layer_by_layer_config --mode pretrain --dataset mock` on each rank. Bridge calls the layer-by-layer schedule through its normal training step. The launcher uses the same NUMA selection order as the FSDP3 study.
@@ -79,7 +91,7 @@ The all-GPU baseline writes to `results/02-layer-by-layer/01-baseline/01-param-g
 
 Bridge prints iteration time and model TFLOP/s per GPU to the terminal and `train.log` as the numbered cases run. TensorBoard records `throughput/tflops/device` and, from the second iteration, `throughput/tokens_per_sec`. Use `--profile none` for throughput measurements without Nsight Systems capture overhead.
 
-Both numbered cases require `status=0` and a nonempty report when profiling.
+The numbered cases require `status=0` and a nonempty report when profiling.
 
 ## Capacity sweep
 
@@ -88,7 +100,7 @@ bash examples/scale-down/02-layer-by-layer/run_sweep.sh \
   --layers 8 16 32 --parameter-tier cpu
 ```
 
-Defaults are eight decoder layers, sequence length 4096, micro-batch size 1, four microbatches per rank per step, three optimizer steps, and GPU placement for every tier. Activations use GPU memory in every case. Choose `gpu` or `cpu` independently for `--parameter-tier` and `--optimizer-tier`. CPU optimizer placement includes gradient offload and CPU gradient accumulation.
+Defaults are eight decoder layers, sequence length 4096, micro-batch size 1, four microbatches per rank per step, three optimizer steps, and GPU placement for every tier. Choose `gpu` or `cpu` independently for `--parameter-tier`, `--activation-tier`, and `--optimizer-tier`. CPU activation placement covers the saved layer boundaries. CPU optimizer placement includes gradient offload and CPU gradient accumulation.
 
 NVMe requires `--parameter-tier nvme --optimizer-tier nvme --nvme-dir /path/to/local/nvme` and the `megatron_nvme_aio` extension from the Megatron-LM checkout's `src/nvme/deepspeed`. Each NVMe case uses a fresh scratch directory. Its filesystem holds all four ranks' files. At full depth, FP32 master weights and the two Adam moments alone require roughly 324 GB in total, with additional storage for compute weights and staging.
 

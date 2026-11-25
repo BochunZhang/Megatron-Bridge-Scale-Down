@@ -48,8 +48,8 @@ def configure_layer_by_layer(config: ConfigContainer) -> None:
         if offload.optimizer_tier is None
         else _normalize_tier(offload.optimizer_tier, "optimizer_tier")
     )
-    if offload.activation_tier != "gpu":
-        raise ValueError("Layer-by-layer boundary activations must stay on the GPU.")
+    if offload.activation_tier == "nvme":
+        raise ValueError("Layer-by-layer boundary activations support GPU or CPU placement.")
     use_nvme = offload.parameter_tier == offload.optimizer_tier == "nvme"
     if not use_nvme and "nvme" in (offload.parameter_tier, offload.optimizer_tier):
         raise ValueError("Layer-by-layer NVMe requires both parameter and optimizer tiers to be nvme.")
@@ -63,6 +63,11 @@ def configure_layer_by_layer(config: ConfigContainer) -> None:
         raise ValueError("Layer-by-layer training requires a dense GPT model provider.")
     if not hasattr(model, "layer_by_layer_schedule"):
         raise ValueError("Layer-by-layer training requires the updated Megatron-LM layer-by-layer branch.")
+    host_activations = offload.activation_tier == "cpu"
+    if host_activations and not hasattr(model, "layer_by_layer_activation_offload"):
+        raise ValueError(
+            "Layer-by-layer CPU activation offload requires the updated Megatron-LM layer-by-layer branch."
+        )
     if (
         (
             model.tensor_model_parallel_size,
@@ -143,6 +148,8 @@ def configure_layer_by_layer(config: ConfigContainer) -> None:
 
     _apply_workload_geometry(model, tiny=offload.tiny)
     model.layer_by_layer_schedule = True
+    if hasattr(model, "layer_by_layer_activation_offload"):
+        model.layer_by_layer_activation_offload = host_activations
     if config.tokenizer.tokenizer_type == "NullTokenizer":
         config.tokenizer.vocab_size = model.vocab_size
 

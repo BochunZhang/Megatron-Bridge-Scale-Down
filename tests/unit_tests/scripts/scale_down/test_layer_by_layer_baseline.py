@@ -15,10 +15,14 @@ SWEEP = BASELINE_DIR.parent / "sweep.py"
 
 @pytest.mark.unit
 @pytest.mark.parametrize(
-    ("case", "parameter_tier"),
-    [("01_param_gpu_act_gpu_opt_gpu", "gpu"), ("02_param_cpu_act_gpu_opt_gpu", "cpu")],
+    ("case", "parameter_tier", "activation_tier"),
+    [
+        ("01_param_gpu_act_gpu_opt_gpu", "gpu", "gpu"),
+        ("02_param_cpu_act_gpu_opt_gpu", "cpu", "gpu"),
+        ("03_param_cpu_act_cpu_opt_gpu", "cpu", "cpu"),
+    ],
 )
-def test_layer_by_layer_baseline_dry_run(tmp_path: Path, case: str, parameter_tier: str) -> None:
+def test_layer_by_layer_baseline_dry_run(tmp_path: Path, case: str, parameter_tier: str, activation_tier: str) -> None:
     script = BASELINE_DIR / f"{case}.sh"
     results_root = tmp_path / "results with spaces"
     args = ["bash", str(script), "--output-dir", str(results_root)]
@@ -36,7 +40,7 @@ def test_layer_by_layer_baseline_dry_run(tmp_path: Path, case: str, parameter_ti
         "train.global_batch_size=16",
         "train.train_iters=10",
         f"layer_by_layer.parameter_tier={parameter_tier}",
-        "layer_by_layer.activation_tier=gpu",
+        f"layer_by_layer.activation_tier={activation_tier}",
         "layer_by_layer.optimizer_tier=gpu",
         "profiling.profile_step_start=7",
         "profiling.profile_step_end=8",
@@ -49,7 +53,7 @@ def test_layer_by_layer_baseline_dry_run(tmp_path: Path, case: str, parameter_ti
     assert result_path.parent.name.startswith("model_27b-lbl-schedule-")
     report = Path(next(arg.removeprefix("--output=") for arg in command if arg.startswith("--output=")))
     assert report.parent == result_path
-    assert report.name.endswith(f"-param_{parameter_tier}-act_gpu-opt_gpu")
+    assert report.name.endswith(f"-param_{parameter_tier}-act_{activation_tier}-opt_gpu")
     assert not results_root.exists()
 
 
@@ -57,24 +61,47 @@ def test_layer_by_layer_baseline_dry_run(tmp_path: Path, case: str, parameter_ti
 @pytest.mark.parametrize(
     ("extra_args", "expected"),
     [
-        ([], {"layer_by_layer.parameter_tier=gpu", "layer_by_layer.optimizer_tier=gpu"}),
-        (["--parameter-tier", "cpu"], {"layer_by_layer.parameter_tier=cpu", "layer_by_layer.optimizer_tier=gpu"}),
+        (
+            [],
+            {
+                "layer_by_layer.parameter_tier=gpu",
+                "layer_by_layer.activation_tier=gpu",
+                "layer_by_layer.optimizer_tier=gpu",
+            },
+        ),
+        (
+            ["--parameter-tier", "cpu"],
+            {
+                "layer_by_layer.parameter_tier=cpu",
+                "layer_by_layer.activation_tier=gpu",
+                "layer_by_layer.optimizer_tier=gpu",
+            },
+        ),
+        (
+            ["--parameter-tier", "cpu", "--activation-tier", "cpu_act"],
+            {
+                "layer_by_layer.parameter_tier=cpu",
+                "layer_by_layer.activation_tier=cpu",
+                "layer_by_layer.optimizer_tier=gpu",
+            },
+        ),
         (
             ["--optimizer-tier", "cpu"],
             {
                 "layer_by_layer.parameter_tier=gpu",
+                "layer_by_layer.activation_tier=gpu",
                 "layer_by_layer.optimizer_tier=cpu",
                 "layer_by_layer.cpu_optimizer=torch",
             },
         ),
     ],
 )
-def test_layer_by_layer_sweep_gpu_activation_placements(extra_args: list[str], expected: set[str]) -> None:
+def test_layer_by_layer_sweep_placements(extra_args: list[str], expected: set[str]) -> None:
     result = subprocess.run(
         [sys.executable, str(SWEEP), "--dry-run", *extra_args], capture_output=True, text=True, check=True
     )
     command = shlex.split(result.stderr)
-    assert expected | {"layer_by_layer.activation_tier=gpu"} <= set(command)
+    assert expected <= set(command)
 
 
 @pytest.mark.unit
@@ -110,7 +137,7 @@ def test_layer_by_layer_sweep_nvme_uses_case_scratch(tmp_path: Path) -> None:
 @pytest.mark.parametrize(
     "extra_args",
     [
-        ["--activation-tier", "cpu"],
+        ["--activation-tier", "nvme"],
         ["--parameter-tier", "nvme"],
         ["--optimizer-tier", "nvme"],
         ["--parameter-tier", "nvme", "--optimizer-tier", "nvme"],
@@ -123,20 +150,22 @@ def test_layer_by_layer_sweep_rejects_unsupported_placements(extra_args: list[st
 
 @pytest.mark.unit
 @pytest.mark.parametrize(
-    ("parameter_tier", "fsdp_result", "expected_status"),
+    ("parameter_tier", "activation_tier", "fsdp_result", "expected_status"),
     [
-        ("gpu", {}, "passed"),
-        ("cpu", {}, "passed"),
-        ("cpu", {"schedule": "no_pipeline"}, "invalid_result"),
-        ("cpu", {"parameter_backend": "layer_by_layer"}, "invalid_result"),
-        ("cpu", {"fsdp_strategy": "optim_grads"}, "invalid_result"),
-        ("cpu", {"fsdp_cpu_offload": []}, "invalid_result"),
-        ("cpu", {"steps": 9}, "invalid_result"),
-        ("cpu", {"world_size": 1}, "invalid_result"),
+        ("gpu", "gpu", {}, "passed"),
+        ("cpu", "gpu", {}, "passed"),
+        ("cpu", "cpu", {}, "passed"),
+        ("cpu", "cpu", {"activation_tier": "gpu"}, "invalid_result"),
+        ("cpu", "gpu", {"schedule": "no_pipeline"}, "invalid_result"),
+        ("cpu", "gpu", {"parameter_backend": "layer_by_layer"}, "invalid_result"),
+        ("cpu", "gpu", {"fsdp_strategy": "optim_grads"}, "invalid_result"),
+        ("cpu", "gpu", {"fsdp_cpu_offload": []}, "invalid_result"),
+        ("cpu", "gpu", {"steps": 9}, "invalid_result"),
+        ("cpu", "gpu", {"world_size": 1}, "invalid_result"),
     ],
 )
 def test_baseline_result_checks_native_fsdp_metrics(
-    tmp_path: Path, parameter_tier: str, fsdp_result: dict, expected_status: str
+    tmp_path: Path, parameter_tier: str, activation_tier: str, fsdp_result: dict, expected_status: str
 ) -> None:
     state_dir = tmp_path / "state"
     state_dir.mkdir()
@@ -144,7 +173,7 @@ def test_baseline_result_checks_native_fsdp_metrics(
         "layers": 8,
         "steps": 10,
         "parameter_tier": parameter_tier,
-        "activation_tier": "gpu",
+        "activation_tier": activation_tier,
         "optimizer_tier": "gpu",
     }
     state = {
@@ -180,6 +209,7 @@ def test_baseline_result_checks_native_fsdp_metrics(
         row = next(csv.DictReader(summary))
     assert row["status"] == expected_status
     if expected_status == "passed":
+        assert row["activation_tier"] == activation_tier
         assert row["optimizer_backend"] == "FusedAdam"
         assert row["fsdp_cpu_offload"] == ("weight" if parameter_tier == "cpu" else "")
         assert row["peak_allocated_bytes"] == "1024"
