@@ -984,12 +984,15 @@ class InProcessRestartConfig:
 # ---------------- Container config (standalone top-level config) ----------------
 @dataclass(kw_only=True)
 class LayerByLayerRecipeConfig:
-    """Select the native schedule or the sharded capacity-test backend."""
+    """Storage placement for native layer-by-layer Megatron-FSDP training."""
 
-    backend: Literal["schedule", "offload"] = "schedule"
     parameter_tier: Literal["gpu", "cpu", "nvme", "gpu_param", "cpu_param", "nvme_param"] = "gpu"
     activation_tier: Literal["gpu", "cpu", "nvme", "gpu_act", "cpu_act", "nvme_act"] = "gpu"
-    optimizer_tier: Literal["gpu", "cpu", "nvme"] = "gpu"
+    optimizer_tier: Literal["gpu", "cpu", "nvme"] | None = None
+    """Optimizer state placement. Defaults to the parameter tier."""
+
+    cpu_optimizer: Literal["grace_adam", "torch"] = "torch"
+    """AdamW backend for updates with CPU or NVMe optimizer state."""
     nvme_dir: str = "/tmp"
     cpu_threads: int = 8
     tiny: bool = False

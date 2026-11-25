@@ -463,7 +463,7 @@ def qwen35_text_27b_pretrain_4gpu_gb200_bf16_fsdp1_config() -> ConfigContainer:
 
 
 def qwen35_text_27b_pretrain_4gpu_gb200_bf16_layer_by_layer_config() -> ConfigContainer:
-    """Return the offline eight-layer Qwen3.5 GB200 full-attention mock recipe."""
+    """Return the eight-layer Qwen3.5 Megatron-FSDP layer-by-layer mock recipe."""
     cfg = _pretrain_common()
     cfg.model = GPTModelProvider(
         hf_model_id=_QWEN35_27B_BASE,
@@ -499,6 +499,7 @@ def qwen35_text_27b_pretrain_4gpu_gb200_bf16_layer_by_layer_config() -> ConfigCo
         bf16=True,
         params_dtype=torch.bfloat16,
         use_cpu_initialization=False,
+        init_model_with_meta_device=True,
         gradient_accumulation_fusion=False,
         disable_parameter_transpose_cache=True,
         tensor_model_parallel_size=1,
@@ -527,13 +528,8 @@ def qwen35_text_27b_pretrain_4gpu_gb200_bf16_layer_by_layer_config() -> ConfigCo
     cfg.optimizer.adam_eps = 1e-8
     cfg.optimizer.weight_decay = 0.1
     cfg.optimizer.clip_grad = 0.0
-    cfg.optimizer.use_distributed_optimizer = False
     cfg.scheduler.lr_decay_style = "constant"
     cfg.scheduler.lr_warmup_iters = 0
-    cfg.ddp.use_distributed_optimizer = False
-    cfg.ddp.data_parallel_sharding_strategy = "no_shard"
-    cfg.ddp.overlap_grad_reduce = False
-    cfg.ddp.overlap_param_gather = False
     cfg.checkpoint.load = None
     cfg.checkpoint.save = None
     cfg.profiling.profile_step_start = 7

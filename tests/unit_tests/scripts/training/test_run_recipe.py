@@ -227,13 +227,12 @@ def test_full_recipe_uses_library_recipe_and_default_llm_step():
 
 
 @pytest.mark.parametrize("dryrun", [False, True])
-@pytest.mark.parametrize("backend", ["schedule", "offload"])
-def test_layer_by_layer_recipe_uses_standard_run_config(dryrun, backend):
+def test_layer_by_layer_recipe_uses_standard_run_config(dryrun):
     module, handles = _load_module()
     recipe_name = "qwen35_text_27b_pretrain_4gpu_gb200_bf16_layer_by_layer_config"
-    config = SimpleNamespace(layer_by_layer=SimpleNamespace(backend=backend))
+    config = SimpleNamespace(layer_by_layer=SimpleNamespace())
     handles.recipe_runner.load_recipe.return_value = config
-    dataset = "mock" if backend == "offload" else "megatron-indexed"
+    dataset = "megatron-indexed"
     args = [
         "--recipe",
         recipe_name,
@@ -249,38 +248,15 @@ def test_layer_by_layer_recipe_uses_standard_run_config(dryrun, backend):
 
     handles.recipe_runner.apply_cli_overrides.assert_called_once_with(config, ["train.train_iters=2"])
     assert config.dataset.dataset_name == dataset
-    if backend == "offload":
-        handles.recipe_runner.load_forward_step.assert_not_called()
-        forward_step = None
-    else:
-        handles.recipe_runner.load_forward_step.assert_called_once_with("llm_step", mode="pretrain")
-        forward_step = handles.recipe_runner.load_forward_step.return_value
+    handles.recipe_runner.load_forward_step.assert_called_once_with("llm_step", mode="pretrain")
     handles.recipe_runner.run_config.assert_called_once_with(
         config=config,
         mode="pretrain",
-        step_func=forward_step,
+        step_func=handles.recipe_runner.load_forward_step.return_value,
         dryrun=dryrun,
         dryrun_world_size=4 if dryrun else None,
         dump_environment=False,
     )
-
-
-@pytest.mark.parametrize(
-    ("args", "error_match"),
-    [
-        (["--dataset", "megatron-indexed"], "Layer-by-layer.*mock"),
-        (["--step-func", "llm_step"], "Layer-by-layer.*--step-func"),
-    ],
-)
-def test_layer_by_layer_offload_rejects_alternative_workload(args, error_match):
-    module, handles = _load_module()
-    recipe_name = "qwen35_text_27b_pretrain_4gpu_gb200_bf16_layer_by_layer_config"
-    handles.recipe_runner.load_recipe.return_value = SimpleNamespace(layer_by_layer=SimpleNamespace(backend="offload"))
-
-    with pytest.raises(ValueError, match=error_match):
-        module.main(["--recipe", recipe_name, "--mode", "pretrain", *args])
-
-    handles.recipe_runner.run_config.assert_not_called()
 
 
 def test_kimi_supported_pp_vp_override_refreshes_pipeline_layout():

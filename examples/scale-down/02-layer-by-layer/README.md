@@ -1,6 +1,6 @@
 # Qwen3.5-27B layer-by-layer capacity test
 
-The Qwen3.5 layer-by-layer recipe defaults to the Megatron `PP=1` schedule. The numbered capacity experiments and sweep explicitly select `layer_by_layer.backend=offload` for four-way weight sharding and the existing storage-tier measurements. Both paths use BF16 and gated full attention in every decoder layer.
+The numbered experiments and capacity sweep run Bridge pretraining with Megatron's layer-by-layer schedule at `PP=1` and four-way Megatron-FSDP parameter, gradient, and optimizer sharding. The model uses BF16 and gated full attention in every decoder layer.
 
 ## Prepare the training environment
 
@@ -18,23 +18,26 @@ git switch v0.6.0-scale-down
 git pull --ff-only origin v0.6.0-scale-down
 ```
 
-The capacity launchers use Bridge's configured CUDA environment through `uv run --no-sync` and the sharded trainer from the installed Megatron-LM checkout. Run them on one GB200 node with four CUDA/NCCL ranks. Set `PYTHON` to use an explicit interpreter with that same environment configuration.
+The capacity launchers use Bridge's configured CUDA environment through `uv run --no-sync` and the native scheduler and Megatron-FSDP from the installed Megatron-LM checkout. Run them on one GB200 node with four CUDA/NCCL ranks. Set `PYTHON` to use an explicit interpreter with that same environment configuration.
+
+If the environment resolves the older pinned submodule, put the updated sibling checkout first on the Python import path from the Bridge root.
+
+```bash
+export PYTHONPATH="$PWD/../megatron-lm${PYTHONPATH:+:$PYTHONPATH}"
+```
+
+CPU and NVMe optimizer tiers default to PyTorch CPU AdamW. `--cpu-optimizer grace_adam` requires Megatron-LM's native Megatron-FSDP GraceAdam support and an SVE-enabled build of DeepSpeed `v0.20.1`. The sweep sets OpenMP threads per CPU optimizer rank from `--cpu-threads` (default 8). For a direct recipe launch, set `OMP_NUM_THREADS` before startup to match `layer_by_layer.cpu_threads`. The native update in DeepSpeed `v0.20.1` holds the Python GIL and can delay new GPU submissions while previously submitted GPU work continues.
 
 ## Native schedule smoke test
 
-Run from the Bridge root with the updated Megatron-LM checkout on the Python import path.
+Run from the Bridge root with the updated Megatron-LM checkout on the Python import path. The launcher uses the same model and training path as the numbered baseline.
 
 ```bash
-PYTHONPATH="$PWD/../megatron-lm${PYTHONPATH:+:$PYTHONPATH}" \
-uv run --no-sync python -m torch.distributed.run --standalone --nproc-per-node=4 \
-  scripts/training/run_recipe.py \
-  --recipe qwen35_text_27b_pretrain_4gpu_gb200_bf16_layer_by_layer_config \
-  --mode pretrain --dataset mock \
-  layer_by_layer.tiny=true model.num_layers=2 dataset.seq_length=128 \
-  train.train_iters=2 train.micro_batch_size=1 train.global_batch_size=8 logger.log_interval=1
+bash examples/scale-down/02-layer-by-layer/run_sweep.sh \
+  --tiny --layers 2 --seq-length 128 --microbatches 2 --steps 2
 ```
 
-The scheduler runs all microbatches through a decoder layer before advancing, then traverses the layers in reverse during backward. It uses a Megatron activation checkpoint per decoder layer and reuses Bridge's GPT step, DDP gradient synchronization, and optimizer. This path keeps parameters and activations on the GPU with Megatron DDP. Use the capacity launchers below for sharded weights and CPU/NVMe tiers.
+The scheduler runs all microbatches through a decoder layer before advancing, then traverses the layers in reverse during backward. It uses Megatron activation checkpointing across the microbatches of each decoder layer. Bridge runs the standard GPT data and loss path, Megatron gradient finalization, and a standard optimizer step after backward.
 
 ## 8-layer all-GPU baseline
 
@@ -50,7 +53,7 @@ This baseline keeps parameter shards, layer-boundary activations, and optimizer 
 
 ## 8-layer CPU parameter offload
 
-Run the matched case from the Bridge repository root with the layer-by-layer Megatron-FSDP backend installed in Megatron-LM.
+Run the matched case from the Bridge repository root with the native layer-by-layer scheduler and Megatron-FSDP installed in Megatron-LM.
 
 ```bash
 study=examples/scale-down/02-layer-by-layer/01-baseline
@@ -58,49 +61,37 @@ bash "$study/02_param_cpu_act_gpu_opt_gpu.sh" --dry-run
 bash "$study/02_param_cpu_act_gpu_opt_gpu.sh"
 ```
 
-Megatron-FSDP stores each rank's BF16 compute-weight shards in pinned host memory. Its double buffer holds the current unit and the next prefetched unit on the GPU. The H2D copy fills the local slice of a GPU buffer in place, then NCCL all-gathers that unit's weights. AdamW, its FP32 master weights and moments, and layer-boundary activations stay on the GPU. The GPU optimizer publishes updated compute-weight shards back to pinned host memory.
+Megatron-FSDP stores each rank's BF16 decoder compute-weight shards in pinned host memory and stages them to the GPU for NCCL all-gather. Embedding and output weights follow Megatron-FSDP's default handling. AdamW, its FP32 master weights and moments, and layer-boundary activations stay on the GPU. The optimizer publishes updated decoder compute-weight shards back to pinned host memory.
 
-Results go under `results/02-layer-by-layer/01-baseline/02-param-cpu-act-gpu-opt-gpu/`. A default run requires two GPU prefetch slots and 190 unit-level parameter reloads per rank. It also requires zero activation D2H and H2D copies. The result log and `summary.csv` record the backend, slot count, and reload count. The output head is reused from forward into backward, so each step reloads `2 * num_layers + 3` units including the input embedding.
-
-The existing CPU and NVMe offload scripts select CPU parameters and activations with NVMe optimizer state, or NVMe for all three. Set `--nvme DIR` or `NVME_PATH` if those cases use a node-local NVMe mount other than `/tmp`.
+Results go under `results/02-layer-by-layer/01-baseline/02-param-cpu-act-gpu-opt-gpu/`. A pass records `weight` as the only FSDP CPU-offload component, alongside the scheduler, FSDP sharding strategy, optimizer backend, final loss, and peak GPU allocation and reservation across ranks. Use the Nsight trace to inspect actual weight transfers or collectives.
 
 ## Running and profiling the numbered cases
 
-The numbered scripts select the experiment settings and call `run_pretrain_layer_by_layer.sh`. That Bash launcher wraps four torchrun workers in Nsight Systems and runs Bridge's `scripts/training/run_recipe.py --recipe qwen35_text_27b_pretrain_4gpu_gb200_bf16_layer_by_layer_config --mode pretrain --dataset mock` on each rank. Bridge runs its pretraining loop and iteration logger, using the Megatron-LM layer-by-layer trainer for each optimizer step. The launcher uses the same NUMA selection order as the FSDP3 study.
+The numbered scripts select the experiment settings and call `run_pretrain_layer_by_layer.sh`. That Bash launcher wraps four torchrun workers in Nsight Systems and runs Bridge's `scripts/training/run_recipe.py --recipe qwen35_text_27b_pretrain_4gpu_gb200_bf16_layer_by_layer_config --mode pretrain --dataset mock` on each rank. Bridge calls the layer-by-layer schedule through its normal training step. The launcher uses the same NUMA selection order as the FSDP3 study.
 
-The cases use Nsight Systems **2026.6.1** to capture the CUDA and NVTX execution timeline with GPU metrics sampling disabled. The default window is iteration 8 (step 7, zero-based). With `--train-iters 3`, capture covers iteration 3. The eight-layer baseline uses outer NVTX ranges `forward.embedding`, `forward.transformer.0` through `forward.transformer.7`, and `forward.output`. Each contains `fwd.microbatch.{index}.{layer}` ranges with zero-based micro-batch indices, such as `fwd.microbatch.0.embedding`, `fwd.microbatch.0.transformer.0`, and `fwd.microbatch.0.output`. The launcher checks the version at `NsightSystems-2026.6.1/bin/nsys` under the Bridge repository root, or at the executable set through `NSYS_BIN`. Use `--profile none` for an unprofiled run. [Nsight Systems CLI reference](https://docs.nvidia.com/nsight-systems/UserGuide/)
+The cases use Nsight Systems **2026.6.1** to capture the CUDA and NVTX execution timeline with GPU metrics sampling disabled. The default window is iteration 8 (step 7, zero-based). With `--train-iters 3`, capture covers iteration 3. The launcher checks `NsightSystems-2026.6.1/bin/nsys` under the Bridge repository root or the executable set through `NSYS_BIN`. Use `--profile none` for an unprofiled run. [Nsight Systems CLI reference](https://docs.nvidia.com/nsight-systems/UserGuide/)
+
+The eight-layer baseline uses outer NVTX ranges `forward.embedding`, `forward.transformer.0` through `forward.transformer.7`, and `forward.output`. Each contains `fwd.microbatch.{mb}.{stage}` ranges, such as `fwd.microbatch.0.transformer.0`. Backward uses `backward.output`, `backward.transformer.7` through `backward.transformer.0`, and `backward.embedding`. Decoder checkpoint replay has separate `recompute.microbatch.{mb}.transformer.{layer}` ranges. The `bwd.microbatch.{mb}.{stage}` ranges track gradient work through autograd hooks. Decoder and output ranges end when their stage-input gradient is ready. Embedding ranges end when the grouped backward completes because token IDs have no gradient and weight-gradient accumulation is shared. Microbatch ranges can overlap. Microbatch and decoder layer indices are zero-based.
 
 On each node the launcher checks IPv4 addresses on up interfaces. It honors valid `GLOO_SOCKET_IFNAME` and `NCCL_SOCKET_IFNAME` values. Automatic selection tries `eth0`, then `bond1`, then an IPv4 default-route interface. NCCL uses an exact interface name. The selected interfaces and Nsight version are recorded in `run_info.txt`.
 
-The all-GPU baseline writes to `results/02-layer-by-layer/01-baseline/01-param-gpu-act-gpu-opt-gpu/model_.../node0/` in Bridge. The Nsight report is named `qwen35_27b-lbl-layers_8-attn_full-bf16-cg_off-tp_1-cp_1-pp_1-dp_4-mbs_1-gbs_16-seq_4k-iters_10-param_gpu-act_gpu-opt_gpu.nsys-rep`. `launch.json` records its filename. The same directory contains `command.txt`, `config.yaml`, `run_info.txt`, `train.log`, `summary.csv`, `tensorboard/`, and the source revisions and hashes. Use `--print-result-dir` to resolve the path or `--output-dir` for a fresh repeat.
+The all-GPU baseline writes to `results/02-layer-by-layer/01-baseline/01-param-gpu-act-gpu-opt-gpu/model_27b-lbl-schedule-.../node0/` in Bridge. The Nsight report is named `qwen35_27b-lbl-layers_8-attn_full-bf16-cg_off-tp_1-cp_1-pp_1-dp_4-mbs_1-gbs_16-seq_4k-iters_10-param_gpu-act_gpu-opt_gpu.nsys-rep`. `launch.json` records its filename. The same directory contains `command.txt`, `config.yaml`, `run_info.txt`, `train.log`, `summary.csv`, `tensorboard/`, and the source revisions and hashes. Use `--print-result-dir` to resolve the path or `--output-dir` for a fresh repeat.
 
 Bridge prints iteration time and model TFLOP/s per GPU to the terminal and `train.log` as the numbered cases run. TensorBoard records `throughput/tflops/device` and, from the second iteration, `throughput/tokens_per_sec`. Use `--profile none` for throughput measurements without Nsight Systems capture overhead.
 
-The all-GPU baseline passes with `status=0`, a nonempty report when profiling, and zero activation D2H and H2D copies per rank.
+Both numbered cases require `status=0` and a nonempty report when profiling.
 
 ## Capacity sweep
 
 ```bash
 bash examples/scale-down/02-layer-by-layer/run_sweep.sh \
-  --nvme-dir /path/to/local/nvme --layers 16 32 64
+  --layers 8 16 32 --parameter-tier cpu
 ```
 
-Defaults are eight decoder layers, sequence length 4096, micro-batch size 1, four micro-batches per rank per step, three optimizer steps, and `nvme` for each tier. Use an already configured Megatron CUDA environment with Transformer Engine. Set `PYTHON` to the interpreter in that environment if needed.
+Defaults are eight decoder layers, sequence length 4096, micro-batch size 1, four microbatches per rank per step, three optimizer steps, and GPU placement for every tier. Activations use GPU memory in every case. Choose `gpu` or `cpu` independently for `--parameter-tier` and `--optimizer-tier`. CPU optimizer placement includes gradient offload and CPU gradient accumulation.
 
-Select `--parameter-tier`, `--activation-tier`, and `--optimizer-tier` independently.
+NVMe requires `--parameter-tier nvme --optimizer-tier nvme --nvme-dir /path/to/local/nvme` and the `megatron_nvme_aio` extension from the Megatron-LM checkout's `src/nvme/deepspeed`. Each NVMe case uses a fresh scratch directory. Its filesystem holds all four ranks' files. At full depth, FP32 master weights and the two Adam moments alone require roughly 324 GB in total, with additional storage for compute weights and staging.
 
-| Tier | Parameter shards | Layer-boundary activations | AdamW state and execution |
-| --- | --- | --- | --- |
-| `gpu` | GPU memory | GPU memory | GPU memory and GPU AdamW |
-| `cpu` | Host RAM | Pinned host RAM | Host RAM and CPU AdamW |
-| `nvme` | Local NVMe | Local NVMe via pinned host buffers | Local NVMe, staged to host RAM for CPU AdamW |
+Add `--dry-run` to inspect the commands. To narrow the capacity limit, rerun at depths between the largest passing case and the first allocation failure.
 
-Each decoder layer processes all micro-batches before advancing. Two GPU weight slots alternate across layers, and all micro-batches of a layer share the same gathered weights. Backward rematerializes each layer and reduce-scatters its FP32 accumulated gradient. The shared communicator issues the gradient reduce-scatter before the next weight all-gather. The prototype uses fixed learning rate, with gradient scaling and gradient clipping disabled.
-
-When the `megatron_nvme_aio` extension from the Megatron-LM checkout's `src/nvme/deepspeed` is installed, the trainer uses direct I/O. Otherwise it uses buffered I/O, with file sync and cache eviction advice where supported. Checkpoint and rollback support are outside the prototype's training entry point.
-
-For a quick smoke test, add `--tiny --layers 4 --seq-length 128 --microbatches 2 --steps 2`. Add `--dry-run` to inspect the commands. To find the limit after 64 layers passes, try more depths with `--layers 64 80 96`, then narrow the interval around a capacity failure. The NVMe filesystem must have room for all four ranks' files. At full depth the FP32 master weights and two Adam moment tensors alone require roughly 324 GB in total. Staging and temporary files add to that footprint.
-
-To verify CPU activation offload, run the smoke test with `--activation-tier cpu`. The log's `LAYER_BY_LAYER_RESULT` records `activation_d2h_completed_by_rank` and `activation_h2d_completed_by_rank` after CUDA synchronization. Expect `[20, 20, 20, 20]` and `[40, 40, 40, 40]` for this smoke test. In general, each rank offloads `(layers + 1) * microbatches * steps` boundary tensors and reloads each twice. The `nvme` activation tier has the same copy counts and additionally reads and writes activation files. The `gpu` activation tier reports zero for both counts.
-
-Each sweep creates a new result directory under `./results`, or at the unused path passed as `--results-dir`. It retains the Bridge revision in `revision.txt`, the Megatron-LM revision in `megatron_lm_revision.txt`, and SHA-256 hashes keyed by `bridge/<file>` and `megatron-lm/<file>` in `source_sha256.json`. It also saves commands, per-depth training logs and TensorBoard directories, and `summary.csv` with the status, final loss, peak GPU memory, and activation copy counts per rank. Each case uses a fresh scratch directory on NVMe. A pass requires every rank to finish the requested steps with finite losses, finite gradient shards, and the expected activation copy counts. CUDA allocation errors, explicit host allocation errors, and NVMe space or quota errors get separate statuses. Other errors require inspecting the corresponding log. The reported depth is the largest case observed to pass in the sweep.
+Each sweep creates a new result directory under `./results`, or at the unused path passed as `--results-dir`. It retains the Bridge revision in `revision.txt`, the Megatron-LM revision in `megatron_lm_revision.txt`, and SHA-256 hashes keyed by `bridge/<file>` and `megatron-lm/<file>` in `source_sha256.json`. It also saves commands, per-depth training logs and TensorBoard directories, and `summary.csv`. A pass requires successful worker exit, the expected number of successful optimizer steps, finite final loss, valid measured peak GPU memory, and an exact match for the scheduler and FSDP offload settings in `LAYER_BY_LAYER_RESULT`. CUDA allocation errors, explicit host allocation errors, and NVMe space or quota errors get separate statuses. The reported depth is the largest observed passing case.

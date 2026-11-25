@@ -15,6 +15,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+from contextlib import nullcontext
 from importlib.util import find_spec
 from pathlib import Path
 
@@ -29,6 +30,7 @@ _PLACEMENTS = ("gpu", "cpu", "nvme")
 _EXAMPLE_DIR = "examples/scale-down/02-layer-by-layer"
 _RECIPE = "qwen35_text_27b_pretrain_4gpu_gb200_bf16_layer_by_layer_config"
 _RECIPE_RUNNER = "scripts/training/run_recipe.py"
+_LM_FSDP_SOURCE = "megatron/core/distributed/fsdp/src/megatron_fsdp/megatron_fsdp.py"
 _BRIDGE_SOURCE_FILES = (
     f"{_EXAMPLE_DIR}/run_sweep.sh",
     f"{_EXAMPLE_DIR}/run_pretrain_layer_by_layer.sh",
@@ -50,15 +52,21 @@ _BRIDGE_SOURCE_FILES = (
     "src/megatron/bridge/training/utils/train_utils.py",
 )
 _LM_SOURCE_FILES = (
-    "megatron/core/distributed/layer_by_layer.py",
-    "megatron/core/distributed/layer_by_layer_storage.py",
-    "megatron/training/layer_by_layer_workload.py",
-)
-_LM_FSDP_SOURCE_FILES = (
-    "megatron/core/distributed/layer_by_layer_fsdp.py",
+    "megatron/core/distributed/distributed_data_parallel_config.py",
+    "megatron/core/distributed/fsdp/mcore_fsdp_adapter.py",
     "megatron/core/distributed/fsdp/src/megatron_fsdp/distributed_data_parallel_config.py",
+    _LM_FSDP_SOURCE,
+    "megatron/core/distributed/fsdp/src/megatron_fsdp/offload.py",
     "megatron/core/distributed/fsdp/src/megatron_fsdp/param_and_grad_buffer.py",
     "megatron/core/distributed/fsdp/src/megatron_fsdp/utils.py",
+    "megatron/core/models/gpt/gpt_model.py",
+    "megatron/core/optimizer/__init__.py",
+    "megatron/core/optimizer/cpu_offloading/fsdp_adam.py",
+    "megatron/core/optimizer/distrib_optimizer.py",
+    "megatron/core/optimizer/optimizer_config.py",
+    "megatron/core/pipeline_parallel/schedules.py",
+    "megatron/core/tensor_parallel/random.py",
+    "megatron/training/layer_by_layer_workload.py",
 )
 _CASE_SCRIPTS = tuple(
     f"{_EXAMPLE_DIR}/01-baseline/{name}"
@@ -83,17 +91,18 @@ _RESULT_COLUMNS = (
     "parameter_tier",
     "activation_tier",
     "optimizer_tier",
+    "optimizer_backend",
     "status",
     "returncode",
     "steps",
     "loss",
     "peak_allocated_bytes",
     "peak_reserved_bytes",
-    "activation_d2h_completed_per_rank",
-    "activation_h2d_completed_per_rank",
+    "schedule",
     "parameter_backend",
-    "parameter_gpu_prefetch_slots",
-    "parameter_h2d_prefetched_units_per_rank",
+    "fsdp_strategy",
+    "fsdp_cpu_offload",
+    "world_size",
     "log",
 )
 
@@ -129,17 +138,20 @@ def _module_source(module: str) -> Path | None:
 
 def _installed_megatron_lm() -> Path:
     workload = _module_source("megatron.training.layer_by_layer_workload")
-    trainer = _module_source("megatron.core.distributed.layer_by_layer")
-    if workload is not None and trainer is not None:
+    schedules = _module_source("megatron.core.pipeline_parallel.schedules")
+    if workload is not None and schedules is not None:
         root = workload.parents[2]
-        if trainer == root / _LM_SOURCE_FILES[0] and all(
-            (root / source).is_file() for source in _LM_SOURCE_FILES
+        if (
+            schedules == root / "megatron/core/pipeline_parallel/schedules.py"
+            and all((root / source).is_file() for source in _LM_SOURCE_FILES)
+            and "def layer_by_layer_forward_backward_no_pipelining(" in schedules.read_text(encoding="utf-8")
+            and "def layer_by_layer_unit(" in (root / _LM_FSDP_SOURCE).read_text(encoding="utf-8")
         ):
             return root
     training_source = workload or _module_source("megatron.training")
-    core_source = trainer or _module_source("megatron.core")
+    core_source = schedules or _module_source("megatron.core")
     raise RuntimeError(
-        "The Bridge Python environment does not expose the complete layer-by-layer trainer.\n"
+        "The Bridge Python environment does not expose the native layer-by-layer schedule and Megatron-FSDP sources.\n"
         f"Python: {sys.executable}\n"
         f"Megatron training source: {training_source or 'missing'}\n"
         f"Megatron Core source: {core_source or 'missing'}\n"
@@ -165,7 +177,7 @@ def _lm_revision(lm_dir: Path) -> str | None:
 def _arguments() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
-        "--nvme-dir", "--nvme", type=Path, required=True, help="existing directory on local NVMe"
+        "--nvme-dir", "--nvme", type=Path, help="existing local NVMe directory for the NVMe weight and optimizer case"
     )
     parser.add_argument(
         "--results-dir",
@@ -182,12 +194,13 @@ def _arguments() -> argparse.Namespace:
     )
     parser.add_argument("--steps", type=_positive, default=3)
     parser.add_argument(
-        "--parameter-tier", type=lambda tier: tier.removesuffix("_param"), choices=_PLACEMENTS, default="nvme"
+        "--parameter-tier", type=lambda tier: tier.removesuffix("_param"), choices=_PLACEMENTS, default="gpu"
     )
     parser.add_argument(
-        "--activation-tier", type=lambda tier: tier.removesuffix("_act"), choices=_PLACEMENTS, default="nvme"
+        "--activation-tier", type=lambda tier: tier.removesuffix("_act"), choices=("gpu",), default="gpu"
     )
-    parser.add_argument("--optimizer-tier", choices=_PLACEMENTS, default="nvme")
+    parser.add_argument("--optimizer-tier", choices=_PLACEMENTS, default="gpu")
+    parser.add_argument("--cpu-optimizer", choices=("torch", "grace_adam"), default="torch")
     parser.add_argument("--learning-rate", type=float)
     parser.add_argument("--cpu-threads", type=_positive)
     parser.add_argument("--profile", choices=("none", "nsys"), default="none")
@@ -202,6 +215,12 @@ def _arguments() -> argparse.Namespace:
         "--dry-run", action="store_true", help="show commands without writing or launching"
     )
     args = parser.parse_args()
+    if "nvme" in (args.parameter_tier, args.optimizer_tier):
+        if (args.parameter_tier, args.optimizer_tier) != ("nvme", "nvme"):
+            parser.error("NVMe requires --parameter-tier nvme and --optimizer-tier nvme")
+        if args.nvme_dir is None:
+            parser.error("NVMe requires --nvme-dir")
+    args.optimizer_backend = None if args.optimizer_tier == "gpu" else args.cpu_optimizer
     if len(set(args.layers)) != len(args.layers):
         parser.error("--layers must contain distinct values")
     if args.single_case_layout and (len(args.layers) != 1 or args.results_dir is None):
@@ -266,7 +285,7 @@ def _numa_worker() -> tuple[str, list[str]]:
 def _command(
     args: argparse.Namespace,
     layers: int,
-    scratch: Path,
+    scratch: Path | None,
     report: Path,
     worker_overrides: dict[str, str] | None = None,
 ) -> list[str]:
@@ -276,6 +295,9 @@ def _command(
     config_path = report.parent / ("config.yaml" if args.single_case_layout else f"layers-{layers}.config.yaml")
     tensorboard_dir = report.parent / ("tensorboard" if args.single_case_layout else f"layers-{layers}.tensorboard")
     _, numa_wrapper = _numa_worker()
+    worker_env = []
+    if args.optimizer_backend is not None:
+        worker_env = ["env", f"OMP_NUM_THREADS={args.cpu_threads or 8}"]
     command = [
         *python,
         "-m",
@@ -285,6 +307,7 @@ def _command(
         f"--nproc-per-node={_WORLD_SIZE}",
         "--no-python",
         *numa_wrapper,
+        *worker_env,
         *python,
         str(_REPO / _RECIPE_RUNNER),
         "--recipe",
@@ -299,11 +322,9 @@ def _command(
         f"train.micro_batch_size={args.micro_batch_size}",
         f"train.global_batch_size={args.micro_batch_size * args.microbatches * _WORLD_SIZE}",
         f"train.train_iters={args.steps}",
-        "layer_by_layer.backend=offload",
         f"layer_by_layer.parameter_tier={args.parameter_tier}",
         f"layer_by_layer.activation_tier={args.activation_tier}",
         f"layer_by_layer.optimizer_tier={args.optimizer_tier}",
-        f"layer_by_layer.nvme_dir={json.dumps(str(scratch))}",
         "logger.log_interval=1",
         "logger.log_throughput=true",
         "logger.log_throughput_to_tensorboard=true",
@@ -315,8 +336,12 @@ def _command(
         command.append("layer_by_layer.tiny=true")
     if args.learning_rate is not None:
         command.append(f"optimizer.lr={args.learning_rate}")
-    if args.cpu_threads is not None:
-        command.append(f"layer_by_layer.cpu_threads={args.cpu_threads}")
+    if args.optimizer_backend is not None:
+        command.append(f"layer_by_layer.cpu_optimizer={args.cpu_optimizer}")
+        if args.cpu_threads is not None:
+            command.append(f"layer_by_layer.cpu_threads={args.cpu_threads}")
+    if scratch is not None:
+        command.append(f"layer_by_layer.nvme_dir={json.dumps(str(scratch))}")
     if args.profile == "nsys":
         command.extend(
             (
@@ -356,16 +381,17 @@ def _read_result(
     layers: int,
     *,
     steps: int,
-    microbatches: int,
     parameter_tier: str,
     activation_tier: str,
     optimizer_tier: str,
+    optimizer_backend: str | None,
 ) -> dict:
     result = {
         "layers": layers,
         "parameter_tier": parameter_tier,
         "activation_tier": activation_tier,
         "optimizer_tier": optimizer_tier,
+        "optimizer_backend": optimizer_backend,
         "status": "failed",
         "returncode": returncode,
         "log": log_path.name,
@@ -394,36 +420,27 @@ def _read_result(
     loss = metrics.get("loss")
     allocated = metrics.get("peak_allocated_bytes")
     reserved = metrics.get("peak_reserved_bytes")
-    d2h = metrics.get("activation_d2h_completed_by_rank")
-    h2d = metrics.get("activation_h2d_completed_by_rank")
-    expected_d2h = 0 if activation_tier == "gpu" else (layers + 1) * microbatches * steps
-    parameter_metrics = {}
-    if parameter_tier == "cpu":
-        slots = metrics.get("parameter_gpu_prefetch_slots")
-        reloads = metrics.get("parameter_h2d_prefetched_units_by_rank")
-        expected_reloads = (2 * layers + 3) * steps
-        if (
-            metrics.get("parameter_backend") != "megatron_fsdp"
-            or type(slots) is not int
-            or slots != 2
-            or reloads != [expected_reloads] * _WORLD_SIZE
-            or any(type(count) is not int for count in reloads)
-        ):
-            return result
-        parameter_metrics = {
-            "parameter_backend": "megatron_fsdp",
-            "parameter_gpu_prefetch_slots": slots,
-            "parameter_h2d_prefetched_units_per_rank": expected_reloads,
-        }
+    actual_optimizer = metrics.get("optimizer_backend")
+    offload = metrics.get("fsdp_cpu_offload")
+    expected_offload = ["gradient", "optimizer"] if optimizer_tier != "gpu" else []
+    if parameter_tier != "gpu":
+        expected_offload.append("weight")
     if (
-        metrics.get("layers") == layers
+        metrics.get("schedule") == "layer_by_layer"
+        and metrics.get("parameter_backend") == "megatron_fsdp"
+        and metrics.get("fsdp_strategy") == "optim_grads_params"
+        and metrics.get("world_size") == _WORLD_SIZE
+        and isinstance(offload, list)
+        and all(isinstance(component, str) for component in offload)
+        and sorted(offload) == expected_offload
+        and metrics.get("layers") == layers
         and metrics.get("steps") == steps
         and metrics.get("parameter_tier") == parameter_tier
         and metrics.get("activation_tier") == activation_tier
         and metrics.get("optimizer_tier") == optimizer_tier
-        and d2h == [expected_d2h] * _WORLD_SIZE
-        and h2d == [2 * expected_d2h] * _WORLD_SIZE
-        and all(type(count) is int for count in (*d2h, *h2d))
+        and isinstance(actual_optimizer, str)
+        and bool(actual_optimizer.strip())
+        and (optimizer_backend is None or actual_optimizer == optimizer_backend)
         and type(loss) in (float, int)
         and math.isfinite(loss)
         and type(allocated) is int
@@ -436,9 +453,12 @@ def _read_result(
             loss=loss,
             peak_allocated_bytes=allocated,
             peak_reserved_bytes=reserved,
-            activation_d2h_completed_per_rank=d2h[0],
-            activation_h2d_completed_per_rank=h2d[0],
-            **parameter_metrics,
+            optimizer_backend=actual_optimizer,
+            schedule=metrics["schedule"],
+            parameter_backend=metrics["parameter_backend"],
+            fsdp_strategy=metrics["fsdp_strategy"],
+            fsdp_cpu_offload=",".join(expected_offload),
+            world_size=_WORLD_SIZE,
         )
     return result
 
@@ -446,7 +466,7 @@ def _read_result(
 def _write_launch(
     args: argparse.Namespace,
     results: Path,
-    nvme_dir: Path,
+    nvme_dir: Path | None,
     worker_overrides: dict[str, str],
     nsys_version: str | None,
     source_metadata: dict[str, str | None],
@@ -459,6 +479,7 @@ def _write_launch(
         "attention": "full",
         "linear_attention_freq": 1,
         "tiny": args.tiny,
+        "schedule": "layer_by_layer",
         "fully_sharded": True,
         "data_parallel_size": _WORLD_SIZE,
         "pipeline_model_parallel_size": 1,
@@ -476,7 +497,8 @@ def _write_launch(
         "parameter_tier": args.parameter_tier,
         "activation_tier": args.activation_tier,
         "optimizer_tier": args.optimizer_tier,
-        "nvme_path": str(nvme_dir),
+        "optimizer_backend": args.optimizer_backend,
+        "nvme_path": str(nvme_dir) if nvme_dir is not None else None,
         "profile": args.profile,
         "profile_start": args.profile_start,
         "profile_end": args.profile_end,
@@ -495,7 +517,7 @@ def _case_command(
     args: argparse.Namespace,
     layers: int,
     results: Path,
-    scratch: Path,
+    scratch: Path | None,
     worker_overrides: dict[str, str],
 ) -> tuple[Path, list[str]]:
     log_name, command_name = (
@@ -514,11 +536,16 @@ def _run_case(
     args: argparse.Namespace,
     layers: int,
     results: Path,
-    nvme_dir: Path,
+    nvme_dir: Path | None,
     worker_overrides: dict[str, str],
 ) -> dict:
-    with tempfile.TemporaryDirectory(prefix=f"layer-by-layer-{layers}-", dir=nvme_dir) as scratch:
-        log_path, command = _case_command(args, layers, results, Path(scratch), worker_overrides)
+    scratch_dir = (
+        tempfile.TemporaryDirectory(prefix=f"layer-by-layer-{layers}-", dir=nvme_dir)
+        if nvme_dir is not None
+        else nullcontext()
+    )
+    with scratch_dir as scratch:
+        log_path, command = _case_command(args, layers, results, Path(scratch) if scratch else None, worker_overrides)
         with log_path.open("w", encoding="utf-8") as log:
             returncode = subprocess.run(
                 command,
@@ -536,10 +563,10 @@ def _collect_case(args: argparse.Namespace, layers: int, results: Path, log_path
         returncode,
         layers,
         steps=args.steps,
-        microbatches=args.microbatches,
         parameter_tier=args.parameter_tier,
         activation_tier=args.activation_tier,
         optimizer_tier=args.optimizer_tier,
+        optimizer_backend=args.optimizer_backend,
     )
     if args.profile == "nsys" and case["status"] == "passed":
         report = _profile_report(args, layers, results)
@@ -566,19 +593,21 @@ def _write_run_info(results: Path, case: dict, worker_overrides: dict[str, str],
 def _prepare_case(
     args: argparse.Namespace,
     results: Path,
-    nvme_dir: Path,
+    nvme_dir: Path | None,
     worker_overrides: dict[str, str],
     nsys_version: str | None,
 ) -> None:
     """Hand one validated launch command to the test's Bash launcher."""
     layers = args.layers[0]
     state_dir = args.prepare_case
-    scratch = Path(tempfile.mkdtemp(prefix=f"layer-by-layer-{layers}-", dir=nvme_dir))
-    try:
-        (state_dir / "scratch").write_text(f"{scratch}\n", encoding="utf-8")
-    except OSError:
-        scratch.rmdir()
-        raise
+    scratch = None
+    if nvme_dir is not None:
+        scratch = Path(tempfile.mkdtemp(prefix=f"layer-by-layer-{layers}-", dir=nvme_dir))
+        try:
+            (state_dir / "scratch").write_text(f"{scratch}\n", encoding="utf-8")
+        except OSError:
+            scratch.rmdir()
+            raise
     log_path, command = _case_command(args, layers, results, scratch, worker_overrides)
     state = {
         "results": str(results),
@@ -591,6 +620,7 @@ def _prepare_case(
         "parameter_tier": args.parameter_tier,
         "activation_tier": args.activation_tier,
         "optimizer_tier": args.optimizer_tier,
+        "optimizer_backend": args.optimizer_backend,
         "profile": args.profile,
         "worker_overrides": worker_overrides,
         "nsys_version": nsys_version,
@@ -620,24 +650,19 @@ def main() -> int:
     if sys.argv[1:2] == ["--finish-case"]:
         return _finish_case(Path(sys.argv[2]), int(sys.argv[3]))
     args = _arguments()
-    nvme_dir = args.nvme_dir.absolute()
+    nvme_dir = args.nvme_dir.absolute() if args.parameter_tier == "nvme" else None
     if args.dry_run:
         results = args.results_dir or Path("results/02-layer-by-layer-<unique>")
         for layers in args.layers:
-            scratch = nvme_dir / f"layer-by-layer-{layers}-<unique>"
+            scratch = nvme_dir / f"layer-by-layer-{layers}-<unique>" if nvme_dir is not None else None
             report = _profile_report(args, layers, results.absolute())
             _LOG.info("%s", shlex.join(_command(args, layers, scratch, report)))
         return 0
-    if not nvme_dir.is_dir():
+    if nvme_dir is not None and not nvme_dir.is_dir():
         _LOG.error("NVMe directory does not exist: %s", nvme_dir)
         return 2
     try:
         lm_dir = _installed_megatron_lm()
-        lm_sources = _LM_SOURCE_FILES
-        if args.parameter_tier == "cpu":
-            if not all((lm_dir / path).is_file() for path in _LM_FSDP_SOURCE_FILES):
-                raise RuntimeError("CPU parameter offload requires the Megatron-LM layer-by-layer FSDP backend.")
-            lm_sources += _LM_FSDP_SOURCE_FILES
         nsys_version = _check_nsys_version() if args.profile == "nsys" else None
         worker_overrides = (
             resolve_network(os.environ) if args.single_case_layout or nsys_version else {}
@@ -691,7 +716,7 @@ def main() -> int:
         f"{prefix}/{path}": hashlib.sha256((root / path).read_bytes()).hexdigest()
         for prefix, root, paths in (
             ("bridge", _REPO, bridge_source_files),
-            ("megatron-lm", lm_dir, lm_sources),
+            ("megatron-lm", lm_dir, _LM_SOURCE_FILES),
         )
         for path in paths
     }

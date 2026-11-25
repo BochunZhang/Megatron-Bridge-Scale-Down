@@ -10,6 +10,7 @@ import pytest
 
 
 BASELINE_DIR = Path(__file__).resolve().parents[4] / "examples/scale-down/02-layer-by-layer/01-baseline"
+SWEEP = BASELINE_DIR.parent / "sweep.py"
 
 
 @pytest.mark.unit
@@ -20,7 +21,7 @@ BASELINE_DIR = Path(__file__).resolve().parents[4] / "examples/scale-down/02-lay
 def test_layer_by_layer_baseline_dry_run(tmp_path: Path, case: str, parameter_tier: str) -> None:
     script = BASELINE_DIR / f"{case}.sh"
     results_root = tmp_path / "results with spaces"
-    args = ["bash", str(script), "--output-dir", str(results_root), "--nvme", str(tmp_path)]
+    args = ["bash", str(script), "--output-dir", str(results_root)]
     env = {**os.environ, "PYTHON": sys.executable, "NSYS_BIN": "/example/nsys"}
     result = subprocess.run([*args, "--dry-run"], env=env, check=True, capture_output=True, text=True)
     command = shlex.split(result.stderr.strip())
@@ -34,17 +35,18 @@ def test_layer_by_layer_baseline_dry_run(tmp_path: Path, case: str, parameter_ti
         "train.micro_batch_size=1",
         "train.global_batch_size=16",
         "train.train_iters=10",
-        "layer_by_layer.backend=offload",
         f"layer_by_layer.parameter_tier={parameter_tier}",
         "layer_by_layer.activation_tier=gpu",
         "layer_by_layer.optimizer_tier=gpu",
         "profiling.profile_step_start=7",
         "profiling.profile_step_end=8",
     }.issubset(command)
+    assert all(not arg.startswith(("layer_by_layer.backend=", "layer_by_layer.nvme_dir=")) for arg in command)
 
     result = subprocess.run([*args, "--print-result-dir"], env=env, check=True, capture_output=True, text=True)
     result_path = Path(result.stdout.strip())
     assert result_path.parent.parent == results_root / "01-baseline" / case.replace("_", "-")
+    assert result_path.parent.name.startswith("model_27b-lbl-schedule-")
     report = Path(next(arg.removeprefix("--output=") for arg in command if arg.startswith("--output=")))
     assert report.parent == result_path
     assert report.name.endswith(f"-param_{parameter_tier}-act_gpu-opt_gpu")
@@ -53,28 +55,102 @@ def test_layer_by_layer_baseline_dry_run(tmp_path: Path, case: str, parameter_ti
 
 @pytest.mark.unit
 @pytest.mark.parametrize(
-    ("fsdp_result", "expected_status"),
+    ("extra_args", "expected"),
     [
-        ({}, "passed"),
-        ({"parameter_backend": "layer_by_layer"}, "invalid_result"),
-        ({"parameter_gpu_prefetch_slots": 1}, "invalid_result"),
-        ({"parameter_h2d_prefetched_units_by_rank": [190, 190, 190, 189]}, "invalid_result"),
+        ([], {"layer_by_layer.parameter_tier=gpu", "layer_by_layer.optimizer_tier=gpu"}),
+        (["--parameter-tier", "cpu"], {"layer_by_layer.parameter_tier=cpu", "layer_by_layer.optimizer_tier=gpu"}),
+        (
+            ["--optimizer-tier", "cpu"],
+            {
+                "layer_by_layer.parameter_tier=gpu",
+                "layer_by_layer.optimizer_tier=cpu",
+                "layer_by_layer.cpu_optimizer=torch",
+            },
+        ),
     ],
 )
-def test_param_cpu_result_requires_fsdp_prefetch(tmp_path: Path, fsdp_result: dict, expected_status: str) -> None:
+def test_layer_by_layer_sweep_gpu_activation_placements(extra_args: list[str], expected: set[str]) -> None:
+    result = subprocess.run(
+        [sys.executable, str(SWEEP), "--dry-run", *extra_args], capture_output=True, text=True, check=True
+    )
+    command = shlex.split(result.stderr)
+    assert expected | {"layer_by_layer.activation_tier=gpu"} <= set(command)
+
+
+@pytest.mark.unit
+def test_layer_by_layer_sweep_nvme_uses_case_scratch(tmp_path: Path) -> None:
+    nvme = tmp_path / "nvme with spaces"
+    nvme.mkdir()
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(SWEEP),
+            "--dry-run",
+            "--parameter-tier",
+            "nvme",
+            "--optimizer-tier",
+            "nvme",
+            "--nvme",
+            str(nvme),
+        ],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    command = shlex.split(result.stderr)
+    assert {"layer_by_layer.parameter_tier=nvme", "layer_by_layer.optimizer_tier=nvme"} <= set(command)
+    scratch = next(
+        arg.removeprefix("layer_by_layer.nvme_dir=") for arg in command if arg.startswith("layer_by_layer.nvme_dir=")
+    )
+    assert Path(json.loads(scratch)).parent.resolve() == nvme.resolve()
+    assert not any(nvme.iterdir())
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    "extra_args",
+    [
+        ["--activation-tier", "cpu"],
+        ["--parameter-tier", "nvme"],
+        ["--optimizer-tier", "nvme"],
+        ["--parameter-tier", "nvme", "--optimizer-tier", "nvme"],
+    ],
+)
+def test_layer_by_layer_sweep_rejects_unsupported_placements(extra_args: list[str]) -> None:
+    result = subprocess.run([sys.executable, str(SWEEP), "--dry-run", *extra_args], capture_output=True, text=True)
+    assert result.returncode == 2
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    ("parameter_tier", "fsdp_result", "expected_status"),
+    [
+        ("gpu", {}, "passed"),
+        ("cpu", {}, "passed"),
+        ("cpu", {"schedule": "no_pipeline"}, "invalid_result"),
+        ("cpu", {"parameter_backend": "layer_by_layer"}, "invalid_result"),
+        ("cpu", {"fsdp_strategy": "optim_grads"}, "invalid_result"),
+        ("cpu", {"fsdp_cpu_offload": []}, "invalid_result"),
+        ("cpu", {"steps": 9}, "invalid_result"),
+        ("cpu", {"world_size": 1}, "invalid_result"),
+    ],
+)
+def test_baseline_result_checks_native_fsdp_metrics(
+    tmp_path: Path, parameter_tier: str, fsdp_result: dict, expected_status: str
+) -> None:
     state_dir = tmp_path / "state"
     state_dir.mkdir()
     shared = {
         "layers": 8,
         "steps": 10,
-        "parameter_tier": "cpu",
+        "parameter_tier": parameter_tier,
         "activation_tier": "gpu",
         "optimizer_tier": "gpu",
     }
     state = {
         **shared,
         "results": str(tmp_path),
-        "microbatches": 4,
+        "optimizer_backend": None,
         "profile": "none",
         "nsys_version": None,
         "worker_overrides": {"GLOO_SOCKET_IFNAME": "eth0", "NCCL_SOCKET_IFNAME": "=eth0"},
@@ -85,16 +161,17 @@ def test_param_cpu_result_requires_fsdp_prefetch(tmp_path: Path, fsdp_result: di
         "loss": 7.0,
         "peak_allocated_bytes": 1024,
         "peak_reserved_bytes": 2048,
-        "activation_d2h_completed_by_rank": [0] * 4,
-        "activation_h2d_completed_by_rank": [0] * 4,
+        "schedule": "layer_by_layer",
         "parameter_backend": "megatron_fsdp",
-        "parameter_gpu_prefetch_slots": 2,
-        "parameter_h2d_prefetched_units_by_rank": [190] * 4,
+        "fsdp_strategy": "optim_grads_params",
+        "fsdp_cpu_offload": ["weight"] if parameter_tier == "cpu" else [],
+        "optimizer_backend": "FusedAdam",
+        "world_size": 4,
         **fsdp_result,
     }
     (tmp_path / "train.log").write_text(f"LAYER_BY_LAYER_RESULT {json.dumps(metrics)}\n", encoding="utf-8")
     result = subprocess.run(
-        [sys.executable, str(BASELINE_DIR.parent / "sweep.py"), "--finish-case", str(state_dir), "0"],
+        [sys.executable, str(SWEEP), "--finish-case", str(state_dir), "0"],
         capture_output=True,
         text=True,
     )
@@ -103,5 +180,6 @@ def test_param_cpu_result_requires_fsdp_prefetch(tmp_path: Path, fsdp_result: di
         row = next(csv.DictReader(summary))
     assert row["status"] == expected_status
     if expected_status == "passed":
-        assert row["parameter_gpu_prefetch_slots"] == "2"
-        assert row["parameter_h2d_prefetched_units_per_rank"] == "190"
+        assert row["optimizer_backend"] == "FusedAdam"
+        assert row["fsdp_cpu_offload"] == ("weight" if parameter_tier == "cpu" else "")
+        assert row["peak_allocated_bytes"] == "1024"

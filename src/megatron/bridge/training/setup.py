@@ -48,7 +48,7 @@ from megatron.bridge.training.checkpointing import (
     create_checkpoint_manager,
     maybe_load_dataloader_state,
 )
-from megatron.bridge.training.config import ConfigContainer, LayerByLayerRecipeConfig
+from megatron.bridge.training.config import ConfigContainer
 from megatron.bridge.training.initialize import initialize_megatron, set_jit_fusion_options
 from megatron.bridge.training.optim import (
     memory_efficient_fp32_optimizer_state_loading,
@@ -123,8 +123,8 @@ class SetupOutput(NamedTuple):
 
     state: GlobalState
     model: list[MegatronModule]
-    optimizer: MegatronOptimizer | None
-    scheduler: OptimizerParamScheduler | None
+    optimizer: MegatronOptimizer
+    scheduler: OptimizerParamScheduler
     train_data_iterator: Optional[RerunDataIterator | list[RerunDataIterator]]
     valid_data_iterator: Optional[RerunDataIterator | list[RerunDataIterator]]
     test_data_iterator: Optional[RerunDataIterator | list[RerunDataIterator]]
@@ -282,11 +282,6 @@ def setup(
 
     # Create checkpoint manager for save/load operations.
     checkpoint_manager = create_checkpoint_manager(cfg.checkpoint)
-
-    layer_by_layer = getattr(cfg, "layer_by_layer", None)
-    if isinstance(layer_by_layer, LayerByLayerRecipeConfig) and layer_by_layer.backend == "offload":
-        state.train_state.do_train = True
-        return SetupOutput(state, [], None, None, None, None, None, checkpoint_manager, pg_collection)
 
     # Tokenizer
     timers("tokenizer-setup", log_level=0).start(barrier=True)
