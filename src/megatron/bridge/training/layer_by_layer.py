@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Run Megatron-LM's layer-by-layer backend from Bridge pretraining."""
+"""Configure layer-by-layer training and support the sharded capacity-test backend."""
 
 import json
 import logging
@@ -46,21 +46,14 @@ def _normalize_tier(value: object, field_name: str, *, legacy_suffix: str = "") 
 
 
 def configure_layer_by_layer(config: ConfigContainer) -> None:
-    """Validate backend capabilities and set the geometry used by Bridge metrics."""
+    """Validate the requested layer-by-layer backend and set its model geometry."""
     offload = config.layer_by_layer
     assert offload is not None
+    if offload.backend not in ("schedule", "offload"):
+        raise ValueError("Layer-by-layer backend must be schedule or offload.")
     offload.parameter_tier = _normalize_tier(offload.parameter_tier, "parameter_tier", legacy_suffix="_param")
     offload.activation_tier = _normalize_tier(offload.activation_tier, "activation_tier", legacy_suffix="_act")
     offload.optimizer_tier = _normalize_tier(offload.optimizer_tier, "optimizer_tier")
-    if not isinstance(config.dataset, MockGPTDatasetConfig) or config.dataset.blend or config.dataset.blend_per_split:
-        raise ValueError("Layer-by-layer training requires a mock dataset without data blends.")
-    if config.peft is not None or any(
-        (config.checkpoint.load, config.checkpoint.save, config.checkpoint.pretrained_checkpoint)
-    ):
-        raise ValueError("Layer-by-layer training does not support PEFT or checkpoint loading and saving.")
-    if config.validation.eval_iters or config.validation.skip_train:
-        raise ValueError("Layer-by-layer training requires training without evaluation.")
-
     model = config.model
     if not isinstance(model, GPTModelProvider) or model.num_moe_experts:
         raise ValueError("Layer-by-layer training requires a dense GPT model provider.")
@@ -80,6 +73,25 @@ def configure_layer_by_layer(config: ConfigContainer) -> None:
         raise ValueError("Layer-by-layer training requires TP=PP=CP=EP=ETP=1 without sequence or virtual parallelism.")
     if model.position_embedding_type != "rope" or model.share_embeddings_and_output_weights:
         raise ValueError("Layer-by-layer training requires rotary embeddings and untied output weights.")
+    if not model.bf16 or model.params_dtype != torch.bfloat16 or model.fp16 or model.fp8 or model.fp4:
+        raise ValueError("Layer-by-layer training requires BF16 model parameters and compute.")
+
+    if offload.backend == "schedule":
+        _configure_native_schedule(config, model)
+        _apply_workload_geometry(model, tiny=offload.tiny)
+        model.layer_by_layer_schedule = True
+        if config.tokenizer.tokenizer_type == "NullTokenizer":
+            config.tokenizer.vocab_size = model.vocab_size
+        return
+
+    if not isinstance(config.dataset, MockGPTDatasetConfig) or config.dataset.blend or config.dataset.blend_per_split:
+        raise ValueError("Layer-by-layer training requires a mock dataset without data blends.")
+    if config.peft is not None or any(
+        (config.checkpoint.load, config.checkpoint.save, config.checkpoint.pretrained_checkpoint)
+    ):
+        raise ValueError("Layer-by-layer training does not support PEFT or checkpoint loading and saving.")
+    if config.validation.eval_iters or config.validation.skip_train:
+        raise ValueError("Layer-by-layer training requires training without evaluation.")
     if (
         model.cuda_graph_impl != "none"
         or model.cuda_graph_scope
@@ -93,8 +105,6 @@ def configure_layer_by_layer(config: ConfigContainer) -> None:
         raise ValueError("Layer-by-layer training owns sharding and requires MPU groups without CUDA graphs.")
     if config.rng.data_parallel_random_init:
         raise ValueError("Layer-by-layer training requires the same parameter initialization on every data rank.")
-    if not model.bf16 or model.params_dtype != torch.bfloat16 or model.fp16 or model.fp8 or model.fp4:
-        raise ValueError("Layer-by-layer training requires BF16 model parameters and compute.")
 
     training = config.train
     world_size = get_world_size_safe()
@@ -167,6 +177,46 @@ def configure_layer_by_layer(config: ConfigContainer) -> None:
     ):
         raise ValueError("Layer-by-layer profiling requires all ranks and 0 <= start < end <= train_iters.")
 
+    _apply_workload_geometry(model, tiny=offload.tiny)
+
+
+def _configure_native_schedule(config: ConfigContainer, model: GPTModelProvider) -> None:
+    offload = config.layer_by_layer
+    assert offload is not None
+    if not hasattr(model, "layer_by_layer_schedule"):
+        raise ValueError("The native layer-by-layer schedule requires the updated Megatron-LM layer-by-layer branch.")
+    if (offload.parameter_tier, offload.activation_tier, offload.optimizer_tier) != ("gpu", "gpu", "gpu"):
+        raise ValueError(
+            "The native layer-by-layer schedule requires GPU tiers. Select backend=offload for other tiers."
+        )
+    if (
+        config.peft is not None
+        or config.dist.use_megatron_fsdp
+        or config.ddp.use_megatron_fsdp
+        or config.dist.use_torch_fsdp2
+        or config.dist.use_decentralized_pg
+        or model.cuda_graph_impl != "none"
+        or model.cuda_graph_scope
+        or config.optimizer.optimizer_cpu_offload
+        or config.optimizer.optimizer_cuda_graph
+        or model.cpu_offloading
+        or model.fine_grained_activation_offloading
+        or model.hybrid_context_parallel
+        or model.overlap_moe_expert_parallel_comm
+        or model.mtp_num_layers
+    ):
+        raise ValueError(
+            "The native layer-by-layer schedule requires eager Megatron DDP and standard dense GPT layers."
+        )
+    if model.recompute_granularity is not None and (
+        model.recompute_granularity,
+        model.recompute_method,
+        model.recompute_num_layers,
+    ) != ("full", "uniform", 1):
+        raise ValueError("The native layer-by-layer schedule checkpoints each decoder layer individually.")
+
+
+def _apply_workload_geometry(model: GPTModelProvider, *, tiny: bool) -> None:
     from megatron.training.layer_by_layer_workload import (
         QWEN35_LAYER_BY_LAYER_TINY_VOCAB_SIZE,
         QWEN35_LAYER_BY_LAYER_VOCAB_SIZE,
@@ -174,7 +224,7 @@ def configure_layer_by_layer(config: ConfigContainer) -> None:
     )
 
     # Standard FLOP accounting and saved config must reflect the actual cropped workload.
-    if offload.tiny:
+    if tiny:
         tiny_model = build_qwen35_layer_by_layer_config(model.num_layers, tiny=True)
         tiny_model.linear_attention_freq = model.linear_attention_freq
         for field in fields(tiny_model):

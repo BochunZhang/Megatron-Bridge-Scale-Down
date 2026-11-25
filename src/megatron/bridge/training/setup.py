@@ -283,7 +283,8 @@ def setup(
     # Create checkpoint manager for save/load operations.
     checkpoint_manager = create_checkpoint_manager(cfg.checkpoint)
 
-    if isinstance(getattr(cfg, "layer_by_layer", None), LayerByLayerRecipeConfig):
+    layer_by_layer = getattr(cfg, "layer_by_layer", None)
+    if isinstance(layer_by_layer, LayerByLayerRecipeConfig) and layer_by_layer.backend == "offload":
         state.train_state.do_train = True
         return SetupOutput(state, [], None, None, None, None, None, checkpoint_manager, pg_collection)
 

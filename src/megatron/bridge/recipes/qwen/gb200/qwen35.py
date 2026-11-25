@@ -17,6 +17,9 @@
 from __future__ import annotations
 
 import torch
+from megatron.core.models.gpt.experimental_attention_variant_module_specs import (
+    get_transformer_block_with_experimental_attention_variant_spec,
+)
 from torch.nn import functional as F
 from transformers import AutoConfig
 
@@ -27,6 +30,7 @@ from megatron.bridge.recipes.utils.dataset_utils import build_dataset_config
 from megatron.bridge.training.comm_overlap import CommOverlapConfig
 from megatron.bridge.training.config import ConfigContainer, LayerByLayerRecipeConfig
 from megatron.bridge.training.mixed_precision import bf16_mixed, bf16_with_mxfp8_mixed
+from megatron.bridge.training.tokenizers.config import TokenizerConfig
 
 
 _QWEN35_9B_BASE = "Qwen/Qwen3.5-9B-Base"
@@ -463,6 +467,7 @@ def qwen35_text_27b_pretrain_4gpu_gb200_bf16_layer_by_layer_config() -> ConfigCo
     cfg = _pretrain_common()
     cfg.model = GPTModelProvider(
         hf_model_id=_QWEN35_27B_BASE,
+        transformer_layer_spec=get_transformer_block_with_experimental_attention_variant_spec,
         num_layers=8,
         hidden_size=5120,
         ffn_hidden_size=17408,
@@ -509,6 +514,7 @@ def qwen35_text_27b_pretrain_4gpu_gb200_bf16_layer_by_layer_config() -> ConfigCo
         seq_length=4096,
     )
     cfg.dataset = build_dataset_config(cfg, "mock")
+    cfg.tokenizer = TokenizerConfig(tokenizer_type="NullTokenizer", vocab_size=cfg.model.vocab_size)
     cfg.train.train_iters = 10
     cfg.train.global_batch_size = 16
     cfg.train.micro_batch_size = 1
@@ -525,6 +531,7 @@ def qwen35_text_27b_pretrain_4gpu_gb200_bf16_layer_by_layer_config() -> ConfigCo
     cfg.scheduler.lr_decay_style = "constant"
     cfg.scheduler.lr_warmup_iters = 0
     cfg.ddp.use_distributed_optimizer = False
+    cfg.ddp.data_parallel_sharding_strategy = "no_shard"
     cfg.ddp.overlap_grad_reduce = False
     cfg.ddp.overlap_param_gather = False
     cfg.checkpoint.load = None

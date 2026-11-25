@@ -52,7 +52,7 @@ def pretrain(
         config: The main configuration container holding all necessary parameters.
         forward_step_func: A callable (function or functor) that performs a single
                           forward and backward step, returning the loss and any computed
-                          metrics. Use None for a layer-by-layer recipe, whose backend owns the whole step.
+                          metrics. Use None for the layer-by-layer offload backend, which owns the whole step.
                           Supports the following signatures:
                           - 2 args: (data_iterator, model)
                           - 3 args: (data_iterator, model, return_schedule_plan=False)
@@ -151,7 +151,8 @@ def _pretrain(
             if state.train_state.do_train and config.train.train_iters > 0:
                 with ExitStack() as stack:
                     step_kwargs = {}
-                    if isinstance(getattr(config, "layer_by_layer", None), LayerByLayerRecipeConfig):
+                    layer_by_layer = getattr(config, "layer_by_layer", None)
+                    if isinstance(layer_by_layer, LayerByLayerRecipeConfig) and layer_by_layer.backend == "offload":
                         from megatron.bridge.training.layer_by_layer import layer_by_layer_step
 
                         step_kwargs["whole_step"] = stack.enter_context(layer_by_layer_step(state, pg_collection))

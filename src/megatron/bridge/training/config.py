@@ -984,8 +984,9 @@ class InProcessRestartConfig:
 # ---------------- Container config (standalone top-level config) ----------------
 @dataclass(kw_only=True)
 class LayerByLayerRecipeConfig:
-    """Offload controls for the layer-by-layer pretraining schedule."""
+    """Select the native schedule or the sharded capacity-test backend."""
 
+    backend: Literal["schedule", "offload"] = "schedule"
     parameter_tier: Literal["gpu", "cpu", "nvme", "gpu_param", "cpu_param", "nvme_param"] = "gpu"
     activation_tier: Literal["gpu", "cpu", "nvme", "gpu_act", "cpu_act", "nvme_act"] = "gpu"
     optimizer_tier: Literal["gpu", "cpu", "nvme"] = "gpu"

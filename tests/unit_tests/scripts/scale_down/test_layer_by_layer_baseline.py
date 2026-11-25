@@ -34,6 +34,7 @@ def test_layer_by_layer_baseline_dry_run(tmp_path: Path, case: str, parameter_ti
         "train.micro_batch_size=1",
         "train.global_batch_size=16",
         "train.train_iters=10",
+        "layer_by_layer.backend=offload",
         f"layer_by_layer.parameter_tier={parameter_tier}",
         "layer_by_layer.activation_tier=gpu",
         "layer_by_layer.optimizer_tier=gpu",

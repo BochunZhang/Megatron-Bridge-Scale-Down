@@ -1,6 +1,6 @@
 # Qwen3.5-27B layer-by-layer capacity test
 
-Run on one GB200 node with four GPUs available to the same CUDA/NCCL environment. The sweep uses four-way full sharding with TP, PP and CP each set to 1. It keeps the Qwen3.5-27B dense text-model widths and uses gated full attention in every decoder layer. Training uses BF16, randomly initialized weights, and synthetic token batches.
+The Qwen3.5 layer-by-layer recipe defaults to the Megatron `PP=1` schedule. The numbered capacity experiments and sweep explicitly select `layer_by_layer.backend=offload` for four-way weight sharding and the existing storage-tier measurements. Both paths use BF16 and gated full attention in every decoder layer.
 
 ## Prepare the training environment
 
@@ -18,7 +18,23 @@ git switch v0.6.0-scale-down
 git pull --ff-only origin v0.6.0-scale-down
 ```
 
-The launcher uses Bridge's configured CUDA environment through `uv run --no-sync`. Bridge's layer-by-layer step uses the workload builder and sharded trainer from the installed Megatron-LM checkout. Set `PYTHON` to use an explicit interpreter with that same environment configuration.
+The capacity launchers use Bridge's configured CUDA environment through `uv run --no-sync` and the sharded trainer from the installed Megatron-LM checkout. Run them on one GB200 node with four CUDA/NCCL ranks. Set `PYTHON` to use an explicit interpreter with that same environment configuration.
+
+## Native schedule smoke test
+
+Run from the Bridge root with the updated Megatron-LM checkout on the Python import path.
+
+```bash
+PYTHONPATH="$PWD/../megatron-lm${PYTHONPATH:+:$PYTHONPATH}" \
+uv run --no-sync python -m torch.distributed.run --standalone --nproc-per-node=4 \
+  scripts/training/run_recipe.py \
+  --recipe qwen35_text_27b_pretrain_4gpu_gb200_bf16_layer_by_layer_config \
+  --mode pretrain --dataset mock \
+  layer_by_layer.tiny=true model.num_layers=2 dataset.seq_length=128 \
+  train.train_iters=2 train.micro_batch_size=1 train.global_batch_size=8 logger.log_interval=1
+```
+
+The scheduler runs all microbatches through a decoder layer before advancing, then traverses the layers in reverse during backward. It uses a Megatron activation checkpoint per decoder layer and reuses Bridge's GPT step, DDP gradient synchronization, and optimizer. This path keeps parameters and activations on the GPU with Megatron DDP. Use the capacity launchers below for sharded weights and CPU/NVMe tiers.
 
 ## 8-layer all-GPU baseline
 

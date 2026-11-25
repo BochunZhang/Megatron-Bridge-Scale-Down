@@ -316,9 +316,14 @@ def train(
     # Wrap forward_backward_func for Full iteration CUDA graph
     forward_backward_func = None
     if whole_step is None:
+        layer_by_layer = getattr(config, "layer_by_layer", None)
+        schedule_kwargs = {}
+        if layer_by_layer is not None and layer_by_layer.backend == "schedule":
+            schedule_kwargs["layer_by_layer"] = True
         forward_backward_func = get_forward_backward_func(
             pp_size=pg_collection.pp.size(),
             vp_size=config.model.virtual_pipeline_model_parallel_size,
+            **schedule_kwargs,
         )
     if is_full_iteration_cuda_graph(config.model):
         forward_backward_func = FullCudaGraphWrapper(

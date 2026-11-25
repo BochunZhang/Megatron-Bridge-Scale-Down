@@ -299,6 +299,7 @@ def _command(
         f"train.micro_batch_size={args.micro_batch_size}",
         f"train.global_batch_size={args.micro_batch_size * args.microbatches * _WORLD_SIZE}",
         f"train.train_iters={args.steps}",
+        "layer_by_layer.backend=offload",
         f"layer_by_layer.parameter_tier={args.parameter_tier}",
         f"layer_by_layer.activation_tier={args.activation_tier}",
         f"layer_by_layer.optimizer_tier={args.optimizer_tier}",

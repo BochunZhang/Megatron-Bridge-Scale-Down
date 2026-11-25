@@ -513,14 +513,15 @@ def main(argv: list[str] | None = None) -> None:
     recipe = sync_offline_packing_alignment(recipe)
     recipe = sync_model_dataset_sequence_length(recipe)
 
-    if getattr(recipe, "layer_by_layer", None) is not None:
+    layer_by_layer = getattr(recipe, "layer_by_layer", None)
+    if layer_by_layer is not None and args.dryrun:
+        benchmark_world_size = 4
+    if layer_by_layer is not None and layer_by_layer.backend == "offload":
         if args.mode != "pretrain" or args.dataset not in (None, "mock"):
             raise ValueError("Layer-by-layer training supports mock-data pretraining only.")
         if args.step_func is not None:
             raise ValueError("Layer-by-layer training owns its whole step and does not accept --step-func.")
         forward_step = None
-        if args.dryrun:
-            benchmark_world_size = 4
     else:
         step_func_name = args.step_func or recipe_step(recipe_name)
         forward_step = load_forward_step(step_func_name, mode=step_mode)

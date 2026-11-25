@@ -29,6 +29,7 @@ from megatron.core.pipeline_parallel.utils import (
 from megatron.core.transformer.enums import LayerType
 from megatron.core.transformer.pipeline_parallel_layer_layout import PipelineParallelLayerLayout
 from megatron.core.utils import (
+    get_attr_wrapped_model,
     get_batch_on_this_cp_rank,
     get_model_config,
     get_pg_rank,
@@ -456,6 +457,10 @@ def _forward_step_common(
 
     with straggler_timer:
         if return_schedule_plan:
+            if getattr(config, "layer_by_layer_schedule", False):
+                build_plan = get_attr_wrapped_model(model, "build_layer_by_layer_schedule_plan")
+                schedule_plan = build_plan(**forward_args, loss_mask=loss_mask)
+                return schedule_plan, loss_mask
             assert config.overlap_moe_expert_parallel_comm, (
                 "overlap_moe_expert_parallel_comm must be enabled to return the schedule plan"
             )
