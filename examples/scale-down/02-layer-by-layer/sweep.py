@@ -65,8 +65,6 @@ _CASE_SCRIPTS = tuple(
     for name in (
         "01_param_gpu_act_gpu_opt_gpu.sh",
         "02_param_cpu_act_gpu_opt_gpu.sh",
-        "01_cpu_offload.sh",
-        "02_nvme_offload.sh",
         "offload_common.sh",
     )
 )
