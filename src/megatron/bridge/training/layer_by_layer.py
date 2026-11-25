@@ -201,6 +201,9 @@ def layer_by_layer_step(
     config = state.cfg
     offload, model, optimizer = config.layer_by_layer, config.model, config.optimizer
     assert offload is not None and isinstance(model, GPTModelProvider) and optimizer.lr is not None
+    parameter_cpu = offload.parameter_tier == "cpu"
+    if parameter_cpu and not hasattr(LayerByLayerTrainer, "parameter_prefetch_stats"):
+        raise RuntimeError("CPU parameter offload requires the Megatron-LM layer-by-layer FSDP backend.")
     torch.set_num_threads(offload.cpu_threads)
     device = torch.device("cuda", torch.cuda.current_device())
     torch.cuda.reset_peak_memory_stats(device)
@@ -246,6 +249,9 @@ def layer_by_layer_step(
             torch.cuda.synchronize(device)
             parameter_count = trainer.param_count
             transfers = trainer.activation_transfer_counts
+            if parameter_cpu:
+                parameter_backend = trainer.parameter_backend
+                transfers += trainer.parameter_prefetch_stats
 
     steps = state.train_state.step
     if steps != config.train.train_iters or loss is None:
@@ -259,12 +265,22 @@ def layer_by_layer_step(
     local_transfers = torch.tensor(transfers, dtype=torch.int64, device=device)
     all_transfers = torch.empty(group.size() * local_transfers.numel(), dtype=torch.int64, device=device)
     dist.all_gather_into_tensor(all_transfers, local_transfers, group=group)
-    transfers_by_rank = all_transfers.view(group.size(), 2).tolist()
+    transfers_by_rank = all_transfers.view(group.size(), -1).tolist()
     microbatches = config.train.global_batch_size // (config.train.micro_batch_size * group.size())
     expected_d2h = 0 if offload.activation_tier == "gpu" else (model.num_layers + 1) * microbatches * steps
     expected = [expected_d2h, 2 * expected_d2h]
-    if any(counts != expected for counts in transfers_by_rank):
-        raise RuntimeError(f"Expected {expected} D2H/H2D transfers per rank, got {transfers_by_rank}.")
+    activation_transfers = [counts[:2] for counts in transfers_by_rank]
+    if any(counts != expected for counts in activation_transfers):
+        raise RuntimeError(f"Expected {expected} D2H/H2D activation transfers per rank, got {activation_transfers}.")
+    if parameter_cpu:
+        # Embedding and loss head count as units. The loss head stays gathered into backward.
+        expected_prefetch = [2, (2 * model.num_layers + 3) * steps]
+        parameter_prefetch = [counts[2:] for counts in transfers_by_rank]
+        if parameter_backend != "megatron_fsdp" or any(counts != expected_prefetch for counts in parameter_prefetch):
+            raise RuntimeError(
+                f"Expected Megatron-FSDP prefetch stats {expected_prefetch} per rank, "
+                f"got {parameter_backend}: {parameter_prefetch}."
+            )
     if dist.get_rank() == 0:
         allocated, reserved = peaks.tolist()
         result = {
@@ -274,10 +290,16 @@ def layer_by_layer_step(
             "parameter_tier": offload.parameter_tier,
             "activation_tier": offload.activation_tier,
             "optimizer_tier": offload.optimizer_tier,
-            "activation_d2h_completed_by_rank": [counts[0] for counts in transfers_by_rank],
-            "activation_h2d_completed_by_rank": [counts[1] for counts in transfers_by_rank],
+            "activation_d2h_completed_by_rank": [counts[0] for counts in activation_transfers],
+            "activation_h2d_completed_by_rank": [counts[1] for counts in activation_transfers],
             "loss": loss,
             "peak_allocated_bytes": allocated,
             "peak_reserved_bytes": reserved,
         }
+        if parameter_cpu:
+            result.update(
+                parameter_backend=parameter_backend,
+                parameter_gpu_prefetch_slots=expected_prefetch[0],
+                parameter_h2d_prefetched_units_by_rank=[counts[1] for counts in parameter_prefetch],
+            )
         logger.info("LAYER_BY_LAYER_RESULT %s", json.dumps(result, allow_nan=False))

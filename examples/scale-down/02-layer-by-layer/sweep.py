@@ -54,9 +54,21 @@ _LM_SOURCE_FILES = (
     "megatron/core/distributed/layer_by_layer_storage.py",
     "megatron/training/layer_by_layer_workload.py",
 )
+_LM_FSDP_SOURCE_FILES = (
+    "megatron/core/distributed/layer_by_layer_fsdp.py",
+    "megatron/core/distributed/fsdp/src/megatron_fsdp/distributed_data_parallel_config.py",
+    "megatron/core/distributed/fsdp/src/megatron_fsdp/param_and_grad_buffer.py",
+    "megatron/core/distributed/fsdp/src/megatron_fsdp/utils.py",
+)
 _CASE_SCRIPTS = tuple(
     f"{_EXAMPLE_DIR}/01-baseline/{name}"
-    for name in ("01_param_gpu_act_gpu_opt_gpu.sh", "01_cpu_offload.sh", "02_nvme_offload.sh", "offload_common.sh")
+    for name in (
+        "01_param_gpu_act_gpu_opt_gpu.sh",
+        "02_param_cpu_act_gpu_opt_gpu.sh",
+        "01_cpu_offload.sh",
+        "02_nvme_offload.sh",
+        "offload_common.sh",
+    )
 )
 _RESULT_PREFIX = "LAYER_BY_LAYER_RESULT "
 _RESOURCE_ERRORS = {
@@ -81,6 +93,9 @@ _RESULT_COLUMNS = (
     "peak_reserved_bytes",
     "activation_d2h_completed_per_rank",
     "activation_h2d_completed_per_rank",
+    "parameter_backend",
+    "parameter_gpu_prefetch_slots",
+    "parameter_h2d_prefetched_units_per_rank",
     "log",
 )
 
@@ -383,6 +398,24 @@ def _read_result(
     d2h = metrics.get("activation_d2h_completed_by_rank")
     h2d = metrics.get("activation_h2d_completed_by_rank")
     expected_d2h = 0 if activation_tier == "gpu" else (layers + 1) * microbatches * steps
+    parameter_metrics = {}
+    if parameter_tier == "cpu":
+        slots = metrics.get("parameter_gpu_prefetch_slots")
+        reloads = metrics.get("parameter_h2d_prefetched_units_by_rank")
+        expected_reloads = (2 * layers + 3) * steps
+        if (
+            metrics.get("parameter_backend") != "megatron_fsdp"
+            or type(slots) is not int
+            or slots != 2
+            or reloads != [expected_reloads] * _WORLD_SIZE
+            or any(type(count) is not int for count in reloads)
+        ):
+            return result
+        parameter_metrics = {
+            "parameter_backend": "megatron_fsdp",
+            "parameter_gpu_prefetch_slots": slots,
+            "parameter_h2d_prefetched_units_per_rank": expected_reloads,
+        }
     if (
         metrics.get("layers") == layers
         and metrics.get("steps") == steps
@@ -406,6 +439,7 @@ def _read_result(
             peak_reserved_bytes=reserved,
             activation_d2h_completed_per_rank=d2h[0],
             activation_h2d_completed_per_rank=h2d[0],
+            **parameter_metrics,
         )
     return result
 
@@ -600,6 +634,11 @@ def main() -> int:
         return 2
     try:
         lm_dir = _installed_megatron_lm()
+        lm_sources = _LM_SOURCE_FILES
+        if args.parameter_tier == "cpu":
+            if not all((lm_dir / path).is_file() for path in _LM_FSDP_SOURCE_FILES):
+                raise RuntimeError("CPU parameter offload requires the Megatron-LM layer-by-layer FSDP backend.")
+            lm_sources += _LM_FSDP_SOURCE_FILES
         nsys_version = _check_nsys_version() if args.profile == "nsys" else None
         worker_overrides = (
             resolve_network(os.environ) if args.single_case_layout or nsys_version else {}
@@ -653,7 +692,7 @@ def main() -> int:
         f"{prefix}/{path}": hashlib.sha256((root / path).read_bytes()).hexdigest()
         for prefix, root, paths in (
             ("bridge", _REPO, bridge_source_files),
-            ("megatron-lm", lm_dir, _LM_SOURCE_FILES),
+            ("megatron-lm", lm_dir, lm_sources),
         )
         for path in paths
     }

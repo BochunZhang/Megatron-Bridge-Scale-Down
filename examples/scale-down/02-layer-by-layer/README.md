@@ -30,7 +30,25 @@ bash "$study/01_param_gpu_act_gpu_opt_gpu.sh" --dry-run
 bash "$study/01_param_gpu_act_gpu_opt_gpu.sh"
 ```
 
-This baseline keeps parameter shards, layer-boundary activations, and optimizer state on the GPUs and executes AdamW on the GPUs. The other numbered scripts select CPU parameters and activations with NVMe optimizer state, or NVMe for all three. Set `--nvme DIR` or `NVME_PATH` if those cases use a node-local NVMe mount other than `/tmp`.
+This baseline keeps parameter shards, layer-boundary activations, and optimizer state on the GPUs and executes AdamW on the GPUs.
+
+## 8-layer CPU parameter offload
+
+Run the matched case from the Bridge repository root with the layer-by-layer Megatron-FSDP backend installed in Megatron-LM.
+
+```bash
+study=examples/scale-down/02-layer-by-layer/01-baseline
+bash "$study/02_param_cpu_act_gpu_opt_gpu.sh" --dry-run
+bash "$study/02_param_cpu_act_gpu_opt_gpu.sh"
+```
+
+Megatron-FSDP stores each rank's BF16 compute-weight shards in pinned host memory. Its double buffer holds the current unit and the next prefetched unit on the GPU. The H2D copy fills the local slice of a GPU buffer in place, then NCCL all-gathers that unit's weights. AdamW, its FP32 master weights and moments, and layer-boundary activations stay on the GPU. The GPU optimizer publishes updated compute-weight shards back to pinned host memory.
+
+Results go under `results/02-layer-by-layer/01-baseline/02-param-cpu-act-gpu-opt-gpu/`. A default run requires two GPU prefetch slots and 190 unit-level parameter reloads per rank. It also requires zero activation D2H and H2D copies. The result log and `summary.csv` record the backend, slot count, and reload count. The output head is reused from forward into backward, so each step reloads `2 * num_layers + 3` units including the input embedding.
+
+The existing CPU and NVMe offload scripts select CPU parameters and activations with NVMe optimizer state, or NVMe for all three. Set `--nvme DIR` or `NVME_PATH` if those cases use a node-local NVMe mount other than `/tmp`.
+
+## Running and profiling the numbered cases
 
 The numbered scripts select the experiment settings and call `run_pretrain_layer_by_layer.sh`. That Bash launcher wraps four torchrun workers in Nsight Systems and runs Bridge's `scripts/training/run_recipe.py --recipe qwen35_text_27b_pretrain_4gpu_gb200_bf16_layer_by_layer_config --mode pretrain --dataset mock` on each rank. Bridge runs its pretraining loop and iteration logger, using the Megatron-LM layer-by-layer trainer for each optimizer step. The launcher uses the same NUMA selection order as the FSDP3 study.
 
