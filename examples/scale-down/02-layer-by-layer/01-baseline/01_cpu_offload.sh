@@ -3,4 +3,4 @@
 set -euo pipefail
 
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-exec bash "${script_dir}/offload_common.sh" 01-cpu-offload cpu_param cpu_act "$@"
+exec bash "${script_dir}/offload_common.sh" 01-cpu-offload cpu cpu nvme "$@"

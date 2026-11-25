@@ -7,7 +7,8 @@ repo_root="$(cd "${script_dir}/../../../.." && pwd)"
 case_name="$1"
 parameter_tier="$2"
 activation_tier="$3"
-shift 3
+optimizer_tier="$4"
+shift 4
 nvme_path="${NVME_PATH:-/tmp}"
 output_dir="${OUTPUT_DIR:-${repo_root}/results/02-layer-by-layer}"
 train_iters=10
@@ -52,7 +53,7 @@ done
 
 [[ "${output_dir}" == /* ]] || output_dir="${PWD}/${output_dir}"
 model_name="model_27b-layers_32-cg_off-mbs_1-seq_4096-tp_1-cp_1-gbs_16-gpus_4"
-model_name+="-param_${parameter_tier}-act_${activation_tier}-iters_${train_iters}-profile_${profile}"
+model_name+="-param_${parameter_tier}-act_${activation_tier}-opt_${optimizer_tier}-iters_${train_iters}-profile_${profile}"
 result_dir="${output_dir%/}/01-baseline/${case_name}/${model_name}/node0"
 if [[ "${print_result_dir}" == true ]]; then
     printf '%s\n' "${result_dir}"
@@ -62,6 +63,7 @@ fi
 args=(--single-case-layout --results-dir "${result_dir}"
     --layers 32 --seq-length 4096 --micro-batch-size 1 --microbatches 4
     --steps "${train_iters}" --parameter-tier "${parameter_tier}" --activation-tier "${activation_tier}"
+    --optimizer-tier "${optimizer_tier}"
     --profile "${profile}")
 [[ "${dry_run}" == true ]] && args+=(--dry-run)
 

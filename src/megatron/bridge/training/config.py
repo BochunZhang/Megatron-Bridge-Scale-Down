@@ -986,8 +986,9 @@ class InProcessRestartConfig:
 class LayerByLayerRecipeConfig:
     """Offload controls for the layer-by-layer pretraining schedule."""
 
-    parameter_tier: Literal["cpu_param", "nvme_param"] = "cpu_param"
-    activation_tier: Literal["gpu_act", "cpu_act", "nvme_act"] = "cpu_act"
+    parameter_tier: Literal["gpu", "cpu", "nvme", "gpu_param", "cpu_param", "nvme_param"] = "gpu"
+    activation_tier: Literal["gpu", "cpu", "nvme", "gpu_act", "cpu_act", "nvme_act"] = "gpu"
+    optimizer_tier: Literal["gpu", "cpu", "nvme"] = "gpu"
     nvme_dir: str = "/tmp"
     cpu_threads: int = 8
     tiny: bool = False

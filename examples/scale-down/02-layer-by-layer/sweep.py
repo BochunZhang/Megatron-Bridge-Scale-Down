@@ -25,6 +25,7 @@ _LOG = logging.getLogger(__name__)
 _REPO = Path(__file__).resolve().parents[3]
 _WORLD_SIZE = 4
 _NSYS_VERSION = "2026.6.1"
+_PLACEMENTS = ("gpu", "cpu", "nvme")
 _EXAMPLE_DIR = "examples/scale-down/02-layer-by-layer"
 _RECIPE = "qwen35_text_27b_pretrain_4gpu_gb200_bf16_layer_by_layer_config"
 _RECIPE_RUNNER = "scripts/training/run_recipe.py"
@@ -55,7 +56,7 @@ _LM_SOURCE_FILES = (
 )
 _CASE_SCRIPTS = tuple(
     f"{_EXAMPLE_DIR}/01-baseline/{name}"
-    for name in ("01_cpu_offload.sh", "02_nvme_offload.sh", "offload_common.sh")
+    for name in ("01-param-gpu-act-gpu-opt-gpu.sh", "01_cpu_offload.sh", "02_nvme_offload.sh", "offload_common.sh")
 )
 _RESULT_PREFIX = "LAYER_BY_LAYER_RESULT "
 _RESOURCE_ERRORS = {
@@ -69,7 +70,9 @@ _RESOURCE_ERRORS = {
 }
 _RESULT_COLUMNS = (
     "layers",
+    "parameter_tier",
     "activation_tier",
+    "optimizer_tier",
     "status",
     "returncode",
     "steps",
@@ -166,11 +169,12 @@ def _arguments() -> argparse.Namespace:
     )
     parser.add_argument("--steps", type=_positive, default=3)
     parser.add_argument(
-        "--parameter-tier", choices=("cpu_param", "nvme_param"), default="nvme_param"
+        "--parameter-tier", type=lambda tier: tier.removesuffix("_param"), choices=_PLACEMENTS, default="nvme"
     )
     parser.add_argument(
-        "--activation-tier", choices=("gpu_act", "cpu_act", "nvme_act"), default="nvme_act"
+        "--activation-tier", type=lambda tier: tier.removesuffix("_act"), choices=_PLACEMENTS, default="nvme"
     )
+    parser.add_argument("--optimizer-tier", choices=_PLACEMENTS, default="nvme")
     parser.add_argument("--learning-rate", type=float)
     parser.add_argument("--cpu-threads", type=_positive)
     parser.add_argument("--profile", choices=("none", "nsys"), default="none")
@@ -225,7 +229,14 @@ def _check_nsys_version() -> str:
 
 
 def _profile_report(args: argparse.Namespace, layers: int, results: Path) -> Path:
-    return results / ("train.nsys-rep" if args.single_case_layout else f"layers-{layers}.nsys-rep")
+    model = "qwen35_tiny" if args.tiny else "qwen35_27b"
+    seq = f"{args.seq_length // 1024}k" if args.seq_length % 1024 == 0 else str(args.seq_length)
+    gbs = args.micro_batch_size * args.microbatches * _WORLD_SIZE
+    return results / (
+        f"{model}-layer_by_layer-layers_{layers}-attn_hybrid-bf16-cg_off-tp_1-cp_1-pp_1-dp_{_WORLD_SIZE}"
+        f"-mbs_{args.micro_batch_size}-gbs_{gbs}-seq_{seq}-iters_{args.steps}"
+        f"-param_{args.parameter_tier}-act_{args.activation_tier}-opt_{args.optimizer_tier}.nsys-rep"
+    )
 
 
 def _numa_worker() -> tuple[str, list[str]]:
@@ -249,8 +260,8 @@ def _command(
     python = (
         [sys.executable] if os.environ.get("PYTHON") else ["uv", "run", "--project", str(_REPO), "--no-sync", "python"]
     )
-    config_path = report.parent / "config.yaml" if args.single_case_layout else report.with_suffix(".config.yaml")
-    tensorboard_dir = report.parent / "tensorboard" if args.single_case_layout else report.with_suffix(".tensorboard")
+    config_path = report.parent / ("config.yaml" if args.single_case_layout else f"layers-{layers}.config.yaml")
+    tensorboard_dir = report.parent / ("tensorboard" if args.single_case_layout else f"layers-{layers}.tensorboard")
     _, numa_wrapper = _numa_worker()
     command = [
         *python,
@@ -276,6 +287,7 @@ def _command(
         f"train.train_iters={args.steps}",
         f"layer_by_layer.parameter_tier={args.parameter_tier}",
         f"layer_by_layer.activation_tier={args.activation_tier}",
+        f"layer_by_layer.optimizer_tier={args.optimizer_tier}",
         f"layer_by_layer.nvme_dir={json.dumps(str(scratch))}",
         "logger.log_interval=1",
         "logger.log_throughput=true",
@@ -330,11 +342,15 @@ def _read_result(
     *,
     steps: int,
     microbatches: int,
+    parameter_tier: str,
     activation_tier: str,
+    optimizer_tier: str,
 ) -> dict:
     result = {
         "layers": layers,
+        "parameter_tier": parameter_tier,
         "activation_tier": activation_tier,
+        "optimizer_tier": optimizer_tier,
         "status": "failed",
         "returncode": returncode,
         "log": log_path.name,
@@ -365,11 +381,13 @@ def _read_result(
     reserved = metrics.get("peak_reserved_bytes")
     d2h = metrics.get("activation_d2h_completed_by_rank")
     h2d = metrics.get("activation_h2d_completed_by_rank")
-    expected_d2h = 0 if activation_tier == "gpu_act" else (layers + 1) * microbatches * steps
+    expected_d2h = 0 if activation_tier == "gpu" else (layers + 1) * microbatches * steps
     if (
         metrics.get("layers") == layers
         and metrics.get("steps") == steps
+        and metrics.get("parameter_tier") == parameter_tier
         and metrics.get("activation_tier") == activation_tier
+        and metrics.get("optimizer_tier") == optimizer_tier
         and d2h == [expected_d2h] * _WORLD_SIZE
         and h2d == [2 * expected_d2h] * _WORLD_SIZE
         and all(type(count) is int for count in (*d2h, *h2d))
@@ -421,11 +439,13 @@ def _write_launch(
         "numa_mode": _numa_worker()[0],
         "parameter_tier": args.parameter_tier,
         "activation_tier": args.activation_tier,
+        "optimizer_tier": args.optimizer_tier,
         "nvme_path": str(nvme_dir),
         "profile": args.profile,
         "profile_start": args.profile_start,
         "profile_end": args.profile_end,
         "nsys_version": nsys_version,
+        "nsys_report": _profile_report(args, args.layers[0], results).name if nsys_version else None,
         "gpu_metrics_hz": None,
         "gloo_socket_ifname": worker_overrides["GLOO_SOCKET_IFNAME"],
         "nccl_socket_ifname": worker_overrides["NCCL_SOCKET_IFNAME"],
@@ -481,7 +501,9 @@ def _collect_case(args: argparse.Namespace, layers: int, results: Path, log_path
         layers,
         steps=args.steps,
         microbatches=args.microbatches,
+        parameter_tier=args.parameter_tier,
         activation_tier=args.activation_tier,
+        optimizer_tier=args.optimizer_tier,
     )
     if args.profile == "nsys" and case["status"] == "passed":
         report = _profile_report(args, layers, results)
@@ -527,7 +549,12 @@ def _prepare_case(
         "layers": layers,
         "steps": args.steps,
         "microbatches": args.microbatches,
+        "micro_batch_size": args.micro_batch_size,
+        "seq_length": args.seq_length,
+        "tiny": args.tiny,
+        "parameter_tier": args.parameter_tier,
         "activation_tier": args.activation_tier,
+        "optimizer_tier": args.optimizer_tier,
         "profile": args.profile,
         "worker_overrides": worker_overrides,
         "nsys_version": nsys_version,

@@ -23,6 +23,7 @@ from contextlib import contextmanager
 from dataclasses import fields
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from typing import Literal
 
 import torch
 from megatron.core.process_groups_config import ProcessGroupCollection
@@ -37,10 +38,20 @@ from megatron.bridge.utils.common_utils import get_world_size_safe
 logger = logging.getLogger(__name__)
 
 
+def _normalize_tier(value: object, field_name: str, *, legacy_suffix: str = "") -> Literal["gpu", "cpu", "nvme"]:
+    tier = value.removesuffix(legacy_suffix) if isinstance(value, str) else None
+    if tier == "gpu" or tier == "cpu" or tier == "nvme":
+        return tier
+    raise ValueError(f"Layer-by-layer {field_name} must be gpu, cpu, or nvme, got {value!r}.")
+
+
 def configure_layer_by_layer(config: ConfigContainer) -> None:
     """Validate backend capabilities and set the geometry used by Bridge metrics."""
     offload = config.layer_by_layer
     assert offload is not None
+    offload.parameter_tier = _normalize_tier(offload.parameter_tier, "parameter_tier", legacy_suffix="_param")
+    offload.activation_tier = _normalize_tier(offload.activation_tier, "activation_tier", legacy_suffix="_act")
+    offload.optimizer_tier = _normalize_tier(offload.optimizer_tier, "optimizer_tier")
     if not isinstance(config.dataset, MockGPTDatasetConfig) or config.dataset.blend or config.dataset.blend_per_split:
         raise ValueError("Layer-by-layer training requires a mock dataset without data blends.")
     if config.peft is not None or any(
@@ -215,6 +226,7 @@ def layer_by_layer_step(
             directory=Path(scratch),
             tier=offload.parameter_tier,
             activation_tier=offload.activation_tier,
+            optimizer_tier=offload.optimizer_tier,
             betas=(optimizer.adam_beta1, optimizer.adam_beta2),
             eps=optimizer.adam_eps,
             weight_decay=optimizer.weight_decay,
@@ -223,7 +235,7 @@ def layer_by_layer_step(
             def step(iteration: int, microbatches: int) -> dict[str, torch.Tensor]:
                 nonlocal loss
                 batches = [workload.make_batch(iteration, mb, rank) for mb in range(microbatches)]
-                loss = trainer.step(batches, lr=optimizer.lr)
+                loss = trainer.step(batches, lr=optimizer.lr, iteration=iteration)
                 if config.profiling.use_nsys_profiler and iteration + 1 == config.profiling.profile_step_end:
                     # Keep the first rank to stop capture from cutting off another rank's final step.
                     dist.barrier(group=group, device_ids=[device.index])
@@ -248,7 +260,7 @@ def layer_by_layer_step(
     dist.all_gather_into_tensor(all_transfers, local_transfers, group=group)
     transfers_by_rank = all_transfers.view(group.size(), 2).tolist()
     microbatches = config.train.global_batch_size // (config.train.micro_batch_size * group.size())
-    expected_d2h = 0 if offload.activation_tier == "gpu_act" else (model.num_layers + 1) * microbatches * steps
+    expected_d2h = 0 if offload.activation_tier == "gpu" else (model.num_layers + 1) * microbatches * steps
     expected = [expected_d2h, 2 * expected_d2h]
     if any(counts != expected for counts in transfers_by_rank):
         raise RuntimeError(f"Expected {expected} D2H/H2D transfers per rank, got {transfers_by_rank}.")
@@ -260,6 +272,7 @@ def layer_by_layer_step(
             "parameter_count": parameter_count,
             "parameter_tier": offload.parameter_tier,
             "activation_tier": offload.activation_tier,
+            "optimizer_tier": offload.optimizer_tier,
             "activation_d2h_completed_by_rank": [counts[0] for counts in transfers_by_rank],
             "activation_h2d_completed_by_rank": [counts[1] for counts in transfers_by_rank],
             "loss": loss,
