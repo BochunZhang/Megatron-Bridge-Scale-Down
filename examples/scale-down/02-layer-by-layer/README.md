@@ -67,7 +67,7 @@ Results go under `results/02-layer-by-layer/01-baseline/02-param-cpu-act-gpu-opt
 
 ## 8-layer CPU parameter and boundary activation offload
 
-Case 03 uses the same model, batches, FSDP weight offload, and GPU AdamW as case 02. It reuses Megatron's selective activation offload copy routines to save checkpoint inputs in pinned CPU memory, from the embedding output through the final decoder output. The layer-by-layer scheduler manages its own per-layer transfer order using checkpoint tags that identify the microbatch, layer group, and tensor index. Reloads follow microbatch order within each layer. Grouped decoder checkpointing restores that layer's saved inputs before replaying any of its microbatches. Activation gradients and optimizer state stay on the GPU.
+Case 03 uses the same model, batches, FSDP weight offload, and GPU AdamW as case 02. Each decoder microbatch submits its checkpoint input to pinned CPU memory after its layer forward. The last microbatch of the final decoder layer keeps its input on the GPU. Backward reloads checkpoint inputs in descending microbatch order within the current stage and prefetches the preceding input as the current microbatch runs. Each decoder layer accumulates its parameter gradients in a single backward call. Activation gradients and optimizer state stay on the GPU.
 
 ```bash
 study=examples/scale-down/02-layer-by-layer/01-baseline
