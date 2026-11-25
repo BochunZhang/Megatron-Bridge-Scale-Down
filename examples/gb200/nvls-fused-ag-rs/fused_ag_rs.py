@@ -1,7 +1,7 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Compare one fused NCCL launch with two concurrent PyTorch collectives."""
+"""Measure fused, concurrent, or isolated NCCL collectives with PyTorch."""
 
 from __future__ import annotations
 
@@ -129,7 +129,7 @@ def _run_pairs(
                 launch()
                 completion.record()
             control.wait_event(completion)
-        # The next pair starts only after both outputs from this pair are usable.
+        # Reuse the buffers only after every output from this iteration is usable.
         end.record(control)
     control.synchronize()
     return [start.elapsed_time(end) * 1_000 for start, end in zip(starts, ends, strict=True)]
@@ -137,7 +137,7 @@ def _run_pairs(
 
 def _args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--mode", choices=("fused", "split"), required=True)
+    parser.add_argument("--mode", choices=("fused", "split", "ag-only", "rs-only"), required=True)
     parser.add_argument("--ag-mib", type=int, required=True, help="Full AG output per GPU")
     parser.add_argument("--rs-mib", type=int, required=True, help="Full RS input per GPU")
     parser.add_argument("--warmup", type=int, required=True)
@@ -163,7 +163,7 @@ def _args() -> argparse.Namespace:
 
 
 def main() -> None:
-    """Run and validate the selected collective pair on each torchrun rank."""
+    """Run and validate the selected collective workload on each torchrun rank."""
     args = _args()
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s")
     device = torch.device("cuda", int(os.environ["LOCAL_RANK"]))
@@ -176,25 +176,35 @@ def main() -> None:
         dist.init_process_group(backend="gloo")
         cleanup.callback(dist.destroy_process_group)
         rank, world = dist.get_rank(), dist.get_world_size()
-        ag_bytes, rs_bytes = args.ag_mib << 20, args.rs_mib << 20
-        if not 2 <= world <= 64 or ag_bytes % (world * 16) or rs_bytes % (world * 16):
+        sizes_mib = {}
+        if args.mode != "rs-only":
+            sizes_mib["ag"] = args.ag_mib
+        if args.mode != "ag-only":
+            sizes_mib["rs"] = args.rs_mib
+        if not 2 <= world <= 64 or any((size << 20) % (world * 16) for size in sizes_mib.values()):
             raise ValueError("Use 2–64 GPUs and AG/RS sizes that split into 16-byte-aligned shards")
-        ag_count, rs_count = ag_bytes // 2, rs_bytes // 2
 
-        ag_group = _new_group(device, cleanup)
-        ag_backend = ag_group._get_backend(device)
-        rs_group = _new_group(device, cleanup) if args.mode == "split" else ag_group
-        rs_backend = rs_group._get_backend(device)
-        # Distinct pools make each tensor the first allocation in its own NCCL-backed segment.
-        ag_out, ag_pool = _symmetric_tensor(ag_backend, ag_count, device=device)
-        rs_in, rs_pool = _symmetric_tensor(rs_backend, rs_count, device=device)
-        ag_in = torch.empty(ag_count // world, device=device, dtype=torch.bfloat16)
-        rs_out = torch.empty(rs_count // world, device=device, dtype=torch.bfloat16)
+        if args.mode == "fused":
+            groups = dict.fromkeys(sizes_mib, _new_group(device, cleanup))
+        else:
+            groups = {op: _new_group(device, cleanup) for op in sizes_mib}
+        buffers = {}
+        pools = []
+        for op, size in sizes_mib.items():
+            backend = groups[op]._get_backend(device)
+            count = (size << 20) // 2  # Two bytes per BF16 element.
+            # AG output and RS input each start in their own NCCL-backed segment.
+            symmetric, pool = _symmetric_tensor(backend, count, device=device)
+            local = torch.empty(count // world, device=device, dtype=torch.bfloat16)
+            buffers[op] = (local, symmetric)
+            pools.append((backend, pool))
         torch.cuda.synchronize(device)
 
-        ag_stream = torch.cuda.Stream(device=device)
+        operations: list[tuple[torch.cuda.Stream, Callable[[], None]]] = []
         if args.mode == "fused":
-            comm = ag_backend._comm_ptr()
+            ag_in, ag_out = buffers["ag"]
+            rs_out, rs_in = buffers["rs"]
+            comm = groups["ag"]._get_backend(device)._comm_ptr()
             if not comm:
                 raise RuntimeError("PyTorch did not initialize the NCCL communicator")
             fused = _FusedPair(
@@ -208,37 +218,54 @@ def main() -> None:
                 ag_pause_cycles=args.ag_pause_cycles,
             )
             cleanup.callback(fused.close)
-            operations = [(ag_stream, lambda: fused.launch(ag_in=ag_in, rs_out=rs_out, stream=ag_stream))]
+            fused_stream = torch.cuda.Stream(device=device)
+            operations.append((fused_stream, lambda: fused.launch(ag_in=ag_in, rs_out=rs_out, stream=fused_stream)))
         else:
-            ag_backend.register_mem_pool(ag_pool, symm=True)
-            cleanup.callback(ag_backend.deregister_mem_pool, ag_pool)
-            rs_backend.register_mem_pool(rs_pool, symm=True)
-            cleanup.callback(rs_backend.deregister_mem_pool, rs_pool)
-            operations = [
-                (ag_stream, lambda: dist.all_gather_into_tensor(ag_out, ag_in, group=ag_group)),
-                (
-                    torch.cuda.Stream(device=device),
-                    lambda: dist.reduce_scatter_tensor(rs_out, rs_in, op=dist.ReduceOp.SUM, group=rs_group),
-                ),
-            ]
+            for backend, pool in pools:
+                backend.register_mem_pool(pool, symm=True)
+                cleanup.callback(backend.deregister_mem_pool, pool)
+            if "ag" in buffers:
+                ag_in, ag_out = buffers["ag"]
+                operations.append(
+                    (
+                        torch.cuda.Stream(device=device),
+                        lambda: dist.all_gather_into_tensor(ag_out, ag_in, group=groups["ag"]),
+                    )
+                )
+            if "rs" in buffers:
+                rs_out, rs_in = buffers["rs"]
+                operations.append(
+                    (
+                        torch.cuda.Stream(device=device),
+                        lambda: dist.reduce_scatter_tensor(rs_out, rs_in, op=dist.ReduceOp.SUM, group=groups["rs"]),
+                    )
+                )
         cleanup.callback(torch.cuda.synchronize, device)
         control = torch.cuda.Stream(device=device)
 
         def prepare(epoch: int) -> None:
-            ag_in.fill_(rank + epoch)
-            for owner, shard in enumerate(rs_in.chunk(world)):
-                shard.fill_(rank % 2 + epoch + owner % 2)
-            ag_out.zero_()
-            rs_out.zero_()
+            if "ag" in buffers:
+                ag_input, ag_output = buffers["ag"]
+                ag_input.fill_(rank + epoch)
+                ag_output.zero_()
+            if "rs" in buffers:
+                rs_output, rs_input = buffers["rs"]
+                for owner, shard in enumerate(rs_input.chunk(world)):
+                    shard.fill_(rank % 2 + epoch + owner % 2)
+                rs_output.zero_()
             torch.cuda.synchronize(device)
 
         def validate(epoch: int) -> None:
-            for peer, shard in enumerate(ag_out.chunk(world)):
-                if not shard.eq(peer + epoch).all().item():
-                    raise RuntimeError(f"rank {rank}: AG output mismatch for peer {peer}")
-            expected_rs = world * (epoch + rank % 2) + world // 2
-            if not rs_out.eq(expected_rs).all().item():
-                raise RuntimeError(f"rank {rank}: RS output mismatch, expected {expected_rs}")
+            if "ag" in buffers:
+                _, ag_output = buffers["ag"]
+                for peer, shard in enumerate(ag_output.chunk(world)):
+                    if not shard.eq(peer + epoch).all().item():
+                        raise RuntimeError(f"rank {rank}: AG output mismatch for peer {peer}")
+            if "rs" in buffers:
+                rs_output, _ = buffers["rs"]
+                expected_rs = world * (epoch + rank % 2) + world // 2
+                if not rs_output.eq(expected_rs).all().item():
+                    raise RuntimeError(f"rank {rank}: RS output mismatch, expected {expected_rs}")
 
         prepare(1)
         dist.barrier()
@@ -251,7 +278,7 @@ def main() -> None:
             # Byte counters describe sampling intervals. Collect boundary samples outside the kernels.
             time.sleep(2 / args.profile_frequency)
         dist.barrier()
-        run_name = args.variant if args.mode == "fused" else "split"
+        run_name = args.variant if args.mode == "fused" else args.mode
         with torch.cuda.nvtx.range(f"fused_ag_rs/{run_name}/timed") if args.profile else nullcontext():
             local_us = _run_pairs(control, operations, args.iters)
         dist.barrier()
@@ -265,25 +292,28 @@ def main() -> None:
         dist.all_gather_object(all_rank_us, local_us)
         if rank == 0:
             slowest_rank_us = [max(row) for row in zip(*all_rank_us, strict=True)]
+            launch_unit = "operation" if len(buffers) == 1 else "pair"
             report = {
                 "mode": args.mode,
                 "profiled": args.profile,
                 "torch_version": torch.__version__,
                 "nccl_version": torch.cuda.nccl.version(),
-                "ag_output_mib": args.ag_mib,
-                "rs_input_mib": args.rs_mib,
+                "ag_output_mib": sizes_mib.get("ag"),
+                "rs_input_mib": sizes_mib.get("rs"),
                 "fused_ctas": args.ctas if args.mode == "fused" else None,
                 "fused_variant": args.variant if args.mode == "fused" else None,
                 "ag_pause_cycles": args.ag_pause_cycles,
-                "all_rank_pair_us": all_rank_us,
+                f"all_rank_{launch_unit}_us": all_rank_us,
                 "median_slowest_rank_us": median(slowest_rank_us),
                 "validation": "passed",
             }
             args.output.write_text(json.dumps(report, indent=2) + "\n")
             logger.info(
-                "%s: AG and RS correct on %d ranks, median slowest-rank pair %.3f us",
+                "%s: %s correct on %d ranks, median slowest-rank %s %.3f us",
                 run_name,
+                " and ".join(op.upper() for op in buffers),
                 world,
+                launch_unit,
                 report["median_slowest_rank_us"],
             )
 

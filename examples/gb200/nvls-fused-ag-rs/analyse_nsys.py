@@ -1,7 +1,7 @@
 # Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Validate and compare the fused and split AG/RS CUDA traces."""
+"""Validate and compare fused, split, and optional single-operation AG/RS CUDA traces."""
 
 from __future__ import annotations
 
@@ -104,7 +104,7 @@ def _read_launches(
 
 
 def _case_summary(
-    launches: dict[int, dict[str, list[_Launch]]], *, path: Path, ops: tuple[str, ...], iters: int
+    launches: dict[int, dict[str, list[_Launch]]], *, path: Path, ops: tuple[str, ...], iters: int, solo: bool
 ) -> tuple[dict[int, dict[str, object]], list[float], dict[int, list[tuple[int, int]]]]:
     devices = {}
     pair_samples = []
@@ -134,7 +134,7 @@ def _case_summary(
             previous_end = last_end
         pair_samples.append(pair_us)
         devices[device] = {
-            "median_pair_span_us": median(pair_us),
+            "median_kernel_span_us" if solo else "median_pair_span_us": median(pair_us),
             "median_overlap_us": median(overlaps) if overlaps else None,
             "kernels": {
                 op: {
@@ -181,7 +181,7 @@ def _window_bytes(
 
 
 def _nvlink_summary(
-    path: Path, spans: dict[int, list[tuple[int, int]]], *, frequency: int
+    path: Path, spans: dict[int, list[tuple[int, int]]], *, frequency: int, solo: bool = False
 ) -> dict[int, dict[str, object]]:
     period_ns = 1_000_000_000 / frequency
     padding = math.ceil(2 * period_ns)
@@ -239,9 +239,12 @@ def _nvlink_summary(
             traffic["protocol_gb_per_s"] = traffic["request_protocol_gb_per_s"] + traffic["response_protocol_gb_per_s"]
             traffic["total_gb_per_s"] = traffic["user_gb_per_s"] + traffic["protocol_gb_per_s"]
             traffic["percent_of_nominal"] = traffic["total_gb_per_s"] / GB200_NVLINK_NOMINAL_GB_PER_S * 100
+        sample_count_field = (
+            "min_sample_intervals_per_metric_per_iteration" if solo else ("min_sample_intervals_per_metric_per_pair")
+        )
         summary[gpu] = {
             "window_us": window_ns / 1_000,
-            "min_sample_intervals_per_metric_per_pair": min(counts),
+            sample_count_field: min(counts),
             "max_sample_interval_ns": max(interval_ns),
             **categories,
         }
@@ -249,10 +252,12 @@ def _nvlink_summary(
 
 
 def main() -> None:
-    """Write GPU kernel timing and launch geometry for two Nsight Systems exports."""
+    """Write timings and launch geometry from Nsight Systems exports."""
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--fused", type=Path, required=True)
     parser.add_argument("--split", type=Path, required=True)
+    parser.add_argument("--ag-only", type=Path, help="SQLite export of standalone all-gather")
+    parser.add_argument("--rs-only", type=Path, help="SQLite export of standalone reduce-scatter")
     parser.add_argument("--iters", type=int, required=True)
     parser.add_argument("--ranks", type=int, help="Expected number of GPU ranks in each capture")
     parser.add_argument("--variant", choices=tuple(FUSED_VARIANTS), help="Expected fused kernel variant")
@@ -292,39 +297,47 @@ def main() -> None:
             )
         if gpus is not None and fused.keys() != gpus:
             raise ValueError(f"Expected physical GPUs {sorted(gpus)}, found kernels on {sorted(fused)}")
-        fused_devices, fused_slowest, fused_spans = _case_summary(
-            fused, path=args.fused, ops=("fused",), iters=args.iters
-        )
-        split_devices, split_slowest, split_spans = _case_summary(
-            split, path=args.split, ops=("ag", "rs"), iters=args.iters
-        )
-        if gpus is not None:
-            for path, spans, devices in (
-                (args.fused, fused_spans, fused_devices),
-                (args.split, split_spans, split_devices),
-            ):
-                for gpu, traffic in _nvlink_summary(path, spans, frequency=args.frequency).items():
+        cases = {"fused": (args.fused, fused, ("fused",)), "split": (args.split, split, ("ag", "rs"))}
+        for mode, path, op in (("ag_only", args.ag_only, "ag"), ("rs_only", args.rs_only, "rs")):
+            if path is None:
+                continue
+            launches = _read_launches(path, physical_ids=gpus is not None, fused_kernel=fused_kernel)
+            if launches.keys() != fused.keys():
+                raise ValueError(f"{path} has kernels on GPUs {sorted(launches)}, expected {sorted(fused)}")
+            cases[mode] = (path, launches, (op,))
+
+        case_reports = {}
+        medians = {}
+        for mode, (path, launches, ops) in cases.items():
+            solo = mode in ("ag_only", "rs_only")
+            devices, slowest, spans = _case_summary(launches, path=path, ops=ops, iters=args.iters, solo=solo)
+            if gpus is not None:
+                for gpu, traffic in _nvlink_summary(path, spans, frequency=args.frequency, solo=solo).items():
                     devices[gpu]["nvlink"] = traffic
+            medians[mode] = median(slowest)
+            span_field = "median_slowest_device_kernel_span_us" if solo else "median_slowest_device_pair_span_us"
+            case_reports[mode] = {span_field: medians[mode], "devices": devices}
     except ValueError as error:
         parser.error(str(error))
 
-    fused_us = median(fused_slowest)
-    split_us = median(split_slowest)
+    fused_us = medians["fused"]
+    split_us = medians["split"]
     speedup = split_us / fused_us
-    fused_case = {"median_slowest_device_pair_span_us": fused_us, "devices": fused_devices}
     if args.variant is not None:
-        fused_case.update(variant=args.variant, ctas=args.ctas)
+        case_reports["fused"].update(variant=args.variant, ctas=args.ctas)
     summary = {
         "iterations": args.iters,
-        "fused": fused_case,
-        "split": {"median_slowest_device_pair_span_us": split_us, "devices": split_devices},
+        **case_reports,
         "fused_vs_split_speedup": speedup,
     }
     if gpus is not None:
+        window = "sum of per-iteration pair spans from earliest kernel start to latest end"
+        if args.ag_only is not None or args.rs_only is not None:
+            window += "; for solo captures, sum of each measured kernel's start-to-end span"
         summary["nvlink"] = {
             "nominal_gb_per_s_per_direction": GB200_NVLINK_NOMINAL_GB_PER_S,
             "sampling_frequency_hz": args.frequency,
-            "window": "sum of per-iteration pair spans from earliest kernel start to latest end",
+            "window": window,
         }
     args.output.write_text(json.dumps(summary, indent=2) + "\n")
     LOGGER.info("Median slowest GPU pair span: fused %.3f us, split %.3f us (%.3fx)", fused_us, split_us, speedup)

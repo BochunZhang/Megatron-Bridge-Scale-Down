@@ -37,6 +37,7 @@ def _write_trace(
     fused: bool,
     sample_gap: bool = False,
     fused_suffix: str = "",
+    solo: str | None = None,
     grid: int = 4,
     block: int = 256,
 ) -> None:
@@ -58,6 +59,9 @@ def _write_trace(
                         (start + 10_000, start + 20_000, 3, 2),
                     ]
                 )
+                if solo is not None:
+                    op_id = {"ag": 2, "rs": 3}[solo]
+                    launches = [launch for launch in launches if launch[2] == op_id]
                 db.executemany(
                     "INSERT INTO CUPTI_ACTIVITY_KIND_KERNEL VALUES (?, ?, ?, ?, ?, 30, ?, ?, ?)",
                     [
@@ -104,6 +108,7 @@ def test_nvlink_uses_physical_gpu_ids_and_weights_only_pair_spans(tmp_path, monk
     analyse.main()
 
     report = json.loads((tmp_path / "summary.json").read_text())
+    assert "ag_only" not in report and "rs_only" not in report
     for mode in ("fused", "split"):
         devices = report[mode]["devices"]
         assert set(devices) == {"1", "3"}
@@ -177,6 +182,61 @@ def test_trace_rejects_wrong_fused_kernel_or_geometry(
     if variant_args:
         args.extend(("--variant", variant_args[0], "--ctas", variant_args[1]))
     monkeypatch.setattr(sys, "argv", args)
+    with pytest.raises(SystemExit, match="2"):
+        analyse.main()
+    assert error in capsys.readouterr().err
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("solo_ops", [("ag",), ("rs",), ("ag", "rs")])
+def test_trace_measures_optional_solo_kernel_windows(tmp_path, monkeypatch, solo_ops):
+    _write_trace(tmp_path / "fused.sqlite", fused=True)
+    _write_trace(tmp_path / "split.sqlite", fused=False)
+    args = _args(tmp_path)
+    for op in solo_ops:
+        path = tmp_path / f"{op}-only.sqlite"
+        _write_trace(path, fused=False, solo=op)
+        args.extend((f"--{op}-only", str(path)))
+    monkeypatch.setattr(sys, "argv", args)
+    analyse.main()
+
+    report = json.loads((tmp_path / "summary.json").read_text())
+    assert report["fused"]["median_slowest_device_pair_span_us"] == 20
+    assert report["split"]["median_slowest_device_pair_span_us"] == 20
+    assert "solo captures" in report["nvlink"]["window"]
+    for op, duration_us, min_intervals in (("ag", 14, 2), ("rs", 10, 1)):
+        key = f"{op}_only"
+        if op not in solo_ops:
+            assert key not in report
+            continue
+        assert report[key]["median_slowest_device_kernel_span_us"] == duration_us
+        device = report[key]["devices"]["3"]
+        assert device["median_kernel_span_us"] == duration_us
+        assert set(device["kernels"]) == {op}
+        assert device["kernels"][op]["median_duration_us"] == duration_us
+        assert device["nvlink"]["window_us"] == 2 * duration_us
+        assert device["nvlink"]["rx"]["total_gb_per_s"] == pytest.approx(390)
+        assert device["nvlink"]["min_sample_intervals_per_metric_per_iteration"] == min_intervals
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    ("sql", "error"),
+    [
+        ("UPDATE CUPTI_ACTIVITY_KIND_KERNEL SET shortName = 3", "kernel counts {'rs': 2}, expected {'ag': 2}"),
+        ("DELETE FROM CUPTI_ACTIVITY_KIND_KERNEL WHERE start = 10000", "kernel counts {'ag': 1}, expected {'ag': 2}"),
+        ("DELETE FROM CUPTI_ACTIVITY_KIND_KERNEL WHERE deviceId = 1", "has kernels on GPUs [3], expected [1, 3]"),
+    ],
+)
+def test_trace_rejects_mismatched_solo_profile(tmp_path, monkeypatch, capsys, sql, error):
+    _write_trace(tmp_path / "fused.sqlite", fused=True)
+    _write_trace(tmp_path / "split.sqlite", fused=False)
+    path = tmp_path / "ag-only.sqlite"
+    _write_trace(path, fused=False, solo="ag")
+    with closing(sqlite3.connect(path)) as db:
+        db.execute(sql)
+        db.commit()
+    monkeypatch.setattr(sys, "argv", [*_args(tmp_path), "--ag-only", str(path)])
     with pytest.raises(SystemExit, match="2"):
         analyse.main()
     assert error in capsys.readouterr().err

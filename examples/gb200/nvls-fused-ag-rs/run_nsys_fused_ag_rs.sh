@@ -6,9 +6,10 @@ set -euo pipefail
 
 usage() {
     cat <<'USAGE'
-Compare fused AG+RS variants with two concurrent symmetric NCCL kernels.
+Compare fused AG+RS variants with concurrent and isolated symmetric NCCL kernels.
 Each case runs with CUDA event timing, then captures CUDA, NVTX and GB100 NVLink
-metrics with Nsight Systems 2026.6.1. A single split baseline serves all cases.
+metrics with Nsight Systems 2026.6.1. The split baselines run AG+RS, AG alone and RS alone.
+Reports and SQLite exports are saved for analysis on a separate machine.
 
   --gpus LIST        GPU indices (default: CUDA_VISIBLE_DEVICES or 0,1,2,3)
   --ag-mib N         Full AllGather output per rank (default: 1024)
@@ -169,6 +170,7 @@ worker_env=(
 
 run_case() {
     local mode="$1" mode_dir="$2" cta="$3" variant="${4:-}" pause_cycles="${5:-0}"
+    local report_stem="${mode_dir}/${mode}-cta-auto"
     local -a worker timed profiled
     worker=(
         "${worker_env[@]}"
@@ -177,13 +179,14 @@ run_case() {
         --warmup "$warmup" --iters "$iters" --ctas "$cta" --nccl-lib "$nccl_lib" --shim "$shim"
     )
     if [[ "$mode" == fused ]]; then
+        report_stem="${mode_dir}/${variant}-cta-${cta}"
         worker+=(--variant "$variant" --ag-pause-cycles "$pause_cycles")
     fi
     timed=("${worker[@]}" --output "${mode_dir}/timing.json")
     profiled=(
         "$nsys_bin" profile --trace=cuda,nvtx --sample=none --cpuctxsw=none
         --gpu-metrics-devices="$gpus" --gpu-metrics-set="file:$nsys_metrics_file" --gpu-metrics-frequency="$nsys_freq"
-        --capture-range=cudaProfilerApi --capture-range-end=stop --output="${mode_dir}/profile"
+        --capture-range=cudaProfilerApi --capture-range-end=stop --output="$report_stem"
         "${worker[@]}" --profile --profile-frequency "$nsys_freq" --output "${mode_dir}/profile-timing.json"
     )
     if $dry_run; then
@@ -201,7 +204,7 @@ run_case() {
         [[ -s "${mode_dir}/timing.json" && -s "${mode_dir}/profile-timing.json" ]] \
             || die "worker did not finish output validation in ${mode_dir}"
     fi
-    run "$nsys_bin" export --type=sqlite --output="${mode_dir}/profile.sqlite" "${mode_dir}/profile.nsys-rep"
+    run "$nsys_bin" export --type=sqlite --output="${mode_dir}/profile.sqlite" "${report_stem}.nsys-rep"
 }
 
 for cta in "${cta_list[@]}"; do
@@ -213,15 +216,11 @@ for cta in "${cta_list[@]}"; do
         run_case fused "${output_dir}/cta-${cta}/${variant}" "$cta" "$variant" "$pause_cycles"
     done
 done
-# The worker requires a CTA argument, but the split path leaves its grids to NCCL.
+# The worker requires a CTA argument, but NCCL selects the grids for these baselines.
 run_case split "${output_dir}/split" "${cta_list[0]}"
+run_case ag-only "${output_dir}/split/ag-only" "${cta_list[0]}"
+run_case rs-only "${output_dir}/split/rs-only" "${cta_list[0]}"
 
-for cta in "${cta_list[@]}"; do
-    for variant in "${variant_list[@]}"; do
-        case_dir="${output_dir}/cta-${cta}/${variant}"
-        run uv run --active --no-sync python "${script_dir}/analyse_nsys.py" \
-            --variant "$variant" --ctas "$cta" \
-            --fused "${case_dir}/profile.sqlite" --split "${output_dir}/split/profile.sqlite" \
-            --iters "$iters" --ranks "$nranks" --gpus "$gpus" --frequency "$nsys_freq" --output "${case_dir}/summary.json"
-    done
-done
+if ! $dry_run; then
+    printf 'Reports and SQLite exports saved in %s\n' "$output_dir"
+fi
