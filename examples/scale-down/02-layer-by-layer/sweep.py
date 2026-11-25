@@ -318,6 +318,8 @@ def _command(
     worker_env = []
     if args.optimizer_backend is not None:
         worker_env = ["env", f"OMP_NUM_THREADS={args.cpu_threads}", "OMP_DYNAMIC=FALSE", "OMP_PROC_BIND=FALSE"]
+    if args.overlap_cpu_optimizer:
+        worker_env.append(f"MEGATRON_GRACEADAM_OMP_THREADS={args.cpu_threads}")
     command = [
         *python,
         "-m",

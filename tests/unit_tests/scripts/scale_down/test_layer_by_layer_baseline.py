@@ -65,6 +65,8 @@ def test_layer_by_layer_baseline_dry_run(
         } <= set(command)
     overlap = case.endswith("_overlap")
     assert ("layer_by_layer.overlap_cpu_optimizer=true" in command) is overlap
+    graceadam_threads = [arg for arg in command if arg.startswith("MEGATRON_GRACEADAM_OMP_THREADS=")]
+    assert graceadam_threads == (["MEGATRON_GRACEADAM_OMP_THREADS=32"] if overlap else [])
     assert all(not arg.startswith("layer_by_layer.backend=") for arg in command)
     nvme_args = [arg for arg in command if arg.startswith("layer_by_layer.nvme_dir=")]
     if parameter_tier == "nvme":
@@ -100,8 +102,9 @@ def test_layer_by_layer_baseline_nvme_path_override(tmp_path: Path) -> None:
 
 
 @pytest.mark.unit
-def test_layer_by_layer_baseline_grace_adam_cpu_threads() -> None:
-    script = BASELINE_DIR / "04_param_cpu_act_cpu_opt_cpu.sh"
+@pytest.mark.parametrize("case", ["04_param_cpu_act_cpu_opt_cpu", "05_param_cpu_act_cpu_opt_cpu_overlap"])
+def test_layer_by_layer_baseline_grace_adam_cpu_threads(case: str) -> None:
+    script = BASELINE_DIR / f"{case}.sh"
     result = subprocess.run(
         ["bash", str(script), "--dry-run", "--cpu-threads", "12"],
         env={**os.environ, "PYTHON": sys.executable},
@@ -109,7 +112,10 @@ def test_layer_by_layer_baseline_grace_adam_cpu_threads() -> None:
         capture_output=True,
         text=True,
     )
-    assert {"OMP_NUM_THREADS=12", "layer_by_layer.cpu_threads=12"} <= set(shlex.split(result.stderr))
+    command = shlex.split(result.stderr)
+    assert {"OMP_NUM_THREADS=12", "layer_by_layer.cpu_threads=12"} <= set(command)
+    graceadam_threads = [arg for arg in command if arg.startswith("MEGATRON_GRACEADAM_OMP_THREADS=")]
+    assert graceadam_threads == (["MEGATRON_GRACEADAM_OMP_THREADS=12"] if case.endswith("_overlap") else [])
 
 
 @pytest.mark.unit

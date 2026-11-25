@@ -26,7 +26,7 @@ If the environment resolves the older pinned submodule, put the updated sibling 
 export PYTHONPATH="$PWD/../megatron-lm${PYTHONPATH:+:$PYTHONPATH}"
 ```
 
-The sweep defaults to PyTorch CPU AdamW for CPU and NVMe optimizer tiers. Cases 04 through 06 default to GraceAdam, which requires Megatron-LM's native Megatron-FSDP GraceAdam support and an SVE-enabled build of DeepSpeed `v0.20.1`. The launchers use `--cpu-threads` (default 32) for PyTorch intra-op parallelism in CPU gradient accumulation and for OpenMP parallelism in GraceAdam, per rank. For a direct recipe launch, set `OMP_NUM_THREADS` before startup to match `layer_by_layer.cpu_threads`. Cases 05 and 06 also require the GIL release patch below so the training thread can submit GPU work during the native update.
+The sweep defaults to PyTorch CPU AdamW for CPU and NVMe optimizer tiers. Cases 04 through 06 default to GraceAdam, which requires Megatron-LM's native Megatron-FSDP GraceAdam support and an SVE-enabled build of DeepSpeed `v0.20.1`. The launchers use `--cpu-threads` (default 32) for PyTorch intra-op and OpenMP parallelism, per rank. Overlap cases also pass the thread count to the patched native CPUAdam update. For a direct recipe launch, set `OMP_NUM_THREADS` before startup to match `layer_by_layer.cpu_threads`. When enabling `layer_by_layer.overlap_cpu_optimizer`, also set `MEGATRON_GRACEADAM_OMP_THREADS` to the same value and apply the CPUAdam patches below.
 
 ## Native schedule smoke test
 
@@ -95,7 +95,7 @@ Case 05 uses case 04's model, batches, placement, and AdamW hyperparameters. A w
 
 The overlap path uses BF16 with unit loss scale and per-microbatch loss normalization. It disables gradient clipping, gradient zero counts, gradient-based step skipping, gradient checks, and iteration reruns.
 
-On the GB200 node, run the patch helper from the Bridge root. It patches the installed DeepSpeed `v0.20.1` CPUAdam C++ sources in place, JIT-compiles the extension, and checks that the loaded build releases the GIL. The installed package must use JIT for CPUAdam (`DS_BUILD_CPU_ADAM=0` at installation). The command below selects the same Python as the numbered launcher.
+On the GB200 node, run the patch helper from the Bridge root, including when upgrading a build that already releases the GIL. The helper patches the installed DeepSpeed `v0.20.1` CPUAdam C++ sources in place and JIT-compiles the extension. It verifies GIL release and the `graceadam_omp_threads_patch` marker for setting the OpenMP thread count in the native update. The installed package must use JIT for CPUAdam (`DS_BUILD_CPU_ADAM=0` at installation). The command below selects the same Python as the numbered launcher.
 
 ```bash
 train_python="${PYTHON:-$(uv run --no-sync python -c 'import sys; sys.stdout.write(sys.executable)')}"

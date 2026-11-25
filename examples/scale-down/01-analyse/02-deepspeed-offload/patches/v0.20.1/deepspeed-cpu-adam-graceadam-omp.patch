@@ -1,0 +1,63 @@
+diff --git a/csrc/adam/cpu_adam.cpp b/csrc/adam/cpu_adam.cpp
+--- a/csrc/adam/cpu_adam.cpp
++++ b/csrc/adam/cpu_adam.cpp
+@@ -21,6 +21,7 @@
+           &ds_adam_block_numel,
+           "pieces starting at multiples of this element count are updated exactly as one call on "
+           "the whole tensor");
++    m.attr("graceadam_omp_threads_patch") = true;
+     m.def("adam_copy_supported",
+           &ds_adam_copy_supported,
+           "whether adam_update_scaled_copy is available in this build (C++)");
+diff --git a/csrc/includes/sve.h b/csrc/includes/sve.h
+--- a/csrc/includes/sve.h
++++ b/csrc/includes/sve.h
+@@ -8,6 +8,28 @@
+
+ #if defined(__SVE__) && defined(__ARM_FEATURE_SVE)
+ #include <arm_sve.h>
++
++#ifdef _OPENMP
++#include <charconv>
++#include <cstdlib>
++#include <cstring>
++#include <omp.h>
++#include <stdexcept>
++
++inline int graceadam_sve_num_threads()
++{
++    const char* value = std::getenv("MEGATRON_GRACEADAM_OMP_THREADS");
++    if (value == nullptr) { return omp_get_max_threads(); }
++
++    int threads = 0;
++    const char* end = value + std::strlen(value);
++    const auto parsed = std::from_chars(value, end, threads);
++    if (parsed.ec != std::errc{} || parsed.ptr != end || threads < 1) {
++        throw std::invalid_argument("MEGATRON_GRACEADAM_OMP_THREADS must be a positive integer");
++    }
++    return threads;
++}
++#endif
+
+ template <int span>
+ inline void sve_adam_update(float* params,
+@@ -32,11 +54,18 @@
+
+     const float decay = adamw_mode ? -learning_rate * weight_decay : weight_decay;
+
++#ifdef _OPENMP
++    // Request a team for this region even if ATen reset the caller's OpenMP default.
++    const int threads = parallel ? graceadam_sve_num_threads() : 1;
++#endif
++
+     for (size_t tile_start = 0; tile_start < param_size; tile_start += tile_size) {
+         const size_t remaining = param_size - tile_start;
+         const size_t tile_end = tile_start + (remaining < tile_size ? remaining : tile_size);
+
+-#pragma omp parallel if (parallel)
++#ifdef _OPENMP
++#pragma omp parallel if (parallel) num_threads(threads)
++#endif
+         {
+             const svfloat32_t beta1_vec = svdup_n_f32(beta1);
+             const svfloat32_t beta2_vec = svdup_n_f32(beta2);
