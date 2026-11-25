@@ -25,7 +25,7 @@ esac
 
 script_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 repo_root=$(cd "$script_dir/../../../.." && pwd)
-results_parent=${RESULTS_ROOT:-"$repo_root/results/01-analyse/02-deepspeed-nsys"}
+results_parent=${RESULTS_ROOT:-"$repo_root/results/01-analyse/02-deepspeed-sve-nsys"}
 nsys_bin=${NSYS_BIN:-"$PWD/NsightSystems-2026.6.1/bin/nsys"}
 if [[ -z ${NSYS_BIN:-} && ! -x "$nsys_bin" ]]; then
     nsys_bin=nsys
@@ -52,7 +52,6 @@ nsys_version=$("$nsys_bin" --version) || die "failed to query $nsys_bin"
 [[ $nsys_version =~ (^|[^0-9.])2026\.6\.1([.-]|[[:space:]]|$) ]] \
     || die "expected Nsight Systems 2026.6.1, got $nsys_version"
 command -v nvidia-smi >/dev/null || die 'nvidia-smi is required'
-command -v deepspeed >/dev/null || die 'activate the DeepSpeed training environment first'
 
 cuda_gpu_uuids() {
     "${PYTHON_BIN:-python}" - <<'PY'

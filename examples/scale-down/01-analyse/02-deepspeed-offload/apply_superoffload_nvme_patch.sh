@@ -20,10 +20,6 @@
 set -euo pipefail
 
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
-PATCHES=(
-    "$SCRIPT_DIR"/patches/superoffload_nvme{,_fp32_device}_override.patch
-    "$SCRIPT_DIR"/patches/zero3_nvme_prefetch_dedup_override.patch
-)
 
 case "${1:-}" in
     "") wanted=(-N) done_state=(-R) ;;
@@ -34,6 +30,16 @@ esac
 # find_spec locates the package without importing (and initializing) DeepSpeed.
 DS_DIR=$("${PYTHON_BIN:-python}" -c \
     'import importlib.util as u, pathlib; print(pathlib.Path(u.find_spec("deepspeed").origin).parent.parent)')
+
+PATCH_DIR="$SCRIPT_DIR/patches"
+# v0.20.1 includes the ZeRO-3 prefetch deduplication. Leave that upstream fix
+# intact when applying or recovering the SuperOffload patches.
+if grep -Fq 'swap_in_params_set.add(param)' "$DS_DIR/deepspeed/runtime/zero/partitioned_param_coordinator.py"; then
+    PATCHES=("$PATCH_DIR"/v0.20.1/superoffload_nvme{,_fp32_device}_override.patch)
+else
+    PATCHES=("$PATCH_DIR"/superoffload_nvme{,_fp32_device}_override.patch
+             "$PATCH_DIR"/zero3_nvme_prefetch_dedup_override.patch)
+fi
 
 run_patch() { patch --force --silent -p1 -d "$DS_DIR" "$@"; }
 

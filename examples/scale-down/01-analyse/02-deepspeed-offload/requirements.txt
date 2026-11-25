@@ -8,7 +8,7 @@ causal-conv1d
 flash-attn
 # Mandatory on H100 with Triton >= 3.4 for Qwen3.5 fast-path verification.
 tilelang
-# AutoEP: PR #7938 head on upstream (not on PyPI yet). Same commits as tohtana/add_autoep on tohtana/DeepSpeed.
-deepspeed @ git+https://github.com/deepspeedai/DeepSpeed.git@refs/pull/7938/head
+# DeepSpeed v0.20.1 includes AutoEP and the FP32 ARM SVE CPU Adam kernel.
+deepspeed @ git+https://github.com/deepspeedai/DeepSpeed.git@5e97e02c66bdc279d03c4ea6faf1d97960b16dd8
 matplotlib>=3.5.0
 torch>=2.9.1

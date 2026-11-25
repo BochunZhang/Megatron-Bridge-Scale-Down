@@ -1,6 +1,6 @@
 # DeepSpeed Offload × Recompute 矩阵性能报告
 
-本文整理 [02-deepspeed-offload](../../../examples/scale-down/01-analyse/02-deepspeed-offload/README.md) 在 4×GB200 上跑完的组合矩阵，给出 dense 与 expert（MoE）模型的显存–性能曲线，以及各显存预算下的推荐配置。
+本文整理 [02-deepspeed-offload](../../../examples/scale-down/01-analyse/02-deepspeed-offload/README.md) 在 4×GB200 上完成的原始组合矩阵，给出 dense 与 expert（MoE）模型的显存–性能曲线，以及各显存预算下的推荐配置。原始矩阵的 CPU optimizer 配置使用 `DeepSpeedCPUAdam`，NVMe 补丁以 DeepSpeed `c7cc64a90` 为基线。使用 v0.20.1 ARM SVE CPU Adam 的复测输出到 `results/01-analyse/02-deepspeed-sve/`。
 
 - 原始数据：`results/01-analyse/02-deepspeed/`（432 个 run 目录 + 两个 `experiment_summary_*.txt`）
 - 汇总表：`results/01-analyse/02-deepspeed/summary.csv`（每个组合一行）
@@ -12,7 +12,7 @@
 | --- | --- |
 | 影响吞吐最大的轴是什么 | **micro-batch size**。ZeRO-3 每个 micro-step 都有固定开销（dense 约 1.2 s，MoE 约 2.8 s），全局 batch 固定时 mbs 越大，micro-step 越少。“recompute + mbs4” 全面优于 “不 recompute + mbs2”。 |
 | 显存最充裕时的最快配置 | dense：`zero_3 / param_gpu / act(_cpu) / mbs4`，280 TFLOP/s/GPU、11.2 s/iter、90–94 GiB。MoE：`zero_3 / param_gpu / act_cpu / mbs4`，76.6 TFLOP/s/GPU、15.8 s/iter、152 GiB。 |
-| SuperOffload 相比 ZeRO-Offload | 显存相同，iteration 时间平均 **−9.4%（dense）/ −8.7%（MoE）**，收益全部来自 optimizer step（dense 约 2.9 s → 1.0 s）。只要卸载 optimizer，就应该用 SuperOffload。 |
+| SuperOffload 相比 ZeRO-Offload | 显存相同，iteration 时间平均 **−9.4%（dense）/ −8.7%（MoE）**，耗时差主要体现在 optimizer step（dense 约 2.9 s → 1.0 s）。只要卸载 optimizer，就应该用 SuperOffload。 |
 | SuperOffload `ratio=0.9` vs `1.0` | dense 完全等价（subgroup 实际全部落在 CPU）；MoE 显存 +6 GiB，时间只快 0.7%。**用 `ratio=1.0`。** |
 | optimizer 卸载的代价 | 相比 `zero_3`，GPU 峰值显存省 29 GiB（dense）/ 34 GiB（MoE），dense 慢约 4%（mbs4 时约 10%）。 |
 | param 放 CPU | 只省约 4 GiB 显存，时间增加约 3%。性价比低，只在差这 4 GiB 时使用。 |
@@ -116,7 +116,7 @@
 | `super_offload_1.0` | 0.92–1.00 s | 1.03–1.22 s |
 | `zero_offload` | 2.75–2.94 s | 3.27–3.49 s |
 
-各配置的 fwd / bwd 时间基本相同（差异 ≤0.3 s），所以 SuperOffload 的约 1.9 s（dense）/ 2.3 s（MoE）收益全部来自 optimizer step。这与 SuperOffload 的设计一致：CPU 更新后把 optimizer state 直接经 NVLink-C2C 搬回 GPU 再做精度转换，并与 backward 重叠。NVMe 场景下，fwd / bwd 被参数换入拖长到 ~10–60 s，这 1.9 s 的收益就被摊薄到 2.5%。
+各配置的 fwd / bwd 时间基本相同（差异 ≤0.3 s）。SuperOffload 的耗时差主要体现在记录的 optimizer step，约为 1.9 s（dense）和 2.3 s（MoE）。本矩阵的 `gradient_clipping=1.0` 使 SuperOffload 在最后一个 microbatch 的 backward 完成后，按 subgroup 同步执行 CPU Adam 更新。NVMe 场景下，参数换入将 fwd / bwd 拉长到约 10–60 s，dense 的相对收益降到约 2.5%。
 
 **`ratio=0.9` 不值得开**：
 

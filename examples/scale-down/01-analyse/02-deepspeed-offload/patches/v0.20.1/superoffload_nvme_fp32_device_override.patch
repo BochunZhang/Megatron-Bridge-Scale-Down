@@ -1,0 +1,15 @@
+--- a/deepspeed/runtime/zero/stage3.py
++++ b/deepspeed/runtime/zero/stage3.py
+@@ -1213,7 +1213,11 @@
+                 if self.params_in_nvme_and_cpu and tensor is None:
++                    # Partial optimizer offload requires the master and gradient on the same device.
++                    target_device = (
++                        self.subgroup_to_device[i] if self.offload_optimizer and not self.swap_optimizer else self.device
++                    )
+                     unpinned_fp32_buffer = torch.empty(num_elements,
+-                                                       device=self.device,
++                                                       device=target_device,
+                                                        dtype=self.master_weights_and_grads_dtype)
+                     self._swap_in_sub_group_to_flat_buffer(unpinned_fp32_buffer, i)
+                     self.fp32_partitioned_groups_flat.append(unpinned_fp32_buffer)
+                     self._create_momentum_buffer(num_elements, i, ds_id)

@@ -9,6 +9,7 @@
 #       --recompute <none|act|act_cpu> --metrics_out <path> \
 #       --mode <autoep|zero3_leaf|dense> [--autoep_size <N>] [--test]
 #   --test diagnoses non-finite loss/gradients/weights/params and writes JSON reports (disabled by default).
+#   --require-cpu-adam-sve verifies the CPU Adam extension in each training rank.
 #   test_name        self-describing test ID (<strategy>__<recompute>__mbs<N>,
 #                    e.g. super_offload_0.9__recompute_act__mbs4), used for logging
 #   model            HF model name or path, e.g. Qwen/Qwen3.5-9B (dense) or
@@ -35,6 +36,7 @@ TRAIN_MODE=""
 AUTOEP_SIZE=""
 EXTRA_OVERRIDES=""
 TEST_MODE=false
+REQUIRE_CPU_ADAM_SVE=false
 PROFILE_MODE=""
 PROFILE_STEP_START=""
 PROFILE_STEP_END=""
@@ -83,6 +85,10 @@ while [ "$#" -gt 0 ]; do
             ;;
         --test)
             TEST_MODE=true
+            shift
+            ;;
+        --require-cpu-adam-sve)
+            REQUIRE_CPU_ADAM_SVE=true
             shift
             ;;
         --profile)
@@ -306,9 +312,9 @@ echo "================================================"
 # NUMARUN prefixes deepspeed to bind the process to the correct NUMA node;
 # expand to empty (NUMARUN=) to launch deepspeed directly.
 if [ -n "${DEEPSPEED_LOCAL_GPU_IDS:-}" ]; then
-    CMD=(deepspeed --hostfile /dev/null --include "localhost:$DEEPSPEED_LOCAL_GPU_IDS")
+    CMD=("$PYTHON_BIN" -m deepspeed.launcher.runner --hostfile /dev/null --include "localhost:$DEEPSPEED_LOCAL_GPU_IDS")
 else
-    CMD=(deepspeed "--num_gpus=$NUM_GPUS")
+    CMD=("$PYTHON_BIN" -m deepspeed.launcher.runner "--num_gpus=$NUM_GPUS")
 fi
 if [ "$bind_cores" = "true" ]; then
     CMD+=(--bind_cores_to_rank)
@@ -327,6 +333,9 @@ CMD+=(train.py
     --metrics_out "$METRICS_OUT")
 if [ "$TEST_MODE" = "true" ]; then
     CMD+=(--test)
+fi
+if [ "$REQUIRE_CPU_ADAM_SVE" = "true" ]; then
+    CMD+=(--require-cpu-adam-sve)
 fi
 if [ "$TRAIN_MODE" = "autoep" ]; then
     CMD+=(--autoep_size "$AUTOEP_SIZE")

@@ -5,7 +5,7 @@
 在 ZeRO-3 下测量 **parameter 位置 × optimizer 位置 × recompute 策略 × micro-batch size** 的组合矩阵,回答:
 
 1. 各显存预算下能达到的**最佳吞吐**,即显存—吞吐前沿与推荐配置;
-2. `ratio=1.0` 时 SuperOffload 相比 ZeRO-Offload 的收益(SuperOffload 针对 NVLink-C2C,把 CPU 更新后的 optimizer state 直接搬到 GPU 再做精度转换);
+2. 使用 ARM SVE CPU Adam 时，`ratio=1.0` 的 SuperOffload 相比 ZeRO-Offload 的 optimizer step 耗时与吞吐差异。
 3. SuperOffload `ratio` 的最优 CPU/GPU 配比;
 4. `act`(HF 逐层重计算)与 `act+cpu`(再把 checkpoint 层激活异步卸载到 CPU)的显存收益与吞吐代价;
 5. 上述结论在 dense 与 MoE 模型上是否一致。
@@ -24,16 +24,28 @@
 
 - 训练:`wikitext` 加载 1%,`seq_len=4096`,`steps=10`,`seed=42`,按原生层数运行;
 - batch:每 GPU 每 step 16 个样本,`grad_accum = 16 / mbs`,全局 batch 恒定;
-- optimizer:AdamW(`weight_decay=0.01`),lr `1e-6`,WarmupLR 从 0 起 warmup 1000 步,梯度裁剪 `1.0`;`zero_3` 用 torch AdamW,offload 策略用 `DeepSpeedCPUAdam`;
+- Optimizer 使用 AdamW（`weight_decay=0.01`），学习率为 `1e-6`，WarmupLR 从 0 起 warmup 1000 步。`zero_3` 用 torch AdamW，optimizer offload 策略用启用了 ARM SVE 的 `DeepSpeedCPUAdam`。
 - ZeRO-3:`overlap_comm=true`,`reduce_bucket_size = sub_group_size = 4e8`,卸载均 `pin_memory=true`;SuperOffload `cpuadam_cores_perc=0.90` 并自动加 `--bind_cores_to_rank`;
 - 环境变量:`PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`(缺失时 `train.py` 拒绝启动)、`DS_PIN_MEMORY_BACKEND=torch`(设为 `native` 会让 side-stream DMA stall);
 - 依赖:**`transformers >= 5.16.0`**,旧版本会导致 offload 配置出现 NaN,见 §6.1。
 
+梯度裁剪仍为 `1.0`。SuperOffload 在最后一个 microbatch 的 backward 完成后，计算全局梯度范数并执行裁剪路径，逐个等待 CPU optimizer subgroup 更新完成。`overlap_comm=true` 控制通信重叠。这里使用的是 DeepSpeed v0.20.1 中的 SVE CPU Adam 实现，SuperOffload 论文里的 GraceAdam 是独立实现。
+
 ## 3. 测试命令
+
+在 GB200 的训练环境中，从仓库根目录安装固定版本的 DeepSpeed v0.20.1。CPU Adam 扩展在首次验证时使用目标机器的编译器即时构建。
+
+```bash
+DS_BUILD_CPU_ADAM=0 uv pip install --no-deps --no-build-isolation \
+  'deepspeed @ git+https://github.com/deepspeedai/DeepSpeed.git@5e97e02c66bdc279d03c4ea6faf1d97960b16dd8'
+python examples/scale-down/01-analyse/02-deepspeed-offload/cpu_adam_sve.py
+```
+
+正式训练只对启用 optimizer offload 的配置强制验证。启动前先检查 SVE 扩展，每个 rank 在创建模型前再次验证。成功时 `run.log` 中的 `CPU Adam kernel: ARM SVE` 记录 DeepSpeed 版本、Git SHA 和已加载的扩展路径。GPU-only 的 optimizer 路径跳过此检查。
 
 ### 3.1 NVMe 补丁
 
-含 `param_nvme` 的测试,运行前必须先打补丁(SuperOffload 原因见 §6.2,MoE 预取原因见 §6.3)。补丁基于 DeepSpeed `c7cc64a90`:
+运行含 `param_nvme` 的 SuperOffload 测试前，对 DeepSpeed v0.20.1 应用两处参数写回和 FP32 master placement 修复（§6.2）。MoE 参数预取去重已包含在 v0.20.1（§6.3）。
 
 ```bash
 # 应用
@@ -49,7 +61,7 @@ bash examples/scale-down/01-analyse/02-deepspeed-offload/apply_superoffload_nvme
 `pretrain_experiment.sh` 串行执行全部组合:单模型 4×3×6×3 = 216 个 run,两个模型共 432 个。单个 run 失败或 OOM 只记入 summary,不中断扫描:
 
 ```bash
-# 全矩阵
+# 全矩阵（先应用 §3.1 的补丁）
 bash examples/scale-down/01-analyse/02-deepspeed-offload/pretrain_experiment.sh
 
 # 子集:按需收窄各轴
@@ -61,7 +73,7 @@ bash examples/scale-down/01-analyse/02-deepspeed-offload/pretrain_experiment.sh 
   --micro_batch_sizes "1 4"
 ```
 
-加 `--dry_run` 只生成 ds_config 不训练。run 命名为 `<策略>-<param位置>__<recompute>__mbs<N>`,如 `super_offload_0.9-param_cpu__recompute_act__mbs4`。
+加 `--dry_run` 可在本地生成 ds_config 并预览命令，跳过训练和硬件预检。run 命名为 `<策略>-<param位置>__<recompute>__mbs<N>`，例如 `super_offload_0.9-param_cpu__recompute_act__mbs4`。
 
 配置优先级为 CLI 参数 > 环境变量 > 默认值。矩阵各轴如下,其余配置项见[附录 A](#附录-a其余配置项):
 
@@ -113,7 +125,7 @@ bash examples/scale-down/01-analyse/02-deepspeed-offload/pretrain_experiment.sh 
 bash examples/scale-down/01-analyse/02-deepspeed-offload/run_superoffload_nsys.sh
 ```
 
-默认输出到 `results/01-analyse/02-deepspeed-nsys/<timestamp>/`，包含两份 `nsys_trace.nsys-rep`、运行配置和锁频日志。`--dry-run` 可预览命令。
+默认输出到 `results/01-analyse/02-deepspeed-sve-nsys/<timestamp>/`，包含两份 `nsys_trace.nsys-rep`、运行配置和锁频日志。`--dry-run` 可预览命令。
 
 ```bash
 # Dense
@@ -176,7 +188,7 @@ ZeRO-3 的 AG 粒度为单个 submodule 的参数加上 `stage3_prefetch_bucket_
 ## 5. 输出与指标
 
 ```text
-<repo_root>/results/01-analyse/02-deepspeed/
+<repo_root>/results/01-analyse/02-deepspeed-sve/
 ├── experiment_summary_<ts>.txt     # 每个 run 的状态:OK / OOM / FAILED(rc) / DRY_RUN
 └── <model>/<TEST_NAME>/<timestamp>/
     ├── run.log                     # 完整日志,含 wall_clock_breakdown 的 fwd/bwd/step 耗时
@@ -198,7 +210,7 @@ ZeRO-3 的 AG 粒度为单个 submodule 的参数加上 `stage3_prefetch_bucket_
 | --- | --- | --- |
 | offload 配置出现 NaN loss | GatedDeltaNet 初始化时 `log(0) = -inf`,CPU Adam 把 `-inf` 变成 NaN | 升级 transformers 到 >= 5.16.0 |
 | `param_nvme` + SuperOffload 报错 | SuperOffload 对 NVMe 参数卸载支持不完整 | §3.1 补丁 |
-| MoE + `param_nvme` backward 报 `param N already assigned swap buffer id M` | NVMe 预取未去重,同一参数在一次 `swap_in` 中出现两次 | §3.1 补丁(§6.3),已验收 |
+| 旧版本中 MoE + `param_nvme` backward 报 `param N already assigned swap buffer id M` | NVMe 预取未去重,同一参数在一次 `swap_in` 中出现两次 | v0.20.1 已包含去重（§6.3） |
 
 ### 6.1 NaN loss:初始化 `-inf` 被 CPU Adam 变成 NaN
 
@@ -248,7 +260,7 @@ uv pip install --no-config --no-deps "transformers==5.12.1" "tokenizers==0.22.2"
 
 **为什么只有 MoE**:预取窗口按元素数限制为 `2 × numel_in_flight`。dense 每个 Linear 只有一个量级相近的参数,窗口通常只覆盖 1~2 个条目;MoE 层中巨大的 3D expert 张量在 in-flight 时会把窗口撑大,同时 router / shared expert 等小参数和多参数模块(leaf MoE block、`GroupedExperts`)让窗口内条目变多,重复出现的参数就容易同时落入窗口。
 
-**修复**:`patches/zero3_nvme_prefetch_dedup_override.patch` 在收集时按 `ds_id` 去重。参数一旦换入,在释放前对后续所有使用都有效,不改变语义。
+旧矩阵的 `patches/zero3_nvme_prefetch_dedup_override.patch` 在收集时按 `ds_id` 去重。参数一旦换入，在释放前对后续所有使用都有效。DeepSpeed v0.20.1 的预取实现已含去重。
 
 **验收**:2026-10-12 在开发机上应用该补丁后,原先报错的 MoE + `param_nvme` 测试已通过。
 
@@ -280,4 +292,4 @@ uv pip install --no-config --no-deps "transformers==5.12.1" "tokenizers==0.22.2"
 | CPU 核绑定 | `BIND_CORES_TO_RANK` | `auto` | 含 `super_offload` 时自动开启 |
 | pinned memory 后端 | `DS_PIN_MEMORY_BACKEND` | `torch` | |
 | Python 解释器 | `PYTHON_BIN` | `python` | |
-| 输出位置 | `REPO_ROOT` / `TMP_CONFIG_DIR` / `RESULTS_ROOT` | 仓库根 / `<repo_root>/.tmp` / `<repo_root>/results/01-analyse/02-deepspeed` | |
+| 输出位置 | `REPO_ROOT` / `TMP_CONFIG_DIR` / `RESULTS_ROOT` | 仓库根 / `<repo_root>/.tmp` / `<repo_root>/results/01-analyse/02-deepspeed-sve` | |

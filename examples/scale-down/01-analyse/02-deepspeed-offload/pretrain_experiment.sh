@@ -24,12 +24,12 @@
 # NVMe parameter offload is named with the param_nvme placement.
 #
 # Output layout — one independent folder per test, timestamped per run:
-#   <repo_root>/results/01-analyse/02-deepspeed/<model>[_<N>layer]/<TEST_NAME>/<timestamp>/
+#   <repo_root>/results/01-analyse/02-deepspeed-sve/<model>[_<N>layer]/<TEST_NAME>/<timestamp>/
 #       ├── run.log        full stdout/stderr
 #       ├── metrics.csv    per-step metrics (train.py MetricsLogger)
 #       ├── ds_config.json exact config used (copied by pretrain.sh)
 #       └── nsys_trace.nsys-rep  iterations 7-8 (when --profile nsys)
-#   <repo_root>/results/01-analyse/02-deepspeed/experiment_summary_<ts>.txt
+#   <repo_root>/results/01-analyse/02-deepspeed-sve/experiment_summary_<ts>.txt
 #
 # The working ds_config JSONs are generated under <repo_root>/.tmp/ (built by
 # an explicit per-strategy heredoc block in build_ds_config() so each file can
@@ -314,12 +314,12 @@ fi
 # ---------------------------------------------------------------------------
 # Output layout
 #   working ds_configs : <repo_root>/.tmp/
-#   results            : <repo_root>/results/01-analyse/02-deepspeed/
+#   results            : <repo_root>/results/01-analyse/02-deepspeed-sve/
 #                        └── <model>[_<N>layer]/<TEST_NAME>/<timestamp>/{run.log,
 #                            metrics.csv, ds_config.json}
 # ---------------------------------------------------------------------------
 TMP_CONFIG_DIR=${TMP_CONFIG_DIR:-"${REPO_ROOT}/.tmp"}
-RESULTS_ROOT=${RESULTS_ROOT:-"${REPO_ROOT}/results/01-analyse/02-deepspeed"}
+RESULTS_ROOT=${RESULTS_ROOT:-"${REPO_ROOT}/results/01-analyse/02-deepspeed-sve"}
 mkdir -p "$TMP_CONFIG_DIR" "$RESULTS_ROOT"
 
 # DeepSpeed communication overlap is configurable for performance experiments.
@@ -496,6 +496,17 @@ recompute_token() {
 # ---------------------------------------------------------------------------
 # Main sweep: model -> batch size -> recompute combo -> offload strategy
 # ---------------------------------------------------------------------------
+if [ "$DRY_RUN" != "true" ]; then
+    for strategy in $OPTIMIZER_STRATEGIES; do
+        case "$strategy" in
+            zero_offload|super_offload_*)
+                "$PYTHON_BIN" "${SCRIPT_DIR}/cpu_adam_sve.py"
+                break
+                ;;
+        esac
+    done
+fi
+
 INVOKE_TS=$(date +%Y%m%d_%H%M%S)
 SUMMARY_FILE="${RESULTS_ROOT}/experiment_summary_${INVOKE_TS}.txt"
 : > "$SUMMARY_FILE"
@@ -610,6 +621,10 @@ for MODEL in $MODELS; do
                         --warmup_steps "$MEASURE_WARMUP_STEPS"
                         --apply_model_shape_overrides "$APPLY_MODEL_SHAPE_OVERRIDES"
                     )
+                    if [ "$OPTIMIZER_STRATEGY" != "zero_3" ]; then
+                        echo "CPU Adam kernel: ARM SVE (required)"
+                        PRETRAIN_ARGS+=(--require-cpu-adam-sve)
+                    fi
                     if [ "$TEST_MODE" = "true" ]; then
                         PRETRAIN_ARGS+=(--test)
                     fi

@@ -1,0 +1,13 @@
+--- a/deepspeed/runtime/superoffload/superoffload_stage3.py
++++ b/deepspeed/runtime/superoffload/superoffload_stage3.py
+@@ -121,10 +121,4 @@
+     @instrument_w_nvtx
+     def _reassign_or_swap_out_partitioned_parameters(self, sub_group_id):
+-        if self.subgroup_to_device[sub_group_id] == 'cpu':
+-            self.fp16_partitioned_groups_flat[sub_group_id].data.copy_(
+-                self.fp32_partitioned_groups_flat[sub_group_id].data)
+-            self._unflatten_partitioned_parameters(sub_group_id)
+-            return
+-
+         if self.fp16_partitioned_groups_flat[sub_group_id] is not None:
+             self.fp16_partitioned_groups_flat[sub_group_id].data.copy_(

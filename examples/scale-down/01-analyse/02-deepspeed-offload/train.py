@@ -66,6 +66,7 @@ from transformers import (
 import deepspeed
 
 from config import ProfilingConfig
+from cpu_adam_sve import verify_cpu_adam_sve
 from data_utils import (
     build_hf_batch_generator,
     build_model_config,
@@ -136,6 +137,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--log_interval", type=int, default=1)
     parser.add_argument("--seq_len", type=int, default=128)
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument(
+        "--require-cpu-adam-sve",
+        action="store_true",
+        help="Require the ARM SVE CPU Adam extension in each training process.",
+    )
     parser.add_argument(
         "--test",
         action="store_true",
@@ -815,6 +821,8 @@ def prepare_training(args: argparse.Namespace) -> TrainingState:
         level=logging.INFO if rank == 0 else logging.WARNING,
         format=f"[rank {rank}] %(levelname)s: %(message)s",
     )
+    if args.require_cpu_adam_sve:
+        verify_cpu_adam_sve()
     seed_everything(args.seed)
 
     # ProfilingConfig parses the matching CLI arguments from the namespace
