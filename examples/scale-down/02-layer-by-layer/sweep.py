@@ -14,7 +14,6 @@ import shlex
 import subprocess
 import sys
 import tempfile
-from importlib.machinery import PathFinder
 from importlib.util import find_spec
 from pathlib import Path
 
@@ -80,7 +79,16 @@ def _module_source(module: str) -> Path | None:
     for end in range(2, len(parts) + 1):
         if spec is None or spec.submodule_search_locations is None:
             return None
-        spec = PathFinder.find_spec(".".join(parts[:end]), spec.submodule_search_locations)
+        fullname = ".".join(parts[:end])
+        # An editable install can resolve a child via a meta path finder.
+        search_paths = spec.submodule_search_locations
+        spec = None
+        for finder in sys.meta_path:
+            find = getattr(finder, "find_spec", None)
+            if find is not None:
+                spec = find(fullname, search_paths, None)
+                if spec is not None:
+                    break
     if spec is None or spec.origin is None:
         return None
     return Path(spec.origin).resolve()
@@ -95,8 +103,13 @@ def _installed_megatron_lm() -> Path:
             (root / source).is_file() for source in _LM_SOURCE_FILES
         ):
             return root
+    training_source = driver or _module_source("megatron.training")
+    core_source = trainer or _module_source("megatron.core")
     raise RuntimeError(
-        "The Bridge Python environment does not expose the complete layer-by-layer trainer. "
+        "The Bridge Python environment does not expose the complete layer-by-layer trainer.\n"
+        f"Python: {sys.executable}\n"
+        f"Megatron training source: {training_source or 'missing'}\n"
+        f"Megatron Core source: {core_source or 'missing'}\n"
         "Check out layer-by-layer in the Megatron-LM already installed in this environment."
     )
 
