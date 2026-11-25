@@ -2,7 +2,7 @@
 # Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
 # Licensed under the Apache License, Version 2.0.
 
-"""List NVMe-backed mounts and RDMA interfaces visible inside a Linux container."""
+"""Report and save NVMe mounts and RDMA interfaces visible inside a Linux container."""
 
 import argparse
 import json
@@ -11,6 +11,7 @@ import re
 import socket
 import subprocess
 import sys
+from datetime import datetime
 from pathlib import Path
 
 
@@ -52,6 +53,21 @@ def _show_nvme_mounts(mountinfo: str) -> None:
             logger.info("  %s  %s  %s  %s", target, source, filesystem, ", ".join(sorted(backing)))
     logger.info("nvme_mountpoints=%d", len(targets))
     logger.info("mounted_nvme_namespaces=%d", len(namespaces))
+
+
+def _show_filesystem_usage() -> None:
+    logger.info("\nFilesystems (df -h)")
+    try:
+        result = subprocess.run(
+            ["df", "-h"], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, errors="replace", check=False
+        )
+    except OSError as error:
+        logger.warning("Cannot run df -h: %s", error)
+        return
+    if result.stdout:
+        logger.info("%s", result.stdout.rstrip("\n"))
+    if result.returncode:
+        logger.warning("df -h exited with status %d", result.returncode)
 
 
 def _sysfs_port_links(ib_class: Path) -> list[dict[str, str]]:
@@ -115,19 +131,34 @@ def _show_rdma_links() -> None:
 
 def main() -> int:
     """Report device visibility using read-only Linux kernel interfaces."""
-    argparse.ArgumentParser(description=__doc__).parse_args()
-    logging.basicConfig(level=logging.INFO, format="%(message)s", stream=sys.stdout)
+    argparse.ArgumentParser(
+        description=__doc__, epilog="Logs are saved to results/gb200/nvme-io/ under the repository root."
+    ).parse_args()
+    hostname = socket.gethostname()
+    results_dir = Path(__file__).resolve().parents[3] / "results/gb200/nvme-io"
+    log_path = results_dir / f"{hostname}-{datetime.now():%Y%m%d-%H%M%S-%f}.log"
+    try:
+        results_dir.mkdir(parents=True, exist_ok=True)
+        log_file = logging.FileHandler(log_path, mode="x", encoding="utf-8", errors="backslashreplace")
+    except OSError as error:
+        logger.error("Cannot create log %s: %s", log_path, error)
+        return 1
+    logging.basicConfig(
+        level=logging.INFO, format="%(message)s", handlers=[logging.StreamHandler(sys.stdout), log_file]
+    )
+    logger.info("Log: %s", log_path)
     try:
         mountinfo = MOUNTINFO.read_bytes().decode("utf-8", errors="surrogateescape")
     except OSError as error:
         logger.error("Cannot read mount metadata (Linux required): %s", error)
         return 1
 
-    logger.info("Host: %s", socket.gethostname())
+    logger.info("Host: %s", hostname)
     _show_nvme_mounts(mountinfo)
     _show_rdma_links()
     uverbs = sorted(path.name for path in (DEV / "infiniband").glob("uverbs[0-9]*") if path.is_char_device())
     logger.info("uverbs_device_nodes=%d (%s)", len(uverbs), ", ".join(uverbs) or "none")
+    _show_filesystem_usage()
     return 0
 
 
