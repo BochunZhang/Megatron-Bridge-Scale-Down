@@ -34,6 +34,8 @@ def test_layer_by_layer_baseline_dry_run(
     command = shlex.split(result.stderr.strip())
     assert {
         "/example/nsys",
+        "--sample=none",
+        "--cpuctxsw=process-tree",
         "--gpu-metrics-devices=none",
         "--nproc-per-node=4",
         "model.num_layers=8",
