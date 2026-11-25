@@ -25,6 +25,8 @@ bash examples/gb200/nvls-fused-ag-rs/run_nsys_fused_ag_rs.sh \
 
 `--ag-mib` 是每卡的完整 AG 输出，`--rs-mib` 是每卡的完整 RS 输入。两项均可独立指定，均须能按 GPU 数分成 16 B 对齐的分片。默认顺序是先跑 4 CTA 的四种融合内核，再跑 8 CTA 的四种，最后各跑一份 AG+RS 并发、AG 独跑和 RS 独跑基线。三个基线的 CTA 数由 NCCL 选取。`--ctas` 和 `--variants` 支持逗号分隔的列表。pause 变体默认暂停 3072 cycles，设为 0 可测同一变体的零延迟对照。可用 `--dry-run` 核对顺序和参数。
 
+测默认动态调频下的性能时，在上述命令末尾加 `--unlock`。启动器在首个测试前用 `nvidia-smi --reset-gpu-clocks` 解除 `--gpus` 所选 GPU 的核心锁频，需要 root 权限。结果目录会记录 `gpu_clock_reset.log`，以及解除后、首项测试前和整轮结束时各一次时钟快照（`gpu_clocks.before.csv` 和 `gpu_clocks.after.csv`）。
+
 脚本默认使用仓库根目录下的 `NsightSystems-2026.6.1/bin/nsys`，也可通过 `NSYS_BIN` 或 `--nsys` 指定同版本的其他安装位置。每个模式先做无 profiler 的 CUDA event 计时，再单独采集 CUDA 和 NVTX。两轮均验证每个 rank 的对应输出。采集后下载整个 `results/gb200/nvls-fused-ag-rs/<timestamp>/` 目录到本机，保留 `config.txt`、计时结果和原始报告。
 
 在本机用 `nsys export --type=sqlite --output=profile.sqlite` 导出需要分析的 `.nsys-rep`，再把本机生成的 SQLite 交给 `analyse_nsys.py`。分析融合和并发基线时，可用 `--ag-only` 和 `--rs-only` 加入两组独跑结果。

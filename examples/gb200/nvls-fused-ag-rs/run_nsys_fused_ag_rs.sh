@@ -25,6 +25,7 @@ Nsight reports and timing files are saved for analysis on a separate machine.
   --nsys PATH        Override NSYS_BIN or the repo default NsightSystems-2026.6.1/bin/nsys
   --nsys-freq HZ     GPU metrics sampling frequency (10..200000, default: 50000)
   --output-dir DIR   Default: results/gb200/nvls-fused-ag-rs/<timestamp>
+  --unlock           Reset the selected GPUs to default clock control before benchmarking (requires root)
   --dry-run          Print commands without creating outputs or starting workers
   -h, --help
 USAGE
@@ -46,11 +47,13 @@ ag_pause_cycles=3072
 nccl_build="${repo_root}/nccl/nccl-2.32.3-fused-ag-rs/build"
 cuda_home="${CUDA_HOME:-/usr/local/cuda}"
 output_dir=
+unlock_gpu_clocks=false
 dry_run=false
 
 while (( $# )); do
     case "$1" in
         -h|--help) usage; exit 0 ;;
+        --unlock) unlock_gpu_clocks=true; shift ;;
         --dry-run) dry_run=true; shift ;;
         --gpus|--ag-mib|--rs-mib|--warmup|--iters|--ctas|--variants|--ag-pause-cycles|--nccl-build|--cuda-home|--nsys|--nsys-freq|--output-dir)
             [[ -n "${2:-}" && "$2" != --* ]] || die "$1 needs a value"
@@ -122,6 +125,9 @@ else
         || die "expected Nsight Systems ${nsys_release}, found: ${nsys_version}"
     [[ -r "$nsys_metrics_file" ]] || die "NVLink metric set not found at ${nsys_metrics_file}"
     command -v uv >/dev/null || die "uv is required"
+    if $unlock_gpu_clocks; then
+        command -v nvidia-smi >/dev/null || die "nvidia-smi is required for --unlock"
+    fi
     [[ -x "${cuda_home}/bin/nvcc" ]] || die "CUDA toolkit not found (use --cuda-home DIR)"
     [[ -f "$nccl_lib" && -f "${nccl_build}/include/nccl_device.h" ]] &&
         LC_ALL=C grep -aFq 'NCCL version 2.32.3-fused-ag-rs+cuda' "$nccl_lib" \
@@ -135,6 +141,7 @@ else
     {
         echo "$nsys_version"
         echo "gpus=$gpus ag_mib=$ag_mib rs_mib=$rs_mib warmup=$warmup iters=$iters dtype=bf16"
+        echo "unlock_gpu_clocks=$unlock_gpu_clocks"
         echo "fused_ctas=$cta_sizes fused_variants=$variants warp_split_pause_ag_cycles=$ag_pause_cycles"
         echo "nccl_lib=$nccl_lib"
         echo "GLOO_SOCKET_IFNAME=$gloo_ifname"
@@ -156,6 +163,28 @@ cd -- "$repo_root"
 run "${cuda_home}/bin/nvcc" -std=c++17 -shared -Xcompiler=-fPIC \
     -I"${nccl_build}/include" "${script_dir}/fused_ag_rs_shim.cc" -L"${nccl_build}/lib" \
     -Xlinker -rpath -Xlinker "${nccl_build}/lib" -lnccl -o "$shim"
+
+clock_query=(nvidia-smi -i "$gpus" --query-gpu=index,pci.bus_id,uuid,clocks.current.sm,clocks.current.memory --format=csv)
+record_gpu_clocks() {
+    local path="$1"
+    if $dry_run; then
+        printf '%q ' "${clock_query[@]}"
+        printf '> %q\n' "$path"
+    else
+        "${clock_query[@]}" >"$path"
+    fi
+}
+
+if $unlock_gpu_clocks; then
+    reset_clocks=(nvidia-smi -i "$gpus" --reset-gpu-clocks)
+    if $dry_run; then
+        run "${reset_clocks[@]}"
+    else
+        "${reset_clocks[@]}" 2>&1 | tee "${output_dir}/gpu_clock_reset.log" \
+            || die "could not reset clocks on GPUs $gpus; --unlock requires root"
+    fi
+    record_gpu_clocks "${output_dir}/gpu_clocks.before.csv"
+fi
 
 worker_env=(
     env -u NCCL_ALGO -u NCCL_PROTO -u NCCL_CTA_POLICY -u NCCL_SYM_CTAS
@@ -222,6 +251,9 @@ run_case split "${output_dir}/split" "${cta_list[0]}"
 run_case ag-only "${output_dir}/split/ag-only" "${cta_list[0]}"
 run_case rs-only "${output_dir}/split/rs-only" "${cta_list[0]}"
 
+if $unlock_gpu_clocks; then
+    record_gpu_clocks "${output_dir}/gpu_clocks.after.csv"
+fi
 if ! $dry_run; then
     printf 'Nsight reports and timing files saved in %s\n' "$output_dir"
 fi
