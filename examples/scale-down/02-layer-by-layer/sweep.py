@@ -233,7 +233,7 @@ def _profile_report(args: argparse.Namespace, layers: int, results: Path) -> Pat
     seq = f"{args.seq_length // 1024}k" if args.seq_length % 1024 == 0 else str(args.seq_length)
     gbs = args.micro_batch_size * args.microbatches * _WORLD_SIZE
     return results / (
-        f"{model}-lby-layers_{layers}-attn_full-bf16-cg_off-tp_1-cp_1-pp_1-dp_{_WORLD_SIZE}"
+        f"{model}-lbl-layers_{layers}-attn_full-bf16-cg_off-tp_1-cp_1-pp_1-dp_{_WORLD_SIZE}"
         f"-mbs_{args.micro_batch_size}-gbs_{gbs}-seq_{seq}-iters_{args.steps}"
         f"-param_{args.parameter_tier}-act_{args.activation_tier}-opt_{args.optimizer_tier}.nsys-rep"
     )

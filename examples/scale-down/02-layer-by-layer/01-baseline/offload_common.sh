@@ -53,7 +53,7 @@ HELP
 done
 
 [[ "${output_dir}" == /* ]] || output_dir="${PWD}/${output_dir}"
-model_name="model_27b-lby-layers_${layers}-attn_full-cg_off-mbs_1-seq_4096-tp_1-cp_1-gbs_16-gpus_4"
+model_name="model_27b-lbl-layers_${layers}-attn_full-cg_off-mbs_1-seq_4096-tp_1-cp_1-gbs_16-gpus_4"
 model_name+="-param_${parameter_tier}-act_${activation_tier}-opt_${optimizer_tier}-iters_${train_iters}-profile_${profile}"
 result_dir="${output_dir%/}/01-baseline/${case_name}/${model_name}/node0"
 if [[ "${print_result_dir}" == true ]]; then
