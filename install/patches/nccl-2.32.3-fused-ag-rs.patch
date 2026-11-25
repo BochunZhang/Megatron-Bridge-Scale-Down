@@ -1,9 +1,9 @@
 diff --git a/docs/examples/06_device_api/07_fused_ag_rs/c/main.cu b/docs/examples/06_device_api/07_fused_ag_rs/c/main.cu
 new file mode 100644
-index 00000000..952e9bdf
+index 00000000..c6fcd3a2
 --- /dev/null
 +++ b/docs/examples/06_device_api/07_fused_ag_rs/c/main.cu
-@@ -0,0 +1,203 @@
+@@ -0,0 +1,220 @@
 +/*************************************************************************
 + * SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 + * SPDX-License-Identifier: Apache-2.0
@@ -45,7 +45,11 @@ index 00000000..952e9bdf
 +constexpr Shape shapes[] = {{4120, 8200, 0}, {4130, 8206, 0}, {16408, 4104, 0}, {8202, 4126, 2}};
 +constexpr int trials = sizeof(shapes) / sizeof(shapes[0]);
 +constexpr size_t capacity = 16416;
-+constexpr int ctas = 4;
++constexpr int ctaCounts[] = {4, 8};
++constexpr ncclDevFusedAgRsVariant_t variants[] = {
++  ncclDevFusedAgRsAgFirst, ncclDevFusedAgRsRsFirst,
++  ncclDevFusedAgRsWarpSplit, ncclDevFusedAgRsWarpSplitPause,
++};
 +
 +struct Rank {
 +  cudaStream_t stream;
@@ -116,7 +120,7 @@ index 00000000..952e9bdf
 +
 +  ncclDevCommRequirements reqs = NCCL_DEV_COMM_REQUIREMENTS_INITIALIZER;
 +  reqs.lsaMultimem = true;
-+  reqs.lsaBarrierCount = ctas;
++  reqs.lsaBarrierCount = ctaCounts[1];
 +  CHECK_NCCL(ncclGroupStart());
 +  for (int rank = 0; rank < nranks; ++rank) {
 +    CHECK_CUDA(cudaSetDevice(rank));
@@ -128,56 +132,70 @@ index 00000000..952e9bdf
 +  Rank& first = ranks.front();
 +  if (ncclDevFusedAllGatherReduceScatter(first.agSend, first.agWindow, 0, bytes(shapes[0].agCount),
 +                                       first.rsWindow, 0, first.rsRecv, shapes[0].rsCount + 1,
-+                                       &first.devComm, ctas, first.stream) != ncclInvalidArgument) {
++                                       &first.devComm, ctaCounts[0], first.stream) != ncclInvalidArgument) {
 +    std::fprintf(stderr, "Expected ncclInvalidArgument for odd BF16 RS count\n");
 +    return EXIT_FAILURE;
 +  }
 +
-+  // Submit rank-local inputs, the pair, and dependent outputs on each stream.
-+  // Pinned per-trial host buffers allow every launch to queue before any host wait.
-+  for (int trial = 0; trial < trials; ++trial) {
-+    const Shape& shape = shapes[trial];
-+    for (int rank = 0; rank < nranks; ++rank) {
-+      Rank& r = ranks[rank];
-+      CHECK_CUDA(cudaSetDevice(rank));
-+      for (size_t i = 0; i < shape.agCount; ++i) r.agInputs[trial][i] = __float2bfloat16(agValue(trial, rank, i));
-+      for (size_t i = 0; i < nranks * shape.rsCount; ++i) r.rsInputs[trial][i] = __float2bfloat16(rsValue(trial, rank, i));
-+      CHECK_CUDA(cudaMemsetAsync(r.agRecv, 0, bytes(nranks * capacity), r.stream));
-+      CHECK_CUDA(cudaMemsetAsync(r.rsRecv, 0, bytes(capacity), r.stream));
-+      CHECK_CUDA(cudaMemcpyAsync(r.agSend + shape.offset, r.agInputs[trial], bytes(shape.agCount),
-+                                 cudaMemcpyHostToDevice, r.stream));
-+      CHECK_CUDA(cudaMemcpyAsync(r.rsSend + shape.offset, r.rsInputs[trial], bytes(nranks * shape.rsCount),
-+                                 cudaMemcpyHostToDevice, r.stream));
-+      CHECK_NCCL(ncclDevFusedAllGatherReduceScatter(r.agSend + shape.offset, r.agWindow, bytes(shape.offset),
-+                                                  bytes(shape.agCount), r.rsWindow, bytes(shape.offset),
-+                                                  r.rsRecv + shape.offset, shape.rsCount, &r.devComm, ctas, r.stream));
-+      CHECK_CUDA(cudaMemcpyAsync(r.agOutputs[trial], r.agRecv, bytes(nranks * capacity), cudaMemcpyDeviceToHost, r.stream));
-+      CHECK_CUDA(cudaMemcpyAsync(r.rsOutputs[trial], r.rsRecv, bytes(capacity), cudaMemcpyDeviceToHost, r.stream));
-+    }
++  if (ncclDevFusedAllGatherReduceScatterWithConfig(
++        first.agSend, first.agWindow, 0, bytes(shapes[0].agCount), first.rsWindow, 0, first.rsRecv, shapes[0].rsCount,
++        &first.devComm, ctaCounts[0], ncclDevFusedAgRsAgFirst, /*agPauseCycles=*/1, first.stream) != ncclInvalidArgument) {
++    std::fprintf(stderr, "Expected ncclInvalidArgument for a pause on AG-first\n");
++    return EXIT_FAILURE;
 +  }
 +
-+  for (int rank = 0; rank < nranks; ++rank) {
-+    Rank& r = ranks[rank];
-+    CHECK_CUDA(cudaSetDevice(rank));
-+    CHECK_CUDA(cudaStreamSynchronize(r.stream));
-+    for (int trial = 0; trial < trials; ++trial) {
-+      const Shape& shape = shapes[trial];
-+      for (size_t i = 0; i < nranks * capacity; ++i) {
-+        int expected = 0;
-+        if (i >= shape.offset && i - shape.offset < nranks * shape.agCount) {
-+          size_t dataIndex = i - shape.offset;
-+          expected = agValue(trial, dataIndex / shape.agCount, dataIndex % shape.agCount);
++  for (int ctas : ctaCounts) {
++    for (ncclDevFusedAgRsVariant_t variant : variants) {
++      const uint32_t pauseCycles = variant == ncclDevFusedAgRsWarpSplitPause ? 3072 : 0;
++      // Submit rank-local inputs, the pair, and dependent outputs on each stream.
++      // Pinned per-trial host buffers allow every launch to queue before any host wait.
++      for (int trial = 0; trial < trials; ++trial) {
++        const Shape& shape = shapes[trial];
++        for (int rank = 0; rank < nranks; ++rank) {
++          Rank& r = ranks[rank];
++          CHECK_CUDA(cudaSetDevice(rank));
++          for (size_t i = 0; i < shape.agCount; ++i) r.agInputs[trial][i] = __float2bfloat16(agValue(trial, rank, i));
++          for (size_t i = 0; i < nranks * shape.rsCount; ++i) r.rsInputs[trial][i] = __float2bfloat16(rsValue(trial, rank, i));
++          CHECK_CUDA(cudaMemsetAsync(r.agRecv, 0, bytes(nranks * capacity), r.stream));
++          CHECK_CUDA(cudaMemsetAsync(r.rsRecv, 0, bytes(capacity), r.stream));
++          CHECK_CUDA(cudaMemcpyAsync(r.agSend + shape.offset, r.agInputs[trial], bytes(shape.agCount),
++                                     cudaMemcpyHostToDevice, r.stream));
++          CHECK_CUDA(cudaMemcpyAsync(r.rsSend + shape.offset, r.rsInputs[trial], bytes(nranks * shape.rsCount),
++                                     cudaMemcpyHostToDevice, r.stream));
++          CHECK_NCCL(ncclDevFusedAllGatherReduceScatterWithConfig(
++            r.agSend + shape.offset, r.agWindow, bytes(shape.offset), bytes(shape.agCount), r.rsWindow, bytes(shape.offset),
++            r.rsRecv + shape.offset, shape.rsCount, &r.devComm, ctas, variant, pauseCycles, r.stream));
++          CHECK_CUDA(cudaMemcpyAsync(r.agOutputs[trial], r.agRecv, bytes(nranks * capacity), cudaMemcpyDeviceToHost, r.stream));
++          CHECK_CUDA(cudaMemcpyAsync(r.rsOutputs[trial], r.rsRecv, bytes(capacity), cudaMemcpyDeviceToHost, r.stream));
 +        }
-+        check("AG", trial, rank, i, r.agOutputs[trial][i], expected);
 +      }
-+      for (size_t i = 0; i < capacity; ++i) {
-+        int expected = 0;
-+        if (i >= shape.offset && i - shape.offset < shape.rsCount) {
-+          size_t dataIndex = rank * shape.rsCount + i - shape.offset;
-+          for (int peer = 0; peer < nranks; ++peer) expected += rsValue(trial, peer, dataIndex);
++
++      for (int rank = 0; rank < nranks; ++rank) {
++        Rank& r = ranks[rank];
++        CHECK_CUDA(cudaSetDevice(rank));
++        CHECK_CUDA(cudaStreamSynchronize(r.stream));
++        for (int trial = 0; trial < trials; ++trial) {
++          const Shape& shape = shapes[trial];
++          for (size_t i = 0; i < nranks * capacity; ++i) {
++            int expected = 0;
++            if (i >= shape.offset && i - shape.offset < nranks * shape.agCount) {
++              size_t dataIndex = i - shape.offset;
++              expected = agValue(trial, dataIndex / shape.agCount, dataIndex % shape.agCount);
++            }
++            check("AG", trial, rank, i, r.agOutputs[trial][i], expected);
++          }
++          for (size_t i = 0; i < capacity; ++i) {
++            int expected = 0;
++            if (i >= shape.offset && i - shape.offset < shape.rsCount) {
++              size_t dataIndex = rank * shape.rsCount + i - shape.offset;
++              for (int peer = 0; peer < nranks; ++peer) expected += rsValue(trial, peer, dataIndex);
++            }
++            check("RS", trial, rank, i, r.rsOutputs[trial][i], expected);
++          }
 +        }
-+        check("RS", trial, rank, i, r.rsOutputs[trial][i], expected);
 +      }
++      std::printf("Fused AG/RS variant %d passed on %d GPUs at %d CTA (%d queued pairs)\n",
++                  static_cast<int>(variant), nranks, ctas, trials);
 +    }
 +  }
 +
@@ -205,7 +223,6 @@ index 00000000..952e9bdf
 +    CHECK_CUDA(cudaStreamDestroy(r.stream));
 +    CHECK_NCCL(ncclCommDestroy(comms[rank]));
 +  }
-+  std::printf("Fused AG/RS smoke passed on %d GPUs (%d queued pairs)\n", nranks, trials);
 +}
 diff --git a/makefiles/version.mk b/makefiles/version.mk
 index db924347..8fac16c0 100644
@@ -219,16 +236,17 @@ index db924347..8fac16c0 100644
 +NCCL_SUFFIX  := -fused-ag-rs
  PKG_REVISION := 1
 diff --git a/src/dev_runtime.cc b/src/dev_runtime.cc
-index 2bad06e7..3b82f488 100644
+index 2bad06e7..bf39b5a5 100644
 --- a/src/dev_runtime.cc
 +++ b/src/dev_runtime.cc
-@@ -2250,6 +2250,90 @@ ncclResult_t findCommAndHostWindowFromDeviceWindow(ncclWindow_t devWindow, ncclC
+@@ -2250,6 +2250,108 @@ ncclResult_t findCommAndHostWindowFromDeviceWindow(ncclWindow_t devWindow, ncclC
    return ncclSuccess;
  }
  
 +ncclResult_t ncclLaunchFusedAllGatherReduceScatter(const ncclDevComm_t* devComm, uintptr_t agSrc, uintptr_t agDst,
 +                                                    size_t agBytes, uintptr_t rsSrc, uintptr_t rsDst, size_t rsBytes,
-+                                                    int ctas, cudaStream_t stream);
++                                                  int ctas, ncclDevFusedAgRsVariant_t variant, uint32_t agPauseCycles,
++                                                  cudaStream_t stream);
 +
 +static bool fusedAgRsOverlap(uintptr_t first, size_t firstBytes, uintptr_t second, size_t secondBytes) {
 +  return first <= second ? second - first < firstBytes : first - second < secondBytes;
@@ -243,12 +261,17 @@ index 2bad06e7..3b82f488 100644
 +         shardBytes <= (mappedBytes - windowOffset - offset) / ranks;
 +}
 +
-+NCCL_API(ncclResult_t, ncclDevFusedAllGatherReduceScatter, const void* agSend, ncclWindow_t agRecv, size_t agOffset,
-+         size_t agBytes, ncclWindow_t rsSend, size_t rsOffset, void* rsRecv, size_t rsCount, const ncclDevComm_t* devComm,
-+         int ctas, cudaStream_t stream);
-+ncclResult_t ncclDevFusedAllGatherReduceScatter(
++NCCL_API(ncclResult_t, ncclDevFusedAllGatherReduceScatterWithConfig, const void* agSend, ncclWindow_t agRecv,
++         size_t agOffset, size_t agBytes, ncclWindow_t rsSend, size_t rsOffset, void* rsRecv, size_t rsCount,
++         const ncclDevComm_t* devComm, int ctas, ncclDevFusedAgRsVariant_t variant, uint32_t agPauseCycles,
++         cudaStream_t stream);
++ncclResult_t ncclDevFusedAllGatherReduceScatterWithConfig(
 +  const void* agSend, ncclWindow_t agRecv, size_t agOffset, size_t agBytes, ncclWindow_t rsSend, size_t rsOffset,
-+  void* rsRecv, size_t rsCount, const ncclDevComm_t* devComm, int ctas, cudaStream_t stream) {
++  void* rsRecv, size_t rsCount, const ncclDevComm_t* devComm, int ctas, ncclDevFusedAgRsVariant_t variant,
++  uint32_t agPauseCycles, cudaStream_t stream) {
++  if (variant < ncclDevFusedAgRsAgFirst || variant > ncclDevFusedAgRsWarpSplitPause ||
++      (variant != ncclDevFusedAgRsWarpSplitPause && agPauseCycles != 0))
++    return ncclInvalidArgument;
 +  if (!agSend || !agRecv || !rsSend || !rsRecv || !devComm || ctas < 1 || ctas > MAXCHANNELS ||
 +      agBytes == 0 || rsCount == 0 || rsCount > SIZE_MAX / 2 || rsCount % 2 != 0 ||
 +      (reinterpret_cast<uintptr_t>(agSend) | reinterpret_cast<uintptr_t>(rsRecv) | agOffset | rsOffset | agBytes) % 4 != 0)
@@ -307,7 +330,19 @@ index 2bad06e7..3b82f488 100644
 +  const uintptr_t agDst = multicast + agWindow->bigOffset + agOffset + rank * agBytes;
 +  const uintptr_t rsSrc = multicast + rsWindow->bigOffset + rsOffset + rank * rsBytes;
 +  if ((agDst | rsSrc) % 4 != 0) return ncclInvalidArgument;
-+  return ncclLaunchFusedAllGatherReduceScatter(devComm, agSrc, agDst, agBytes, rsSrc, rsDst, rsBytes, ctas, stream);
++  return ncclLaunchFusedAllGatherReduceScatter(devComm, agSrc, agDst, agBytes, rsSrc, rsDst, rsBytes, ctas,
++                                              variant, agPauseCycles, stream);
++}
++
++NCCL_API(ncclResult_t, ncclDevFusedAllGatherReduceScatter, const void* agSend, ncclWindow_t agRecv, size_t agOffset,
++         size_t agBytes, ncclWindow_t rsSend, size_t rsOffset, void* rsRecv, size_t rsCount, const ncclDevComm_t* devComm,
++         int ctas, cudaStream_t stream);
++ncclResult_t ncclDevFusedAllGatherReduceScatter(
++  const void* agSend, ncclWindow_t agRecv, size_t agOffset, size_t agBytes, ncclWindow_t rsSend, size_t rsOffset,
++  void* rsRecv, size_t rsCount, const ncclDevComm_t* devComm, int ctas, cudaStream_t stream) {
++  return ncclDevFusedAllGatherReduceScatterWithConfig(agSend, agRecv, agOffset, agBytes, rsSend, rsOffset,
++                                                     rsRecv, rsCount, devComm, ctas, ncclDevFusedAgRsAgFirst,
++                                                     /*agPauseCycles=*/0, stream);
 +}
 +
  NCCL_API(ncclResult_t, ncclGetMultimemDevicePointer, ncclWindow_t window, size_t offset, ncclMultimemHandle multimem,
@@ -358,10 +393,10 @@ index ba07bd91..e952f777 100644
  
 diff --git a/src/device/fused_ag_rs.cu b/src/device/fused_ag_rs.cu
 new file mode 100644
-index 00000000..74893799
+index 00000000..11122127
 --- /dev/null
 +++ b/src/device/fused_ag_rs.cu
-@@ -0,0 +1,107 @@
+@@ -0,0 +1,228 @@
 +/*************************************************************************
 + * SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 + * SPDX-License-Identifier: Apache-2.0
@@ -371,6 +406,7 @@ index 00000000..74893799
 +
 +#include "core.h"
 +#include "nccl_device.h"
++#include "sym_kernels.h"
 +#include <cuda_runtime.h>
 +
 +namespace {
@@ -378,25 +414,52 @@ index 00000000..74893799
 +constexpr int FusedThreads = 256;
 +
 +#if __CUDA_ARCH__ >= 900
-+template <int PackBytes>
-+__device__ __forceinline__ void gatherPack(uintptr_t src, uintptr_t dst) {
-+  if constexpr (PackBytes == 16) {
-+    asm volatile("{ .reg .b32 p<4>;"
-+                 "ld.global.v4.b32 {p0,p1,p2,p3}, [%0];"
-+                 "multimem.st.global.v4.f32 [%1], {p0,p1,p2,p3}; }" ::"l"(src), "l"(dst) : "memory");
++constexpr int WarpSize = 32;
++constexpr int PackBytes = 16;
++constexpr int TileBytes = ncclSymkMultimemDeepBytePerChunk;
++static_assert(TileBytes == 8 * WarpSize * PackBytes);
++
++// Each tile has eight 16-byte packs per lane. Keep all eight loads ahead of
++// their stores in PTX, matching the STMC and LDMC warp loops.
++#define NCCL_FUSED_TILE_OPS(Op) \
++  Op(0, 1, 2, 3, 0) Op(4, 5, 6, 7, 512) Op(8, 9, 10, 11, 1024) Op(12, 13, 14, 15, 1536) \
++  Op(16, 17, 18, 19, 2048) Op(20, 21, 22, 23, 2560) Op(24, 25, 26, 27, 3072) Op(28, 29, 30, 31, 3584)
++#define NCCL_FUSED_PACK(a, b, c, d) "{p" #a ",p" #b ",p" #c ",p" #d "}"
++#define NCCL_FUSED_LOAD(a, b, c, d, off) \
++  "ld.global.v4.b32 " NCCL_FUSED_PACK(a, b, c, d) ", [%0+" #off "];"
++#define NCCL_FUSED_MCSTORE(a, b, c, d, off) \
++  "multimem.st.global.v4.f32 [%1+" #off "], " NCCL_FUSED_PACK(a, b, c, d) ";"
++#define NCCL_FUSED_REDUCE(a, b, c, d, off) \
++  "multimem.ld_reduce.relaxed.sys.global.add.acc::f32.v4.bf16x2 " NCCL_FUSED_PACK(a, b, c, d) ", [%0+" #off "];"
++#define NCCL_FUSED_STORE(a, b, c, d, off) \
++  "st.global.v4.b32 [%1+" #off "], " NCCL_FUSED_PACK(a, b, c, d) ";"
++
++template <bool Gather>
++__device__ __forceinline__ void transferTile(uintptr_t src, uintptr_t dst) {
++  if constexpr (Gather) {
++    asm volatile("{ .reg .b32 p<32>;"
++                 NCCL_FUSED_TILE_OPS(NCCL_FUSED_LOAD) NCCL_FUSED_TILE_OPS(NCCL_FUSED_MCSTORE)
++                 "}" ::"l"(src), "l"(dst) : "memory");
 +  } else {
-+    asm volatile("{ .reg .b32 p;"
-+                 "ld.global.b32 p, [%0];"
-+                 "multimem.st.global.b32 [%1], p; }" ::"l"(src), "l"(dst) : "memory");
++    asm volatile("{ .reg .b32 p<32>;"
++                 NCCL_FUSED_TILE_OPS(NCCL_FUSED_REDUCE) NCCL_FUSED_TILE_OPS(NCCL_FUSED_STORE)
++                 "}" ::"l"(src), "l"(dst) : "memory");
 +  }
 +}
 +
-+template <int PackBytes>
-+__device__ __forceinline__ void scatterPack(uintptr_t src, uintptr_t dst) {
-+  if constexpr (PackBytes == 16) {
-+    asm volatile("{ .reg .b32 p<4>;"
-+                 "multimem.ld_reduce.relaxed.sys.global.add.acc::f32.v4.bf16x2 {p0,p1,p2,p3}, [%0];"
-+                 "st.global.v4.b32 [%1], {p0,p1,p2,p3}; }" ::"l"(src), "l"(dst) : "memory");
++#undef NCCL_FUSED_TILE_OPS
++#undef NCCL_FUSED_PACK
++#undef NCCL_FUSED_LOAD
++#undef NCCL_FUSED_MCSTORE
++#undef NCCL_FUSED_REDUCE
++#undef NCCL_FUSED_STORE
++
++template <bool Gather>
++__device__ __forceinline__ void transferWord(uintptr_t src, uintptr_t dst) {
++  if constexpr (Gather) {
++    asm volatile("{ .reg .b32 p;"
++                 "ld.global.b32 p, [%0];"
++                 "multimem.st.global.b32 [%1], p; }" ::"l"(src), "l"(dst) : "memory");
 +  } else {
 +    asm volatile("{ .reg .b32 p;"
 +                 "multimem.ld_reduce.relaxed.sys.global.add.acc::f32.bf16x2 p, [%0];"
@@ -404,80 +467,179 @@ index 00000000..74893799
 +  }
 +}
 +
-+template <int PackBytes>
-+__device__ __forceinline__ void fusedPacks(uintptr_t agSrc, uintptr_t agDst, size_t agBytes, uintptr_t rsSrc,
-+                                           uintptr_t rsDst, size_t rsBytes) {
-+  size_t agPacks = agBytes / PackBytes;
-+  size_t rsPacks = rsBytes / PackBytes;
-+  size_t pairedPacks = agPacks < rsPacks ? agPacks : rsPacks;
-+  size_t stride = size_t(gridDim.x) * blockDim.x;
-+  size_t pack = size_t(blockIdx.x) * blockDim.x + threadIdx.x;
-+  // With independent buffers, the multicast store needs no fence before the reduce load.
-+  // Finish each pack's store before introducing the next payload at the PTX level.
++struct Transfer {
++  uintptr_t src, dst;
++  size_t bytes, prefix, tiles;
++};
++
++__device__ __forceinline__ Transfer makeTransfer(uintptr_t src, uintptr_t dst, size_t bytes) {
++  // Match the stock prefix alignment independently for each operation. If the
++  // endpoints have different alignment, transfer the full range in 4-byte words.
++  size_t prefix = (src - dst) % PackBytes == 0 ? -src % PackBytes : bytes;
++  prefix = min(bytes, prefix);
++  return {src, dst, bytes, prefix, (bytes - prefix) / TileBytes};
++}
++
++__device__ __forceinline__ size_t startTile(size_t tiles, unsigned int rank, size_t warp) {
++  // The stock STMC and LDMC permutation starts each rank at a different offset.
++  const unsigned int multiplier = rank ^ ((rank >> 1) & 1);
++  const size_t skew = size_t(multiplier) * (ncclSymkMcPerRankOffsetBytes / TileBytes);
++  return warp + (tiles == 0 ? 0 : skew % tiles);
++}
++
++template <bool Gather>
++__device__ __forceinline__ void nextTile(const Transfer& transfer, size_t& tile, size_t stride) {
++  if (tile >= transfer.tiles) tile -= transfer.tiles;
++  const size_t offset = transfer.prefix + tile * TileBytes + (threadIdx.x % WarpSize) * PackBytes;
++  transferTile<Gather>(transfer.src + offset, transfer.dst + offset);
++  tile += stride;
++}
++
++template <bool Gather>
++__device__ __forceinline__ void transferEnds(const Transfer& transfer, size_t warp, size_t stride) {
++  const size_t end = transfer.prefix + transfer.tiles * TileBytes;
++  const size_t remainder = transfer.prefix + (transfer.bytes - end);
 +  #pragma unroll 1
-+  for (; pack < pairedPacks; pack += stride) {
-+    size_t offset = pack * PackBytes;
-+    gatherPack<PackBytes>(agSrc + offset, agDst + offset);
-+    scatterPack<PackBytes>(rsSrc + offset, rsDst + offset);
++  for (size_t i = (warp * WarpSize + threadIdx.x % WarpSize) * 4; i < remainder; i += stride * WarpSize * 4) {
++    const size_t offset = i < transfer.prefix ? i : end + (i - transfer.prefix);
++    transferWord<Gather>(transfer.src + offset, transfer.dst + offset);
++  }
++}
++
++template <bool RsFirst>
++__device__ __forceinline__ void runPaired(const Transfer& ag, const Transfer& rs, unsigned int rank) {
++  const size_t warp = size_t(threadIdx.x / WarpSize) * gridDim.x + blockIdx.x;
++  const size_t stride = size_t(blockDim.x / WarpSize) * gridDim.x;
++  const size_t sharedTiles = min(ag.tiles, rs.tiles);
++  size_t agTile = startTile(ag.tiles, rank, warp);
++  size_t rsTile = startTile(rs.tiles, rank, warp);
++  size_t work = warp;
++  #pragma unroll 1
++  for (; work < sharedTiles; work += stride) {
++    if constexpr (RsFirst) {
++      nextTile<false>(rs, rsTile, stride);
++      nextTile<true>(ag, agTile, stride);
++    } else {
++      nextTile<true>(ag, agTile, stride);
++      nextTile<false>(rs, rsTile, stride);
++    }
 +  }
 +  #pragma unroll 1
-+  for (; pack < agPacks; pack += stride) {
-+    size_t offset = pack * PackBytes;
-+    gatherPack<PackBytes>(agSrc + offset, agDst + offset);
-+  }
++  for (; work < ag.tiles; work += stride) nextTile<true>(ag, agTile, stride);
 +  #pragma unroll 1
-+  for (; pack < rsPacks; pack += stride) {
-+    size_t offset = pack * PackBytes;
-+    scatterPack<PackBytes>(rsSrc + offset, rsDst + offset);
++  for (; work < rs.tiles; work += stride) nextTile<false>(rs, rsTile, stride);
++  if constexpr (RsFirst) {
++    transferEnds<false>(rs, warp, stride);
++    transferEnds<true>(ag, warp, stride);
++  } else {
++    transferEnds<true>(ag, warp, stride);
++    transferEnds<false>(rs, warp, stride);
 +  }
++}
++
++template <bool Gather, bool Pause>
++__device__ __forceinline__ void runSplit(const Transfer& transfer, unsigned int rank, size_t warp, size_t stride,
++                                         uint32_t agPauseCycles) {
++  size_t tile = startTile(transfer.tiles, rank, warp);
++  #pragma unroll 1
++  for (size_t work = warp; work < transfer.tiles; work += stride) {
++    nextTile<Gather>(transfer, tile, stride);
++    if constexpr (Gather && Pause) {
++      if (agPauseCycles != 0) {
++        const auto started = static_cast<unsigned long long>(clock64());
++        while (static_cast<unsigned long long>(clock64()) - started < agPauseCycles) {}
++      }
++    }
++  }
++  transferEnds<Gather>(transfer, warp, stride);
 +}
 +#endif
 +
-+} // namespace
-+
-+extern "C" __global__ __launch_bounds__(FusedThreads) void ncclDevKernel_FusedAllGatherReduceScatter(
-+  const __grid_constant__ ncclDevComm_t devComm, uintptr_t agSrc, uintptr_t agDst, size_t agBytes, uintptr_t rsSrc,
-+  uintptr_t rsDst, size_t rsBytes) {
++template <ncclDevFusedAgRsVariant_t Variant>
++__device__ __forceinline__ void runFused(const ncclDevComm_t& devComm, uintptr_t agSrc, uintptr_t agDst, size_t agBytes,
++                                         uintptr_t rsSrc, uintptr_t rsDst, size_t rsBytes, uint32_t agPauseCycles) {
 +#if __CUDA_ARCH__ >= 900
 +  ncclLsaBarrierSession<ncclCoopCta> bar{
 +    ncclCoopCta(), devComm, ncclTeamTagLsa(), blockIdx.x, /*multimem=*/true};
 +  bar.sync(ncclCoopCta(), cuda::memory_order_acq_rel);
 +
-+  if ((agSrc | agDst | rsSrc | rsDst) % 16 == 0) {
-+    fusedPacks<16>(agSrc, agDst, agBytes, rsSrc, rsDst, rsBytes);
-+    size_t agMain = agBytes & ~size_t(15);
-+    size_t rsMain = rsBytes & ~size_t(15);
-+    agSrc += agMain;
-+    agDst += agMain;
-+    agBytes -= agMain;
-+    rsSrc += rsMain;
-+    rsDst += rsMain;
-+    rsBytes -= rsMain;
++  if constexpr (Variant == ncclDevFusedAgRsWarpSplit || Variant == ncclDevFusedAgRsWarpSplitPause) {
++    constexpr int WarpsPerOp = FusedThreads / WarpSize / 2;
++    const unsigned int localWarp = threadIdx.x / WarpSize;
++    const size_t warp = size_t(localWarp % WarpsPerOp) * gridDim.x + blockIdx.x;
++    const size_t stride = size_t(WarpsPerOp) * gridDim.x;
++    if (localWarp < WarpsPerOp) {
++      runSplit<true, Variant == ncclDevFusedAgRsWarpSplitPause>(makeTransfer(agSrc, agDst, agBytes), devComm.rank,
++                                                               warp, stride, agPauseCycles);
++    } else {
++      runSplit<false, false>(makeTransfer(rsSrc, rsDst, rsBytes), devComm.rank, warp, stride, 0);
++    }
++  } else {
++    runPaired<Variant == ncclDevFusedAgRsRsFirst>(makeTransfer(agSrc, agDst, agBytes), makeTransfer(rsSrc, rsDst, rsBytes),
++                                                  devComm.rank);
 +  }
-+  fusedPacks<4>(agSrc, agDst, agBytes, rsSrc, rsDst, rsBytes);
 +
-+  // Publish AG writes and wait for peer RS reads before this stream can reuse either window.
++  // Publish AG writes and finish peer RS reads before reusing either window.
++  // The full CTA participates at entry and exit, including the split variants.
 +  bar.sync(ncclCoopCta(), cuda::memory_order_acq_rel);
 +#endif
 +}
 +
++} // namespace
++
++#define NCCL_FUSED_KERNEL(suffix, variant) \
++  extern "C" __global__ __launch_bounds__(FusedThreads) void ncclDevKernel_FusedAllGatherReduceScatter##suffix( \
++    const __grid_constant__ ncclDevComm_t devComm, uintptr_t agSrc, uintptr_t agDst, size_t agBytes, uintptr_t rsSrc, \
++    uintptr_t rsDst, size_t rsBytes, uint32_t agPauseCycles) { \
++    runFused<variant>(devComm, agSrc, agDst, agBytes, rsSrc, rsDst, rsBytes, agPauseCycles); \
++  }
++
++NCCL_FUSED_KERNEL(AgFirst, ncclDevFusedAgRsAgFirst)
++NCCL_FUSED_KERNEL(RsFirst, ncclDevFusedAgRsRsFirst)
++NCCL_FUSED_KERNEL(WarpSplit, ncclDevFusedAgRsWarpSplit)
++NCCL_FUSED_KERNEL(WarpSplitPause, ncclDevFusedAgRsWarpSplitPause)
++#undef NCCL_FUSED_KERNEL
++
 +ncclResult_t ncclLaunchFusedAllGatherReduceScatter(const ncclDevComm_t* devComm, uintptr_t agSrc, uintptr_t agDst,
 +                                                    size_t agBytes, uintptr_t rsSrc, uintptr_t rsDst, size_t rsBytes,
-+                                                    int ctas, cudaStream_t stream) {
-+  void* args[] = {const_cast<ncclDevComm_t*>(devComm), &agSrc, &agDst, &agBytes, &rsSrc, &rsDst, &rsBytes};
-+  CUDACHECK(cudaLaunchKernel(reinterpret_cast<const void*>(ncclDevKernel_FusedAllGatherReduceScatter), ctas,
-+                             FusedThreads, args, 0, stream));
++                                                    int ctas, ncclDevFusedAgRsVariant_t variant, uint32_t agPauseCycles,
++                                                    cudaStream_t stream) {
++  const void* kernel;
++  switch (variant) {
++  case ncclDevFusedAgRsAgFirst:
++    kernel = reinterpret_cast<const void*>(ncclDevKernel_FusedAllGatherReduceScatterAgFirst);
++    break;
++  case ncclDevFusedAgRsRsFirst:
++    kernel = reinterpret_cast<const void*>(ncclDevKernel_FusedAllGatherReduceScatterRsFirst);
++    break;
++  case ncclDevFusedAgRsWarpSplit:
++    kernel = reinterpret_cast<const void*>(ncclDevKernel_FusedAllGatherReduceScatterWarpSplit);
++    break;
++  case ncclDevFusedAgRsWarpSplitPause:
++    kernel = reinterpret_cast<const void*>(ncclDevKernel_FusedAllGatherReduceScatterWarpSplitPause);
++    break;
++  default:
++    return ncclInvalidArgument;
++  }
++  void* args[] = {const_cast<ncclDevComm_t*>(devComm), &agSrc, &agDst, &agBytes, &rsSrc, &rsDst, &rsBytes, &agPauseCycles};
++  CUDACHECK(cudaLaunchKernel(kernel, ctas, FusedThreads, args, 0, stream));
 +  return ncclSuccess;
 +}
 diff --git a/src/include/nccl_device/host.h b/src/include/nccl_device/host.h
-index 12cb0491..5f53c76c 100644
+index 12cb0491..96ba9ade 100644
 --- a/src/include/nccl_device/host.h
 +++ b/src/include/nccl_device/host.h
-@@ -152,6 +152,20 @@ NCCL_EXTERN_C ncclResult_t ncclDevCommCreate(ncclComm_t comm, ncclDevCommRequire
+@@ -152,6 +152,32 @@ NCCL_EXTERN_C ncclResult_t ncclDevCommCreate(ncclComm_t comm, ncclDevCommRequire
                                               ncclDevComm_t* outDevComm);
  NCCL_EXTERN_C ncclResult_t ncclDevCommDestroy(ncclComm_t comm, ncclDevComm_t const* devComm);
  
 +// Experimental single-LSA-team AG (packed bytes) + RS (BF16 sum), using one 256-thread CTA grid.
++typedef enum {
++  ncclDevFusedAgRsAgFirst = 0,
++  ncclDevFusedAgRsRsFirst = 1,
++  ncclDevFusedAgRsWarpSplit = 2,
++  ncclDevFusedAgRsWarpSplitPause = 3,
++} ncclDevFusedAgRsVariant_t;
 +// agBytes and rsCount describe one rank's AG input and RS output respectively. Both must be
 +// nonzero; pointers and byte offsets must be 4-byte aligned, agBytes a multiple of four and
 +// rsCount even. agRecv and rsSend are HBM-backed symmetric windows spanning nRanks shards;
@@ -487,9 +649,15 @@ index 12cb0491..5f53c76c 100644
 +// All ranks use the same counts, offsets, CTA count and launch order. Serialize uses of devComm's
 +// barrier slots, keep the windows and devComm live until stream completion, and do not put this
 +// direct CUDA launch inside an NCCL group. Both outputs become usable after stream completion.
++// ncclDevFusedAllGatherReduceScatter selects AG-first. The configured form requires the
++// same variant and pause on each rank. Only WarpSplitPause accepts nonzero agPauseCycles.
 +NCCL_EXTERN_C ncclResult_t ncclDevFusedAllGatherReduceScatter(
 +  const void* agSend, ncclWindow_t agRecv, size_t agOffset, size_t agBytes, ncclWindow_t rsSend, size_t rsOffset,
 +  void* rsRecv, size_t rsCount, const ncclDevComm_t* devComm, int ctas, cudaStream_t stream);
++NCCL_EXTERN_C ncclResult_t ncclDevFusedAllGatherReduceScatterWithConfig(
++  const void* agSend, ncclWindow_t agRecv, size_t agOffset, size_t agBytes, ncclWindow_t rsSend, size_t rsOffset,
++  void* rsRecv, size_t rsCount, const ncclDevComm_t* devComm, int ctas, ncclDevFusedAgRsVariant_t variant,
++  uint32_t agPauseCycles, cudaStream_t stream);
 +
  ////////////////////////////////////////////////////////////////////////////////
  // Window API:

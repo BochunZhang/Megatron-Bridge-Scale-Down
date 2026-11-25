@@ -6,16 +6,19 @@ set -euo pipefail
 
 usage() {
     cat <<'USAGE'
-Compare one fused AG+RS kernel with two concurrent symmetric NCCL kernels.
-Run both paths with CUDA event timing, then capture CUDA, NVTX and GB100 NVLink metrics
-with Nsight Systems 2026.6.1.
+Compare fused AG+RS variants with two concurrent symmetric NCCL kernels.
+Each case runs with CUDA event timing, then captures CUDA, NVTX and GB100 NVLink
+metrics with Nsight Systems 2026.6.1. A single split baseline serves all cases.
 
   --gpus LIST        GPU indices (default: CUDA_VISIBLE_DEVICES or 0,1,2,3)
-  --ag-mib N         Full AllGather output per rank (default: 256)
-  --rs-mib N         Full ReduceScatter input per rank (default: 256)
+  --ag-mib N         Full AllGather output per rank (default: 1024)
+  --rs-mib N         Full ReduceScatter input per rank (default: 1024)
   --warmup N         Warmup pairs (default: 5)
   --iters N          Measured pairs per run (default: 20)
-  --ctas N           Fused grid size (default: 4)
+  --ctas LIST        Comma-separated fused grid sizes to run in order (default: 4,8)
+  --variants LIST    Comma-separated variants to run at each grid size
+                     (default: ag-first,rs-first,warp-split,warp-split-pause)
+  --ag-pause-cycles N  AG pause for warp-split-pause only (default: 3072)
   --nccl-build DIR   NCCL build from install-nccl-2.32.3-fused-ag-rs.sh
   --cuda-home DIR    Toolkit used for the NCCL host shim (default: CUDA_HOME or /usr/local/cuda)
   --nsys PATH        Override NSYS_BIN or the repo default NsightSystems-2026.6.1/bin/nsys
@@ -35,7 +38,10 @@ nsys_bin="${NSYS_BIN:-${repo_root}/NsightSystems-${nsys_release}/bin/nsys}"
 nsys_metrics_file="${script_dir}/gb200-nvlink-bytes.config"
 nsys_freq=50000
 gpus="${CUDA_VISIBLE_DEVICES:-0,1,2,3}"
-ag_mib=256 rs_mib=256 warmup=5 iters=20 ctas=4
+ag_mib=1024 rs_mib=1024 warmup=5 iters=20
+cta_sizes=4,8
+variants=ag-first,rs-first,warp-split,warp-split-pause
+ag_pause_cycles=3072
 nccl_build="${repo_root}/nccl/nccl-2.32.3-fused-ag-rs/build"
 cuda_home="${CUDA_HOME:-/usr/local/cuda}"
 output_dir=
@@ -45,7 +51,7 @@ while (( $# )); do
     case "$1" in
         -h|--help) usage; exit 0 ;;
         --dry-run) dry_run=true; shift ;;
-        --gpus|--ag-mib|--rs-mib|--warmup|--iters|--ctas|--nccl-build|--cuda-home|--nsys|--nsys-freq|--output-dir)
+        --gpus|--ag-mib|--rs-mib|--warmup|--iters|--ctas|--variants|--ag-pause-cycles|--nccl-build|--cuda-home|--nsys|--nsys-freq|--output-dir)
             [[ -n "${2:-}" && "$2" != --* ]] || die "$1 needs a value"
             case "$1" in
                 --gpus) gpus="$2" ;;
@@ -53,7 +59,9 @@ while (( $# )); do
                 --rs-mib) rs_mib="$2" ;;
                 --warmup) warmup="$2" ;;
                 --iters) iters="$2" ;;
-                --ctas) ctas="$2" ;;
+                --ctas) cta_sizes="$2" ;;
+                --variants) variants="$2" ;;
+                --ag-pause-cycles) ag_pause_cycles="$2" ;;
                 --nccl-build) nccl_build="$2" ;;
                 --cuda-home) cuda_home="$2" ;;
                 --nsys) nsys_bin="$2" ;;
@@ -70,10 +78,27 @@ done
 IFS=, read -r -a gpu_list <<<"$gpus"
 nranks=${#gpu_list[@]}
 [[ "$(printf '%s\n' "${gpu_list[@]}" | sort -u | wc -l)" -eq "$nranks" ]] || die "--gpus must list distinct GPUs"
-for value in "$ag_mib" "$rs_mib" "$warmup" "$iters" "$ctas"; do
-    [[ "$value" =~ ^[1-9][0-9]*$ ]] || die "message sizes, iteration counts and CTA count must be positive integers"
+for value in "$ag_mib" "$rs_mib" "$warmup" "$iters"; do
+    [[ "$value" =~ ^[1-9][0-9]*$ ]] || die "message sizes and iteration counts must be positive integers"
 done
-(( ctas <= 64 )) || die "--ctas cannot exceed 64"
+[[ "$cta_sizes" =~ ^[1-9][0-9]?(,[1-9][0-9]?)*$ ]] || die "--ctas must list values in 1..64"
+IFS=, read -r -a cta_list <<<"$cta_sizes"
+for cta in "${cta_list[@]}"; do
+    (( cta <= 64 )) || die "--ctas must list values in 1..64"
+done
+[[ "$(printf '%s\n' "${cta_list[@]}" | sort -u | wc -l)" -eq "${#cta_list[@]}" ]] || die "--ctas must list distinct values"
+[[ "$variants" =~ ^[a-z-]+(,[a-z-]+)*$ ]] || die "--variants must be a comma-separated list"
+IFS=, read -r -a variant_list <<<"$variants"
+for variant in "${variant_list[@]}"; do
+    case "$variant" in
+        ag-first|rs-first|warp-split|warp-split-pause) ;;
+        *) die "unknown fused variant: ${variant}" ;;
+    esac
+done
+[[ "$(printf '%s\n' "${variant_list[@]}" | sort -u | wc -l)" -eq "${#variant_list[@]}" ]] \
+    || die "--variants must list distinct values"
+[[ "$ag_pause_cycles" =~ ^(0|[1-9][0-9]{0,9})$ ]] && (( ag_pause_cycles <= 4294967295 )) \
+    || die "--ag-pause-cycles must be in 0..4294967295"
 [[ "$nsys_freq" =~ ^[1-9][0-9]{0,5}$ ]] && (( nsys_freq >= 10 && nsys_freq <= 200000 )) \
     || die "--nsys-freq must be in 10..200000 Hz"
 
@@ -108,7 +133,8 @@ else
     [[ -z "$(ls -A "$output_dir")" ]] || die "use an empty output directory: ${output_dir}"
     {
         echo "$nsys_version"
-        echo "gpus=$gpus ag_mib=$ag_mib rs_mib=$rs_mib warmup=$warmup iters=$iters fused_ctas=$ctas dtype=bf16"
+        echo "gpus=$gpus ag_mib=$ag_mib rs_mib=$rs_mib warmup=$warmup iters=$iters dtype=bf16"
+        echo "fused_ctas=$cta_sizes fused_variants=$variants warp_split_pause_ag_cycles=$ag_pause_cycles"
         echo "nccl_lib=$nccl_lib"
         echo "GLOO_SOCKET_IFNAME=$gloo_ifname"
         echo "nsys_gpu_metrics_devices=$gpus nsys_gpu_metrics_alias=gb200-nvlink-bytes nsys_gpu_metrics_frequency_hz=$nsys_freq"
@@ -141,14 +167,18 @@ worker_env=(
     "LD_PRELOAD=$nccl_lib${LD_PRELOAD:+:$LD_PRELOAD}"
 )
 
-for mode in fused split; do
-    mode_dir="${output_dir}/${mode}"
+run_case() {
+    local mode="$1" mode_dir="$2" cta="$3" variant="${4:-}" pause_cycles="${5:-0}"
+    local -a worker timed profiled
     worker=(
         "${worker_env[@]}"
         uv run --active --no-sync python -m torch.distributed.run --standalone --nproc_per_node "$nranks"
         "${script_dir}/fused_ag_rs.py" --mode "$mode" --ag-mib "$ag_mib" --rs-mib "$rs_mib" \
-        --warmup "$warmup" --iters "$iters" --ctas "$ctas" --nccl-lib "$nccl_lib" --shim "$shim"
+        --warmup "$warmup" --iters "$iters" --ctas "$cta" --nccl-lib "$nccl_lib" --shim "$shim"
     )
+    if [[ "$mode" == fused ]]; then
+        worker+=(--variant "$variant" --ag-pause-cycles "$pause_cycles")
+    fi
     timed=("${worker[@]}" --output "${mode_dir}/timing.json")
     profiled=(
         "$nsys_bin" profile --trace=cuda,nvtx --sample=none --cpuctxsw=none
@@ -160,7 +190,8 @@ for mode in fused split; do
         run "${timed[@]}"
         run "${profiled[@]}"
     else
-        mkdir -- "$mode_dir"
+        mkdir -p -- "$mode_dir"
+        echo "=== ${mode_dir#"$output_dir"/}"
         printf '%q ' "${timed[@]}" >"${mode_dir}/timing-command.txt"
         printf '\n' >>"${mode_dir}/timing-command.txt"
         printf '%q ' "${profiled[@]}" >"${mode_dir}/profile-command.txt"
@@ -168,11 +199,29 @@ for mode in fused split; do
         run "${timed[@]}" 2>&1 | tee "${mode_dir}/timing.log"
         run "${profiled[@]}" 2>&1 | tee "${mode_dir}/nsys.log"
         [[ -s "${mode_dir}/timing.json" && -s "${mode_dir}/profile-timing.json" ]] \
-            || die "${mode} worker did not finish output validation"
+            || die "worker did not finish output validation in ${mode_dir}"
     fi
     run "$nsys_bin" export --type=sqlite --output="${mode_dir}/profile.sqlite" "${mode_dir}/profile.nsys-rep"
-done
+}
 
-run uv run --active --no-sync python "${script_dir}/analyse_nsys.py" \
-    --fused "${output_dir}/fused/profile.sqlite" --split "${output_dir}/split/profile.sqlite" \
-    --iters "$iters" --ranks "$nranks" --gpus "$gpus" --frequency "$nsys_freq" --output "${output_dir}/summary.json"
+for cta in "${cta_list[@]}"; do
+    for variant in "${variant_list[@]}"; do
+        pause_cycles=0
+        if [[ "$variant" == warp-split-pause ]]; then
+            pause_cycles="$ag_pause_cycles"
+        fi
+        run_case fused "${output_dir}/cta-${cta}/${variant}" "$cta" "$variant" "$pause_cycles"
+    done
+done
+# The worker requires a CTA argument, but the split path leaves its grids to NCCL.
+run_case split "${output_dir}/split" "${cta_list[0]}"
+
+for cta in "${cta_list[@]}"; do
+    for variant in "${variant_list[@]}"; do
+        case_dir="${output_dir}/cta-${cta}/${variant}"
+        run uv run --active --no-sync python "${script_dir}/analyse_nsys.py" \
+            --variant "$variant" --ctas "$cta" \
+            --fused "${case_dir}/profile.sqlite" --split "${output_dir}/split/profile.sqlite" \
+            --iters "$iters" --ranks "$nranks" --gpus "$gpus" --frequency "$nsys_freq" --output "${case_dir}/summary.json"
+    done
+done

@@ -16,8 +16,8 @@
 set -euo pipefail
 
 tag=v2.32.3-1
-kernel=ncclDevKernel_FusedAllGatherReduceScatter
-symbol=ncclDevFusedAllGatherReduceScatter
+kernel_base=ncclDevKernel_FusedAllGatherReduceScatter
+symbol=ncclDevFusedAllGatherReduceScatterWithConfig
 script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 repo_root="$(cd -- "${script_dir}/.." && pwd)"
 patch="${script_dir}/patches/nccl-2.32.3-fused-ag-rs.patch"
@@ -42,8 +42,9 @@ Build the experimental NCCL v2.32.3-1 fused AG/RS library for GB200 (sm_100).
   --check-only      Reuse the existing patched checkout and library
   --smoke-test N    Build and run the correctness test on 2 or 4 NVLink GPUs
 
-The build exports ncclDevFusedAllGatherReduceScatter via nccl_device.h.
-The installer reports registers, stack, shared and local memory from the sm_100 cubin.
+The build exports ncclDevFusedAllGatherReduceScatterWithConfig via nccl_device.h.
+The installer reports sm_100 resources for all four variants. The smoke test
+checks each variant at 4 and 8 CTAs.
 EOF
 }
 
@@ -87,7 +88,7 @@ if git -C "$dest" apply --reverse --check "$patch" 2>/dev/null; then
 elif $check_only; then
     die "${dest} does not carry ${patch##*/}"
 else
-    git -C "$dest" apply --check "$patch" || die "patch does not apply to ${dest}"
+    git -C "$dest" apply --check "$patch" || die "patch does not apply to ${dest}; use --dest for a fresh checkout"
     git -C "$dest" apply "$patch"
 fi
 
@@ -107,22 +108,25 @@ grep -aqF 'NCCL version 2.32.3-fused-ag-rs+cuda' "$lib" || die "library has the 
 exports="$(nm -D --defined-only "$lib")"
 grep -qw "$symbol" <<<"$exports" || die "${symbol} is missing from ${lib}"
 
-if ! resources="$("${cuda_home}/bin/cuobjdump" --dump-resource-usage --gpu-architecture sm_100 \
-    --function "$kernel" "$lib" 2>&1)"; then
-    echo "$resources" >&2
-    die "cuobjdump failed for ${lib}"
-fi
-resource_line="$(awk -v kernel="$kernel" '$1 == "Function" && $2 == kernel ":" { want = 1; next }
-    want && /REG:/ { print; exit }' <<<"$resources")"
-[[ -n "$resource_line" ]] || die "could not read sm_100 resources for ${kernel}"
-echo "=== ${kernel} (256 threads/CTA)"
-echo "$resource_line"
-if [[ -f "$build_log" ]]; then
-    awk -v kernel="$kernel" '$0 ~ ("Function properties for " kernel "$") {
-        if (getline) print
-        exit
-    }' "$build_log"
-fi
+for variant in AgFirst RsFirst WarpSplit WarpSplitPause; do
+    kernel="${kernel_base}${variant}"
+    if ! resources="$("${cuda_home}/bin/cuobjdump" --dump-resource-usage --gpu-architecture sm_100 \
+        --function "$kernel" "$lib" 2>&1)"; then
+        echo "$resources" >&2
+        die "cuobjdump failed for ${kernel}"
+    fi
+    resource_line="$(awk -v kernel="$kernel" '$1 == "Function" { want = $2 == kernel ":"; next }
+        want && /REG:/ { print; exit }' <<<"$resources")"
+    [[ -n "$resource_line" ]] || die "could not read sm_100 resources for ${kernel}"
+    echo "=== ${kernel} (256 threads/CTA)"
+    echo "$resource_line"
+    if [[ -f "$build_log" ]]; then
+        awk -v kernel="$kernel" '$0 ~ ("Function properties for " kernel "$") {
+            if (getline) print
+            exit
+        }' "$build_log"
+    fi
+done
 echo "Library: ${lib}"
 
 if [[ -n "$smoke_ranks" ]]; then

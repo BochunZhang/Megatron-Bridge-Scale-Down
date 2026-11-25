@@ -70,11 +70,12 @@ extern "C" int fused_ag_rs_create(ncclComm_t comm, void* ag_out, size_t ag_windo
 }
 
 extern "C" int fused_ag_rs_launch(void* handle, const void* ag_in, size_t ag_bytes, void* rs_out, size_t rs_count,
-                                 cudaStream_t stream) {
+                                 int variant, uint32_t ag_pause_cycles, cudaStream_t stream) {
   const auto* state = static_cast<const FusedAgRsState*>(handle);
   if (!state) return ncclInvalidArgument;
-  return ncclDevFusedAllGatherReduceScatter(ag_in, state->ag_window, 0, ag_bytes, state->rs_window, 0, rs_out,
-                                            rs_count, &state->device_comm, state->ctas, stream);
+  return ncclDevFusedAllGatherReduceScatterWithConfig(
+    ag_in, state->ag_window, 0, ag_bytes, state->rs_window, 0, rs_out, rs_count, &state->device_comm,
+    state->ctas, static_cast<ncclDevFusedAgRsVariant_t>(variant), ag_pause_cycles, stream);
 }
 
 extern "C" int fused_ag_rs_destroy(void* handle) {

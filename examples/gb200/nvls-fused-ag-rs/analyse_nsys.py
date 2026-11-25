@@ -25,6 +25,12 @@ KERNEL_NAMES = {
     "ag": "ncclSymkDevKernel_AllGather_STMC",
     "rs": "ncclSymkDevKernel_ReduceScatter_LDMC_sum_bf16",
 }
+FUSED_VARIANTS = {
+    "ag-first": KERNEL_NAMES["fused"] + "AgFirst",
+    "rs-first": KERNEL_NAMES["fused"] + "RsFirst",
+    "warp-split": KERNEL_NAMES["fused"] + "WarpSplit",
+    "warp-split-pause": KERNEL_NAMES["fused"] + "WarpSplitPause",
+}
 KERNEL_QUERY = """
 SELECT {device}, k.start, k.end, k.gridX, k.blockX, k.registersPerThread, k.streamId, s.value
 FROM CUPTI_ACTIVITY_KIND_KERNEL AS k
@@ -63,7 +69,9 @@ class _Launch(NamedTuple):
     stream_id: int
 
 
-def _read_launches(path: Path, *, physical_ids: bool) -> dict[int, dict[str, list[_Launch]]]:
+def _read_launches(
+    path: Path, *, physical_ids: bool, fused_kernel: str, ctas: int | None = None
+) -> dict[int, dict[str, list[_Launch]]]:
     launches = defaultdict(lambda: defaultdict(list))
     # CUDA_VISIBLE_DEVICES can remap kernel.deviceId. Use the process-local map for NVLink metrics.
     query = KERNEL_QUERY.format(
@@ -79,6 +87,16 @@ def _read_launches(path: Path, *, physical_ids: bool) -> dict[int, dict[str, lis
                 if start < 0 or end <= start or grid < 1 or block < 1:
                     raise ValueError(f"{path} GPU {device} has an invalid launch for {name}")
                 op = next(op for op, kernel in KERNEL_NAMES.items() if kernel in name)
+                if op == "fused":
+                    if name != fused_kernel:
+                        raise ValueError(
+                            f"{path} GPU {device} launched fused kernel {name!r}, expected {fused_kernel!r}"
+                        )
+                    if ctas is not None and (grid, block) != (ctas, 256):
+                        raise ValueError(
+                            f"{path} GPU {device} launched {name} with gridX={grid}, blockX={block}; "
+                            f"expected gridX={ctas}, blockX=256"
+                        )
                 launches[device][op].append(_Launch(start, end, grid, block, registers, stream))
     except sqlite3.Error as error:
         raise ValueError(f"Cannot read CUDA kernel records from {path}: {error}") from error
@@ -237,12 +255,18 @@ def main() -> None:
     parser.add_argument("--split", type=Path, required=True)
     parser.add_argument("--iters", type=int, required=True)
     parser.add_argument("--ranks", type=int, help="Expected number of GPU ranks in each capture")
+    parser.add_argument("--variant", choices=tuple(FUSED_VARIANTS), help="Expected fused kernel variant")
+    parser.add_argument("--ctas", type=int, help="Expected fused gridX, supplied with --variant")
     parser.add_argument("--gpus", help="Physical GPU IDs in the NVLink metric capture")
     parser.add_argument("--frequency", type=int, help="NVLink metric sampling frequency in Hz")
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
     if args.iters < 1 or (args.ranks is not None and args.ranks < 2):
         parser.error("--iters must be positive and --ranks must be at least two")
+    if (args.variant is None) != (args.ctas is None):
+        parser.error("--variant and --ctas must be supplied together")
+    if args.ctas is not None and not 1 <= args.ctas <= 64:
+        parser.error("--ctas must be between 1 and 64")
     if (args.gpus is None) != (args.frequency is None):
         parser.error("--gpus and --frequency must be supplied together")
     gpus = None
@@ -258,8 +282,9 @@ def main() -> None:
             parser.error("--frequency must be between 10 and 200000 Hz")
 
     try:
-        fused = _read_launches(args.fused, physical_ids=gpus is not None)
-        split = _read_launches(args.split, physical_ids=gpus is not None)
+        fused_kernel = FUSED_VARIANTS[args.variant] if args.variant is not None else KERNEL_NAMES["fused"]
+        fused = _read_launches(args.fused, physical_ids=gpus is not None, fused_kernel=fused_kernel, ctas=args.ctas)
+        split = _read_launches(args.split, physical_ids=gpus is not None, fused_kernel=fused_kernel)
         if fused.keys() != split.keys() or len(fused) < 2 or (args.ranks is not None and len(fused) != args.ranks):
             raise ValueError(
                 f"Mismatched GPU coverage (expected {args.ranks or 'at least 2'}): "
@@ -286,9 +311,12 @@ def main() -> None:
     fused_us = median(fused_slowest)
     split_us = median(split_slowest)
     speedup = split_us / fused_us
+    fused_case = {"median_slowest_device_pair_span_us": fused_us, "devices": fused_devices}
+    if args.variant is not None:
+        fused_case.update(variant=args.variant, ctas=args.ctas)
     summary = {
         "iterations": args.iters,
-        "fused": {"median_slowest_device_pair_span_us": fused_us, "devices": fused_devices},
+        "fused": fused_case,
         "split": {"median_slowest_device_pair_span_us": split_us, "devices": split_devices},
         "fused_vs_split_speedup": speedup,
     }

@@ -21,6 +21,8 @@ import torch.distributed as dist
 
 
 logger = logging.getLogger(__name__)
+# Mirrors ncclDevFusedAgRsVariant_t in the patched NCCL Device API.
+FUSED_VARIANTS = {"ag-first": 0, "rs-first": 1, "warp-split": 2, "warp-split-pause": 3}
 
 
 def _loaded_nccl(expected: Path) -> ctypes.CDLL:
@@ -36,8 +38,8 @@ def _loaded_nccl(expected: Path) -> ctypes.CDLL:
     library.ncclGetErrorString.argtypes = [ctypes.c_int]
     library.ncclGetErrorString.restype = ctypes.c_char_p
     # The presence of the experimental API also catches a stale patch/build.
-    if not hasattr(library, "ncclDevFusedAllGatherReduceScatter"):
-        raise RuntimeError(f"{expected} does not export ncclDevFusedAllGatherReduceScatter")
+    if not hasattr(library, "ncclDevFusedAllGatherReduceScatterWithConfig"):
+        raise RuntimeError(f"{expected} does not export ncclDevFusedAllGatherReduceScatterWithConfig")
     return library
 
 
@@ -51,12 +53,16 @@ class _FusedPair:
         ag_out: torch.Tensor,
         rs_in: torch.Tensor,
         ctas: int,
+        variant: str,
+        ag_pause_cycles: int,
     ) -> None:
         self._nccl = nccl
+        self._variant = FUSED_VARIANTS[variant]
+        self._ag_pause_cycles = ag_pause_cycles
         self._shim = ctypes.CDLL(str(shim_path.resolve()))
         ptr, size = ctypes.c_void_p, ctypes.c_size_t
         self._shim.fused_ag_rs_create.argtypes = [ptr, ptr, size, ptr, size, ctypes.c_int, ctypes.POINTER(ptr)]
-        self._shim.fused_ag_rs_launch.argtypes = [ptr, ptr, size, ptr, size, ptr]
+        self._shim.fused_ag_rs_launch.argtypes = [ptr, ptr, size, ptr, size, ctypes.c_int, ctypes.c_uint32, ptr]
         self._shim.fused_ag_rs_destroy.argtypes = [ptr]
         self._state = ptr()
         self._check(
@@ -75,7 +81,14 @@ class _FusedPair:
     def launch(self, *, ag_in: torch.Tensor, rs_out: torch.Tensor, stream: torch.cuda.Stream) -> None:
         self._check(
             self._shim.fused_ag_rs_launch(
-                self._state, ag_in.data_ptr(), ag_in.nbytes, rs_out.data_ptr(), rs_out.numel(), stream.cuda_stream
+                self._state,
+                ag_in.data_ptr(),
+                ag_in.nbytes,
+                rs_out.data_ptr(),
+                rs_out.numel(),
+                self._variant,
+                self._ag_pause_cycles,
+                stream.cuda_stream,
             ),
             "launch fused AG/RS",
         )
@@ -130,6 +143,8 @@ def _args() -> argparse.Namespace:
     parser.add_argument("--warmup", type=int, required=True)
     parser.add_argument("--iters", type=int, required=True)
     parser.add_argument("--ctas", type=int, required=True, help="Fused grid size")
+    parser.add_argument("--variant", choices=FUSED_VARIANTS, default="ag-first")
+    parser.add_argument("--ag-pause-cycles", type=int, default=0, help="Cycles per AG warp tile in warp-split-pause")
     parser.add_argument("--nccl-lib", type=Path, required=True)
     parser.add_argument("--shim", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
@@ -140,6 +155,10 @@ def _args() -> argparse.Namespace:
         parser.error("sizes and iteration counts must be positive, and CTAs must be 1–64")
     if not 10 <= args.profile_frequency <= 200_000:
         parser.error("profile frequency must be 10–200000 Hz")
+    if not 0 <= args.ag_pause_cycles <= 0xFFFFFFFF:
+        parser.error("AG pause cycles must fit an unsigned 32-bit integer")
+    if args.ag_pause_cycles and (args.mode != "fused" or args.variant != "warp-split-pause"):
+        parser.error("nonzero AG pause cycles require fused warp-split-pause")
     return args
 
 
@@ -178,7 +197,16 @@ def main() -> None:
             comm = ag_backend._comm_ptr()
             if not comm:
                 raise RuntimeError("PyTorch did not initialize the NCCL communicator")
-            fused = _FusedPair(args.shim, nccl, comm, ag_out=ag_out, rs_in=rs_in, ctas=args.ctas)
+            fused = _FusedPair(
+                args.shim,
+                nccl,
+                comm,
+                ag_out=ag_out,
+                rs_in=rs_in,
+                ctas=args.ctas,
+                variant=args.variant,
+                ag_pause_cycles=args.ag_pause_cycles,
+            )
             cleanup.callback(fused.close)
             operations = [(ag_stream, lambda: fused.launch(ag_in=ag_in, rs_out=rs_out, stream=ag_stream))]
         else:
@@ -223,7 +251,8 @@ def main() -> None:
             # Byte counters describe sampling intervals. Collect boundary samples outside the kernels.
             time.sleep(2 / args.profile_frequency)
         dist.barrier()
-        with torch.cuda.nvtx.range(f"fused_ag_rs/{args.mode}/timed") if args.profile else nullcontext():
+        run_name = args.variant if args.mode == "fused" else "split"
+        with torch.cuda.nvtx.range(f"fused_ag_rs/{run_name}/timed") if args.profile else nullcontext():
             local_us = _run_pairs(control, operations, args.iters)
         dist.barrier()
         if args.profile:
@@ -244,6 +273,8 @@ def main() -> None:
                 "ag_output_mib": args.ag_mib,
                 "rs_input_mib": args.rs_mib,
                 "fused_ctas": args.ctas if args.mode == "fused" else None,
+                "fused_variant": args.variant if args.mode == "fused" else None,
+                "ag_pause_cycles": args.ag_pause_cycles,
                 "all_rank_pair_us": all_rank_us,
                 "median_slowest_rank_us": median(slowest_rank_us),
                 "validation": "passed",
@@ -251,7 +282,7 @@ def main() -> None:
             args.output.write_text(json.dumps(report, indent=2) + "\n")
             logger.info(
                 "%s: AG and RS correct on %d ranks, median slowest-rank pair %.3f us",
-                args.mode,
+                run_name,
                 world,
                 report["median_slowest_rank_us"],
             )
