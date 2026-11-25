@@ -1,0 +1,496 @@
+diff --git a/docs/examples/06_device_api/07_fused_ag_rs/c/main.cu b/docs/examples/06_device_api/07_fused_ag_rs/c/main.cu
+new file mode 100644
+index 00000000..952e9bdf
+--- /dev/null
++++ b/docs/examples/06_device_api/07_fused_ag_rs/c/main.cu
+@@ -0,0 +1,203 @@
++/*************************************************************************
++ * SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
++ * SPDX-License-Identifier: Apache-2.0
++ *
++ * See LICENSE.txt for more license information
++ *************************************************************************/
++
++#include <cuda_bf16.h>
++#include <cuda_runtime.h>
++#include <nccl.h>
++#include <nccl_device.h>
++
++#include <cstdio>
++#include <cstdlib>
++#include <vector>
++
++#define CHECK_CUDA(call) do { \
++  cudaError_t result = (call); \
++  if (result != cudaSuccess) { \
++    std::fprintf(stderr, "%s: %s\n", #call, cudaGetErrorString(result)); \
++    std::exit(EXIT_FAILURE); \
++  } \
++} while (0)
++
++#define CHECK_NCCL(call) do { \
++  ncclResult_t result = (call); \
++  if (result != ncclSuccess) { \
++    std::fprintf(stderr, "%s: %s\n", #call, ncclGetErrorString(result)); \
++    std::exit(EXIT_FAILURE); \
++  } \
++} while (0)
++
++using Bf16 = __nv_bfloat16;
++
++struct Shape {
++  size_t agCount, rsCount, offset;
++};
++
++constexpr Shape shapes[] = {{4120, 8200, 0}, {4130, 8206, 0}, {16408, 4104, 0}, {8202, 4126, 2}};
++constexpr int trials = sizeof(shapes) / sizeof(shapes[0]);
++constexpr size_t capacity = 16416;
++constexpr int ctas = 4;
++
++struct Rank {
++  cudaStream_t stream;
++  ncclDevComm_t devComm;
++  ncclWindow_t agWindow, rsWindow;
++  Bf16 *agSend, *agRecv, *rsSend, *rsRecv;
++  Bf16 *agInputs[trials], *agOutputs[trials], *rsInputs[trials], *rsOutputs[trials];
++};
++
++static int agValue(int trial, int rank, size_t index) {
++  return 1 + 3 * trial + 11 * rank + index % 13;
++}
++
++static int rsValue(int trial, int rank, size_t index) {
++  return 1 + 2 * trial + 3 * rank + (index + (rank + 1) * (index % 7)) % 19;
++}
++
++static size_t bytes(size_t count) {
++  return count * sizeof(Bf16);
++}
++
++static void check(const char* op, int trial, int rank, size_t index, Bf16 actual, int expected) {
++  if (__bfloat162float(actual) != expected) {
++    std::fprintf(stderr, "%s trial %d rank %d element %zu got %.0f, expected %d\n",
++                 op, trial, rank, index, __bfloat162float(actual), expected);
++    std::exit(EXIT_FAILURE);
++  }
++}
++
++int main(int argc, char** argv) {
++  int nranks = argc == 2 ? std::atoi(argv[1]) : 2;
++  int available;
++  CHECK_CUDA(cudaGetDeviceCount(&available));
++  if (argc > 2 || (nranks != 2 && nranks != 4) || nranks > available) {
++    std::fprintf(stderr, "Usage: %s [2|4], with that many NVLink GPUs visible\n", argv[0]);
++    return EXIT_FAILURE;
++  }
++
++  std::vector<ncclComm_t> comms(nranks);
++  std::vector<Rank> ranks(nranks);
++  CHECK_NCCL(ncclCommInitAll(comms.data(), nranks, nullptr));
++  for (int rank = 0; rank < nranks; ++rank) {
++    Rank& r = ranks[rank];
++    CHECK_CUDA(cudaSetDevice(rank));
++    CHECK_CUDA(cudaStreamCreateWithFlags(&r.stream, cudaStreamNonBlocking));
++    CHECK_CUDA(cudaMalloc(&r.agSend, bytes(capacity)));
++    CHECK_CUDA(cudaMalloc(&r.rsRecv, bytes(capacity)));
++    CHECK_NCCL(ncclMemAlloc(reinterpret_cast<void**>(&r.agRecv), bytes(nranks * capacity)));
++    CHECK_NCCL(ncclMemAlloc(reinterpret_cast<void**>(&r.rsSend), bytes(nranks * capacity)));
++    for (int trial = 0; trial < trials; ++trial) {
++      CHECK_CUDA(cudaMallocHost(&r.agInputs[trial], bytes(shapes[trial].agCount)));
++      CHECK_CUDA(cudaMallocHost(&r.rsInputs[trial], bytes(nranks * shapes[trial].rsCount)));
++      CHECK_CUDA(cudaMallocHost(&r.agOutputs[trial], bytes(nranks * capacity)));
++      CHECK_CUDA(cudaMallocHost(&r.rsOutputs[trial], bytes(capacity)));
++    }
++  }
++
++  CHECK_NCCL(ncclGroupStart());
++  for (int rank = 0; rank < nranks; ++rank) {
++    Rank& r = ranks[rank];
++    CHECK_CUDA(cudaSetDevice(rank));
++    CHECK_NCCL(ncclCommWindowRegister(comms[rank], r.agRecv, bytes(nranks * capacity), &r.agWindow,
++                                     NCCL_WIN_COLL_SYMMETRIC));
++    CHECK_NCCL(ncclCommWindowRegister(comms[rank], r.rsSend, bytes(nranks * capacity), &r.rsWindow,
++                                     NCCL_WIN_COLL_SYMMETRIC));
++  }
++  CHECK_NCCL(ncclGroupEnd());
++
++  ncclDevCommRequirements reqs = NCCL_DEV_COMM_REQUIREMENTS_INITIALIZER;
++  reqs.lsaMultimem = true;
++  reqs.lsaBarrierCount = ctas;
++  CHECK_NCCL(ncclGroupStart());
++  for (int rank = 0; rank < nranks; ++rank) {
++    CHECK_CUDA(cudaSetDevice(rank));
++    CHECK_NCCL(ncclDevCommCreate(comms[rank], &reqs, &ranks[rank].devComm));
++  }
++  CHECK_NCCL(ncclGroupEnd());
++
++  CHECK_CUDA(cudaSetDevice(0));
++  Rank& first = ranks.front();
++  if (ncclDevFusedAllGatherReduceScatter(first.agSend, first.agWindow, 0, bytes(shapes[0].agCount),
++                                       first.rsWindow, 0, first.rsRecv, shapes[0].rsCount + 1,
++                                       &first.devComm, ctas, first.stream) != ncclInvalidArgument) {
++    std::fprintf(stderr, "Expected ncclInvalidArgument for odd BF16 RS count\n");
++    return EXIT_FAILURE;
++  }
++
++  // Submit rank-local inputs, the pair, and dependent outputs on each stream.
++  // Pinned per-trial host buffers allow every launch to queue before any host wait.
++  for (int trial = 0; trial < trials; ++trial) {
++    const Shape& shape = shapes[trial];
++    for (int rank = 0; rank < nranks; ++rank) {
++      Rank& r = ranks[rank];
++      CHECK_CUDA(cudaSetDevice(rank));
++      for (size_t i = 0; i < shape.agCount; ++i) r.agInputs[trial][i] = __float2bfloat16(agValue(trial, rank, i));
++      for (size_t i = 0; i < nranks * shape.rsCount; ++i) r.rsInputs[trial][i] = __float2bfloat16(rsValue(trial, rank, i));
++      CHECK_CUDA(cudaMemsetAsync(r.agRecv, 0, bytes(nranks * capacity), r.stream));
++      CHECK_CUDA(cudaMemsetAsync(r.rsRecv, 0, bytes(capacity), r.stream));
++      CHECK_CUDA(cudaMemcpyAsync(r.agSend + shape.offset, r.agInputs[trial], bytes(shape.agCount),
++                                 cudaMemcpyHostToDevice, r.stream));
++      CHECK_CUDA(cudaMemcpyAsync(r.rsSend + shape.offset, r.rsInputs[trial], bytes(nranks * shape.rsCount),
++                                 cudaMemcpyHostToDevice, r.stream));
++      CHECK_NCCL(ncclDevFusedAllGatherReduceScatter(r.agSend + shape.offset, r.agWindow, bytes(shape.offset),
++                                                  bytes(shape.agCount), r.rsWindow, bytes(shape.offset),
++                                                  r.rsRecv + shape.offset, shape.rsCount, &r.devComm, ctas, r.stream));
++      CHECK_CUDA(cudaMemcpyAsync(r.agOutputs[trial], r.agRecv, bytes(nranks * capacity), cudaMemcpyDeviceToHost, r.stream));
++      CHECK_CUDA(cudaMemcpyAsync(r.rsOutputs[trial], r.rsRecv, bytes(capacity), cudaMemcpyDeviceToHost, r.stream));
++    }
++  }
++
++  for (int rank = 0; rank < nranks; ++rank) {
++    Rank& r = ranks[rank];
++    CHECK_CUDA(cudaSetDevice(rank));
++    CHECK_CUDA(cudaStreamSynchronize(r.stream));
++    for (int trial = 0; trial < trials; ++trial) {
++      const Shape& shape = shapes[trial];
++      for (size_t i = 0; i < nranks * capacity; ++i) {
++        int expected = 0;
++        if (i >= shape.offset && i - shape.offset < nranks * shape.agCount) {
++          size_t dataIndex = i - shape.offset;
++          expected = agValue(trial, dataIndex / shape.agCount, dataIndex % shape.agCount);
++        }
++        check("AG", trial, rank, i, r.agOutputs[trial][i], expected);
++      }
++      for (size_t i = 0; i < capacity; ++i) {
++        int expected = 0;
++        if (i >= shape.offset && i - shape.offset < shape.rsCount) {
++          size_t dataIndex = rank * shape.rsCount + i - shape.offset;
++          for (int peer = 0; peer < nranks; ++peer) expected += rsValue(trial, peer, dataIndex);
++        }
++        check("RS", trial, rank, i, r.rsOutputs[trial][i], expected);
++      }
++    }
++  }
++
++  CHECK_NCCL(ncclGroupStart());
++  for (int rank = 0; rank < nranks; ++rank) {
++    CHECK_CUDA(cudaSetDevice(rank));
++    CHECK_NCCL(ncclDevCommDestroy(comms[rank], &ranks[rank].devComm));
++  }
++  CHECK_NCCL(ncclGroupEnd());
++  for (int rank = 0; rank < nranks; ++rank) {
++    Rank& r = ranks[rank];
++    CHECK_CUDA(cudaSetDevice(rank));
++    CHECK_NCCL(ncclCommWindowDeregister(comms[rank], r.agWindow));
++    CHECK_NCCL(ncclCommWindowDeregister(comms[rank], r.rsWindow));
++    CHECK_NCCL(ncclMemFree(r.agRecv));
++    CHECK_NCCL(ncclMemFree(r.rsSend));
++    CHECK_CUDA(cudaFree(r.agSend));
++    CHECK_CUDA(cudaFree(r.rsRecv));
++    for (int trial = 0; trial < trials; ++trial) {
++      CHECK_CUDA(cudaFreeHost(r.agInputs[trial]));
++      CHECK_CUDA(cudaFreeHost(r.agOutputs[trial]));
++      CHECK_CUDA(cudaFreeHost(r.rsInputs[trial]));
++      CHECK_CUDA(cudaFreeHost(r.rsOutputs[trial]));
++    }
++    CHECK_CUDA(cudaStreamDestroy(r.stream));
++    CHECK_NCCL(ncclCommDestroy(comms[rank]));
++  }
++  std::printf("Fused AG/RS smoke passed on %d GPUs (%d queued pairs)\n", nranks, trials);
++}
+diff --git a/makefiles/version.mk b/makefiles/version.mk
+index db924347..8fac16c0 100644
+--- a/makefiles/version.mk
++++ b/makefiles/version.mk
+@@ -9,5 +9,5 @@
+ NCCL_MAJOR   := 2
+ NCCL_MINOR   := 32
+ NCCL_PATCH   := 3
+-NCCL_SUFFIX  :=
++NCCL_SUFFIX  := -fused-ag-rs
+ PKG_REVISION := 1
+diff --git a/src/dev_runtime.cc b/src/dev_runtime.cc
+index 2bad06e7..3b82f488 100644
+--- a/src/dev_runtime.cc
++++ b/src/dev_runtime.cc
+@@ -2250,6 +2250,90 @@ ncclResult_t findCommAndHostWindowFromDeviceWindow(ncclWindow_t devWindow, ncclC
+   return ncclSuccess;
+ }
+ 
++ncclResult_t ncclLaunchFusedAllGatherReduceScatter(const ncclDevComm_t* devComm, uintptr_t agSrc, uintptr_t agDst,
++                                                    size_t agBytes, uintptr_t rsSrc, uintptr_t rsDst, size_t rsBytes,
++                                                    int ctas, cudaStream_t stream);
++
++static bool fusedAgRsOverlap(uintptr_t first, size_t firstBytes, uintptr_t second, size_t secondBytes) {
++  return first <= second ? second - first < firstBytes : first - second < secondBytes;
++}
++
++static bool fusedAgRsWindowFits(const ncclDevrWindow* window, size_t offset, size_t shardBytes, size_t ranks) {
++  const size_t mappedBytes = window->memory->lsaMinSize;
++  const size_t windowOffset = window->bigOffset - window->memory->bigOffset;
++  if (offset > window->size || windowOffset > mappedBytes || offset > mappedBytes - windowOffset)
++    return false;
++  return shardBytes <= (window->size - offset) / ranks &&
++         shardBytes <= (mappedBytes - windowOffset - offset) / ranks;
++}
++
++NCCL_API(ncclResult_t, ncclDevFusedAllGatherReduceScatter, const void* agSend, ncclWindow_t agRecv, size_t agOffset,
++         size_t agBytes, ncclWindow_t rsSend, size_t rsOffset, void* rsRecv, size_t rsCount, const ncclDevComm_t* devComm,
++         int ctas, cudaStream_t stream);
++ncclResult_t ncclDevFusedAllGatherReduceScatter(
++  const void* agSend, ncclWindow_t agRecv, size_t agOffset, size_t agBytes, ncclWindow_t rsSend, size_t rsOffset,
++  void* rsRecv, size_t rsCount, const ncclDevComm_t* devComm, int ctas, cudaStream_t stream) {
++  if (!agSend || !agRecv || !rsSend || !rsRecv || !devComm || ctas < 1 || ctas > MAXCHANNELS ||
++      agBytes == 0 || rsCount == 0 || rsCount > SIZE_MAX / 2 || rsCount % 2 != 0 ||
++      (reinterpret_cast<uintptr_t>(agSend) | reinterpret_cast<uintptr_t>(rsRecv) | agOffset | rsOffset | agBytes) % 4 != 0)
++    return ncclInvalidArgument;
++  if (devComm->magic != NCCL_API_MAGIC || devComm->version != NCCL_VERSION_CODE ||
++      ctas > devComm->lsaBarrier.nBarriers)
++    return ncclInvalidArgument;
++
++  ncclComm_t agComm, rsComm;
++  ncclDevrWindow *agWindow, *rsWindow;
++  NCCLCHECK(findCommAndHostWindowFromDeviceWindow(agRecv, &agComm, &agWindow));
++  NCCLCHECK(findCommAndHostWindowFromDeviceWindow(rsSend, &rsComm, &rsWindow));
++  if (agComm != rsComm || agComm->nRanks != devComm->nRanks || agComm->rank != devComm->rank)
++    return ncclInvalidArgument;
++  if (!agComm->nvlsSupport || agComm->minCompCap < 90 || devComm->lsaSize != devComm->nRanks ||
++      !devComm->lsaMultimem.mcBasePtr)
++    return ncclInvalidUsage;
++
++  // Match the existing LSA mapping without creating new mappings or synchronizing on the host.
++  const ncclTeam_t lsa = ncclTeamLsa(agComm);
++  const ncclDevrTeam* team = agComm->devrState.teamHead;
++  while (team && (team->team.rank != lsa.rank || team->team.nRanks != lsa.nRanks || team->team.stride != lsa.stride))
++    team = team->next;
++  if (!team || team->mcBasePtr != devComm->lsaMultimem.mcBasePtr)
++    return ncclInvalidArgument;
++
++  const size_t rsBytes = rsCount * 2;
++  const size_t ranks = agComm->nRanks;
++  if ((agWindow->winFlags & NCCL_WIN_COLL_SYMMETRIC) == 0 || (rsWindow->winFlags & NCCL_WIN_COLL_SYMMETRIC) == 0 ||
++      !ncclDevrWinRegEnabled(agWindow->winFlags, ncclDevrRegisterLsa) ||
++      !ncclDevrWinRegEnabled(rsWindow->winFlags, ncclDevrRegisterLsa) ||
++      ncclDevrWindowHasSysmemSegment(agWindow) || ncclDevrWindowHasSysmemSegment(rsWindow))
++    return ncclInvalidArgument;
++  if (!fusedAgRsWindowFits(agWindow, agOffset, agBytes, ranks) ||
++      !fusedAgRsWindowFits(rsWindow, rsOffset, rsBytes, ranks))
++    return ncclInvalidArgument;
++
++  const uintptr_t agSrc = reinterpret_cast<uintptr_t>(agSend);
++  const uintptr_t rsDst = reinterpret_cast<uintptr_t>(rsRecv);
++  const uintptr_t localAgDst = reinterpret_cast<uintptr_t>(agWindow->userPtr) + agOffset;
++  const uintptr_t localRsSrc = reinterpret_cast<uintptr_t>(rsWindow->userPtr) + rsOffset;
++  if ((localAgDst | localRsSrc) % 4 != 0 ||
++      fusedAgRsOverlap(agSrc, agBytes, localAgDst, ranks * agBytes) ||
++      fusedAgRsOverlap(agSrc, agBytes, rsDst, rsBytes) ||
++      fusedAgRsOverlap(localAgDst, ranks * agBytes, localRsSrc, ranks * rsBytes) ||
++      fusedAgRsOverlap(localAgDst, ranks * agBytes, rsDst, rsBytes) ||
++      fusedAgRsOverlap(localRsSrc, ranks * rsBytes, rsDst, rsBytes))
++    return ncclInvalidArgument;
++
++  int device;
++  CUDACHECK(cudaGetDevice(&device));
++  if (device != agComm->cudaDev) return ncclInvalidUsage;
++
++  const uintptr_t multicast = reinterpret_cast<uintptr_t>(devComm->lsaMultimem.mcBasePtr);
++  const size_t rank = agComm->rank;
++  const uintptr_t agDst = multicast + agWindow->bigOffset + agOffset + rank * agBytes;
++  const uintptr_t rsSrc = multicast + rsWindow->bigOffset + rsOffset + rank * rsBytes;
++  if ((agDst | rsSrc) % 4 != 0) return ncclInvalidArgument;
++  return ncclLaunchFusedAllGatherReduceScatter(devComm, agSrc, agDst, agBytes, rsSrc, rsDst, rsBytes, ctas, stream);
++}
++
+ NCCL_API(ncclResult_t, ncclGetMultimemDevicePointer, ncclWindow_t window, size_t offset, ncclMultimemHandle multimem,
+          void** outPtr);
+ ncclResult_t ncclGetMultimemDevicePointer(ncclWindow_t window, size_t offset, ncclMultimemHandle multimem,
+diff --git a/src/device/CMakeLists.txt b/src/device/CMakeLists.txt
+index a5824586..c7517c6a 100644
+--- a/src/device/CMakeLists.txt
++++ b/src/device/CMakeLists.txt
+@@ -50,6 +50,7 @@ if(NCCL_OS_WINDOWS)
+                 ${device_symmetric_files}
+                 ${CMAKE_CURRENT_SOURCE_DIR}/common.cu
+                 ${CMAKE_CURRENT_SOURCE_DIR}/onerank.cu
++                ${CMAKE_CURRENT_SOURCE_DIR}/fused_ag_rs.cu
+     )
+     set_target_properties(nccl_device PROPERTIES
+         CUDA_SEPARABLE_COMPILATION ON
+@@ -63,6 +64,7 @@ else()
+                 ${symmetric_files}
+                 ${CMAKE_CURRENT_SOURCE_DIR}/common.cu
+                 ${CMAKE_CURRENT_SOURCE_DIR}/onerank.cu
++                ${CMAKE_CURRENT_SOURCE_DIR}/fused_ag_rs.cu
+     )
+     set_target_properties(nccl_device PROPERTIES
+         CUDA_SEPARABLE_COMPILATION ON
+diff --git a/src/device/Makefile b/src/device/Makefile
+index ba07bd91..e952f777 100644
+--- a/src/device/Makefile
++++ b/src/device/Makefile
+@@ -101,7 +101,7 @@ $(OBJDIR)/gensrc/symmetric/rules.mk: $(OBJDIR)/gensrc/symmetric ;
+ -include $(OBJDIR)/gensrc/symmetric/rules.mk
+ # "gensrc/symmetric/rules.mk" populates $(LIB_OBJS_SYM_GEN)
+ 
+-SRCS = common.cu onerank.cu
++SRCS = common.cu onerank.cu fused_ag_rs.cu
+ 
+ # GIN symbol flow (how ncclGin_BackendMask<...> reaches the test):
+ #   - common.cu uses ncclGin and is built with the default rule below (no -G).
+@@ -111,6 +111,9 @@ SRCS = common.cu onerank.cu
+ #   - test/perf links with -lnccl; the test's device code references the symbol; it is resolved from the .so.
+ LIB_OBJS = $(patsubst %, $(OBJDIR)/%.o, $(SRCS)) $(LIB_OBJS_GEN) $(LIB_OBJS_SYM_GEN)
+ 
++# Keep allocator and spill diagnostics in the experimental build log.
++$(OBJDIR)/fused_ag_rs.cu.o: private NVCUFLAGS += -Xptxas -v
++
+ $(OBJDIR)/%.o: % $(OBJDIR)/%.d
+ 	$(call COMPILE,$@,$<)
+ 
+diff --git a/src/device/fused_ag_rs.cu b/src/device/fused_ag_rs.cu
+new file mode 100644
+index 00000000..74893799
+--- /dev/null
++++ b/src/device/fused_ag_rs.cu
+@@ -0,0 +1,107 @@
++/*************************************************************************
++ * SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
++ * SPDX-License-Identifier: Apache-2.0
++ *
++ * See LICENSE.txt for more license information
++ *************************************************************************/
++
++#include "core.h"
++#include "nccl_device.h"
++#include <cuda_runtime.h>
++
++namespace {
++
++constexpr int FusedThreads = 256;
++
++#if __CUDA_ARCH__ >= 900
++template <int PackBytes>
++__device__ __forceinline__ void gatherPack(uintptr_t src, uintptr_t dst) {
++  if constexpr (PackBytes == 16) {
++    asm volatile("{ .reg .b32 p<4>;"
++                 "ld.global.v4.b32 {p0,p1,p2,p3}, [%0];"
++                 "multimem.st.global.v4.f32 [%1], {p0,p1,p2,p3}; }" ::"l"(src), "l"(dst) : "memory");
++  } else {
++    asm volatile("{ .reg .b32 p;"
++                 "ld.global.b32 p, [%0];"
++                 "multimem.st.global.b32 [%1], p; }" ::"l"(src), "l"(dst) : "memory");
++  }
++}
++
++template <int PackBytes>
++__device__ __forceinline__ void scatterPack(uintptr_t src, uintptr_t dst) {
++  if constexpr (PackBytes == 16) {
++    asm volatile("{ .reg .b32 p<4>;"
++                 "multimem.ld_reduce.relaxed.sys.global.add.acc::f32.v4.bf16x2 {p0,p1,p2,p3}, [%0];"
++                 "st.global.v4.b32 [%1], {p0,p1,p2,p3}; }" ::"l"(src), "l"(dst) : "memory");
++  } else {
++    asm volatile("{ .reg .b32 p;"
++                 "multimem.ld_reduce.relaxed.sys.global.add.acc::f32.bf16x2 p, [%0];"
++                 "st.global.b32 [%1], p; }" ::"l"(src), "l"(dst) : "memory");
++  }
++}
++
++template <int PackBytes>
++__device__ __forceinline__ void fusedPacks(uintptr_t agSrc, uintptr_t agDst, size_t agBytes, uintptr_t rsSrc,
++                                           uintptr_t rsDst, size_t rsBytes) {
++  size_t agPacks = agBytes / PackBytes;
++  size_t rsPacks = rsBytes / PackBytes;
++  size_t pairedPacks = agPacks < rsPacks ? agPacks : rsPacks;
++  size_t stride = size_t(gridDim.x) * blockDim.x;
++  size_t pack = size_t(blockIdx.x) * blockDim.x + threadIdx.x;
++  // With independent buffers, the multicast store needs no fence before the reduce load.
++  // Finish each pack's store before introducing the next payload at the PTX level.
++  #pragma unroll 1
++  for (; pack < pairedPacks; pack += stride) {
++    size_t offset = pack * PackBytes;
++    gatherPack<PackBytes>(agSrc + offset, agDst + offset);
++    scatterPack<PackBytes>(rsSrc + offset, rsDst + offset);
++  }
++  #pragma unroll 1
++  for (; pack < agPacks; pack += stride) {
++    size_t offset = pack * PackBytes;
++    gatherPack<PackBytes>(agSrc + offset, agDst + offset);
++  }
++  #pragma unroll 1
++  for (; pack < rsPacks; pack += stride) {
++    size_t offset = pack * PackBytes;
++    scatterPack<PackBytes>(rsSrc + offset, rsDst + offset);
++  }
++}
++#endif
++
++} // namespace
++
++extern "C" __global__ __launch_bounds__(FusedThreads) void ncclDevKernel_FusedAllGatherReduceScatter(
++  const __grid_constant__ ncclDevComm_t devComm, uintptr_t agSrc, uintptr_t agDst, size_t agBytes, uintptr_t rsSrc,
++  uintptr_t rsDst, size_t rsBytes) {
++#if __CUDA_ARCH__ >= 900
++  ncclLsaBarrierSession<ncclCoopCta> bar{
++    ncclCoopCta(), devComm, ncclTeamTagLsa(), blockIdx.x, /*multimem=*/true};
++  bar.sync(ncclCoopCta(), cuda::memory_order_acq_rel);
++
++  if ((agSrc | agDst | rsSrc | rsDst) % 16 == 0) {
++    fusedPacks<16>(agSrc, agDst, agBytes, rsSrc, rsDst, rsBytes);
++    size_t agMain = agBytes & ~size_t(15);
++    size_t rsMain = rsBytes & ~size_t(15);
++    agSrc += agMain;
++    agDst += agMain;
++    agBytes -= agMain;
++    rsSrc += rsMain;
++    rsDst += rsMain;
++    rsBytes -= rsMain;
++  }
++  fusedPacks<4>(agSrc, agDst, agBytes, rsSrc, rsDst, rsBytes);
++
++  // Publish AG writes and wait for peer RS reads before this stream can reuse either window.
++  bar.sync(ncclCoopCta(), cuda::memory_order_acq_rel);
++#endif
++}
++
++ncclResult_t ncclLaunchFusedAllGatherReduceScatter(const ncclDevComm_t* devComm, uintptr_t agSrc, uintptr_t agDst,
++                                                    size_t agBytes, uintptr_t rsSrc, uintptr_t rsDst, size_t rsBytes,
++                                                    int ctas, cudaStream_t stream) {
++  void* args[] = {const_cast<ncclDevComm_t*>(devComm), &agSrc, &agDst, &agBytes, &rsSrc, &rsDst, &rsBytes};
++  CUDACHECK(cudaLaunchKernel(reinterpret_cast<const void*>(ncclDevKernel_FusedAllGatherReduceScatter), ctas,
++                             FusedThreads, args, 0, stream));
++  return ncclSuccess;
++}
+diff --git a/src/include/nccl_device/host.h b/src/include/nccl_device/host.h
+index 12cb0491..5f53c76c 100644
+--- a/src/include/nccl_device/host.h
++++ b/src/include/nccl_device/host.h
+@@ -152,6 +152,20 @@ NCCL_EXTERN_C ncclResult_t ncclDevCommCreate(ncclComm_t comm, ncclDevCommRequire
+                                              ncclDevComm_t* outDevComm);
+ NCCL_EXTERN_C ncclResult_t ncclDevCommDestroy(ncclComm_t comm, ncclDevComm_t const* devComm);
+ 
++// Experimental single-LSA-team AG (packed bytes) + RS (BF16 sum), using one 256-thread CTA grid.
++// agBytes and rsCount describe one rank's AG input and RS output respectively. Both must be
++// nonzero; pointers and byte offsets must be 4-byte aligned, agBytes a multiple of four and
++// rsCount even. agRecv and rsSend are HBM-backed symmetric windows spanning nRanks shards;
++// agSend and rsRecv are device-local buffers. Output ranges must be disjoint from all other ranges.
++// Create devComm on the windows' communicator with lsaMultimem and at least ctas LSA barriers.
++// ctas is limited to NCCL's 64 channels. Use a grid that can make progress alongside other work.
++// All ranks use the same counts, offsets, CTA count and launch order. Serialize uses of devComm's
++// barrier slots, keep the windows and devComm live until stream completion, and do not put this
++// direct CUDA launch inside an NCCL group. Both outputs become usable after stream completion.
++NCCL_EXTERN_C ncclResult_t ncclDevFusedAllGatherReduceScatter(
++  const void* agSend, ncclWindow_t agRecv, size_t agOffset, size_t agBytes, ncclWindow_t rsSend, size_t rsOffset,
++  void* rsRecv, size_t rsCount, const ncclDevComm_t* devComm, int ctas, cudaStream_t stream);
++
+ ////////////////////////////////////////////////////////////////////////////////
+ // Window API:
+ 
