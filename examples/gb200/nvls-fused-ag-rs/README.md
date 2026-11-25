@@ -10,13 +10,12 @@
 ```bash
 bash install/install-nccl-2.32.3-fused-ag-rs.sh
 bash examples/gb200/nvls-fused-ag-rs/run_nsys_fused_ag_rs.sh \
-  --nsys /path/to/NsightSystems-2026.1.1/bin/nsys \
   --gpus 0,1,2,3 --ag-mib 256 --rs-mib 256 --ctas 4
 ```
 
 补丁在 [install/patches](../../../install/patches/nccl-2.32.3-fused-ag-rs.patch)。`--ag-mib` 是每卡的完整 AG 输出，`--rs-mib` 是每卡的完整 RS 输入。两项均可独立指定，均须能按 GPU 数分成 16B 对齐的分片。独立版 CTA 数由 NCCL 选取，融合版由 `--ctas` 指定。可先加 `--dry-run` 核对命令。
 
-每个模式先做无 profiler 的 CUDA event 计时，再用 Nsight Systems 2026.1.1 单独采 CUDA 和 NVTX。两轮均验证每个 rank 的两项输出。结果写到 `results/gb200/nvls-fused-ag-rs/<timestamp>/`。
+脚本默认使用仓库根目录下的 `NsightSystems-2026.6.1/bin/nsys`，也可通过 `NSYS_BIN` 或 `--nsys` 指定同版本的其他安装位置。每个模式先做无 profiler 的 CUDA event 计时，再单独采集 CUDA 和 NVTX。两轮均验证每个 rank 的两项输出。结果写到 `results/gb200/nvls-fused-ag-rs/<timestamp>/`。
 
 | 文件 | 内容 |
 | --- | --- |

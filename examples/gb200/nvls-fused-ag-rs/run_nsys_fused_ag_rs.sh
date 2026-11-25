@@ -7,7 +7,7 @@ set -euo pipefail
 usage() {
     cat <<'USAGE'
 Compare one fused AG+RS kernel with two concurrent symmetric NCCL kernels.
-Run both paths with CUDA event timing, then capture CUDA and NVTX with Nsight Systems 2026.1.1.
+Run both paths with CUDA event timing, then capture CUDA and NVTX with Nsight Systems 2026.6.1.
 
   --gpus LIST        GPU indices (default: CUDA_VISIBLE_DEVICES or 0,1,2,3)
   --ag-mib N         Full AllGather output per rank (default: 256)
@@ -17,7 +17,7 @@ Run both paths with CUDA event timing, then capture CUDA and NVTX with Nsight Sy
   --ctas N           Fused grid size (default: 4)
   --nccl-build DIR   NCCL build from install-nccl-2.32.3-fused-ag-rs.sh
   --cuda-home DIR    Toolkit used for the NCCL host shim (default: CUDA_HOME or /usr/local/cuda)
-  --nsys PATH        Nsight Systems 2026.1.1 executable (also NSYS_BIN)
+  --nsys PATH        Override NSYS_BIN or the repo default NsightSystems-2026.6.1/bin/nsys
   --output-dir DIR   Default: results/gb200/nvls-fused-ag-rs/<timestamp>
   --dry-run          Print commands without creating outputs or starting workers
   -h, --help
@@ -28,12 +28,8 @@ die() { echo "ERROR: $*" >&2; exit 1; }
 
 script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 repo_root="$(cd -- "${script_dir}/../../.." && pwd)"
-nsys_release=2026.1.1
-repo_nsys="${repo_root}/NsightSystems-${nsys_release}/bin/nsys"
-nsys_bin="${NSYS_BIN:-nsys}"
-if [[ -z "${NSYS_BIN:-}" && -x "$repo_nsys" ]]; then
-    nsys_bin="$repo_nsys"
-fi
+nsys_release=2026.6.1
+nsys_bin="${NSYS_BIN:-${repo_root}/NsightSystems-${nsys_release}/bin/nsys}"
 gpus="${CUDA_VISIBLE_DEVICES:-0,1,2,3}"
 ag_mib=256 rs_mib=256 warmup=5 iters=20 ctas=4
 nccl_build="${repo_root}/nccl/nccl-2.32.3-fused-ag-rs/build"
@@ -82,10 +78,11 @@ output_dir="${output_dir:-${repo_root}/results/gb200/nvls-fused-ag-rs/$(date +%Y
 nccl_lib="${nccl_build}/lib/libnccl.so.2"
 shim="${output_dir}/libfused_ag_rs_shim.so"
 if ! $dry_run; then
-    nsys_bin="$(command -v "$nsys_bin")" || die "Nsight Systems ${nsys_release} is required (use --nsys PATH)"
+    nsys_path="$(command -v "$nsys_bin")" || die "Nsight Systems not found at $nsys_bin (use --nsys PATH)"
+    nsys_bin="$nsys_path"
     [[ "$nsys_bin" = /* ]] || nsys_bin="$PWD/$nsys_bin"
     nsys_version="$("$nsys_bin" --version)"
-    [[ "$nsys_version" =~ (^|[[:space:]])2026\.1\.1([.-]|[[:space:]]|$) ]] \
+    [[ "$nsys_version" =~ (^|[[:space:]])${nsys_release//./\\.}([.-]|[[:space:]]|$) ]] \
         || die "expected Nsight Systems ${nsys_release}, found: ${nsys_version}"
     command -v uv >/dev/null || die "uv is required"
     [[ -x "${cuda_home}/bin/nvcc" ]] || die "CUDA toolkit not found (use --cuda-home DIR)"
