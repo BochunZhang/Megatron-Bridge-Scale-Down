@@ -25,7 +25,6 @@ _LOG = logging.getLogger(__name__)
 _REPO = Path(__file__).resolve().parents[3]
 _WORLD_SIZE = 4
 _NSYS_VERSION = "2026.6.1"
-_GPU_METRICS_HZ = 20000
 _EXAMPLE_DIR = "examples/scale-down/02-layer-by-layer"
 _RECIPE = "qwen35_text_27b_pretrain_4gpu_gb200_bf16_layer_by_layer_config"
 _RECIPE_RUNNER = "scripts/training/run_recipe.py"
@@ -287,7 +286,6 @@ def _command(
                 f"profiling.profile_step_end={args.profile_end}",
             )
         )
-        devices = "cuda-visible" if "CUDA_VISIBLE_DEVICES" in os.environ else "all"
         command = [
             _nsys_binary(),
             "profile",
@@ -297,8 +295,7 @@ def _command(
             "--capture-range=cudaProfilerApi",
             "--capture-range-end=stop",
             f"--output={report.with_suffix('')}",
-            f"--gpu-metrics-devices={devices}",
-            f"--gpu-metrics-frequency={_GPU_METRICS_HZ}",
+            "--gpu-metrics-devices=none",
             *command,
         ]
     return [
@@ -417,7 +414,7 @@ def _write_launch(
         "profile_start": args.profile_start,
         "profile_end": args.profile_end,
         "nsys_version": nsys_version,
-        "gpu_metrics_hz": _GPU_METRICS_HZ if nsys_version else None,
+        "gpu_metrics_hz": None,
         "gloo_socket_ifname": worker_overrides["GLOO_SOCKET_IFNAME"],
         "nccl_socket_ifname": worker_overrides["NCCL_SOCKET_IFNAME"],
         "cuda_graph": "off",
