@@ -28,7 +28,7 @@
 #       ├── run.log        full stdout/stderr
 #       ├── metrics.csv    per-step metrics (train.py MetricsLogger)
 #       ├── ds_config.json exact config used (copied by pretrain.sh)
-#       └── nsys_trace.nsys-rep  iterations 7-8 (when --profile nsys)
+#       └── <model>-<test>-step8-<timestamp>.nsys-rep (when --profile nsys)
 #   <repo_root>/results/01-analyse/02-deepspeed-sve/experiment_summary_<ts>.txt
 #
 # The working ds_config JSONs are generated under <repo_root>/.tmp/ (built by
@@ -50,7 +50,7 @@
 #   ./pretrain_experiment.sh --param_positions param_nvme \
 #       --nvme_path /tmp/deepspeed_nvme_offload \
 #       --nvme_device /dev/nvme2n1
-#   # Capture iterations 7-8 with Nsight Systems:
+#   # Capture step 8 with Nsight Systems:
 #   ./pretrain_experiment.sh --profile nsys --models Qwen/Qwen3.5-9B-Base
 set -euo pipefail
 
@@ -126,11 +126,8 @@ PYTHON_BIN=${PYTHON_BIN:-python}
 DRY_RUN=false
 TEST_MODE=false
 PROFILE_MODE=none
-# Nsys capture is intentionally fixed to these training iterations. The
-# profiler starts before step 7 and stops after step 8, so both iterations are
-# included in the trace.
-NSYS_PROFILE_STEP_START=7
-NSYS_PROFILE_STEP_END=8
+# Start before and stop after the same zero-based optimizer step.
+NSYS_PROFILE_STEP=8
 
 usage() {
     cat <<'EOF'
@@ -606,7 +603,7 @@ for MODEL in $MODELS; do
                     echo ""
                     echo "################ RUN ${MODEL_DIR}/${TEST_NAME}/${RUN_TS} ################"
                     if [ "$PROFILE_MODE" = "nsys" ]; then
-                        echo "Profile: nsys (iterations ${NSYS_PROFILE_STEP_START}-${NSYS_PROFILE_STEP_END})"
+                        echo "Profile: nsys (step ${NSYS_PROFILE_STEP}, zero-based)"
                     fi
                     PRETRAIN_ARGS=(
                         --test_name "$TEST_NAME"
@@ -635,8 +632,8 @@ for MODEL in $MODELS; do
                     if [ "$PROFILE_MODE" = "nsys" ]; then
                         PRETRAIN_ARGS+=(
                             --profile nsys
-                            --profile_step_start "$NSYS_PROFILE_STEP_START"
-                            --profile_step_end "$NSYS_PROFILE_STEP_END"
+                            --profile_step_start "$NSYS_PROFILE_STEP"
+                            --profile_step_end "$NSYS_PROFILE_STEP"
                         )
                     fi
                     if [ "$DRY_RUN" = "true" ]; then

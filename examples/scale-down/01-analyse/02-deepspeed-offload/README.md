@@ -125,7 +125,7 @@ bash examples/scale-down/01-analyse/02-deepspeed-offload/pretrain_experiment.sh 
 bash examples/scale-down/01-analyse/02-deepspeed-offload/run_superoffload_nsys.sh
 ```
 
-默认输出到 `results/01-analyse/02-deepspeed-sve-nsys/<timestamp>/`，包含两份 `nsys_trace.nsys-rep`、运行配置和锁频日志。`--dry-run` 可预览命令。
+默认输出到 `results/01-analyse/02-deepspeed-sve-nsys/<timestamp>/`，包含两份 `.nsys-rep`、运行配置和锁频日志。报告文件名包含模型、策略、参数位置、采集 step 和时间戳，例如 `Qwen3.5-9B-Base-super_offload_1.0-param_cpu__recompute_none__mbs1-sve-step8-20261125_153903.nsys-rep`。`--dry-run` 可预览命令。
 
 ```bash
 # Dense
@@ -150,8 +150,8 @@ bash examples/scale-down/01-analyse/02-deepspeed-offload/pretrain_experiment.sh 
 ```
 
 - `recompute_none`:recompute 会把一次 forward 放进 backward,不便比较通信与 backward 计算;
-- `--per_gpu_batch_size 4`:每 step 4 个 micro-batch,step 7–8 共 8 个,控制 trace 大小;
-- 只有 rank 0 被抓取,trace 为 `<run_dir>/nsys_trace.nsys-rep`。
+- `--per_gpu_batch_size 4` 每步执行 4 个 microbatch。每组只采集日志里的 `Step 8`，即从 0 编号的第 9 次训练迭代。
+- rank 0 在该步第一个 microbatch 开始前启动采集，在 optimizer update 和指标记录完成后停止。Trace 保留 CUDA 和 NVTX 事件，GPU metrics 采样关闭。
 
 在 nsys 中看 `backward_step[i]` NVTX 范围内的计算 stream 是否出现空隙,以及空隙期间在跑什么:
 

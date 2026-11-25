@@ -4,6 +4,7 @@ import json
 import logging
 import os
 import platform
+import re
 import runpy
 import subprocess
 import sys
@@ -206,3 +207,40 @@ def test_gpu_optimizer_only_skips_preflight_and_uses_new_result_root(launcher_en
     assert SVE_REQUIREMENT not in launch
     new_root = Path(launcher_env["REPO_ROOT"]) / "results/01-analyse/02-deepspeed-sve"
     assert len(list(new_root.glob("**/ds_config.json"))) == 1
+
+
+def test_matrix_nsys_captures_only_step_eight_without_gpu_metrics(
+    launcher_env: dict[str, str], tmp_path: Path
+) -> None:
+    nsys = tmp_path / "nsys"
+    nsys.write_text(
+        f"#!{sys.executable}\n"
+        "import json, os, sys\n"
+        "with open(os.environ['TEST_LAUNCH_LOG'], 'a', encoding='utf-8') as log:\n"
+        "    log.write(json.dumps(sys.argv[1:]) + '\\n')\n"
+    )
+    nsys.chmod(0o755)
+
+    result = _run_matrix(
+        {**launcher_env, "NSYS_BIN": str(nsys)},
+        "--optimizer_strategies",
+        "super_offload_1.0",
+        "--param_positions",
+        "param_gpu param_cpu",
+        "--profile",
+        "nsys",
+    )
+
+    assert result.returncode == 0, result.stderr
+    preflight, *launches = _python_invocations(launcher_env)
+    assert Path(preflight[0]).name == "cpu_adam_sve.py"
+    assert len(launches) == 2
+    for placement, args in zip(("param_gpu", "param_cpu"), launches, strict=True):
+        assert args[0] == "profile"
+        assert {"cuda", "nvtx"}.issubset(args[args.index("-t") + 1].split(","))
+        assert "--gpu-metrics-devices=none" in args
+        assert args[args.index("--profile_step_start") + 1] == "8"
+        assert args[args.index("--profile_step_end") + 1] == "8"
+        output_name = Path(args[args.index("-o") + 1]).name
+        prefix = f"Qwen3.5-9B-Base-super_offload_1.0-{placement}__recompute_none__mbs1-sve-step8-"
+        assert re.fullmatch(re.escape(prefix) + r"\d{8}_\d{6}", output_name)

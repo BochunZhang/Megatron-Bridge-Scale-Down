@@ -13,6 +13,7 @@ Usage: bash run_superoffload_nsys.sh [--dry-run]
 
 Profile the SuperOffload 1.0 param_gpu/param_cpu comparison on the first four
 CUDA-visible GPUs. Both runs use Qwen3.5-9B, seq 4096, MBS 1, and no recompute.
+Each run traces one optimizer step with CUDA and NVTX. GPU metrics are disabled.
 Set NSYS_BIN to the Nsight Systems 2026.6.1 executable if needed.
 Set RESULTS_ROOT to override the parent directory for timestamped results.
 --dry-run prints the planned commands without probing or locking GPUs.
@@ -97,7 +98,8 @@ summary=("$run_dir"/experiment_summary_*.txt)
 [[ -f ${summary[0]} ]] && awk '$NF == "OK" { ok++ } END { exit !(NR == 2 && ok == 2) }' "${summary[0]}" \
     || die "one or more cases failed, see $run_dir"
 for placement in param_gpu param_cpu; do
-    reports=("$run_dir/$model/super_offload_1.0-${placement}__recompute_none__mbs1"/*/nsys_trace.nsys-rep)
-    [[ -s ${reports[0]} ]] || die "missing Nsight Systems report for $placement under $run_dir"
+    reports=("$run_dir/$model/super_offload_1.0-${placement}__recompute_none__mbs1"/*/*.nsys-rep)
+    [[ ${#reports[@]} == 1 && -s ${reports[0]} ]] \
+        || die "expected one nonempty Nsight Systems report for $placement under $run_dir"
     printf 'Trace: %s\n' "${reports[0]}"
 done

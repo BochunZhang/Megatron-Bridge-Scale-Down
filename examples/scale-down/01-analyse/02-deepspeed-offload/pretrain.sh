@@ -302,8 +302,17 @@ echo "Model shape:     $MODEL_SHAPE_DESC"
 echo "Metrics out:     $METRICS_OUT"
 echo "Profile:         ${PROFILE_MODE:-disabled}"
 if [ "$PROFILE_MODE" = "nsys" ]; then
+    nsys_step_label="step${PROFILE_STEP_START}"
+    if [ "$PROFILE_STEP_START" != "$PROFILE_STEP_END" ]; then
+        nsys_step_label="steps${PROFILE_STEP_START}-${PROFILE_STEP_END}"
+    fi
+    NSYS_OUTPUT="${RUN_DIR}/${MODEL##*/}-${TEST_NAME##*/}"
+    if [ "$REQUIRE_CPU_ADAM_SVE" = "true" ]; then
+        NSYS_OUTPUT+="-sve"
+    fi
+    NSYS_OUTPUT+="-${nsys_step_label}-$(date +%Y%m%d_%H%M%S)"
     echo "Nsys steps:      ${PROFILE_STEP_START}-${PROFILE_STEP_END}"
-    echo "Nsys output:     ${RUN_DIR}/nsys_trace"
+    echo "Nsys output:     ${NSYS_OUTPUT}.nsys-rep"
 fi
 echo "================================================"
 
@@ -367,11 +376,11 @@ if [ "$PROFILE_MODE" = "nsys" ]; then
 fi
 
 if [ "$PROFILE_MODE" = "nsys" ]; then
-    NSYS_OUTPUT="${RUN_DIR}/nsys_trace"
     CMD=(
         "${NSYS_BIN:-nsys}" profile
         -s none
         -t nvtx,cuda
+        --gpu-metrics-devices=none
         -o "$NSYS_OUTPUT"
         --force-overwrite true
         --capture-range=cudaProfilerApi
