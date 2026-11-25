@@ -994,7 +994,8 @@ class LayerByLayerRecipeConfig:
     cpu_optimizer: Literal["grace_adam", "torch"] = "torch"
     """AdamW backend for updates with CPU or NVMe optimizer state."""
     nvme_dir: str = "/tmp"
-    cpu_threads: int = 8
+    cpu_threads: int = 32
+    """Intra-op threads for CPU gradient accumulation and AdamW per rank."""
     tiny: bool = False
 
 

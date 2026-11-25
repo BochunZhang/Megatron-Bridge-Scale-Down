@@ -26,7 +26,7 @@ If the environment resolves the older pinned submodule, put the updated sibling 
 export PYTHONPATH="$PWD/../megatron-lm${PYTHONPATH:+:$PYTHONPATH}"
 ```
 
-The sweep defaults to PyTorch CPU AdamW for CPU and NVMe optimizer tiers. Case 04 defaults to GraceAdam, which requires Megatron-LM's native Megatron-FSDP GraceAdam support and an SVE-enabled build of DeepSpeed `v0.20.1`. The launchers set OpenMP threads per CPU optimizer rank from `--cpu-threads` (default 8). For a direct recipe launch, set `OMP_NUM_THREADS` before startup to match `layer_by_layer.cpu_threads`. The native update in DeepSpeed `v0.20.1` holds the Python GIL and can delay new GPU submissions while previously submitted GPU work continues.
+The sweep defaults to PyTorch CPU AdamW for CPU and NVMe optimizer tiers. Case 04 defaults to GraceAdam, which requires Megatron-LM's native Megatron-FSDP GraceAdam support and an SVE-enabled build of DeepSpeed `v0.20.1`. The launchers use `--cpu-threads` (default 32) for PyTorch intra-op parallelism in CPU gradient accumulation and for OpenMP parallelism in GraceAdam, per rank. For a direct recipe launch, set `OMP_NUM_THREADS` before startup to match `layer_by_layer.cpu_threads`. The native update in DeepSpeed `v0.20.1` holds the Python GIL and can delay new GPU submissions while previously submitted GPU work continues.
 
 ## Native schedule smoke test
 
@@ -82,12 +82,12 @@ Results go under `results/02-layer-by-layer/01-baseline/03-param-cpu-act-cpu-opt
 ```bash
 study=examples/scale-down/02-layer-by-layer/01-baseline
 bash "$study/04_param_cpu_act_cpu_opt_cpu.sh" --dry-run
-bash "$study/04_param_cpu_act_cpu_opt_cpu.sh" --cpu-threads 8
+bash "$study/04_param_cpu_act_cpu_opt_cpu.sh" --cpu-threads 32
 ```
 
-Case 04 keeps decoder layer 0's weights and AdamW update on the GPU. The rest of the model updates on the CPU using multithreaded GraceAdam. Once all backward stages complete, Megatron-FSDP reduce-scatters the BF16 gradients and promotes the reduced shards to FP32. The optimizer transfers finalized FP32 gradients to pinned host memory in bucket order, allowing a later transfer to overlap with the current CPU update.
+Case 04 keeps decoder layer 0's weights, main gradients, and AdamW update on the GPU. Each decoder layer runs one backward for all its microbatches. Megatron-FSDP queues BF16 reduce-scatter for that layer before starting the next layer's backward. It converts the reduced shards for CPU-updated parameters to FP32 on the GPU, copies them to pinned host memory, and adds them to the CPU main gradients. The gradient worker finishes accumulation before gradient clipping and the optimizer step. GraceAdam reads the finalized CPU shards in place.
 
-In Nsight Systems, `GraceAdam bucket=<id>` brackets the native CPU update and `fsdp.layer_by_layer.GPUAdamW bucket=<id>` brackets the GPU AdamW update. Results go under `results/02-layer-by-layer/01-baseline/04-param-cpu-act-cpu-opt-cpu/`.
+In Nsight Systems, `fsdp.cpu_grad.d2h bucket=<id>` marks the gradient copy submission and `fsdp.cpu_grad.accumulate bucket=<id>` brackets the CPU addition. `GraceAdam bucket=<id>` brackets the native CPU update and `fsdp.layer_by_layer.GPUAdamW bucket=<id>` brackets the GPU AdamW update. Results go under `results/02-layer-by-layer/01-baseline/04-param-cpu-act-cpu-opt-cpu/`.
 
 ## Running and profiling the numbered cases
 
@@ -112,7 +112,7 @@ bash examples/scale-down/02-layer-by-layer/run_sweep.sh \
   --layers 8 16 32 --parameter-tier cpu
 ```
 
-Defaults are eight decoder layers, sequence length 4096, micro-batch size 1, four microbatches per rank per step, three optimizer steps, and GPU placement for every tier. Choose `gpu` or `cpu` independently for `--parameter-tier`, `--activation-tier`, and `--optimizer-tier`. CPU activation placement covers the saved layer boundaries. CPU-tier PyTorch AdamW uses CPU gradient accumulation. CPU-tier GraceAdam uses the post-backward FP32 transfer from case 04.
+Defaults are eight decoder layers, sequence length 4096, micro-batch size 1, four microbatches per rank per step, three optimizer steps, and GPU placement for every tier. Choose `gpu` or `cpu` independently for `--parameter-tier`, `--activation-tier`, and `--optimizer-tier`. CPU activation placement covers the saved layer boundaries. Both CPU optimizer backends use CPU gradient accumulation. GraceAdam uses the per-layer FP32 transfer from case 04.
 
 NVMe requires `--parameter-tier nvme --optimizer-tier nvme --nvme-dir /path/to/local/nvme` and the `megatron_nvme_aio` extension from the Megatron-LM checkout's `src/nvme/deepspeed`. Each NVMe case uses a fresh scratch directory. Its filesystem holds all four ranks' files. At full depth, FP32 master weights and the two Adam moments alone require roughly 324 GB in total, with additional storage for compute weights and staging.
 

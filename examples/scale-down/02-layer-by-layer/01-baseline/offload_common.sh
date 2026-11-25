@@ -53,7 +53,7 @@ Run an 8-layer Qwen3.5-27B full-attention case on one four-GPU node.
   --train-iters N       Optimizer steps (default: 10)
   --profile nsys|none   Use Nsight Systems 2026.6.1 (default: nsys)
   --cpu-optimizer torch|grace_adam   Optimizer backend when a CPU/NVMe optimizer tier is selected
-  --cpu-threads N       OpenMP threads per CPU optimizer rank (default: 8)
+  --cpu-threads N       CPU gradient accumulation and AdamW threads per rank (default: 32)
   --dry-run             Show the training command
   --print-result-dir    Print the node0 result directory
 HELP

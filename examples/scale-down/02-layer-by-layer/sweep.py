@@ -61,8 +61,10 @@ _LM_SOURCE_FILES = (
     "megatron/core/distributed/fsdp/src/megatron_fsdp/utils.py",
     "megatron/core/models/gpt/gpt_model.py",
     "megatron/core/optimizer/__init__.py",
+    "megatron/core/optimizer/clip_grads.py",
     "megatron/core/optimizer/cpu_offloading/fsdp_adam.py",
     "megatron/core/optimizer/distrib_optimizer.py",
+    "megatron/core/optimizer/optimizer.py",
     "megatron/core/optimizer/optimizer_config.py",
     "megatron/core/pipeline_parallel/fine_grained_activation_offload.py",
     "megatron/core/pipeline_parallel/schedules.py",
@@ -206,7 +208,7 @@ def _arguments() -> argparse.Namespace:
     parser.add_argument("--optimizer-tier", choices=_PLACEMENTS, default="gpu")
     parser.add_argument("--cpu-optimizer", choices=("torch", "grace_adam"), default="torch")
     parser.add_argument("--learning-rate", type=float)
-    parser.add_argument("--cpu-threads", type=_positive, default=8)
+    parser.add_argument("--cpu-threads", type=_positive, default=32)
     parser.add_argument("--profile", choices=("none", "nsys"), default="none")
     parser.add_argument("--profile-start", type=int, help="first profiled step, zero-based")
     parser.add_argument("--profile-end", type=int, help="exclusive end of the capture")
@@ -431,9 +433,7 @@ def _read_result(
     layerwise_grace_adam = optimizer_tier == "cpu" and optimizer_backend == "grace_adam"
     expected_offload = []
     if optimizer_tier != "gpu":
-        if not layerwise_grace_adam:
-            expected_offload.append("gradient")
-        expected_offload.append("optimizer")
+        expected_offload.extend(("gradient", "optimizer"))
     if parameter_tier != "gpu":
         expected_offload.append("weight")
     if (
@@ -444,6 +444,7 @@ def _read_result(
         and isinstance(offload, list)
         and all(isinstance(component, str) for component in offload)
         and sorted(offload) == expected_offload
+        and (optimizer_tier == "gpu" or metrics.get("fsdp_cpu_grad_accumulation") is True)
         and metrics.get("layers") == layers
         and metrics.get("steps") == steps
         and metrics.get("parameter_tier") == parameter_tier

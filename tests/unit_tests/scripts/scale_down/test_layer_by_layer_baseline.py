@@ -55,7 +55,8 @@ def test_layer_by_layer_baseline_dry_run(
             "--trace=cuda,nvtx",
             "profiling.nvtx_ranges=true",
             "layer_by_layer.cpu_optimizer=grace_adam",
-            "OMP_NUM_THREADS=8",
+            "OMP_NUM_THREADS=32",
+            "layer_by_layer.cpu_threads=32",
         } <= set(command)
     assert all(not arg.startswith(("layer_by_layer.backend=", "layer_by_layer.nvme_dir=")) for arg in command)
 
@@ -182,6 +183,16 @@ def test_layer_by_layer_sweep_rejects_unsupported_placements(extra_args: list[st
         ("cpu", "cpu", {}, "passed"),
         ("cpu", "cpu", {"optimizer_tier": "cpu", "fsdp_layer_by_layer_cpu_optimizer": True}, "passed"),
         ("cpu", "cpu", {"optimizer_tier": "cpu", "fsdp_layer_by_layer_cpu_optimizer": False}, "invalid_result"),
+        (
+            "cpu",
+            "cpu",
+            {
+                "optimizer_tier": "cpu",
+                "fsdp_layer_by_layer_cpu_optimizer": True,
+                "fsdp_cpu_grad_accumulation": False,
+            },
+            "invalid_result",
+        ),
         ("cpu", "cpu", {"activation_tier": "gpu"}, "invalid_result"),
         ("cpu", "gpu", {"schedule": "no_pipeline"}, "invalid_result"),
         ("cpu", "gpu", {"parameter_backend": "layer_by_layer"}, "invalid_result"),
@@ -200,7 +211,7 @@ def test_baseline_result_checks_native_fsdp_metrics(
     cpu_optimizer = "grace_adam" if optimizer_tier == "cpu" else None
     expected_offload = ["weight"] if parameter_tier == "cpu" else []
     if cpu_optimizer:
-        expected_offload.append("optimizer")
+        expected_offload.extend(("gradient", "optimizer"))
     shared = {
         "layers": 8,
         "steps": 10,
@@ -226,6 +237,7 @@ def test_baseline_result_checks_native_fsdp_metrics(
         "parameter_backend": "megatron_fsdp",
         "fsdp_strategy": "optim_grads_params",
         "fsdp_cpu_offload": expected_offload,
+        "fsdp_cpu_grad_accumulation": bool(cpu_optimizer),
         "optimizer_backend": cpu_optimizer or "FusedAdam",
         "world_size": 4,
         **fsdp_result,
