@@ -5,6 +5,7 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd -- "${SCRIPT_DIR}/../../.." && pwd)"
 BENCH="${SCRIPT_DIR}/cpuadam_benchmark.py"
 PYTHON_BIN="${PYTHON_BIN:-python}"
 CPU_NODE=0
@@ -12,7 +13,7 @@ THREADS=1,2,4,8,16,32
 PARAMS=268435456
 DURATION=30
 WARMUP=5
-OUTPUT_ROOT="${PWD}"
+OUTPUT_ROOT="${REPO_ROOT}/results/gb200/cpu-adam"
 
 usage() {
     cat <<EOF
@@ -22,7 +23,7 @@ Usage: bash $0 [options]
   --params COUNT      FP32 elements in one tensor (default: 268435456, or 1 GiB of weights)
   --duration SEC      Time window including warmup (default: 30)
   --warmup SEC        Leading time to exclude from samples (default: 5)
-  --output-root DIR   Parent for a new results directory (default: current directory)
+  --output-root DIR   Parent for a new results directory (default: results/gb200/cpu-adam in the repo)
   -h, --help          Show this help
 
 Requires numactl, cpuadam_benchmark.py alongside this script, and a Python environment with PyTorch and DeepSpeed.
