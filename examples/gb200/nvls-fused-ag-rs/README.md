@@ -25,7 +25,9 @@ bash examples/gb200/nvls-fused-ag-rs/run_nsys_fused_ag_rs.sh \
 
 `--ag-mib` 是每卡的完整 AG 输出，`--rs-mib` 是每卡的完整 RS 输入。两项均可独立指定，均须能按 GPU 数分成 16 B 对齐的分片。默认顺序是先跑 4 CTA 的四种融合内核，再跑 8 CTA 的四种，最后各跑一份 AG+RS 并发、AG 独跑和 RS 独跑基线。三个基线的 CTA 数由 NCCL 选取。`--ctas` 和 `--variants` 支持逗号分隔的列表。pause 变体默认暂停 3072 cycles，设为 0 可测同一变体的零延迟对照。可用 `--dry-run` 核对顺序和参数。
 
-脚本默认使用仓库根目录下的 `NsightSystems-2026.6.1/bin/nsys`，也可通过 `NSYS_BIN` 或 `--nsys` 指定同版本的其他安装位置。每个模式先做无 profiler 的 CUDA event 计时，再单独采集 CUDA 和 NVTX。两轮均验证每个 rank 的对应输出。采集并导出后，下载整个 `results/gb200/nvls-fused-ag-rs/<timestamp>/` 目录到本机。用 `analyse_nsys.py` 汇总融合和并发基线时，可追加 `--ag-only <结果目录>/split/ag-only/profile.sqlite --rs-only <结果目录>/split/rs-only/profile.sqlite`。
+脚本默认使用仓库根目录下的 `NsightSystems-2026.6.1/bin/nsys`，也可通过 `NSYS_BIN` 或 `--nsys` 指定同版本的其他安装位置。每个模式先做无 profiler 的 CUDA event 计时，再单独采集 CUDA 和 NVTX。两轮均验证每个 rank 的对应输出。采集后下载整个 `results/gb200/nvls-fused-ag-rs/<timestamp>/` 目录到本机，保留 `config.txt`、计时结果和原始报告。
+
+在本机用 `nsys export --type=sqlite --output=profile.sqlite` 导出需要分析的 `.nsys-rep`，再把本机生成的 SQLite 交给 `analyse_nsys.py`。分析融合和并发基线时，可用 `--ag-only` 和 `--rs-only` 加入两组独跑结果。
 
 Gloo 网卡由仓库的 [单节点选择脚本](../../../scripts/scale-down/common/gloo_socket_ifname.sh) 解析。已有 `GLOO_SOCKET_IFNAME` 且网卡已启用并有 IPv4 地址时沿用该值，否则优先选 `eth0`，其次选 `bond1`。`config.txt` 记录生效网卡和采样设置。
 
@@ -34,7 +36,7 @@ Nsight 对 `--gpus` 中的每张卡采集 NVLink RX/TX，区分请求、响应�
 | 文件 | 内容 |
 | --- | --- |
 | 各模式的 `timing.json` | 无 profiler，从 GPU start event 到本轮全部输出可用的时间，汇总取每次最慢 rank，再取中位数。 |
-| 融合版的 `<variant>-cta-<N>.nsys-rep`、基线的 `split-cta-auto.nsys-rep`、`ag-only-cta-auto.nsys-rep`、`rs-only-cta-auto.nsys-rep`，以及各模式的 `profile.sqlite` | 每卡 CUDA/NVTX 时间线和原始 NVLink GPU Metrics。 |
+| 融合版的 `<variant>-cta-<N>.nsys-rep`、基线的 `split-cta-auto.nsys-rep`、`ag-only-cta-auto.nsys-rep`、`rs-only-cta-auto.nsys-rep` | 每卡 CUDA/NVTX 时间线和原始 NVLink GPU Metrics。 |
 | `cta-<N>/<variant>/summary.json`（本机分析生成） | 校验实际融合 kernel 名称和 CTA 数，再汇总与独立版的 kernel 跨度、AG/RS 重叠、寄存器数和逐 GPU NVLink RX/TX。 |
 
 评估总耗时优先用 `timing.json`。GPU 时间线可用来解释是哪一项结束得晚、独立版是否真正并发，以及融合期间各卡的 NVLink 流量。

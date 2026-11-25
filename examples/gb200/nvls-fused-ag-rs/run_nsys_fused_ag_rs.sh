@@ -9,7 +9,7 @@ usage() {
 Compare fused AG+RS variants with concurrent and isolated symmetric NCCL kernels.
 Each case runs with CUDA event timing, then captures CUDA, NVTX and GB100 NVLink
 metrics with Nsight Systems 2026.6.1. The split baselines run AG+RS, AG alone and RS alone.
-Reports and SQLite exports are saved for analysis on a separate machine.
+Nsight reports and timing files are saved for analysis on a separate machine.
 
   --gpus LIST        GPU indices (default: CUDA_VISIBLE_DEVICES or 0,1,2,3)
   --ag-mib N         Full AllGather output per rank (default: 1024)
@@ -185,6 +185,7 @@ run_case() {
     timed=("${worker[@]}" --output "${mode_dir}/timing.json")
     profiled=(
         "$nsys_bin" profile --trace=cuda,nvtx --sample=none --cpuctxsw=none
+        --export=none --stats=false
         --gpu-metrics-devices="$gpus" --gpu-metrics-set="file:$nsys_metrics_file" --gpu-metrics-frequency="$nsys_freq"
         --capture-range=cudaProfilerApi --capture-range-end=stop --output="$report_stem"
         "${worker[@]}" --profile --profile-frequency "$nsys_freq" --output "${mode_dir}/profile-timing.json"
@@ -203,8 +204,8 @@ run_case() {
         run "${profiled[@]}" 2>&1 | tee "${mode_dir}/nsys.log"
         [[ -s "${mode_dir}/timing.json" && -s "${mode_dir}/profile-timing.json" ]] \
             || die "worker did not finish output validation in ${mode_dir}"
+        [[ -s "${report_stem}.nsys-rep" ]] || die "Nsight Systems did not write ${report_stem}.nsys-rep"
     fi
-    run "$nsys_bin" export --type=sqlite --output="${mode_dir}/profile.sqlite" "${report_stem}.nsys-rep"
 }
 
 for cta in "${cta_list[@]}"; do
@@ -222,5 +223,5 @@ run_case ag-only "${output_dir}/split/ag-only" "${cta_list[0]}"
 run_case rs-only "${output_dir}/split/rs-only" "${cta_list[0]}"
 
 if ! $dry_run; then
-    printf 'Reports and SQLite exports saved in %s\n' "$output_dir"
+    printf 'Nsight reports and timing files saved in %s\n' "$output_dir"
 fi
