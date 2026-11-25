@@ -431,6 +431,7 @@ def _read_result(
     actual_optimizer = metrics.get("optimizer_backend")
     offload = metrics.get("fsdp_cpu_offload")
     layerwise_grace_adam = optimizer_tier == "cpu" and optimizer_backend == "grace_adam"
+    expected_cpu_accumulation = optimizer_tier != "gpu" and not layerwise_grace_adam
     expected_offload = []
     if optimizer_tier != "gpu":
         expected_offload.extend(("gradient", "optimizer"))
@@ -444,7 +445,7 @@ def _read_result(
         and isinstance(offload, list)
         and all(isinstance(component, str) for component in offload)
         and sorted(offload) == expected_offload
-        and (optimizer_tier == "gpu" or metrics.get("fsdp_cpu_grad_accumulation") is True)
+        and (optimizer_tier == "gpu" or metrics.get("fsdp_cpu_grad_accumulation") is expected_cpu_accumulation)
         and metrics.get("layers") == layers
         and metrics.get("steps") == steps
         and metrics.get("parameter_tier") == parameter_tier

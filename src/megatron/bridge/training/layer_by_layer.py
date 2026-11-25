@@ -148,7 +148,7 @@ def configure_layer_by_layer(config: ConfigContainer) -> None:
     if layerwise_grace_adam:
         ddp.megatron_fsdp_grad_comm_dtype = torch.bfloat16
     ddp.fsdp_cpu_offload = tuple(components)
-    ddp.fsdp_cpu_grad_accumulation = cpu_optimizer
+    ddp.fsdp_cpu_grad_accumulation = cpu_optimizer and not layerwise_grace_adam
     ddp.fsdp_cpu_optimizer = cpu_optimizer
     ddp.fsdp_nvme_path = offload.nvme_dir if use_nvme else None
     config.checkpoint.ckpt_format = "fsdp_dtensor"

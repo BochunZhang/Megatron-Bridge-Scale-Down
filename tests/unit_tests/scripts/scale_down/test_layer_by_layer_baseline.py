@@ -182,6 +182,7 @@ def test_layer_by_layer_sweep_rejects_unsupported_placements(extra_args: list[st
         ("cpu", "gpu", {}, "passed"),
         ("cpu", "cpu", {}, "passed"),
         ("cpu", "cpu", {"optimizer_tier": "cpu", "fsdp_layer_by_layer_cpu_optimizer": True}, "passed"),
+        ("cpu", "cpu", {"optimizer_tier": "cpu", "optimizer_backend": "torch"}, "passed"),
         ("cpu", "cpu", {"optimizer_tier": "cpu", "fsdp_layer_by_layer_cpu_optimizer": False}, "invalid_result"),
         (
             "cpu",
@@ -189,7 +190,7 @@ def test_layer_by_layer_sweep_rejects_unsupported_placements(extra_args: list[st
             {
                 "optimizer_tier": "cpu",
                 "fsdp_layer_by_layer_cpu_optimizer": True,
-                "fsdp_cpu_grad_accumulation": False,
+                "fsdp_cpu_grad_accumulation": True,
             },
             "invalid_result",
         ),
@@ -208,7 +209,7 @@ def test_baseline_result_checks_native_fsdp_metrics(
     state_dir = tmp_path / "state"
     state_dir.mkdir()
     optimizer_tier = fsdp_result.get("optimizer_tier", "gpu")
-    cpu_optimizer = "grace_adam" if optimizer_tier == "cpu" else None
+    cpu_optimizer = fsdp_result.get("optimizer_backend", "grace_adam") if optimizer_tier == "cpu" else None
     expected_offload = ["weight"] if parameter_tier == "cpu" else []
     if cpu_optimizer:
         expected_offload.extend(("gradient", "optimizer"))
@@ -237,7 +238,7 @@ def test_baseline_result_checks_native_fsdp_metrics(
         "parameter_backend": "megatron_fsdp",
         "fsdp_strategy": "optim_grads_params",
         "fsdp_cpu_offload": expected_offload,
-        "fsdp_cpu_grad_accumulation": bool(cpu_optimizer),
+        "fsdp_cpu_grad_accumulation": cpu_optimizer == "torch",
         "optimizer_backend": cpu_optimizer or "FusedAdam",
         "world_size": 4,
         **fsdp_result,

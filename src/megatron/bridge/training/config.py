@@ -995,7 +995,7 @@ class LayerByLayerRecipeConfig:
     """AdamW backend for updates with CPU or NVMe optimizer state."""
     nvme_dir: str = "/tmp"
     cpu_threads: int = 32
-    """Intra-op threads for CPU gradient accumulation and AdamW per rank."""
+    """CPU optimizer and PyTorch intra-op thread count per rank."""
     tiny: bool = False
 
 
