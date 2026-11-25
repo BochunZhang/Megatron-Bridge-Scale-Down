@@ -95,16 +95,15 @@ Case 05 uses case 04's model, batches, placement, and AdamW hyperparameters. A w
 
 The overlap path uses BF16 with unit loss scale and per-microbatch loss normalization. It disables gradient clipping, gradient zero counts, gradient-based step skipping, gradient checks, and iteration reruns.
 
-On the GB200 node, apply the patch in a DeepSpeed `v0.20.1` checkout. Run these commands from the Bridge root with the training environment active. The extension is compiled for the host on first load.
+On the GB200 node, run the patch helper from the Bridge root. It patches the installed DeepSpeed `v0.20.1` CPUAdam C++ sources in place, JIT-compiles the extension, and checks that the loaded build releases the GIL. The installed package must use JIT for CPUAdam (`DS_BUILD_CPU_ADAM=0` at installation). The command below selects the same Python as the numbered launcher.
 
 ```bash
-git -C ../deepspeed switch --detach v0.20.1
-git -C ../deepspeed apply ../megatron-lm/src/optimizer/deepspeed-cpu-adam-release-gil.patch
-DS_BUILD_OPS=0 DS_BUILD_CPU_ADAM=0 uv pip install --reinstall --no-deps --no-build-isolation ../deepspeed
-export TORCH_EXTENSIONS_DIR="$PWD/.cache/torch-extensions-layer-by-layer-05"
-uv run --no-sync python examples/scale-down/01-analyse/02-deepspeed-offload/cpu_adam_sve.py
-uv run --no-sync python -c 'from deepspeed.ops.op_builder import CPUAdamBuilder; assert CPUAdamBuilder().load().adam_update_releases_gil'
+train_python="${PYTHON:-$(uv run --no-sync python -c 'import sys; sys.stdout.write(sys.executable)')}"
+patch_helper=examples/scale-down/01-analyse/02-deepspeed-offload/apply_cpu_adam_gil_patch.sh
+PYTHON_BIN="$train_python" bash "$patch_helper"
 ```
+
+If you set `TORCH_EXTENSIONS_DIR`, export the same value for the patch helper and the training launcher. To restore the original CPUAdam sources and build, run `PYTHON_BIN="$train_python" bash "$patch_helper" --recovery`.
 
 ```bash
 study=examples/scale-down/02-layer-by-layer/01-baseline

@@ -56,6 +56,8 @@ bash examples/scale-down/01-analyse/02-deepspeed-offload/apply_superoffload_nvme
 
 脚本按 `PYTHON_BIN`(默认 `python`)所在环境定位 DeepSpeed,可重复执行;补丁与源码不匹配时报错且不改动任何文件。
 
+Megatron Bridge 的 layer-by-layer optimizer overlap 测试使用 `apply_cpu_adam_gil_patch.sh` 给已安装的 CPUAdam C++ 源码打补丁并重新 JIT 编译。训练解释器选择和恢复命令见 [layer-by-layer CPU optimizer overlap](../../02-layer-by-layer/README.md#8-layer-cpu-optimizer-overlap)。
+
 ### 3.2 运行矩阵
 
 `pretrain_experiment.sh` 串行执行全部组合:单模型 4×3×6×3 = 216 个 run,两个模型共 432 个。单个 run 失败或 OOM 只记入 summary,不中断扫描:

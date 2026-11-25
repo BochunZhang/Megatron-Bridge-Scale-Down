@@ -1,0 +1,94 @@
+diff --git a/csrc/adam/cpu_adam.cpp b/csrc/adam/cpu_adam.cpp
+--- a/csrc/adam/cpu_adam.cpp
++++ b/csrc/adam/cpu_adam.cpp
+@@ -9,7 +9,11 @@
+ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
+ {
+     using namespace pybind11::literals;
+-    m.def("adam_update", &ds_adam_step, "DeepSpeed CPU Adam update (C++)");
++    m.def("adam_update",
++          &ds_adam_step,
++          "DeepSpeed CPU Adam update (C++)",
++          pybind11::call_guard<pybind11::gil_scoped_release>());
++    m.attr("adam_update_releases_gil") = true;
+     m.def("adam_update_scaled",
+           &ds_adam_step_scaled,
+           "DeepSpeed CPU Adam update with every gradient multiplied by grad_scale first (C++)");
+diff --git a/csrc/adam/cpu_adam_impl.cpp b/csrc/adam/cpu_adam_impl.cpp
+--- a/csrc/adam/cpu_adam_impl.cpp
++++ b/csrc/adam/cpu_adam_impl.cpp
+@@ -29,6 +29,15 @@
+
+ using namespace std::string_literals;
+ static std::unordered_map<int, std::shared_ptr<void>> s_optimizers;
++static std::mutex s_optimizer_mutex;
++
++// Adam updates may run without the GIL. Keep the registry locked only for lookup;
++// callers serialize operations on each individual optimizer.
++static std::shared_ptr<Adam_Optimizer> get_adam_optimizer(int optimizer_id)
++{
++    std::lock_guard<std::mutex> lock(s_optimizer_mutex);
++    return std::static_pointer_cast<Adam_Optimizer>(s_optimizers.at(optimizer_id));
++}
+
+ // C++ interface
+
+@@ -126,7 +135,10 @@
+     auto opt =
+         std::make_shared<Adam_Optimizer>(alpha, betta1, betta2, eps, weight_decay, adamw_mode);
+
+-    s_optimizers[optimizer_id] = opt;
++    {
++        std::lock_guard<std::mutex> lock(s_optimizer_mutex);
++        s_optimizers[optimizer_id] = opt;
++    }
+
+     if (should_log) {
+         std::string vectorization = "";
+@@ -269,8 +281,7 @@
+     auto exp_avg_c = exp_avg.contiguous();
+     auto exp_avg_sq_c = exp_avg_sq.contiguous();
+
+-    std::shared_ptr<Adam_Optimizer> opt =
+-        std::static_pointer_cast<Adam_Optimizer>(s_optimizers[optimizer_id]);
++    auto opt = get_adam_optimizer(optimizer_id);
+     opt->IncrementStep(step, beta1, beta2);
+     opt->update_state(lr, epsilon, weight_decay, bias_correction);
+
+@@ -347,8 +358,7 @@
+         params_copy.scalar_type() == torch::kBFloat16 && params_copy.is_contiguous() &&
+             params_copy.numel() == params.numel(),
+         "adam_update_scaled_copy: params_copy must be contiguous bfloat16 with params' numel");
+-    std::shared_ptr<Adam_Optimizer> opt =
+-        std::static_pointer_cast<Adam_Optimizer>(s_optimizers[optimizer_id]);
++    auto opt = get_adam_optimizer(optimizer_id);
+     opt->set_params_copy(params.data_ptr<float>(), params_copy.data_ptr<c10::BFloat16>());
+     try {
+         ds_adam_step_scaled(optimizer_id,
+@@ -388,8 +398,7 @@
+ {
+     TORCH_CHECK(ds_adam_grad_scale_supported(),
+                 "adam_update_scaled: the RVV kernel does not apply grad_scale");
+-    std::shared_ptr<Adam_Optimizer> opt =
+-        std::static_pointer_cast<Adam_Optimizer>(s_optimizers[optimizer_id]);
++    auto opt = get_adam_optimizer(optimizer_id);
+     opt->set_grad_scale(grad_scale);
+     try {
+         ds_adam_step(optimizer_id,
+@@ -510,6 +519,7 @@
+
+ int destroy_adam_optimizer(int optimizer_id)
+ {
++    std::lock_guard<std::mutex> lock(s_optimizer_mutex);
+     s_optimizers.erase(optimizer_id);
+
+     return 0;
+@@ -723,7 +733,7 @@
+ private:
+     void run_step(int now_state, int64_t step, const std::vector<ZenHP>& hps)
+     {
+-        auto opt = std::static_pointer_cast<Adam_Optimizer>(s_optimizers[opt_id_]);
++        auto opt = get_adam_optimizer(opt_id_);
+         for (size_t g = 0; g < groups_.size(); ++g) {
+             const ZenHP& hp = hps[g];
+             // Groups share one Adam_Optimizer; advance its bias-correction state for
