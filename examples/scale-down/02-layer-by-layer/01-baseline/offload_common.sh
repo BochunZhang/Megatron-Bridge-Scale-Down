@@ -15,6 +15,7 @@ layers=8
 train_iters=10
 profile=nsys
 cpu_optimizer=torch
+cpu_threads=""
 dry_run=false
 print_result_dir=false
 
@@ -22,7 +23,7 @@ fail() { printf '%s\n' "$*" >&2; exit 2; }
 
 while (( $# )); do
     case "$1" in
-        --nvme|--nvme-path|--output-dir|--train-iters|--profile|--cpu-optimizer)
+        --nvme|--nvme-path|--output-dir|--train-iters|--profile|--cpu-optimizer|--cpu-threads)
             [[ -n "${2:-}" && "$2" != --* ]] || fail "Missing value for $1"
             case "$1" in
                 --nvme|--nvme-path) nvme_path="$2";;
@@ -30,6 +31,9 @@ while (( $# )); do
                 --cpu-optimizer)
                     [[ "$2" == grace_adam || "$2" == torch ]] || fail "--cpu-optimizer must be grace_adam or torch"
                     cpu_optimizer="$2";;
+                --cpu-threads)
+                    [[ "$2" =~ ^[1-9][0-9]*$ ]] || fail "--cpu-threads must be a positive integer"
+                    cpu_threads="$2";;
                 --profile)
                     [[ "$2" == nsys || "$2" == none ]] || fail "--profile must be nsys or none"
                     profile="$2";;
@@ -49,6 +53,7 @@ Run an 8-layer Qwen3.5-27B full-attention case on one four-GPU node.
   --train-iters N       Optimizer steps (default: 10)
   --profile nsys|none   Use Nsight Systems 2026.6.1 (default: nsys)
   --cpu-optimizer torch|grace_adam   Optimizer backend when a CPU/NVMe optimizer tier is selected
+  --cpu-threads N       OpenMP threads per CPU optimizer rank (default: 8)
   --dry-run             Show the training command
   --print-result-dir    Print the node0 result directory
 HELP
@@ -74,5 +79,6 @@ args=(--single-case-layout --results-dir "${result_dir}"
     --profile "${profile}")
 [[ "${dry_run}" == true ]] && args+=(--dry-run)
 [[ -z "${nvme_path}" ]] || args+=(--nvme-dir "${nvme_path}")
+[[ -z "${cpu_threads}" ]] || args+=(--cpu-threads "${cpu_threads}")
 
 exec bash "${script_dir}/../run_pretrain_layer_by_layer.sh" "${args[@]}"

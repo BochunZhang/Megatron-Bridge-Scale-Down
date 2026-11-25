@@ -76,6 +76,7 @@ _CASE_SCRIPTS = tuple(
         "01_param_gpu_act_gpu_opt_gpu.sh",
         "02_param_cpu_act_gpu_opt_gpu.sh",
         "03_param_cpu_act_cpu_opt_gpu.sh",
+        "04_param_cpu_act_cpu_opt_cpu.sh",
         "offload_common.sh",
     )
 )
@@ -205,7 +206,7 @@ def _arguments() -> argparse.Namespace:
     parser.add_argument("--optimizer-tier", choices=_PLACEMENTS, default="gpu")
     parser.add_argument("--cpu-optimizer", choices=("torch", "grace_adam"), default="torch")
     parser.add_argument("--learning-rate", type=float)
-    parser.add_argument("--cpu-threads", type=_positive)
+    parser.add_argument("--cpu-threads", type=_positive, default=8)
     parser.add_argument("--profile", choices=("none", "nsys"), default="none")
     parser.add_argument("--profile-start", type=int, help="first profiled step, zero-based")
     parser.add_argument("--profile-end", type=int, help="exclusive end of the capture")
@@ -300,7 +301,7 @@ def _command(
     _, numa_wrapper = _numa_worker()
     worker_env = []
     if args.optimizer_backend is not None:
-        worker_env = ["env", f"OMP_NUM_THREADS={args.cpu_threads or 8}"]
+        worker_env = ["env", f"OMP_NUM_THREADS={args.cpu_threads}"]
     command = [
         *python,
         "-m",
@@ -340,9 +341,9 @@ def _command(
     if args.learning_rate is not None:
         command.append(f"optimizer.lr={args.learning_rate}")
     if args.optimizer_backend is not None:
-        command.append(f"layer_by_layer.cpu_optimizer={args.cpu_optimizer}")
-        if args.cpu_threads is not None:
-            command.append(f"layer_by_layer.cpu_threads={args.cpu_threads}")
+        command.extend(
+            (f"layer_by_layer.cpu_optimizer={args.cpu_optimizer}", f"layer_by_layer.cpu_threads={args.cpu_threads}")
+        )
     if scratch is not None:
         command.append(f"layer_by_layer.nvme_dir={json.dumps(str(scratch))}")
     if args.profile == "nsys":
@@ -353,6 +354,8 @@ def _command(
                 f"profiling.profile_step_end={args.profile_end}",
             )
         )
+        if args.optimizer_tier == "cpu" and args.optimizer_backend == "grace_adam":
+            command.append("profiling.nvtx_ranges=true")
         command = [
             _nsys_binary(),
             "profile",
@@ -425,7 +428,12 @@ def _read_result(
     reserved = metrics.get("peak_reserved_bytes")
     actual_optimizer = metrics.get("optimizer_backend")
     offload = metrics.get("fsdp_cpu_offload")
-    expected_offload = ["gradient", "optimizer"] if optimizer_tier != "gpu" else []
+    layerwise_grace_adam = optimizer_tier == "cpu" and optimizer_backend == "grace_adam"
+    expected_offload = []
+    if optimizer_tier != "gpu":
+        if not layerwise_grace_adam:
+            expected_offload.append("gradient")
+        expected_offload.append("optimizer")
     if parameter_tier != "gpu":
         expected_offload.append("weight")
     if (
@@ -444,6 +452,7 @@ def _read_result(
         and isinstance(actual_optimizer, str)
         and bool(actual_optimizer.strip())
         and (optimizer_backend is None or actual_optimizer == optimizer_backend)
+        and (not layerwise_grace_adam or metrics.get("fsdp_layer_by_layer_cpu_optimizer") is True)
         and type(loss) in (float, int)
         and math.isfinite(loss)
         and type(allocated) is int
@@ -501,6 +510,7 @@ def _write_launch(
         "activation_tier": args.activation_tier,
         "optimizer_tier": args.optimizer_tier,
         "optimizer_backend": args.optimizer_backend,
+        "cpu_threads": args.cpu_threads if args.optimizer_backend is not None else None,
         "nvme_path": str(nvme_dir) if nvme_dir is not None else None,
         "profile": args.profile,
         "profile_start": args.profile_start,

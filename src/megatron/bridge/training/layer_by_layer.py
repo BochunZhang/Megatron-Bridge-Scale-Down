@@ -112,13 +112,20 @@ def configure_layer_by_layer(config: ConfigContainer) -> None:
     ddp = config.ddp
     optimizer = config.optimizer
     cpu_optimizer = offload.optimizer_tier != "gpu"
+    layerwise_grace_adam = offload.optimizer_tier == "cpu" and offload.cpu_optimizer == "grace_adam"
+    if hasattr(ddp, "fsdp_layer_by_layer_cpu_optimizer"):
+        ddp.fsdp_layer_by_layer_cpu_optimizer = layerwise_grace_adam
+    elif layerwise_grace_adam:
+        raise ValueError("Layer-by-layer GraceAdam requires the updated Megatron-FSDP layer-by-layer backend.")
     components = []
     if offload.parameter_tier != "gpu":
         components.append("weight")
     if cpu_optimizer:
         if optimizer.optimizer != "adam" or not optimizer.decoupled_weight_decay:
             raise ValueError("Layer-by-layer CPU and NVMe optimizer tiers require AdamW.")
-        components.extend(("gradient", "optimizer"))
+        if not layerwise_grace_adam:
+            components.append("gradient")
+        components.append("optimizer")
         optimizer.use_precision_aware_optimizer = False
         ddp.megatron_fsdp_use_decoupled_grad = False
         if hasattr(optimizer, "fsdp_cpu_optimizer_backend"):
@@ -140,8 +147,10 @@ def configure_layer_by_layer(config: ConfigContainer) -> None:
     optimizer.overlap_param_gather = True
     ddp.megatron_fsdp_main_params_dtype = torch.float32
     ddp.megatron_fsdp_main_grads_dtype = torch.float32
+    if layerwise_grace_adam:
+        ddp.megatron_fsdp_grad_comm_dtype = torch.bfloat16
     ddp.fsdp_cpu_offload = tuple(components)
-    ddp.fsdp_cpu_grad_accumulation = cpu_optimizer
+    ddp.fsdp_cpu_grad_accumulation = cpu_optimizer and not layerwise_grace_adam
     ddp.fsdp_cpu_optimizer = cpu_optimizer
     ddp.fsdp_nvme_path = offload.nvme_dir if use_nvme else None
     config.checkpoint.ckpt_format = "fsdp_dtensor"
@@ -213,6 +222,7 @@ def log_layer_by_layer_result(
                 "parameter_backend": "megatron_fsdp",
                 "fsdp_strategy": config.ddp.data_parallel_sharding_strategy,
                 "fsdp_cpu_offload": config.ddp.fsdp_cpu_offload,
+                "fsdp_layer_by_layer_cpu_optimizer": getattr(config.ddp, "fsdp_layer_by_layer_cpu_optimizer", False),
                 "parameter_tier": offload.parameter_tier,
                 "activation_tier": offload.activation_tier,
                 "optimizer_tier": offload.optimizer_tier,

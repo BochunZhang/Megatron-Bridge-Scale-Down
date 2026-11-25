@@ -15,14 +15,17 @@ SWEEP = BASELINE_DIR.parent / "sweep.py"
 
 @pytest.mark.unit
 @pytest.mark.parametrize(
-    ("case", "parameter_tier", "activation_tier"),
+    ("case", "parameter_tier", "activation_tier", "optimizer_tier"),
     [
-        ("01_param_gpu_act_gpu_opt_gpu", "gpu", "gpu"),
-        ("02_param_cpu_act_gpu_opt_gpu", "cpu", "gpu"),
-        ("03_param_cpu_act_cpu_opt_gpu", "cpu", "cpu"),
+        ("01_param_gpu_act_gpu_opt_gpu", "gpu", "gpu", "gpu"),
+        ("02_param_cpu_act_gpu_opt_gpu", "cpu", "gpu", "gpu"),
+        ("03_param_cpu_act_cpu_opt_gpu", "cpu", "cpu", "gpu"),
+        ("04_param_cpu_act_cpu_opt_cpu", "cpu", "cpu", "cpu"),
     ],
 )
-def test_layer_by_layer_baseline_dry_run(tmp_path: Path, case: str, parameter_tier: str, activation_tier: str) -> None:
+def test_layer_by_layer_baseline_dry_run(
+    tmp_path: Path, case: str, parameter_tier: str, activation_tier: str, optimizer_tier: str
+) -> None:
     script = BASELINE_DIR / f"{case}.sh"
     results_root = tmp_path / "results with spaces"
     args = ["bash", str(script), "--output-dir", str(results_root)]
@@ -41,10 +44,17 @@ def test_layer_by_layer_baseline_dry_run(tmp_path: Path, case: str, parameter_ti
         "train.train_iters=10",
         f"layer_by_layer.parameter_tier={parameter_tier}",
         f"layer_by_layer.activation_tier={activation_tier}",
-        "layer_by_layer.optimizer_tier=gpu",
+        f"layer_by_layer.optimizer_tier={optimizer_tier}",
         "profiling.profile_step_start=7",
         "profiling.profile_step_end=8",
     }.issubset(command)
+    if optimizer_tier == "cpu":
+        assert {
+            "--trace=cuda,nvtx",
+            "profiling.nvtx_ranges=true",
+            "layer_by_layer.cpu_optimizer=grace_adam",
+            "OMP_NUM_THREADS=8",
+        } <= set(command)
     assert all(not arg.startswith(("layer_by_layer.backend=", "layer_by_layer.nvme_dir=")) for arg in command)
 
     result = subprocess.run([*args, "--print-result-dir"], env=env, check=True, capture_output=True, text=True)
@@ -53,8 +63,21 @@ def test_layer_by_layer_baseline_dry_run(tmp_path: Path, case: str, parameter_ti
     assert result_path.parent.name.startswith("model_27b-lbl-schedule-")
     report = Path(next(arg.removeprefix("--output=") for arg in command if arg.startswith("--output=")))
     assert report.parent == result_path
-    assert report.name.endswith(f"-param_{parameter_tier}-act_{activation_tier}-opt_gpu")
+    assert report.name.endswith(f"-param_{parameter_tier}-act_{activation_tier}-opt_{optimizer_tier}")
     assert not results_root.exists()
+
+
+@pytest.mark.unit
+def test_layer_by_layer_baseline_grace_adam_cpu_threads() -> None:
+    script = BASELINE_DIR / "04_param_cpu_act_cpu_opt_cpu.sh"
+    result = subprocess.run(
+        ["bash", str(script), "--dry-run", "--cpu-threads", "12"],
+        env={**os.environ, "PYTHON": sys.executable},
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    assert {"OMP_NUM_THREADS=12", "layer_by_layer.cpu_threads=12"} <= set(shlex.split(result.stderr))
 
 
 @pytest.mark.unit
@@ -155,6 +178,8 @@ def test_layer_by_layer_sweep_rejects_unsupported_placements(extra_args: list[st
         ("gpu", "gpu", {}, "passed"),
         ("cpu", "gpu", {}, "passed"),
         ("cpu", "cpu", {}, "passed"),
+        ("cpu", "cpu", {"optimizer_tier": "cpu", "fsdp_layer_by_layer_cpu_optimizer": True}, "passed"),
+        ("cpu", "cpu", {"optimizer_tier": "cpu", "fsdp_layer_by_layer_cpu_optimizer": False}, "invalid_result"),
         ("cpu", "cpu", {"activation_tier": "gpu"}, "invalid_result"),
         ("cpu", "gpu", {"schedule": "no_pipeline"}, "invalid_result"),
         ("cpu", "gpu", {"parameter_backend": "layer_by_layer"}, "invalid_result"),
@@ -169,17 +194,22 @@ def test_baseline_result_checks_native_fsdp_metrics(
 ) -> None:
     state_dir = tmp_path / "state"
     state_dir.mkdir()
+    optimizer_tier = fsdp_result.get("optimizer_tier", "gpu")
+    cpu_optimizer = "grace_adam" if optimizer_tier == "cpu" else None
+    expected_offload = ["weight"] if parameter_tier == "cpu" else []
+    if cpu_optimizer:
+        expected_offload.append("optimizer")
     shared = {
         "layers": 8,
         "steps": 10,
         "parameter_tier": parameter_tier,
         "activation_tier": activation_tier,
-        "optimizer_tier": "gpu",
+        "optimizer_tier": optimizer_tier,
     }
     state = {
         **shared,
         "results": str(tmp_path),
-        "optimizer_backend": None,
+        "optimizer_backend": cpu_optimizer,
         "profile": "none",
         "nsys_version": None,
         "worker_overrides": {"GLOO_SOCKET_IFNAME": "eth0", "NCCL_SOCKET_IFNAME": "=eth0"},
@@ -193,8 +223,8 @@ def test_baseline_result_checks_native_fsdp_metrics(
         "schedule": "layer_by_layer",
         "parameter_backend": "megatron_fsdp",
         "fsdp_strategy": "optim_grads_params",
-        "fsdp_cpu_offload": ["weight"] if parameter_tier == "cpu" else [],
-        "optimizer_backend": "FusedAdam",
+        "fsdp_cpu_offload": expected_offload,
+        "optimizer_backend": cpu_optimizer or "FusedAdam",
         "world_size": 4,
         **fsdp_result,
     }
@@ -210,6 +240,6 @@ def test_baseline_result_checks_native_fsdp_metrics(
     assert row["status"] == expected_status
     if expected_status == "passed":
         assert row["activation_tier"] == activation_tier
-        assert row["optimizer_backend"] == "FusedAdam"
-        assert row["fsdp_cpu_offload"] == ("weight" if parameter_tier == "cpu" else "")
+        assert row["optimizer_backend"] == (cpu_optimizer or "FusedAdam")
+        assert row["fsdp_cpu_offload"] == ",".join(sorted(expected_offload))
         assert row["peak_allocated_bytes"] == "1024"
