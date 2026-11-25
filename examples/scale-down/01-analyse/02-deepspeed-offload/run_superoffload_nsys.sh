@@ -6,27 +6,34 @@ set -euo pipefail
 
 die() { printf 'error: %s\n' "$*" >&2; exit 1; }
 
-case "${1:-}" in
-    -h|--help)
-        cat <<'EOF'
-Usage: bash run_superoffload_nsys.sh [--dry-run]
+dry_run=false
+cpu_adam_overlap=false
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        -h|--help)
+            cat <<'EOF'
+Usage: bash run_superoffload_nsys.sh [--cpu-adam-overlap] [--dry-run]
 
 Profile the SuperOffload 1.0 param_gpu/param_cpu comparison on the first four
 CUDA-visible GPUs. Both runs use Qwen3.5-9B, seq 4096, MBS 1, and no recompute.
 Each run traces one optimizer step with CUDA and NVTX. GPU metrics are disabled.
 Set NSYS_BIN to the Nsight Systems 2026.6.1 executable if needed.
 Set RESULTS_ROOT to override the parent directory for timestamped results.
+--cpu-adam-overlap disables global gradient clipping to allow CPU Adam
+  updates during the last microbatch's backward pass.
 --dry-run prints the planned commands without probing or locking GPUs.
 EOF
-        exit 0
-        ;;
-    ''|--dry-run) [[ $# -le 1 ]] || die 'expected only --dry-run' ;;
-    *) die "unknown argument: $1" ;;
-esac
+            exit 0
+            ;;
+        --dry-run) dry_run=true ;;
+        --cpu-adam-overlap) cpu_adam_overlap=true ;;
+        *) die "unknown argument: $1" ;;
+    esac
+    shift
+done
 
 script_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 repo_root=$(cd "$script_dir/../../../.." && pwd)
-results_parent=${RESULTS_ROOT:-"$repo_root/results/01-analyse/02-deepspeed-sve-nsys"}
 nsys_bin=${NSYS_BIN:-"$PWD/NsightSystems-2026.6.1/bin/nsys"}
 if [[ -z ${NSYS_BIN:-} && ! -x "$nsys_bin" ]]; then
     nsys_bin=nsys
@@ -37,8 +44,14 @@ experiment=(bash "$script_dir/pretrain_experiment.sh"
     --models "Qwen/$model" --num_gpus 4 --optimizer_strategies super_offload_1.0
     --param_positions 'param_gpu param_cpu' --recompute_combos recompute_none
     --micro_batch_sizes 1 --per_gpu_batch_size 4 --profile nsys)
+results_name=02-deepspeed-sve-nsys
+if [[ $cpu_adam_overlap == true ]]; then
+    experiment+=(--no_gradient_clipping)
+    results_name+=-adam-overlap
+fi
+results_parent=${RESULTS_ROOT:-"$repo_root/results/01-analyse/$results_name"}
 
-if [[ ${1:-} == --dry-run ]]; then
+if [[ $dry_run == true ]]; then
     printf '%q --version   # requires 2026.6.1\n' "$nsys_bin"
     printf 'nvidia-smi -i <first-four-visible-GPU-UUIDs> --lock-gpu-clocks=tdp,tdp\n'
     printf 'OVERLAP_COMM=true STEPS=10 SEQ_LEN=4096 '
@@ -85,6 +98,7 @@ gpu_uuids=$(awk '{print $2}' <<< "$gpu_map" | paste -sd , -)
 mkdir -p "$results_parent"
 run_dir=$(mktemp -d "$(cd "$results_parent" && pwd)/$(date +%Y%m%d_%H%M%S).XXXXXX")
 printf '%s\n' "$nsys_version" "NSYS_BIN=$nsys_bin" "CUDA slots=$gpu_slots" "GPU UUIDs=$gpu_uuids" \
+    "CPU Adam overlap requested=$cpu_adam_overlap" \
     > "$run_dir/profile_env.txt"
 printf 'Results: %s\nLocking GPU clocks to TDP on %s\n' "$run_dir" "$gpu_uuids"
 nvidia-smi -i "$gpu_uuids" --lock-gpu-clocks=tdp,tdp 2>&1 | tee "$run_dir/gpu_clock_lock.log" \

@@ -101,6 +101,7 @@ WARMUP_STEPS=${WARMUP_STEPS:-1000}
 # Number of initial optimizer steps excluded from throughput/memory metrics in
 # train.py. Keep this independent from the learning-rate schedule.
 MEASURE_WARMUP_STEPS=${MEASURE_WARMUP_STEPS:-2}
+GRADIENT_CLIPPING=1.0
 # Shrunk layer count; only applied — and only tagged onto result folder names
 # as _<N>layer — when APPLY_MODEL_SHAPE_OVERRIDES=true (see pretrain.sh model
 # shape section). Passed explicitly to pretrain.sh.
@@ -143,6 +144,7 @@ Options use space-separated values where noted:
   --learning_rate VALUE
   --warmup_steps VALUE
   --measure_warmup_steps VALUE
+  --no_gradient_clipping  Disable global gradient clipping for the run
   --num_gpus VALUE
   --num_layers VALUE
   --apply_model_shape_overrides true|false
@@ -211,6 +213,10 @@ while [ "$#" -gt 0 ]; do
             fi
             PROFILE_MODE=$2
             shift 2
+            ;;
+        --no_gradient_clipping)
+            GRADIENT_CLIPPING=0.0
+            shift
             ;;
         --test)
             TEST_MODE=true
@@ -444,7 +450,7 @@ build_ds_config() {
     "train_micro_batch_size_per_gpu": $mbs,
     "gradient_accumulation_steps": $grad_accum,
     "bf16": { "enabled": true },
-    "gradient_clipping": 1.0,
+    "gradient_clipping": $GRADIENT_CLIPPING,
     "scheduler": {
         "type": "WarmupLR",
         "params": {

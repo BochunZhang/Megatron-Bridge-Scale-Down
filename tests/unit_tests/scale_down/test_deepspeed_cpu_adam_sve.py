@@ -209,8 +209,16 @@ def test_gpu_optimizer_only_skips_preflight_and_uses_new_result_root(launcher_en
     assert len(list(new_root.glob("**/ds_config.json"))) == 1
 
 
+@pytest.mark.parametrize(
+    ("clipping_options", "expected_gradient_clipping"),
+    [((), 1.0), (("--no_gradient_clipping",), 0.0)],
+    ids=["default", "cpu-adam-overlap"],
+)
 def test_matrix_nsys_captures_only_step_eight_without_gpu_metrics(
-    launcher_env: dict[str, str], tmp_path: Path
+    launcher_env: dict[str, str],
+    tmp_path: Path,
+    clipping_options: tuple[str, ...],
+    expected_gradient_clipping: float,
 ) -> None:
     nsys = tmp_path / "nsys"
     nsys.write_text(
@@ -229,6 +237,7 @@ def test_matrix_nsys_captures_only_step_eight_without_gpu_metrics(
         "param_gpu param_cpu",
         "--profile",
         "nsys",
+        *clipping_options,
     )
 
     assert result.returncode == 0, result.stderr
@@ -237,6 +246,8 @@ def test_matrix_nsys_captures_only_step_eight_without_gpu_metrics(
     assert len(launches) == 2
     for placement, args in zip(("param_gpu", "param_cpu"), launches, strict=True):
         assert args[0] == "profile"
+        config_path = Path(args[args.index("--deepspeed_config") + 1])
+        assert json.loads(config_path.read_text())["gradient_clipping"] == expected_gradient_clipping
         assert {"cuda", "nvtx"}.issubset(args[args.index("-t") + 1].split(","))
         assert "--gpu-metrics-devices=none" in args
         assert args[args.index("--profile_step_start") + 1] == "8"
@@ -244,3 +255,30 @@ def test_matrix_nsys_captures_only_step_eight_without_gpu_metrics(
         output_name = Path(args[args.index("-o") + 1]).name
         prefix = f"Qwen3.5-9B-Base-super_offload_1.0-{placement}__recompute_none__mbs1-sve-step8-"
         assert re.fullmatch(re.escape(prefix) + r"\d{8}_\d{6}", output_name)
+
+
+@pytest.mark.parametrize(
+    ("options", "results_dir_name"),
+    [
+        (("--dry-run",), "02-deepspeed-sve-nsys"),
+        (("--cpu-adam-overlap", "--dry-run"), "02-deepspeed-sve-nsys-adam-overlap"),
+        (("--dry-run", "--cpu-adam-overlap"), "02-deepspeed-sve-nsys-adam-overlap"),
+    ],
+    ids=["default", "overlap-first", "dry-run-first"],
+)
+def test_superoffload_nsys_dry_run_selects_cpu_adam_mode(
+    launcher_env: dict[str, str], options: tuple[str, ...], results_dir_name: str
+) -> None:
+    launcher_env.pop("RESULTS_ROOT")
+    result = subprocess.run(
+        ["bash", str(EXAMPLE / "run_superoffload_nsys.sh"), *options],
+        env=launcher_env,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert ("--no_gradient_clipping" in result.stdout.split()) == ("--cpu-adam-overlap" in options)
+    results_dir = EXAMPLE.parents[3] / "results/01-analyse" / results_dir_name
+    assert f"Results parent: {results_dir}" in result.stdout.splitlines()
+    assert not Path(launcher_env["TEST_LAUNCH_LOG"]).exists()

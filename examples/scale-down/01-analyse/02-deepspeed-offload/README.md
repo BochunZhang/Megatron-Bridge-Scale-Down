@@ -29,7 +29,7 @@
 - 环境变量:`PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`(缺失时 `train.py` 拒绝启动)、`DS_PIN_MEMORY_BACKEND=torch`(设为 `native` 会让 side-stream DMA stall);
 - 依赖:**`transformers >= 5.16.0`**,旧版本会导致 offload 配置出现 NaN,见 §6.1。
 
-梯度裁剪仍为 `1.0`。SuperOffload 在最后一个 microbatch 的 backward 完成后，计算全局梯度范数并执行裁剪路径，逐个等待 CPU optimizer subgroup 更新完成。`overlap_comm=true` 控制通信重叠。这里使用的是 DeepSpeed v0.20.1 中的 SVE CPU Adam 实现，SuperOffload 论文里的 GraceAdam 是独立实现。
+梯度裁剪默认设为 `1.0`。开启裁剪时，SuperOffload 在最后一个 microbatch 的 backward 完成后计算全局梯度范数，逐个等待 CPU optimizer subgroup 更新完成。`overlap_comm=true` 控制通信重叠。这里使用的是 DeepSpeed v0.20.1 中的 SVE CPU Adam 实现，SuperOffload 论文里的 GraceAdam 是独立实现。
 
 ## 3. 测试命令
 
@@ -162,6 +162,14 @@ bash examples/scale-down/01-analyse/02-deepspeed-offload/pretrain_experiment.sh 
 | HtoD memcpy(`param_cpu`) | 参数分片从 CPU 拷回 GPU,未完成前无法 all-gather |
 
 ZeRO-3 的 AG 粒度为单个 submodule 的参数加上 `stage3_prefetch_bucket_size`(默认 5e7 元素)的预取,RS 每攒满 `reduce_bucket_size`(本测试 4e8 元素)发起一次,因此单次 RS 通常比 AG 大一个量级。MoE 在 AutoEP 下 EDP=1,expert 参数不被 ZeRO 切分,AG/RS 只覆盖非 expert 参数,expert 流量体现为 AutoEP 的 all-to-all。nsys 会增加 host 开销,比较 iteration 绝对时间时以不加 `--profile` 的 `metrics.csv` 为准。
+
+#### CPU Adam 与 backward 重叠补测
+
+```bash
+bash examples/scale-down/01-analyse/02-deepspeed-offload/run_superoffload_nsys.sh --cpu-adam-overlap
+```
+
+该模式为 `param_gpu` 和 `param_cpu` 各跑一次，将 `gradient_clipping` 设为 `0.0`。SVE CPU Adam 可以从第 4 个 microbatch 的 backward 开始逐组更新。默认输出到 `results/01-analyse/02-deepspeed-sve-nsys-adam-overlap/<timestamp>/`，追加 `--dry-run` 可预览命令。对照上一轮时，检查 step 8 中 CPU worker 的调度活动与 GPU backward 是否重叠，并用 `metrics.csv` 的 step 2–7 比较整步耗时。`optimizer_step` 计时从异步结果等待之后开始。
 
 ### 3.6 `--test` 非有限值诊断
 
