@@ -993,6 +993,8 @@ class LayerByLayerRecipeConfig:
 
     cpu_optimizer: Literal["grace_adam", "torch"] = "torch"
     """AdamW backend for updates with CPU or NVMe optimizer state."""
+    overlap_cpu_optimizer: bool = False
+    """Start GraceAdam updates as the CPU main gradients become ready."""
     nvme_dir: str = "/tmp"
     cpu_threads: int = 32
     """CPU optimizer and PyTorch intra-op thread count per rank."""

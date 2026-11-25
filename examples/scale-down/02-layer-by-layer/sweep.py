@@ -79,6 +79,7 @@ _CASE_SCRIPTS = tuple(
         "02_param_cpu_act_gpu_opt_gpu.sh",
         "03_param_cpu_act_cpu_opt_gpu.sh",
         "04_param_cpu_act_cpu_opt_cpu.sh",
+        "05_param_cpu_act_cpu_opt_cpu_overlap.sh",
         "offload_common.sh",
     )
 )
@@ -98,6 +99,7 @@ _RESULT_COLUMNS = (
     "activation_tier",
     "optimizer_tier",
     "optimizer_backend",
+    "overlap_cpu_optimizer",
     "status",
     "returncode",
     "steps",
@@ -207,6 +209,9 @@ def _arguments() -> argparse.Namespace:
     )
     parser.add_argument("--optimizer-tier", choices=_PLACEMENTS, default="gpu")
     parser.add_argument("--cpu-optimizer", choices=("torch", "grace_adam"), default="torch")
+    parser.add_argument(
+        "--overlap-cpu-optimizer", action="store_true", help="start GraceAdam when its CPU main gradients are ready"
+    )
     parser.add_argument("--learning-rate", type=float)
     parser.add_argument("--cpu-threads", type=_positive, default=32)
     parser.add_argument("--profile", choices=("none", "nsys"), default="none")
@@ -227,6 +232,14 @@ def _arguments() -> argparse.Namespace:
         if args.nvme_dir is None:
             parser.error("NVMe requires --nvme-dir")
     args.optimizer_backend = None if args.optimizer_tier == "gpu" else args.cpu_optimizer
+    if args.overlap_cpu_optimizer and (args.parameter_tier, args.optimizer_tier, args.optimizer_backend) != (
+        "cpu",
+        "cpu",
+        "grace_adam",
+    ):
+        parser.error(
+            "--overlap-cpu-optimizer requires --parameter-tier cpu --optimizer-tier cpu --cpu-optimizer grace_adam"
+        )
     if len(set(args.layers)) != len(args.layers):
         parser.error("--layers must contain distinct values")
     if args.single_case_layout and (len(args.layers) != 1 or args.results_dir is None):
@@ -270,10 +283,11 @@ def _profile_report(args: argparse.Namespace, layers: int, results: Path) -> Pat
     model = "qwen35_tiny" if args.tiny else "qwen35_27b"
     seq = f"{args.seq_length // 1024}k" if args.seq_length % 1024 == 0 else str(args.seq_length)
     gbs = args.micro_batch_size * args.microbatches * _WORLD_SIZE
+    overlap = "-opt_overlap" if args.overlap_cpu_optimizer else ""
     return results / (
         f"{model}-lbl-layers_{layers}-attn_full-bf16-cg_off-tp_1-cp_1-pp_1-dp_{_WORLD_SIZE}"
         f"-mbs_{args.micro_batch_size}-gbs_{gbs}-seq_{seq}-iters_{args.steps}"
-        f"-param_{args.parameter_tier}-act_{args.activation_tier}-opt_{args.optimizer_tier}.nsys-rep"
+        f"-param_{args.parameter_tier}-act_{args.activation_tier}-opt_{args.optimizer_tier}{overlap}.nsys-rep"
     )
 
 
@@ -346,6 +360,8 @@ def _command(
         command.extend(
             (f"layer_by_layer.cpu_optimizer={args.cpu_optimizer}", f"layer_by_layer.cpu_threads={args.cpu_threads}")
         )
+    if args.overlap_cpu_optimizer:
+        command.append("layer_by_layer.overlap_cpu_optimizer=true")
     if scratch is not None:
         command.append(f"layer_by_layer.nvme_dir={json.dumps(str(scratch))}")
     if args.profile == "nsys":
@@ -393,6 +409,7 @@ def _read_result(
     activation_tier: str,
     optimizer_tier: str,
     optimizer_backend: str | None,
+    overlap_cpu_optimizer: bool,
 ) -> dict:
     result = {
         "layers": layers,
@@ -400,6 +417,7 @@ def _read_result(
         "activation_tier": activation_tier,
         "optimizer_tier": optimizer_tier,
         "optimizer_backend": optimizer_backend,
+        "overlap_cpu_optimizer": overlap_cpu_optimizer,
         "status": "failed",
         "returncode": returncode,
         "log": log_path.name,
@@ -455,6 +473,8 @@ def _read_result(
         and bool(actual_optimizer.strip())
         and (optimizer_backend is None or actual_optimizer == optimizer_backend)
         and (not layerwise_grace_adam or metrics.get("fsdp_layer_by_layer_cpu_optimizer") is True)
+        and metrics.get("fsdp_layer_by_layer_overlap_cpu_optimizer", False) is overlap_cpu_optimizer
+        and (not overlap_cpu_optimizer or metrics.get("clip_grad") == 0.0)
         and type(loss) in (float, int)
         and math.isfinite(loss)
         and type(allocated) is int
@@ -512,6 +532,7 @@ def _write_launch(
         "activation_tier": args.activation_tier,
         "optimizer_tier": args.optimizer_tier,
         "optimizer_backend": args.optimizer_backend,
+        "overlap_cpu_optimizer": args.overlap_cpu_optimizer,
         "cpu_threads": args.cpu_threads if args.optimizer_backend is not None else None,
         "nvme_path": str(nvme_dir) if nvme_dir is not None else None,
         "profile": args.profile,
@@ -582,6 +603,7 @@ def _collect_case(args: argparse.Namespace, layers: int, results: Path, log_path
         activation_tier=args.activation_tier,
         optimizer_tier=args.optimizer_tier,
         optimizer_backend=args.optimizer_backend,
+        overlap_cpu_optimizer=args.overlap_cpu_optimizer,
     )
     if args.profile == "nsys" and case["status"] == "passed":
         report = _profile_report(args, layers, results)
@@ -636,6 +658,7 @@ def _prepare_case(
         "activation_tier": args.activation_tier,
         "optimizer_tier": args.optimizer_tier,
         "optimizer_backend": args.optimizer_backend,
+        "overlap_cpu_optimizer": args.overlap_cpu_optimizer,
         "profile": args.profile,
         "worker_overrides": worker_overrides,
         "nsys_version": nsys_version,
@@ -647,6 +670,7 @@ def _prepare_case(
 def _finish_case(state_dir: Path, returncode: int) -> int:
     """Validate the worker's output and write the numbered case's summary."""
     state = json.loads((state_dir / "case.json").read_text(encoding="utf-8"))
+    state.setdefault("overlap_cpu_optimizer", False)
     args = argparse.Namespace(single_case_layout=True, **state)
     results = Path(args.results)
     case = _collect_case(args, args.layers, results, results / "train.log", returncode)

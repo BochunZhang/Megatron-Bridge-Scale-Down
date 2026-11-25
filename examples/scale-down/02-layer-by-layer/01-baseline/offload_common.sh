@@ -15,6 +15,7 @@ layers=8
 train_iters=10
 profile=nsys
 cpu_optimizer=torch
+overlap_cpu_optimizer=false
 cpu_threads=""
 dry_run=false
 print_result_dir=false
@@ -42,6 +43,7 @@ while (( $# )); do
                     train_iters="$2";;
             esac
             shift 2;;
+        --overlap-cpu-optimizer) overlap_cpu_optimizer=true; shift;;
         --dry-run) dry_run=true; shift;;
         --print-result-dir) print_result_dir=true; shift;;
         -h|--help)
@@ -53,6 +55,7 @@ Run an 8-layer Qwen3.5-27B full-attention case on one four-GPU node.
   --train-iters N       Optimizer steps (default: 10)
   --profile nsys|none   Use Nsight Systems 2026.6.1 (default: nsys)
   --cpu-optimizer torch|grace_adam   Optimizer backend when a CPU/NVMe optimizer tier is selected
+  --overlap-cpu-optimizer  Start GraceAdam updates as CPU main gradients become ready
   --cpu-threads N       CPU optimizer and PyTorch intra-op threads per rank (default: 32)
   --dry-run             Show the training command
   --print-result-dir    Print the node0 result directory
@@ -61,6 +64,11 @@ HELP
         *) fail "Unknown option $1";;
     esac
 done
+
+if [[ "${overlap_cpu_optimizer}" == true ]]; then
+    [[ "${parameter_tier}" == cpu && "${optimizer_tier}" == cpu && "${cpu_optimizer}" == grace_adam ]] ||
+        fail "--overlap-cpu-optimizer requires CPU weights and the CPU optimizer tier with GraceAdam"
+fi
 
 [[ "${output_dir}" == /* ]] || output_dir="${PWD}/${output_dir}"
 model_name="model_27b-lbl-schedule-layers_${layers}-attn_full-cg_off-mbs_1-seq_4096-tp_1-cp_1-gbs_16-gpus_4"
@@ -77,6 +85,7 @@ args=(--single-case-layout --results-dir "${result_dir}"
     --optimizer-tier "${optimizer_tier}"
     --cpu-optimizer "${cpu_optimizer}"
     --profile "${profile}")
+[[ "${overlap_cpu_optimizer}" == true ]] && args+=(--overlap-cpu-optimizer)
 [[ "${dry_run}" == true ]] && args+=(--dry-run)
 [[ -z "${nvme_path}" ]] || args+=(--nvme-dir "${nvme_path}")
 [[ -z "${cpu_threads}" ]] || args+=(--cpu-threads "${cpu_threads}")

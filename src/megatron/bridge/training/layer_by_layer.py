@@ -117,6 +117,25 @@ def configure_layer_by_layer(config: ConfigContainer) -> None:
         ddp.fsdp_layer_by_layer_cpu_optimizer = layerwise_grace_adam
     elif layerwise_grace_adam:
         raise ValueError("Layer-by-layer GraceAdam requires the updated Megatron-FSDP layer-by-layer backend.")
+    if offload.overlap_cpu_optimizer:
+        if not layerwise_grace_adam or offload.parameter_tier != "cpu":
+            raise ValueError("Layer-by-layer optimizer overlap requires CPU weights and GraceAdam on the CPU tier.")
+        if not hasattr(ddp, "fsdp_layer_by_layer_overlap_cpu_optimizer"):
+            raise ValueError("Layer-by-layer optimizer overlap requires the updated Megatron-FSDP backend.")
+        if model.calculate_per_token_loss or model.qk_clip:
+            raise ValueError(
+                "Layer-by-layer optimizer overlap requires per-microbatch loss normalization and qk_clip=False."
+            )
+
+        optimizer.clip_grad = 0.0
+        optimizer.log_num_zeros_in_grad = False
+        optimizer.loss_scale = None
+        optimizer.grad_norm_skip_threshold = float("inf")
+        ddp.check_for_nan_in_grad = False
+        ddp.check_for_large_grads = False
+        config.rerun_state_machine.rerun_mode = "disabled"
+    if hasattr(ddp, "fsdp_layer_by_layer_overlap_cpu_optimizer"):
+        ddp.fsdp_layer_by_layer_overlap_cpu_optimizer = offload.overlap_cpu_optimizer
     components = []
     if offload.parameter_tier != "gpu":
         components.append("weight")
@@ -222,6 +241,10 @@ def log_layer_by_layer_result(
                 "fsdp_cpu_offload": config.ddp.fsdp_cpu_offload,
                 "fsdp_cpu_grad_accumulation": config.ddp.fsdp_cpu_grad_accumulation,
                 "fsdp_layer_by_layer_cpu_optimizer": getattr(config.ddp, "fsdp_layer_by_layer_cpu_optimizer", False),
+                "fsdp_layer_by_layer_overlap_cpu_optimizer": getattr(
+                    config.ddp, "fsdp_layer_by_layer_overlap_cpu_optimizer", False
+                ),
+                "clip_grad": config.optimizer.clip_grad,
                 "parameter_tier": offload.parameter_tier,
                 "activation_tier": offload.activation_tier,
                 "optimizer_tier": offload.optimizer_tier,

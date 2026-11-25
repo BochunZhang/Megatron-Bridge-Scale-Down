@@ -21,6 +21,7 @@ SWEEP = BASELINE_DIR.parent / "sweep.py"
         ("02_param_cpu_act_gpu_opt_gpu", "cpu", "gpu", "gpu"),
         ("03_param_cpu_act_cpu_opt_gpu", "cpu", "cpu", "gpu"),
         ("04_param_cpu_act_cpu_opt_cpu", "cpu", "cpu", "cpu"),
+        ("05_param_cpu_act_cpu_opt_cpu_overlap", "cpu", "cpu", "cpu"),
     ],
 )
 def test_layer_by_layer_baseline_dry_run(
@@ -58,6 +59,8 @@ def test_layer_by_layer_baseline_dry_run(
             "OMP_NUM_THREADS=32",
             "layer_by_layer.cpu_threads=32",
         } <= set(command)
+    overlap = case.startswith("05_")
+    assert ("layer_by_layer.overlap_cpu_optimizer=true" in command) is overlap
     assert all(not arg.startswith(("layer_by_layer.backend=", "layer_by_layer.nvme_dir=")) for arg in command)
 
     result = subprocess.run([*args, "--print-result-dir"], env=env, check=True, capture_output=True, text=True)
@@ -66,7 +69,8 @@ def test_layer_by_layer_baseline_dry_run(
     assert result_path.parent.name.startswith("model_27b-lbl-schedule-")
     report = Path(next(arg.removeprefix("--output=") for arg in command if arg.startswith("--output=")))
     assert report.parent == result_path
-    assert report.name.endswith(f"-param_{parameter_tier}-act_{activation_tier}-opt_{optimizer_tier}")
+    overlap_suffix = "-opt_overlap" if overlap else ""
+    assert report.name.endswith(f"-param_{parameter_tier}-act_{activation_tier}-opt_{optimizer_tier}{overlap_suffix}")
     assert not results_root.exists()
 
 
@@ -167,11 +171,41 @@ def test_layer_by_layer_sweep_nvme_uses_case_scratch(tmp_path: Path) -> None:
         ["--parameter-tier", "nvme"],
         ["--optimizer-tier", "nvme"],
         ["--parameter-tier", "nvme", "--optimizer-tier", "nvme"],
+        ["--overlap-cpu-optimizer"],
+        ["--overlap-cpu-optimizer", "--optimizer-tier", "cpu", "--cpu-optimizer", "torch"],
     ],
 )
 def test_layer_by_layer_sweep_rejects_unsupported_placements(extra_args: list[str]) -> None:
     result = subprocess.run([sys.executable, str(SWEEP), "--dry-run", *extra_args], capture_output=True, text=True)
     assert result.returncode == 2
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    ("launch_overlap", "reported_overlap", "clip_grad", "expected_status"),
+    [
+        (True, True, 0.0, "passed"),
+        (True, False, 0.0, "invalid_result"),
+        (True, True, 1.0, "invalid_result"),
+        (False, True, 0.0, "invalid_result"),
+    ],
+)
+def test_baseline_result_checks_optimizer_overlap(
+    tmp_path: Path, launch_overlap: bool, reported_overlap: bool, clip_grad: float, expected_status: str
+) -> None:
+    verify_baseline_result(
+        tmp_path,
+        "cpu",
+        "cpu",
+        {
+            "optimizer_tier": "cpu",
+            "fsdp_layer_by_layer_cpu_optimizer": True,
+            "fsdp_layer_by_layer_overlap_cpu_optimizer": reported_overlap,
+            "clip_grad": clip_grad,
+        },
+        expected_status,
+        launch_overlap=launch_overlap,
+    )
 
 
 @pytest.mark.unit
@@ -206,6 +240,18 @@ def test_layer_by_layer_sweep_rejects_unsupported_placements(extra_args: list[st
 def test_baseline_result_checks_native_fsdp_metrics(
     tmp_path: Path, parameter_tier: str, activation_tier: str, fsdp_result: dict, expected_status: str
 ) -> None:
+    verify_baseline_result(tmp_path, parameter_tier, activation_tier, fsdp_result, expected_status)
+
+
+def verify_baseline_result(
+    tmp_path: Path,
+    parameter_tier: str,
+    activation_tier: str,
+    fsdp_result: dict,
+    expected_status: str,
+    *,
+    launch_overlap: bool | None = None,
+) -> None:
     state_dir = tmp_path / "state"
     state_dir.mkdir()
     optimizer_tier = fsdp_result.get("optimizer_tier", "gpu")
@@ -228,6 +274,8 @@ def test_baseline_result_checks_native_fsdp_metrics(
         "nsys_version": None,
         "worker_overrides": {"GLOO_SOCKET_IFNAME": "eth0", "NCCL_SOCKET_IFNAME": "=eth0"},
     }
+    if launch_overlap is not None:
+        state["overlap_cpu_optimizer"] = launch_overlap
     (state_dir / "case.json").write_text(json.dumps(state), encoding="utf-8")
     metrics = {
         **shared,
@@ -256,5 +304,6 @@ def test_baseline_result_checks_native_fsdp_metrics(
     if expected_status == "passed":
         assert row["activation_tier"] == activation_tier
         assert row["optimizer_backend"] == (cpu_optimizer or "FusedAdam")
+        assert row["overlap_cpu_optimizer"] == str(bool(launch_overlap))
         assert row["fsdp_cpu_offload"] == ",".join(sorted(expected_offload))
         assert row["peak_allocated_bytes"] == "1024"
