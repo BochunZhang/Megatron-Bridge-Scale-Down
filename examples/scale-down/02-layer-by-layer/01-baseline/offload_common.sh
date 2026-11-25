@@ -66,8 +66,9 @@ HELP
 done
 
 if [[ "${overlap_cpu_optimizer}" == true ]]; then
-    [[ "${parameter_tier}" == cpu && "${optimizer_tier}" == cpu && "${cpu_optimizer}" == grace_adam ]] ||
-        fail "--overlap-cpu-optimizer requires CPU weights and the CPU optimizer tier with GraceAdam"
+    [[ ( "${parameter_tier}" == cpu || "${parameter_tier}" == nvme ) &&
+        "${optimizer_tier}" == cpu && "${cpu_optimizer}" == grace_adam ]] ||
+        fail "--overlap-cpu-optimizer requires CPU or NVMe weights and the CPU optimizer tier with GraceAdam"
 fi
 
 [[ "${output_dir}" == /* ]] || output_dir="${PWD}/${output_dir}"

@@ -22,6 +22,7 @@ SWEEP = BASELINE_DIR.parent / "sweep.py"
         ("03_param_cpu_act_cpu_opt_gpu", "cpu", "cpu", "gpu"),
         ("04_param_cpu_act_cpu_opt_cpu", "cpu", "cpu", "cpu"),
         ("05_param_cpu_act_cpu_opt_cpu_overlap", "cpu", "cpu", "cpu"),
+        ("06_param_nvme_act_cpu_opt_cpu_overlap", "nvme", "cpu", "cpu"),
     ],
 )
 def test_layer_by_layer_baseline_dry_run(
@@ -31,6 +32,7 @@ def test_layer_by_layer_baseline_dry_run(
     results_root = tmp_path / "results with spaces"
     args = ["bash", str(script), "--output-dir", str(results_root)]
     env = {**os.environ, "PYTHON": sys.executable, "NSYS_BIN": "/example/nsys"}
+    env.pop("NVME_PATH", None)
     result = subprocess.run([*args, "--dry-run"], env=env, check=True, capture_output=True, text=True)
     command = shlex.split(result.stderr.strip())
     assert {
@@ -59,9 +61,14 @@ def test_layer_by_layer_baseline_dry_run(
             "OMP_NUM_THREADS=32",
             "layer_by_layer.cpu_threads=32",
         } <= set(command)
-    overlap = case.startswith("05_")
+    overlap = case.endswith("_overlap")
     assert ("layer_by_layer.overlap_cpu_optimizer=true" in command) is overlap
-    assert all(not arg.startswith(("layer_by_layer.backend=", "layer_by_layer.nvme_dir=")) for arg in command)
+    assert all(not arg.startswith("layer_by_layer.backend=") for arg in command)
+    nvme_args = [arg for arg in command if arg.startswith("layer_by_layer.nvme_dir=")]
+    if parameter_tier == "nvme":
+        assert nvme_args == ['layer_by_layer.nvme_dir="/tmp/layer-by-layer-8-<unique>"']
+    else:
+        assert not nvme_args
 
     result = subprocess.run([*args, "--print-result-dir"], env=env, check=True, capture_output=True, text=True)
     result_path = Path(result.stdout.strip())
@@ -72,6 +79,22 @@ def test_layer_by_layer_baseline_dry_run(
     overlap_suffix = "-opt_overlap" if overlap else ""
     assert report.name.endswith(f"-param_{parameter_tier}-act_{activation_tier}-opt_{optimizer_tier}{overlap_suffix}")
     assert not results_root.exists()
+
+
+@pytest.mark.unit
+def test_layer_by_layer_baseline_nvme_path_override(tmp_path: Path) -> None:
+    script = BASELINE_DIR / "06_param_nvme_act_cpu_opt_cpu_overlap.sh"
+    nvme = tmp_path / "shared NVMe"
+    result = subprocess.run(
+        ["bash", str(script), "--dry-run", "--nvme", str(nvme)],
+        env={**os.environ, "PYTHON": sys.executable, "NVME_PATH": "/example/nvme"},
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    scratch = nvme / "layer-by-layer-8-<unique>"
+    assert f"layer_by_layer.nvme_dir={json.dumps(str(scratch))}" in shlex.split(result.stderr)
+    assert not nvme.exists()
 
 
 @pytest.mark.unit
@@ -168,7 +191,8 @@ def test_layer_by_layer_sweep_nvme_uses_case_scratch(tmp_path: Path) -> None:
     "extra_args",
     [
         ["--activation-tier", "nvme"],
-        ["--parameter-tier", "nvme"],
+        ["--parameter-tier", "nvme", "--nvme", "/tmp"],
+        ["--parameter-tier", "nvme", "--optimizer-tier", "cpu"],
         ["--optimizer-tier", "nvme"],
         ["--parameter-tier", "nvme", "--optimizer-tier", "nvme"],
         ["--overlap-cpu-optimizer"],
@@ -205,6 +229,32 @@ def test_baseline_result_checks_optimizer_overlap(
         },
         expected_status,
         launch_overlap=launch_overlap,
+    )
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    ("nvme_metrics", "expected_status"),
+    [
+        ({"fsdp_nvme_weights_only": True}, "passed"),
+        ({"fsdp_nvme_weights_only": False}, "invalid_result"),
+        ({}, "invalid_result"),
+    ],
+)
+def test_baseline_result_checks_nvme_weights_only(tmp_path: Path, nvme_metrics: dict, expected_status: str) -> None:
+    verify_baseline_result(
+        tmp_path,
+        "nvme",
+        "cpu",
+        {
+            "optimizer_tier": "cpu",
+            "fsdp_layer_by_layer_cpu_optimizer": True,
+            "fsdp_layer_by_layer_overlap_cpu_optimizer": True,
+            "clip_grad": 0.0,
+            **nvme_metrics,
+        },
+        expected_status,
+        launch_overlap=True,
     )
 
 
@@ -256,7 +306,7 @@ def verify_baseline_result(
     state_dir.mkdir()
     optimizer_tier = fsdp_result.get("optimizer_tier", "gpu")
     cpu_optimizer = fsdp_result.get("optimizer_backend", "grace_adam") if optimizer_tier == "cpu" else None
-    expected_offload = ["weight"] if parameter_tier == "cpu" else []
+    expected_offload = ["weight"] if parameter_tier != "gpu" else []
     if cpu_optimizer:
         expected_offload.extend(("gradient", "optimizer"))
     shared = {

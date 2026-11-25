@@ -50,9 +50,11 @@ def configure_layer_by_layer(config: ConfigContainer) -> None:
     )
     if offload.activation_tier == "nvme":
         raise ValueError("Layer-by-layer boundary activations support GPU or CPU placement.")
-    use_nvme = offload.parameter_tier == offload.optimizer_tier == "nvme"
-    if not use_nvme and "nvme" in (offload.parameter_tier, offload.optimizer_tier):
-        raise ValueError("Layer-by-layer NVMe requires both parameter and optimizer tiers to be nvme.")
+    use_nvme = offload.parameter_tier == "nvme"
+    if offload.optimizer_tier == "nvme" and not use_nvme:
+        raise ValueError("Layer-by-layer NVMe optimizer state requires NVMe parameters.")
+    if use_nvme and offload.optimizer_tier == "gpu":
+        raise ValueError("Layer-by-layer NVMe parameters require the CPU or NVMe optimizer tier.")
     if use_nvme and not offload.nvme_dir:
         raise ValueError("Layer-by-layer NVMe requires layer_by_layer.nvme_dir.")
     if offload.cpu_optimizer not in ("grace_adam", "torch") or offload.cpu_threads < 1:
@@ -111,6 +113,11 @@ def configure_layer_by_layer(config: ConfigContainer) -> None:
 
     ddp = config.ddp
     optimizer = config.optimizer
+    nvme_weights_only = use_nvme and offload.optimizer_tier == "cpu"
+    if nvme_weights_only and not hasattr(ddp, "fsdp_nvme_weights_only"):
+        raise ValueError(
+            "Layer-by-layer NVMe parameters with the CPU optimizer require the updated Megatron-LM backend."
+        )
     cpu_optimizer = offload.optimizer_tier != "gpu"
     layerwise_grace_adam = offload.optimizer_tier == "cpu" and offload.cpu_optimizer == "grace_adam"
     if hasattr(ddp, "fsdp_layer_by_layer_cpu_optimizer"):
@@ -118,8 +125,10 @@ def configure_layer_by_layer(config: ConfigContainer) -> None:
     elif layerwise_grace_adam:
         raise ValueError("Layer-by-layer GraceAdam requires the updated Megatron-FSDP layer-by-layer backend.")
     if offload.overlap_cpu_optimizer:
-        if not layerwise_grace_adam or offload.parameter_tier != "cpu":
-            raise ValueError("Layer-by-layer optimizer overlap requires CPU weights and GraceAdam on the CPU tier.")
+        if not layerwise_grace_adam or offload.parameter_tier == "gpu":
+            raise ValueError(
+                "Layer-by-layer optimizer overlap requires CPU or NVMe weights and GraceAdam on the CPU tier."
+            )
         if not hasattr(ddp, "fsdp_layer_by_layer_overlap_cpu_optimizer"):
             raise ValueError("Layer-by-layer optimizer overlap requires the updated Megatron-FSDP backend.")
         if model.calculate_per_token_loss or model.qk_clip:
@@ -170,6 +179,8 @@ def configure_layer_by_layer(config: ConfigContainer) -> None:
     ddp.fsdp_cpu_grad_accumulation = cpu_optimizer and not layerwise_grace_adam
     ddp.fsdp_cpu_optimizer = cpu_optimizer
     ddp.fsdp_nvme_path = offload.nvme_dir if use_nvme else None
+    if hasattr(ddp, "fsdp_nvme_weights_only"):
+        ddp.fsdp_nvme_weights_only = nvme_weights_only
     config.checkpoint.ckpt_format = "fsdp_dtensor"
 
     _apply_workload_geometry(model, tiny=offload.tiny)
@@ -240,6 +251,7 @@ def log_layer_by_layer_result(
                 "fsdp_strategy": config.ddp.data_parallel_sharding_strategy,
                 "fsdp_cpu_offload": config.ddp.fsdp_cpu_offload,
                 "fsdp_cpu_grad_accumulation": config.ddp.fsdp_cpu_grad_accumulation,
+                "fsdp_nvme_weights_only": getattr(config.ddp, "fsdp_nvme_weights_only", False),
                 "fsdp_layer_by_layer_cpu_optimizer": getattr(config.ddp, "fsdp_layer_by_layer_cpu_optimizer", False),
                 "fsdp_layer_by_layer_overlap_cpu_optimizer": getattr(
                     config.ddp, "fsdp_layer_by_layer_overlap_cpu_optimizer", False

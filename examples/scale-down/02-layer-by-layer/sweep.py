@@ -80,6 +80,7 @@ _CASE_SCRIPTS = tuple(
         "03_param_cpu_act_cpu_opt_gpu.sh",
         "04_param_cpu_act_cpu_opt_cpu.sh",
         "05_param_cpu_act_cpu_opt_cpu_overlap.sh",
+        "06_param_nvme_act_cpu_opt_cpu_overlap.sh",
         "offload_common.sh",
     )
 )
@@ -184,9 +185,7 @@ def _lm_revision(lm_dir: Path) -> str | None:
 
 def _arguments() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument(
-        "--nvme-dir", "--nvme", type=Path, help="existing local NVMe directory for the NVMe weight and optimizer case"
-    )
+    parser.add_argument("--nvme-dir", "--nvme", type=Path, help="existing local directory for NVMe storage")
     parser.add_argument(
         "--results-dir",
         type=Path,
@@ -226,19 +225,20 @@ def _arguments() -> argparse.Namespace:
         "--dry-run", action="store_true", help="show commands without writing or launching"
     )
     args = parser.parse_args()
-    if "nvme" in (args.parameter_tier, args.optimizer_tier):
-        if (args.parameter_tier, args.optimizer_tier) != ("nvme", "nvme"):
-            parser.error("NVMe requires --parameter-tier nvme and --optimizer-tier nvme")
+    if args.optimizer_tier == "nvme" and args.parameter_tier != "nvme":
+        parser.error("--optimizer-tier nvme requires --parameter-tier nvme")
+    if args.parameter_tier == "nvme":
+        if args.optimizer_tier == "gpu":
+            parser.error("--parameter-tier nvme requires --optimizer-tier cpu or nvme")
         if args.nvme_dir is None:
             parser.error("NVMe requires --nvme-dir")
     args.optimizer_backend = None if args.optimizer_tier == "gpu" else args.cpu_optimizer
-    if args.overlap_cpu_optimizer and (args.parameter_tier, args.optimizer_tier, args.optimizer_backend) != (
-        "cpu",
-        "cpu",
-        "grace_adam",
+    if args.overlap_cpu_optimizer and (
+        args.parameter_tier == "gpu" or (args.optimizer_tier, args.optimizer_backend) != ("cpu", "grace_adam")
     ):
         parser.error(
-            "--overlap-cpu-optimizer requires --parameter-tier cpu --optimizer-tier cpu --cpu-optimizer grace_adam"
+            "--overlap-cpu-optimizer requires --parameter-tier cpu or nvme, "
+            "--optimizer-tier cpu, and --cpu-optimizer grace_adam"
         )
     if len(set(args.layers)) != len(args.layers):
         parser.error("--layers must contain distinct values")
@@ -469,6 +469,7 @@ def _read_result(
         and metrics.get("parameter_tier") == parameter_tier
         and metrics.get("activation_tier") == activation_tier
         and metrics.get("optimizer_tier") == optimizer_tier
+        and metrics.get("fsdp_nvme_weights_only", False) is (parameter_tier == "nvme" and optimizer_tier == "cpu")
         and isinstance(actual_optimizer, str)
         and bool(actual_optimizer.strip())
         and (optimizer_backend is None or actual_optimizer == optimizer_backend)

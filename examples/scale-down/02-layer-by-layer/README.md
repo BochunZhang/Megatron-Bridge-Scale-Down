@@ -26,7 +26,7 @@ If the environment resolves the older pinned submodule, put the updated sibling 
 export PYTHONPATH="$PWD/../megatron-lm${PYTHONPATH:+:$PYTHONPATH}"
 ```
 
-The sweep defaults to PyTorch CPU AdamW for CPU and NVMe optimizer tiers. Cases 04 and 05 default to GraceAdam, which requires Megatron-LM's native Megatron-FSDP GraceAdam support and an SVE-enabled build of DeepSpeed `v0.20.1`. The launchers use `--cpu-threads` (default 32) for PyTorch intra-op parallelism in CPU gradient accumulation and for OpenMP parallelism in GraceAdam, per rank. For a direct recipe launch, set `OMP_NUM_THREADS` before startup to match `layer_by_layer.cpu_threads`. Case 05 also requires the GIL release patch below so the training thread can submit GPU work during the native update.
+The sweep defaults to PyTorch CPU AdamW for CPU and NVMe optimizer tiers. Cases 04 through 06 default to GraceAdam, which requires Megatron-LM's native Megatron-FSDP GraceAdam support and an SVE-enabled build of DeepSpeed `v0.20.1`. The launchers use `--cpu-threads` (default 32) for PyTorch intra-op parallelism in CPU gradient accumulation and for OpenMP parallelism in GraceAdam, per rank. For a direct recipe launch, set `OMP_NUM_THREADS` before startup to match `layer_by_layer.cpu_threads`. Cases 05 and 06 also require the GIL release patch below so the training thread can submit GPU work during the native update.
 
 ## Native schedule smoke test
 
@@ -114,6 +114,24 @@ bash "$study/05_param_cpu_act_cpu_opt_cpu_overlap.sh" --cpu-threads 32
 
 Results go under `results/02-layer-by-layer/01-baseline/05-param-cpu-act-cpu-opt-cpu-overlap/`. Compare cases 04 and 05 with the same DeepSpeed build and thread count. On the Nsight timeline, check that each worker's `GraceAdam bucket=<id>` update starts after the corresponding GPU-to-CPU gradient transfer ends. Use the same timeline to measure its overlap with subsequent backward and NCCL operations. Use `--profile none` for matching step-time runs.
 
+## 8-layer NVMe parameters with CPU optimizer overlap
+
+Case 06 places all BF16 FSDP compute-weight shards on NVMe and uses case 05's CPU activation and GraceAdam overlap settings. Each rank synchronously stages its local shard from NVMe through CPU memory to GPU before all-gather. When FSDP releases a managed weight bucket, it copies the local shard through CPU memory back to NVMe before freeing the GPU buffer.
+
+Decoder layer 0 keeps its FP32 master weights, main gradients, and Adam moments on the GPU. Its AdamW update casts the updated shard to BF16 on the GPU and writes it through CPU memory to NVMe. GraceAdam updates the remaining buckets' FP32 master weights on the CPU, then casts their updated shards to BF16 on the CPU for NVMe writeback. The next forward reads the updated shards after these writes complete.
+
+Install the Megatron-LM `megatron_nvme_aio` extension in the training environment. It uses the DeepSpeed-derived Linux `libaio` worker and host direct I/O. Building it requires a C++17 compiler, `libaio-dev`, and NVTX3 headers. Set `NVTX_INCLUDE_DIR` if the headers live outside the CUDA include directory.
+
+```bash
+uv pip install --no-build-isolation --no-deps --reinstall ../megatron-lm/src/nvme/deepspeed
+
+study=examples/scale-down/02-layer-by-layer/01-baseline
+bash "$study/06_param_nvme_act_cpu_opt_cpu_overlap.sh" --dry-run
+bash "$study/06_param_nvme_act_cpu_opt_cpu_overlap.sh" --cpu-threads 32
+```
+
+All four ranks share the NVMe root `/tmp`. Each launch creates a temporary directory there with separate swap files per rank. To select another local NVMe directory, pass `--nvme DIR` or set `NVME_PATH`. Results go under `results/02-layer-by-layer/01-baseline/06-param-nvme-act-cpu-opt-cpu-overlap/`. The result records `parameter_tier=nvme`, `optimizer_tier=cpu`, and `fsdp_nvme_weights_only=true`.
+
 ## Running and profiling the numbered cases
 
 The numbered scripts select the experiment settings and call `run_pretrain_layer_by_layer.sh`. That Bash launcher wraps four torchrun workers in Nsight Systems and runs Bridge's `scripts/training/run_recipe.py --recipe qwen35_text_27b_pretrain_4gpu_gb200_bf16_layer_by_layer_config --mode pretrain --dataset mock` on each rank. Bridge calls the layer-by-layer schedule through its normal training step. The launcher uses the same NUMA selection order as the FSDP3 study.
@@ -139,7 +157,7 @@ bash examples/scale-down/02-layer-by-layer/run_sweep.sh \
 
 Defaults are eight decoder layers, sequence length 4096, micro-batch size 1, four microbatches per rank per step, three optimizer steps, and GPU placement for every tier. Choose `gpu` or `cpu` independently for `--parameter-tier`, `--activation-tier`, and `--optimizer-tier`. CPU activation placement covers the saved layer boundaries. CPU-tier PyTorch AdamW uses CPU gradient accumulation. CPU-tier GraceAdam uses the direct per-layer FP32 transfer from case 04. Add `--overlap-cpu-optimizer` with `--parameter-tier cpu --optimizer-tier cpu --cpu-optimizer grace_adam` to enable case 05's optimizer scheduling.
 
-NVMe requires `--parameter-tier nvme --optimizer-tier nvme --nvme-dir /path/to/local/nvme` and the `megatron_nvme_aio` extension from the Megatron-LM checkout's `src/nvme/deepspeed`. Each NVMe case uses a fresh scratch directory. Its filesystem holds all four ranks' files. At full depth, FP32 master weights and the two Adam moments alone require roughly 324 GB in total, with additional storage for compute weights and staging.
+Use `--parameter-tier nvme --optimizer-tier cpu --nvme-dir /path/to/local/nvme` to swap BF16 compute weights. Use `--optimizer-tier nvme` with the same parameter tier to swap both weights and optimizer state. Both modes require the `megatron_nvme_aio` extension from the Megatron-LM checkout's `src/nvme/deepspeed`. Each NVMe case uses a fresh scratch directory. Its filesystem holds all four ranks' files. With `--optimizer-tier nvme` at full depth, FP32 master weights and the two Adam moments alone require roughly 324 GB in total, with additional storage for compute weights and staging.
 
 Add `--dry-run` to inspect the commands. To narrow the capacity limit, rerun at depths between the largest passing case and the first allocation failure.
 
