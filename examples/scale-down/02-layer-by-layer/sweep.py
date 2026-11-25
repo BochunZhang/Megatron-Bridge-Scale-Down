@@ -56,7 +56,7 @@ _LM_SOURCE_FILES = (
 )
 _CASE_SCRIPTS = tuple(
     f"{_EXAMPLE_DIR}/01-baseline/{name}"
-    for name in ("01-param-gpu-act-gpu-opt-gpu.sh", "01_cpu_offload.sh", "02_nvme_offload.sh", "offload_common.sh")
+    for name in ("01_param_gpu_act_gpu_opt_gpu.sh", "01_cpu_offload.sh", "02_nvme_offload.sh", "offload_common.sh")
 )
 _RESULT_PREFIX = "LAYER_BY_LAYER_RESULT "
 _RESOURCE_ERRORS = {

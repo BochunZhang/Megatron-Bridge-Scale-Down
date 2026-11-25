@@ -26,8 +26,8 @@ Run the baseline from the Bridge repository root. It uses eight full-attention d
 
 ```bash
 study=examples/scale-down/02-layer-by-layer/01-baseline
-bash "$study/01-param-gpu-act-gpu-opt-gpu.sh" --dry-run
-bash "$study/01-param-gpu-act-gpu-opt-gpu.sh"
+bash "$study/01_param_gpu_act_gpu_opt_gpu.sh" --dry-run
+bash "$study/01_param_gpu_act_gpu_opt_gpu.sh"
 ```
 
 This baseline keeps parameter shards, layer-boundary activations, and optimizer state on the GPUs and executes AdamW on the GPUs. The other numbered scripts select CPU parameters and activations with NVMe optimizer state, or NVMe for all three. Set `--nvme DIR` or `NVME_PATH` if those cases use a node-local NVMe mount other than `/tmp`.
