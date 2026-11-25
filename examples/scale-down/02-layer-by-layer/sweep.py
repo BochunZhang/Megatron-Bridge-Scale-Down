@@ -379,7 +379,7 @@ def _command(
             "profile",
             "--trace=cuda,nvtx",
             "--sample=none",
-            "--cpuctxsw=process-tree",
+            "--cpuctxsw=system-wide",
             "--capture-range=cudaProfilerApi",
             "--capture-range-end=stop",
             f"--output={report.with_suffix('')}",
