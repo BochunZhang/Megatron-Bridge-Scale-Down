@@ -59,6 +59,8 @@ def test_layer_by_layer_baseline_dry_run(
             "profiling.nvtx_ranges=true",
             "layer_by_layer.cpu_optimizer=grace_adam",
             "OMP_NUM_THREADS=32",
+            "OMP_DYNAMIC=FALSE",
+            "OMP_PROC_BIND=FALSE",
             "layer_by_layer.cpu_threads=32",
         } <= set(command)
     overlap = case.endswith("_overlap")

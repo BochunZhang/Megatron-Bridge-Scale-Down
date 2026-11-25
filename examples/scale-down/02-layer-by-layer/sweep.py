@@ -317,7 +317,7 @@ def _command(
     _, numa_wrapper = _numa_worker()
     worker_env = []
     if args.optimizer_backend is not None:
-        worker_env = ["env", f"OMP_NUM_THREADS={args.cpu_threads}"]
+        worker_env = ["env", f"OMP_NUM_THREADS={args.cpu_threads}", "OMP_DYNAMIC=FALSE", "OMP_PROC_BIND=FALSE"]
     command = [
         *python,
         "-m",
