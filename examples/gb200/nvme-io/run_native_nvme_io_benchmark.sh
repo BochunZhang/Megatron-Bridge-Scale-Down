@@ -22,10 +22,8 @@ File sizes are 40 MiB, 160 MiB, 320 MiB, and 1 GiB. QP ranges from 1 through
 64 by powers of two. Block sizes are 64 KiB, 128 KiB, and 256 KiB.
 
 NVME_DIR defaults to $NVME_PATH or /tmp. Use a directory on the local NVMe.
-MEGATRON_LM_DIR defaults to the sibling megatron-lm checkout with async AIO.
-PYTHON can select the training interpreter. The default uses uv run --no-sync.
-The temporary build needs setuptools, Python headers, a C++17 compiler, libaio
-headers, and NVTX3 headers (see NVTX_INCLUDE_DIR in the native extension).
+Requires megatron-nvme-aio 0.1.1 or newer in the active Python environment.
+The default interpreter is python from PATH. Set PYTHON to override it.
 The 1 GiB cases use two 1 GiB files and two 1 GiB host buffers.
 
 Results go to results/gb200/nvme-io/native-*/summary.csv and stdout in GiB/s.
@@ -37,20 +35,13 @@ fi
 [[ $(uname -s) == Linux ]] || die 'Run this benchmark on the GB200 Linux node.'
 repo_root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../../.." && pwd -P)
 nvme_dir=$(cd -- "${1:-${NVME_PATH:-/tmp}}" && pwd -P)
-native_source="${MEGATRON_LM_DIR:-$repo_root/../megatron-lm}/src/nvme/deepspeed"
-[[ -r $native_source/aio.cpp ]] || die 'Set MEGATRON_LM_DIR to the Megatron-LM checkout with native AIO.'
-
-if [[ -n ${PYTHON:-} ]]; then
-    python=("$PYTHON")
-else
-    python=(uv run --project "$repo_root" --no-sync python)
-fi
+python_bin=${PYTHON:-python}
+command -v "$python_bin" >/dev/null || die 'Activate the Python environment with megatron-nvme-aio or set PYTHON.'
 
 scratch_dir=$(mktemp -d -- "$nvme_dir/.gb200-native-aio.XXXXXX")
 trap 'rm -rf -- "$scratch_dir"' EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
-cp -- "$native_source/"{aio.cpp,setup.py,LICENSE} "$scratch_dir/"
 
 results_root="$repo_root/results/gb200/nvme-io"
 mkdir -p -- "$results_root"
@@ -59,10 +50,8 @@ printf 'Results directory: %s\n' "$results_dir" >&2
 {
     uname -snrm
     findmnt --target "$nvme_dir" --output SOURCE,TARGET,FSTYPE,MAJ:MIN
-    (cd -- "$scratch_dir" && sha256sum aio.cpp setup.py)
     cat <<'EOF'
 Engine: megatron_nvme_aio, libaio with O_DIRECT
-Build: one temporary extension per block size with a queue depth limit of 64
 QP: queue depth per worker; concurrent read/write uses one worker per direction
 Files: two fully allocated, initialized files of the specified size on the same mount
 Timing: one pass per direction after warmup; writes overwrite existing data without fsync
@@ -74,20 +63,13 @@ partial="$results_dir/partial.csv"
 summary="$results_dir/summary.csv"
 printf '%s\n' 'file_size,block_kib,qp,mode,read_gib_per_s,write_gib_per_s,total_gib_per_s' >"$partial"
 
-# Each process imports exactly one build of the native extension.
-for block_kib in 64 128 256; do
-    printf 'Running native AIO with %s KiB blocks\n' "$block_kib" >&2
-    "${python[@]}" -u - "$scratch_dir" "$results_dir/build-${block_kib}k.log" "$block_kib" >>"$partial" <<'PYTHON'
+"$python_bin" -u - "$scratch_dir" "$results_dir/host_info.txt" >>"$partial" <<'PYTHON'
 import csv
-import importlib.util
 import mmap
 import os
-import re
-import shutil
-import subprocess
 import sys
-import sysconfig
 from concurrent.futures import ThreadPoolExecutor, wait
+from hashlib import sha256
 from pathlib import Path
 from threading import Barrier
 from time import perf_counter_ns
@@ -97,40 +79,26 @@ from types import ModuleType
 MIB = 1024**2
 GIB = 1024**3
 FILE_SIZES = (("40MiB", 40 * MIB), ("160MiB", 160 * MIB), ("320MiB", 320 * MIB), ("1GiB", GIB))
+BLOCK_SIZES_KIB = (64, 128, 256)
 QUEUE_DEPTHS = (1, 2, 4, 8, 16, 32, 64)
 
 
-def _build_aio(scratch: Path, *, block_kib: int, build_log: Path) -> ModuleType:
-    build = scratch / f"build-{block_kib}k"
-    build.mkdir()
-    source = (scratch / "aio.cpp").read_text(encoding="utf-8")
-    max_depth = max(QUEUE_DEPTHS)
-    for constant, value in (("size_t kBlockSize", block_kib * 1024), ("int kMaxQueueDepth", max_depth)):
-        source, count = re.subn(
-            rf"^constexpr {constant} = [^;\n]+;", f"constexpr {constant} = {value};", source, flags=re.M
-        )
-        if count != 1:
-            raise SystemExit(f"Expected one definition of {constant} in the native AIO source. Check MEGATRON_LM_DIR.")
-    source = source.replace("AIO queue depth must be in [1, 16]", f"AIO queue depth must be in [1, {max_depth}]")
-    (build / "aio.cpp").write_text(source, encoding="utf-8")
-    for name in ("setup.py", "LICENSE"):
-        shutil.copyfile(scratch / name, build / name)
+def _load_aio() -> ModuleType:
+    try:
+        import megatron_nvme_aio
+    except ImportError as error:
+        raise SystemExit(
+            f"Cannot import megatron_nvme_aio in {sys.executable}: {error}. Install megatron-nvme-aio 0.1.1 or newer."
+        ) from None
 
-    with build_log.open("w", encoding="utf-8") as log:
-        result = subprocess.run(
-            [sys.executable, "setup.py", "build_ext", "--inplace"], cwd=build, stdout=log, stderr=subprocess.STDOUT
-        )
-    if result.returncode:
-        raise SystemExit(f"Could not build the {block_kib} KiB native AIO extension. See {build_log}.")
-
-    name = "megatron_nvme_aio"
-    library = build / (name + sysconfig.get_config_var("EXT_SUFFIX"))
-    spec = importlib.util.spec_from_file_location(name, library)
-    if spec is None or spec.loader is None:
-        raise SystemExit(f"Could not load the native AIO extension at {library}.")
-    aio = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(aio)
-    return aio
+    try:
+        megatron_nvme_aio.create_worker(max(QUEUE_DEPTHS), max(BLOCK_SIZES_KIB) * 1024)
+    except (TypeError, ValueError):
+        raise SystemExit(
+            f"Upgrade megatron-nvme-aio in {sys.executable} to 0.1.1 or newer. "
+            "The installed extension does not support both QP 64 and configurable block sizes."
+        ) from None
+    return megatron_nvme_aio
 
 
 def _transfer(
@@ -166,10 +134,10 @@ def _benchmark(aio: ModuleType, scratch: Path, block_kib: int) -> None:
     output = csv.writer(sys.stdout, lineterminator="\n")
     read_path = scratch / "read.bin"
     write_path = scratch / "write.bin"
-    initializer = aio.create_worker(16)
+    block_bytes = block_kib * 1024
+    initializer = aio.create_worker(16, block_bytes)
     data = os.urandom(MIB)
     zero = bytes(MIB)
-    block_bytes = block_kib * 1024
 
     with ThreadPoolExecutor(max_workers=2) as pool:
         for file_size, size in FILE_SIZES:
@@ -182,8 +150,8 @@ def _benchmark(aio: ModuleType, scratch: Path, block_kib: int) -> None:
                 _prepare(aio, initializer, write_buffer, write_path)
 
                 for qp in QUEUE_DEPTHS:
-                    reader = aio.create_worker(qp)
-                    writer = aio.create_worker(qp)
+                    reader = aio.create_worker(qp, block_bytes)
+                    writer = aio.create_worker(qp, block_bytes)
                     # The workers open their libaio contexts on their first I/O.
                     with (
                         memoryview(read_buffer)[:block_bytes] as read_block,
@@ -220,12 +188,18 @@ def _benchmark(aio: ModuleType, scratch: Path, block_kib: int) -> None:
                     )
 
 
+aio = _load_aio()
+extension_path = Path(aio.__file__)
+with Path(sys.argv[2]).open("a", encoding="utf-8") as host_info:
+    host_info.write(f"Python: {sys.executable}\n")
+    host_info.write(f"Extension: {extension_path}\n")
+    host_info.write(f"Extension SHA256: {sha256(extension_path.read_bytes()).hexdigest()}\n")
+
 scratch = Path(sys.argv[1])
-build_log = Path(sys.argv[2])
-block_kib = int(sys.argv[3])
-_benchmark(_build_aio(scratch, block_kib=block_kib, build_log=build_log), scratch, block_kib)
+for block_kib in BLOCK_SIZES_KIB:
+    sys.stderr.write(f"Running native AIO with {block_kib} KiB blocks\n")
+    _benchmark(aio, scratch, block_kib)
 PYTHON
-done
 
 mv -- "$partial" "$summary"
 cat -- "$summary"
