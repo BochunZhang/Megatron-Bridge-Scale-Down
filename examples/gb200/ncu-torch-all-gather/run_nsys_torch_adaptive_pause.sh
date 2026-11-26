@@ -7,7 +7,7 @@ set -euo pipefail
 usage() {
     cat <<'USAGE'
 Profile a 4 GiB BF16 all-gather and a delayed 1 GiB reduce-scatter on four GB200 GPUs.
-Samples NVLink RX/TX bytes on all four GPUs at 200000 Hz and runs a matched control.
+Records NVLink RX/TX Bytes, GB/s and Throughput % at 200000 Hz and runs a matched control.
 
   --gpus LIST       Four numeric GPU indices in CUDA PCI bus order (default: CUDA_VISIBLE_DEVICES or 0,1,2,3)
   --rs-delay-ms N   Delay of the RS stream after the common GPU start gate (default: 1)
@@ -84,7 +84,8 @@ poll_chunks="${NCCL_SYM_AG_STMC_PAUSE_POLL_CHUNKS:-4}"
 output_dir="${output_dir:-$repo_root/results/gb200/ncu-torch-all-gather/nsys-adaptive-pause-$(date +%Y%m%d-%H%M%S)}"
 [[ "$output_dir" = /* ]] || output_dir="$PWD/$output_dir"
 [[ "$nccl_lib" = /* ]] || nccl_lib="$PWD/$nccl_lib"
-config="$output_dir/gb200-nvlink-bytes.config"
+metric_set="$repo_root/examples/gb200/nvls-fused-ag-rs/gb200-nvlink-bytes.config"
+config="$metric_set"
 if ! $dry_run; then
     nsys_bin="$(command -v "$nsys_bin")" || die "nsys not found (use --nsys)"
     [[ "$nsys_bin" = /* ]] || nsys_bin="$PWD/$nsys_bin"
@@ -93,7 +94,8 @@ if ! $dry_run; then
         || die "--nccl-lib must point to the build from install/install-nccl-2.32.3-adaptive-pause.sh"
     mkdir -p -- "$output_dir"
     [[ -z "$(ls -A "$output_dir")" ]] || die "use an empty output directory: $output_dir"
-    cp -- "$script_dir/gb200-nvlink-bytes.config" "$config"
+    config="$output_dir/gb200-nvlink-bytes.config"
+    cp -- "$metric_set" "$config"
     "$nsys_bin" --version >"$output_dir/nsys-version.txt"
 fi
 
@@ -150,4 +152,4 @@ for mode in adaptive control; do
 done
 
 run uv run --no-sync python "$worker" analyse --output-dir "$output_dir" --gpus "$gpus" \
-    --nvlink-peak-gb-s "$nvlink_peak_gb_s"
+    --nvlink-peak-gb-s "$nvlink_peak_gb_s" --require-native-nvlink-metrics

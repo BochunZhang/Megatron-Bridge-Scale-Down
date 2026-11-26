@@ -304,8 +304,32 @@ def _nvlink_totals(rates: dict[str, float], *, peak_gb_s: float) -> NvlinkRates:
     return NvlinkRates(rx, 100 * rx / peak_gb_s, tx, 100 * tx / peak_gb_s, requests, responses, user_share)
 
 
+def _require_native_nvlink_metrics(conn: sqlite3.Connection, gpus: tuple[int, ...], *, start: int, end: int) -> None:
+    sampled = set(
+        conn.execute(
+            """
+            SELECT DISTINCT m.typeId & 255, m.metricName
+            FROM TARGET_INFO_GPU_METRICS AS m
+            JOIN GPU_METRICS AS g USING (typeId, metricId)
+            WHERE g.timestamp BETWEEN ? AND ? AND g.value >= 0 AND m.metricName LIKE 'NVLink %'
+            """,
+            (start, end),
+        )
+    )
+    expected = {(gpu, f"{name} [{unit}]") for gpu in gpus for name in METRICS for unit in ("GB/s", "Throughput %")}
+    missing = sorted(expected - sampled)
+    if missing:
+        gpu, name = missing[0]
+        raise ValueError(f"GPU {gpu}: missing native Nsight sample for {name} during overlap ({len(missing)} missing)")
+
+
 def analyse(
-    mode_dir: Path, gpus: tuple[int, ...], *, adaptive: bool, peak_gb_s: float = NVLINK_PEAK_GB_S
+    mode_dir: Path,
+    gpus: tuple[int, ...],
+    *,
+    adaptive: bool,
+    peak_gb_s: float = NVLINK_PEAK_GB_S,
+    require_native_nvlink_metrics: bool = False,
 ) -> CaptureSummary:
     """Validate kernel order and derive throughput and NVLink utilization from a saved capture."""
     database = mode_dir / "profile.sqlite"
@@ -317,6 +341,8 @@ def analyse(
             ag = _kernels(conn, gpus, kernel="ncclSymkDevKernel_AllGather_STMC")
             rs = _kernels(conn, gpus, kernel="ncclSymkDevKernel_ReduceScatter_LDMC")
         else:
+            if require_native_nvlink_metrics:
+                raise ValueError("profile.sqlite is required to verify native Nsight metrics")
             conn = None
             ag, rs = _read_kernel_timing(timing_csv, gpus)
         kernel_rows = []
@@ -358,6 +384,10 @@ def analyse(
         if conn is None:
             rates = _read_phase_rates(phase_csv, gpus, phases)
         else:
+            if require_native_nvlink_metrics:
+                start, end = phases["ag_rs_overlap"]
+                _require_native_nvlink_metrics(conn, gpus, start=start, end=end)
+                LOGGER.info("%s has native NVLink GB/s and Throughput %% samples on GPUs %s", mode_dir, gpus)
             rates = _capture_phase_rates(phase_csv, conn, gpus, phases)
 
     _write_csv(
@@ -441,6 +471,11 @@ def main() -> None:
     analysis.add_argument("--output-dir", type=Path, required=True)
     analysis.add_argument("--gpus", required=True)
     analysis.add_argument("--nvlink-peak-gb-s", type=float, default=NVLINK_PEAK_GB_S)
+    analysis.add_argument(
+        "--require-native-nvlink-metrics",
+        action="store_true",
+        help="Verify that all GPUs recorded native GB/s and Throughput %% during overlap",
+    )
     args = parser.parse_args()
     if args.command == "benchmark":
         if not math.isfinite(args.rs_delay_ms) or args.rs_delay_ms <= 0:
@@ -463,7 +498,11 @@ def main() -> None:
             mode_dir = args.output_dir / mode
             try:
                 captures[mode] = analyse(
-                    mode_dir, gpus, adaptive=(mode == "adaptive"), peak_gb_s=args.nvlink_peak_gb_s
+                    mode_dir,
+                    gpus,
+                    adaptive=(mode == "adaptive"),
+                    peak_gb_s=args.nvlink_peak_gb_s,
+                    require_native_nvlink_metrics=args.require_native_nvlink_metrics,
                 )
             except (OSError, sqlite3.Error, ValueError, KeyError) as exc:
                 errors.append(f"{mode_dir}: {exc}")

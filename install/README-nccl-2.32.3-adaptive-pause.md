@@ -73,7 +73,11 @@ bash examples/gb200/ncu-torch-all-gather/run_nsys_torch_adaptive_pause.sh --gpus
 用 `--nccl-lib` 和 `--nsys` 指定安装路径。
 
 Nsight Systems 需要 GPU 性能计数器权限。每轮用一个会话对四张卡采样，设置为 **200 kHz（标称 5 µs）**，
-采集 NVLink RX/TX 的 request/response user/protocol 字节数。采样分析会检查间隔，发现缺样会报错并保留原始报告。
+采集 NVLink RX/TX 的 request、response、user 和 protocol 数据。每项指标的 `Bytes`、`GB/s` 和
+`Throughput %` 都写入 `profile.nsys-rep`。打开报告后展开 **GPU Metrics → NVLink RX / TX**，查看
+`GB/s` 和 `Throughput %` 子指标。Nsight 的原生百分比以硬件计数器的持续峰值为基准。
+采集完成后会检查四张卡在 AG/RS 重叠期间都有这两类原生样本。采样分析会检查间隔，发现缺样会报错并保留原始报告。
+要让旧采集也带这两类 GPU Metrics 曲线，需重新运行采集脚本。
 
 分析使用 CUDA kernel 时间戳核对 AG 先开始以及四张卡确实同时执行两个 kernel。Adaptive 轮还要求最后一个
 RS 比第一个 AG 先结束，顺序不满足时测试返回非零。根目录的 `summary.md` 并排展示两轮的整次吞吐和分阶段带宽。
@@ -81,7 +85,7 @@ RS 比第一个 AG 先结束，顺序不满足时测试返回非零。根目录�
 - `kernel_timing.csv` 记录每卡的 kernel 时长和 algbw，AG 用 4 GiB 输出，RS 用 1 GiB 输入。
   `summary.md` 用每种操作首个 kernel 开始到最后一个结束的跨度计算整次吞吐。
 - `nvlink_phase_summary.csv` 按卡、按阶段汇总 RX/TX GB/s 和占比。同方向的 request/response user/protocol
-  字节速率相加，除以单卡单向峰值。GB200 NVL72 默认用 900 GB/s，可用 `--nvlink-peak-gb-s` 覆盖。
+  字节速率相加，除以单卡单向峰值。GB200 NVL72 报表默认用 900 GB/s，可用 `--nvlink-peak-gb-s` 覆盖报表分母。
   RX request user 占比以 RX request 与 response 的 user 字节总量为分母。
   [GB200 NVLink 规格](https://developer.nvidia.com/blog/nvidia-gb200-nvl72-delivers-trillion-parameter-llm-training-and-real-time-inference)
 - `nvlink_by_phase.csv` 保留单个计数器的速率和采样间隔。`profile.nsys-rep` 保留逐样本时间线，

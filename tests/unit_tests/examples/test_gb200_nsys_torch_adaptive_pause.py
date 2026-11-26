@@ -120,6 +120,35 @@ def test_metric_gap_rejects_missing_samples():
 
 
 @pytest.mark.unit
+def test_fresh_capture_requires_native_nvlink_samples_during_overlap(tmp_path):
+    gpus = (1, 3, 4, 7)
+    profile = tmp_path / "profile.sqlite"
+    _write_profile(profile, gpus, rs_end=90_000)
+    with closing(sqlite3.connect(profile)) as db:
+        for unit, offset in (("GB/s", 8), ("Throughput %", 16)):
+            db.execute(
+                """
+                INSERT INTO TARGET_INFO_GPU_METRICS
+                SELECT typeId, metricId + ?, replace(metricName, '[Bytes]', ?)
+                FROM TARGET_INFO_GPU_METRICS WHERE metricName LIKE '%[Bytes]'
+                """,
+                (offset, f"[{unit}]"),
+            )
+        db.execute(
+            "INSERT INTO GPU_METRICS SELECT typeId, metricId, 20000, 0 "
+            "FROM TARGET_INFO_GPU_METRICS WHERE metricId >= 8"
+        )
+        db.commit()
+        with pytest.raises(ValueError, match="missing native Nsight sample"):
+            benchmark.analyse(tmp_path, gpus, adaptive=True, require_native_nvlink_metrics=True)
+        db.execute("UPDATE GPU_METRICS SET timestamp = 50000 WHERE metricId >= 8")
+        db.commit()
+
+    result = benchmark.analyse(tmp_path, gpus, adaptive=True, require_native_nvlink_metrics=True)
+    assert result.phases["ag_rs_overlap"].rx_request_user_gb_s == 50
+
+
+@pytest.mark.unit
 @pytest.mark.parametrize(
     ("base_env", "rs_env", "options", "expected_base", "expected_rs", "expected_peak"),
     [
@@ -173,7 +202,13 @@ def test_dry_run_uses_a_matched_control_and_the_requested_pauses(
         assert "NCCL_SYM_AG_STMC_PAUSE_POLL_CHUNKS=8" in profile
         assert f"NCCL_SYM_AG_STMC_RS_PAUSE_CYCLES={rs_pause}" in profile
         assert profile[-2:] == ["--rs-delay-ms", "0.5"]
+        metric_set = next(arg for arg in profile if arg.startswith("--gpu-metrics-set=file:"))
+        config = Path(metric_set.removeprefix("--gpu-metrics-set=file:"))
+        assert config == EXAMPLE.parent / "nvls-fused-ag-rs" / "gb200-nvlink-bytes.config"
+        definition = config.read_text()
+        assert definition.count("- name: GB/s") == definition.count("- name: Throughput %") == 8
     assert f"--nvlink-peak-gb-s {expected_peak}" in result.stdout
+    assert "--require-native-nvlink-metrics" in result.stdout
     assert not output.exists()
 
 
