@@ -15,6 +15,7 @@ MODELS=(27b 2.4t)
 if [[ "${GROUP}" == 05-nccl ]]; then MODELS=(27b); fi
 LAUNCHER=("${BENCHMARK_DIR}/run_pretrain_fsdp3.sh")
 UNLOCK_GPU_CLOCKS=false
+NSYS_REPORT_ONLY=false
 TORCH_THREADS=""
 DRY_RUN=false
 PRINT_CASE_DIRS=false
@@ -61,8 +62,10 @@ while (( $# )); do
         --dry-run) DRY_RUN=true; shift;;
         --print-case-dirs) PRINT_CASE_DIRS=true; shift;;
         -h|--help)
-            printf 'Usage: %s [--model 27b|2.4t] [--output-dir DIR] [--torch-thread N] [--unlock] [--dry-run | --print-case-dirs]\n' "$0"
-            echo '  --unlock    Restore automatic GPU clocks (TDP lock by default)'
+            model_choices='27b|2.4t'
+            [[ "${GROUP}" == 05-nccl ]] && model_choices=27b
+            printf 'Usage: %s [--model %s] [--output-dir DIR] [--torch-thread N] [--unlock] [--dry-run | --print-case-dirs]\n' "$0" "${model_choices}"
+            echo '  --unlock    Restore automatic GPU clocks'
             echo '  --torch-thread N    Set PyTorch intra-op threads per rank for every case'
             if [[ "${STUDY_SCRIPT}" == 02_mbs.sh ]]; then
                 echo '  --fsdp 1|3    MBS sweep sharding level (default: 1, synchronous parameter AG in optimizer step)'
@@ -71,8 +74,8 @@ while (( $# )); do
                 02-comm-overlap) echo '  --profile nsys|pytorch    Capture Nsight Systems (default) or per-rank PyTorch traces for HTA';;
                 04-nvme) echo '  --nvme-path DIR    Directory on local NVMe (default: /tmp/megatron-fsdp3-nvme, or set NVME_PATH)';;
                 05-nccl)
-                    echo '  --nccl-lib FILE    Override the NCCL library (or set NCCL_LIB); 27b only'
-                    echo '                     Default: nccl/nccl-2.32.3-cta-with-pause/build/lib/libnccl.so.2';;
+                    echo '  --nccl-lib FILE    Override the patched NCCL library for this 27b study'
+                    echo "                     Defaults to ${NCCL_DEFAULT_LIB}";;
             esac
             exit 0;;
         *) fail "Unknown option: $1";;
@@ -103,6 +106,7 @@ run_case() {
         --profile "${STUDY_PROFILE}" --train-iters 10 --profile-start 7 --profile-end 8
         --results-root "${OUTPUT_DIR}/${result_group}" "${result_args[@]}" "$@")
     [[ "${UNLOCK_GPU_CLOCKS}" == true ]] && args+=(--unlock)
+    [[ "${NSYS_REPORT_ONLY}" == true ]] && args+=(--nsys-report-only)
     [[ -n "${TORCH_THREADS}" ]] && args+=(--torch-thread "${TORCH_THREADS}")
     local label="${result_group}${name:+/${name}} model=${model} fsdp=${fsdp} graph=${graph} tp=${tp} cp=${cp} mbs=${mbs} seq=${seq} profile=${STUDY_PROFILE}"
     local case_dir=""

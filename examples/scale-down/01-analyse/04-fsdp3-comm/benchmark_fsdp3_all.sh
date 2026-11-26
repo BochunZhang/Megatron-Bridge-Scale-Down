@@ -15,9 +15,11 @@ usage() {
 Usage: benchmark_fsdp3_all.sh [--output-dir DIR] [--torch-thread N] [--unlock] [--dry-run]
 
 Run all numbered FSDP3 communication studies in order on one 4-GPU GB200 node.
-Each new case locks GPU clocks to TDP by default. Use --unlock for automatic clocks.
+Cases normally lock GPU clocks to TDP. The adaptive pause study always resets GPU clocks.
+Use --unlock to reset GPU clocks before every case.
 Defaults to results/01-analyse/04-fsdp3-comm-tdp (-unlocked with --unlock).
-Use NVME_PATH and NCCL_LIB to override the NVMe scratch path and patched NCCL library.
+Use NVME_PATH for the NVMe scratch path, NCCL_LIB for the static pause build and
+NCCL_ADAPTIVE_PAUSE_LIB for the adaptive pause build.
 Pass --torch-thread N to set PyTorch intra-op threads per rank for every case.
 Use --dry-run to preview every case without launching training or changing clocks.
 USAGE

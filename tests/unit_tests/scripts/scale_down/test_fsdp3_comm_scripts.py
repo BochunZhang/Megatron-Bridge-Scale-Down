@@ -77,16 +77,18 @@ def test_all_numbered_studies_use_the_requested_gpu_clocks(options: tuple[str, .
     ]
     result_root = REPO_ROOT / f"results/01-analyse/04-fsdp3-comm-{mode}"
     planned_cases = []
+    expected_clocks = []
     for study in studies:
         plan = _run(study, "--print-case-dirs", "--output-dir", str(result_root), *options, **env)
         assert plan.returncode == 0, plan.stderr
         assert plan.stdout.strip()
-        planned_cases.extend(Path(line) for line in plan.stdout.splitlines())
+        case_dirs = list(map(Path, plan.stdout.splitlines()))
+        planned_cases.extend(case_dirs)
+        study_clocks = "unlocked" if study.name == "04_adaptive_pause.sh" else clocks
+        expected_clocks.extend([f"gpu_clocks={study_clocks}"] * len(case_dirs))
     commands = _commands(result.stderr)
     assert [_node_dir(command).parent for command in commands] == planned_cases
-    assert [line for line in result.stderr.splitlines() if line.startswith("gpu_clocks=")] == [
-        f"gpu_clocks={clocks}"
-    ] * len(commands)
+    assert [line for line in result.stderr.splitlines() if line.startswith("gpu_clocks=")] == expected_clocks
 
 
 def test_default_sweep_per_model_crops_layers_and_experts(tmp_path: Path):
@@ -619,6 +621,43 @@ def test_nccl_studies_use_the_cta_pause_build_and_automatic_kernel_selection(scr
         split_ag = "dist.create_all_gather_group=true" in args
         assert f"dist.create_reduce_scatter_group={str(split_ag).lower()}" in args
         assert ("-separate-rs-" in _report_base(command).name) == split_ag
+
+
+@pytest.mark.unit
+def test_adaptive_pause_study_compares_matched_nccl_builds(tmp_path: Path):
+    result = _run(
+        EXAMPLE / "05-nccl/04_adaptive_pause.sh",
+        "--dry-run",
+        "--output-dir",
+        str(tmp_path),
+        NCCL_LIB="static-pause/libnccl.so.2",
+        NCCL_STOCK_LIB="",
+        NCCL_ADAPTIVE_PAUSE_LIB="",
+        LD_PRELOAD="",
+    )
+    assert result.returncode == 0, result.stderr
+    stock, adaptive = [shlex.split(line) for line in result.stderr.splitlines() if line.startswith("NCCL case ")]
+    assert f"LD_PRELOAD={REPO_ROOT}/nccl/nccl-2.32.3/build/lib/libnccl.so.2" in stock
+    assert f"LD_PRELOAD={REPO_ROOT}/nccl/nccl-2.32.3-adaptive-pause/build/lib/libnccl.so.2" in adaptive
+    assert "NCCL_SYM_AG_STMC_PAUSE_CYCLES=-1" in adaptive
+    assert "NCCL_SYM_AG_STMC_RS_PAUSE_CYCLES=-1" in adaptive
+    assert result.stderr.splitlines().count("gpu_clocks=unlocked") == 2
+
+    commands = _commands(result.stderr)
+    assert len(commands) == 2
+    for command, name in zip(commands, ("stock", "adaptive-pause"), strict=True):
+        assert f"-profile_nsys-{name}-" in _node_dir(command).parent.name
+        assert {
+            "--export=none",
+            "--stats=false",
+            "qwen35_text_27b_pretrain_4gpu_gb200_bf16_fsdp1_config",
+            "model.num_layers=8",
+            "ddp.data_parallel_sharding_strategy=optim_grads_params",
+            "dist.create_all_gather_group=true",
+            "dist.create_reduce_scatter_group=true",
+            "dist.high_priority_stream_groups=[dp_cp,ep_dp]",
+            "ddp.nccl_ub=true",
+        }.issubset(shlex.split(command))
 
 
 @pytest.mark.unit

@@ -20,7 +20,7 @@ Qwen3.8-2.4T-A95B 的 HF 配置是纯文本的 `Qwen3_5MoeForCausalLM`（没有 
 - `run_pretrain_fsdp3.sh`：启动一个 case，`--model` 选择模型与对应的 GB200 recipe（`--recipe` 可覆盖）；
 - `benchmark_fsdp3.sh`：对列表选项取笛卡尔积，逐个调用 `run_pretrain_fsdp3.sh`。启动第一个 case 前，所有 case 会先用 `run_pretrain_fsdp3.sh --print-result-dir` 做一遍和真实启动相同的校验；单个 case 失败（例如 OOM）只记录下来，sweep 继续。
 - `benchmark_fsdp3_suite.sh`：原 8 项综合矩阵，使用 GBS=8。
-- `benchmark_fsdp3_all.sh`：按编号串行运行 `01-baseline` 到 `05-nccl` 下的全部实验脚本。各 case 默认锁频到 TDP。
+- `benchmark_fsdp3_all.sh`：按编号串行运行 `01-baseline` 到 `05-nccl` 下的全部实验脚本。
 
 每个实际启动的 case 默认在本节点执行 `nvidia-smi --lock-gpu-clocks=tdp,tdp`。通用启动器、矩阵和编号实验都接受 `--unlock`，在启动前执行 `nvidia-smi --reset-gpu-clocks`。启动账户需具备修改 GPU 频率的权限。设置作用于本节点上 `nvidia-smi` 可见的所有 GPU，并持续到重新设置或重置。结果元数据记录 `gpu_clocks`。对照两种频率模式时，为新的运行指定单独的 `--output-dir`（通用启动器使用 `--results-root`），以免续跑直接复用已完成的 case。
 
@@ -34,7 +34,13 @@ Qwen3.8-2.4T-A95B 的 HF 配置是纯文本的 `Qwen3_5MoeForCausalLM`（没有 
 | `02-comm-overlap` | [01_fsdp3_cp_overlap.sh](02-comm-overlap/01_fsdp3_cp_overlap.sh)、[02_ddp_cp_tp.sh](02-comm-overlap/02_ddp_cp_tp.sh) | FSDP3 在 CP=1/4 内分别比较 AG/RS 共用与独立 communicator。27B 用 full-iteration graph，2.4T 用 eager。DDP + graph 对比 CP4 与 TP4 的通信，并在 TP4 下对照 Transformer Engine TP overlap 的开启与关闭。 |
 | `03-cpu-offload` | [01_weight_offload.sh](03-cpu-offload/01_weight_offload.sh)、[02_cpu_grad_optimizer.sh](03-cpu-offload/02_cpu_grad_optimizer.sh) | 两个模型都在 CP=1 和 CP=4 测权重回载 × AG/RS overlap。固定 CP=1、卸载组件和各模型的 graph 范围，逐项把梯度累加和 AdamW 移到 CPU。 |
 | `04-nvme` | [01_dram_vs_nvme.sh](04-nvme/01_dram_vs_nvme.sh) | eager CPU 累加 + CPU AdamW，比较 DRAM 与 NVMe。默认用 `/tmp/megatron-fsdp3-nvme`，启动前检查默认目录所在设备。可用 `--nvme-path DIR` 或 `NVME_PATH` 指向节点的本地 NVMe 目录。 |
-| `05-nccl` | [01_priority.sh](05-nccl/01_priority.sh)、[02_symmetric_multicast.sh](05-nccl/02_symmetric_multicast.sh)、[03_ag_pause.sh](05-nccl/03_ag_pause.sh) | 27B graph 下的默认/高优先级、AG 和 RS 独立 communicator × symmetric multicast、AG pause 1536/3072/4608 cycles。三脚本默认加载已有的 `nccl/nccl-2.32.3-cta-with-pause/build/lib/libnccl.so.2`。可用 `--nccl-lib FILE` 或 `NCCL_LIB` 覆盖。 |
+| `05-nccl` | [01_priority.sh](05-nccl/01_priority.sh)、[02_symmetric_multicast.sh](05-nccl/02_symmetric_multicast.sh)、[03_ag_pause.sh](05-nccl/03_ag_pause.sh)、[04_adaptive_pause.sh](05-nccl/04_adaptive_pause.sh) | 27B graph 下的 communicator 优先级、独立 AG/RS communicator 与对称 multicast、静态 AG pause 1536/3072/4608 cycles，以及原版 NCCL 与 adaptive pause 对照。 |
+
+`05-nccl` 的前 3 个脚本默认加载 `nccl/nccl-2.32.3-cta-with-pause/build/lib/libnccl.so.2`。可用 `--nccl-lib FILE` 或 `NCCL_LIB` 覆盖。
+
+`04_adaptive_pause.sh` 用 27B dense 的 8 层 BF16 FSDP3 配置比较两个 NCCL 2.32.3 构建。两组都启用 full-iteration CUDA Graph、对称缓冲区，以及各自独立的高优先级 AG 和 RS communicator。每组启动前都解除 GPU 锁频。采集保留带 GPU metrics 的 `.nsys-rep`，关闭 SQLite 导出。
+
+两份库默认位于 `nccl/nccl-2.32.3/build/lib/libnccl.so.2` 和 `nccl/nccl-2.32.3-adaptive-pause/build/lib/libnccl.so.2`。可用 `NCCL_STOCK_LIB` 指定原版路径，用 `--nccl-lib FILE` 或 `NCCL_ADAPTIVE_PAUSE_LIB` 指定 adaptive pause 路径。Adaptive 轮采用库的默认档位，4 卡时 AG 单跑为 1024 cycles，检测到 RS 时为 3072 cycles。构建和 PyTorch 环境见 [adaptive pause 安装说明](../../../../install/README-nccl-2.32.3-adaptive-pause.md)。
 
 `01_cuda_graph.sh` 固定每个模型对照里的首个参数 bucket AG 位置。27B 的 eager 和 full-iteration Graph 都在首个 microbatch 的 forward 发起 embedding AG，两个 case 目录都带 `-forward-ag`。2.4T 的 eager 和 partial Graph 都在 optimizer 尾部发起下一步的首个参数 bucket AG。
 
@@ -50,7 +56,7 @@ bash "$study/benchmark_fsdp3_all.sh" --dry-run
 bash "$study/benchmark_fsdp3_all.sh"
 ```
 
-总入口默认写入 `results/01-analyse/04-fsdp3-comm-tdp/`，加 `--unlock` 时写入 `results/01-analyse/04-fsdp3-comm-unlocked/`。可用 `--output-dir DIR` 覆盖。NVMe 和 NCCL 实验沿用各自默认路径，可通过 `NVME_PATH` 和 `NCCL_LIB` 覆盖。重跑沿用各脚本的续跑规则。单个脚本失败后继续下一个，最终返回非零状态。
+总入口默认写入 `results/01-analyse/04-fsdp3-comm-tdp/`，其中 adaptive pause 对照仍使用动态频率。加 `--unlock` 时所有 case 都解除锁频并写入 `results/01-analyse/04-fsdp3-comm-unlocked/`。可用 `--output-dir DIR` 覆盖。NVMe 路径可通过 `NVME_PATH` 覆盖。重跑沿用各脚本的续跑规则。单个脚本失败后继续下一个，最终返回非零状态。
 
 `02_ddp_cp_tp.sh` 对每个模型依次运行 CP4、TP4、TP4 + overlap。它与 `03_fsdp3.sh` 都会检查 `run_info.txt` 中的 `status=0` 和该模式要求的 trace 文件，跳过已完成的 case。启动器会归档未完成的 `node0/` 并重新测量。
 

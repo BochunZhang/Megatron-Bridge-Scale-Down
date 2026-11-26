@@ -19,6 +19,7 @@ SEQ_LENGTH=""
 DTYPE="${DTYPE:-bf16}"
 PROFILE="${PROFILE:-none}"
 METRIC_FREQUENCY=""
+NSYS_REPORT_ONLY=false
 TENSOR_PARALLEL="1"
 CONTEXT_PARALLEL="1"
 MICRO_BATCH_SIZE="1"
@@ -163,6 +164,7 @@ Options:
                                  into one report. pytorch exports per-rank Chrome traces
                                  under each node's torch_profile directory.
   --nsys                         Alias for --profile nsys
+  --nsys-report-only             Capture the native Nsight Systems report without SQLite export
   --metric [HZ]                  Enable nsys GPU metrics on all GPUs on node 0
                                  (default frequency: 20000 Hz)
   --merge                        With nsys and --cuda-graph on, draw each graph launch
@@ -236,6 +238,7 @@ while [[ $# -gt 0 ]]; do
         --master-port) need_value "$@"; MASTER_PORT="$2"; shift 2;;
         --profile) need_value "$@"; PROFILE="$2"; shift 2;;
         --nsys) PROFILE=nsys; shift;;
+        --nsys-report-only) NSYS_REPORT_ONLY=true; shift;;
         --metric|--metric=*)
             METRIC_FREQUENCY=20000
             if [[ "$1" == --metric=* ]]; then
@@ -743,6 +746,9 @@ if [[ "${PROFILE}" == nsys ]] && (( NODE_RANK == 0 )); then
     COMMAND=(nsys profile --trace=cuda,nvtx --sample=none --cpuctxsw=none --capture-range=cudaProfilerApi --capture-range-end=stop --force-overwrite=true --output="${RESULT_DIR}/${NSYS_NAME}")
     if [[ -n "${METRIC_FREQUENCY}" ]]; then
         COMMAND+=(--gpu-metrics-devices=all --gpu-metrics-frequency="${METRIC_FREQUENCY}")
+    fi
+    if [[ "${NSYS_REPORT_ONLY}" == true ]]; then
+        COMMAND+=(--export=none --stats=false)
     fi
     # nsys draws each graph launch as one opaque block by default (graph, kept by
     # --merge); node tracing records every kernel inside the graph (GEMMs, NCCL,
