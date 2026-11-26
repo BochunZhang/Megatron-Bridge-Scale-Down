@@ -20,6 +20,7 @@ ALL_STUDIES = EXAMPLE / "benchmark_fsdp3_all.sh"
 RUN_ONE = EXAMPLE / "run_pretrain_fsdp3.sh"
 FSDP_STUDY = EXAMPLE / "01-baseline/03_fsdp3.sh"
 DDP_CP_TP_STUDY = EXAMPLE / "02-comm-overlap/02_ddp_cp_tp.sh"
+CP_ADAPTIVE_PAUSE_STUDY = EXAMPLE / "05-nccl/05_cp_adaptive_pause.sh"
 TFLOPS = EXAMPLE.parent / "05-tflops/benchmark_tflops.sh"
 RUN_DATE = "261031-120000"
 
@@ -70,7 +71,7 @@ def test_all_numbered_studies_use_the_requested_gpu_clocks(options: tuple[str, .
     env = {"OUTPUT_DIR": "", "NVME_PATH": "", "NCCL_LIB": ""}
     result = _run(ALL_STUDIES, "--dry-run", *options, **env)
     assert result.returncode == 0, result.stderr
-    studies = sorted(EXAMPLE.glob("[0-9][0-9]-*/[0-9][0-9]_*.sh"))
+    studies = sorted(set(EXAMPLE.glob("[0-9][0-9]-*/[0-9][0-9]_*.sh")) - {CP_ADAPTIVE_PAUSE_STUDY})
     assert studies
     assert [line for line in result.stderr.splitlines() if line.startswith("Study ")] == [
         f"Study {study.relative_to(EXAMPLE)}" for study in studies
@@ -699,9 +700,48 @@ def test_adaptive_pause_study_scales_batch_size_and_node_topology(
 
 
 @pytest.mark.unit
+@pytest.mark.parametrize(("rank", "fixed_gbs"), [(0, ""), (7, "128")])
+def test_cp_adaptive_pause_study_pairs_layouts(tmp_path: Path, rank: int, fixed_gbs: str):
+    result = _run(
+        CP_ADAPTIVE_PAUSE_STUDY,
+        "--dry-run",
+        "--output-dir",
+        str(tmp_path),
+        NODE_RANK=str(rank),
+        MASTER_ADDR="rank0",
+        MASTER_PORT="29501",
+        CP_SWEEP_GBS=fixed_gbs,
+        NCCL_STOCK_LIB="",
+        NCCL_ADAPTIVE_PAUSE_LIB="",
+        LD_PRELOAD="",
+    )
+    assert result.returncode == 0, result.stderr
+    layouts = [(cp, variant) for cp in (4, 8, 16, 32) for variant in ("stock", "adaptive-pause")]
+    for offset, (command, (cp, variant)) in enumerate(zip(_commands(result.stderr), layouts, strict=True)):
+        node_dir = _node_dir(command)
+        gbs = int(fixed_gbs) if fixed_gbs else 128 // cp
+        assert node_dir.name == f"node{rank}"
+        assert f"-seq_{4096 * cp}-cp_{cp}-" in node_dir.parent.name
+        assert f"-gbs_{gbs}-gpus_32-profile_nsys-{variant}-" in node_dir.parent.name
+        assert {
+            "--nproc_per_node=4",
+            "--nnodes=8",
+            f"--node_rank={rank}",
+            f"--master_port={29501 + offset}",
+            f"model.context_parallel_size={cp}",
+            f"train.global_batch_size={gbs}",
+            "train.train_iters=30",
+            "ddp.num_distributed_optimizer_instances=1",
+            "ddp.nccl_ub=true",
+            "dist.create_all_gather_group=true",
+            "dist.create_reduce_scatter_group=true",
+        }.issubset(shlex.split(command))
+
+
+@pytest.mark.unit
 @pytest.mark.parametrize(
     "script",
-    sorted(set(EXAMPLE.glob("[0-9][0-9]-*/[0-9][0-9]_*.sh")) - {DDP_CP_TP_STUDY, FSDP_STUDY}),
+    sorted(set(EXAMPLE.glob("[0-9][0-9]-*/[0-9][0-9]_*.sh")) - {DDP_CP_TP_STUDY, FSDP_STUDY, CP_ADAPTIVE_PAUSE_STUDY}),
     ids=lambda p: p.stem,
 )
 def test_numbered_studies_skip_existing_case_directories(tmp_path: Path, script: Path):

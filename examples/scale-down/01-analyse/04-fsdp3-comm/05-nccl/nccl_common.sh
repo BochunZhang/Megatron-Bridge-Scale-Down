@@ -10,6 +10,7 @@ NCCL_LIB="${NCCL_LIB:-${REPO_ROOT}/${NCCL_DEFAULT_LIB}}"
 NCCL_BUILD=static-pause
 NCCL_CHECKED=""
 NCCL_PRELOAD_SUFFIX=""
+STUDY_CONTEXT_PARALLEL=1
 
 # Replace any NCCL selected by nccl_use and preserve other preloaded libraries.
 IFS=': ' read -r -a inherited_preloads <<< "${LD_PRELOAD:-}"
@@ -88,5 +89,6 @@ run_nccl_case() {
     printf ' %q' "${launcher_env[@]}" "LD_PRELOAD=${nccl_preload}" >&2
     printf '\n' >&2
     local LAUNCHER=("${launcher_env[@]}" "${BENCHMARK_DIR}/run_pretrain_fsdp3.sh")
-    run_case 27b "${name}" 3 on 1 1 1 --override "dist.high_priority_stream_groups=${groups}" "$@"
+    run_case 27b "${name}" 3 on 1 "${STUDY_CONTEXT_PARALLEL}" 1 \
+        --override "dist.high_priority_stream_groups=${groups}" "$@"
 }

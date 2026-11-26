@@ -53,6 +53,20 @@ bash "$study/05-nccl/04_adaptive_pause.sh" --gpu 32
 
 两份库默认位于 `nccl/nccl-2.32.3/build/lib/libnccl.so.2` 和 `nccl/nccl-2.32.3-adaptive-pause/build/lib/libnccl.so.2`。可用 `NCCL_STOCK_LIB` 指定原版路径，用 `--nccl-lib FILE` 或 `NCCL_ADAPTIVE_PAUSE_LIB` 指定 adaptive pause 路径。Adaptive 轮采用库的默认档位，4 卡时 AG 单跑为 1024 cycles，检测到 RS 时为 3072 cycles。构建和 PyTorch 环境见 [adaptive pause 安装说明](../../../../install/README-nccl-2.32.3-adaptive-pause.md)。
 
+### 32 卡 CP 与 adaptive pause 对照
+
+在同一 NVL72 域内的 8 个 4 卡节点上，沿用上一实验的 NCCL 2.32.3 环境和节点变量。各节点从仓库根目录运行以下命令，使用各自的 `NODE_RANK` 或 `RANK`，以及相同的 `MASTER_ADDR` 或 `DLC_MASTER_ADDR`。`MASTER_PORT` 和其后的 7 个端口用于八轮启动。
+
+```bash
+study="$PWD/examples/scale-down/01-analyse/04-fsdp3-comm"
+bash "$study/05-nccl/05_cp_adaptive_pause.sh" \
+  --output-dir "$PWD/results/01-analyse/04-fsdp3-comm/cp-sweep-run01"
+```
+
+每档先跑 stock，再跑 adaptive pause。CP 为 4、8、16、32，序列长度分别为 16K、32K、64K、128K，FSDP 始终按 32 卡分片。默认 GBS 为 32、16、8、4，每卡每步 4 个 microbatch，全局每步 524,288 token。若要沿用 GBS=128，在各节点设置 `CP_SWEEP_GBS=128`。可加 `--dry-run` 检查命令。
+
+每轮跑 30 步，第 8 步在 `node0` 采集 trace。脚本按卡核对 `AllGather_STMC` 和 `ReduceScatter_LDMC`，将内核计数写入 `node0/multimem_check.txt`。使用 `node7/train.log` 第 10–30 步的中位步时计算吞吐，重跑时使用新的共享输出目录。
+
 `01_cuda_graph.sh` 固定每个模型对照里的首个参数 bucket AG 位置。27B 的 eager 和 full-iteration Graph 都在首个 microbatch 的 forward 发起 embedding AG，两个 case 目录都带 `-forward-ag`。2.4T 的 eager 和 partial Graph 都在 optimizer 尾部发起下一步的首个参数 bucket AG。
 
 `01-baseline/02_mbs.sh` 默认以 FSDP1 扫描 MBS=1、2、4。每步累积完梯度后做梯度 RS，optimizer 更新并写回参数后，在同一个 optimizer step 内同步执行参数 AG。使用 `bash "$study/01-baseline/02_mbs.sh" --fsdp 3` 可按原 FSDP3 配置运行相同的 MBS 扫描。结果目录名中的 `fsdp_1` 和 `fsdp_3` 区分两组数据。

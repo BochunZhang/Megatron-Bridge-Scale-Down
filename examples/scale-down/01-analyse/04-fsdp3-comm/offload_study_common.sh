@@ -18,6 +18,7 @@ STUDY_GPUS_PER_NODE=4
 STUDY_NNODES=1
 STUDY_NODE_RANK=0
 STUDY_GBS=16
+STUDY_SEQ_LENGTH=""
 OUTPUT_DIR="${OUTPUT_DIR:-${REPO_ROOT}/results/01-analyse/04-fsdp3-comm}"
 MODELS=(27b 2.4t)
 if [[ "${GROUP}" == 05-nccl ]]; then MODELS=(27b); fi
@@ -107,6 +108,7 @@ run_case() {
     shift 7
     local seq=4096
     if (( tp == 4 || cp == 4 )); then seq=16384; fi
+    seq="${STUDY_SEQ_LENGTH:-${seq}}"
     local model_args=(--num-layers 8)
     if [[ "${model}" == 2.4t ]]; then
         model_args=(--num-layers 4 --num-experts 64 --ep 4 --dispatcher hybridep)
@@ -172,7 +174,12 @@ run_case() {
         if (( STUDY_NNODES > 1 )) || [[ "${RESUME_CASES}" == true ]]; then ACTIVE_CASE_LOCK="${claim_dir}"; fi
     fi
     printf 'case %s\n' "${label}" >&2
-    if ! "${LAUNCHER[@]}" "${args[@]}"; then
+    local run_status=0
+    "${LAUNCHER[@]}" "${args[@]}" || run_status=$?
+    if [[ "${DRY_RUN}" == false ]] && declare -F finish_case >/dev/null; then
+        finish_case "${node_dir}" "${run_status}" || run_status=$?
+    fi
+    if (( run_status != 0 )); then
         if (( STUDY_NNODES == 1 )) && [[ -n "${case_dir}" && "${RESUME_CASES}" == false ]]; then
             rmdir -- "${case_dir}" 2>/dev/null || true
         fi
