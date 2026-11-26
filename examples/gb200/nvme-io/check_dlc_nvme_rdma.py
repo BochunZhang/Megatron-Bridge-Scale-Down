@@ -2,7 +2,7 @@
 # Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
 # Licensed under the Apache License, Version 2.0.
 
-"""Report and save NVMe, RDMA, and GPUDirect Storage diagnostics from a Linux container."""
+"""Automatically test local NVMe GPUDirect Storage and save a container diagnostic report."""
 
 import argparse
 import ctypes as ct
@@ -43,15 +43,47 @@ def _nvme_backing(block: Path) -> set[str]:
     return {namespace for slave in (block / "slaves").glob("*") for namespace in _nvme_backing(slave)}
 
 
+def _path_mount(path: Path) -> tuple[Path, str, str | None] | None:
+    try:
+        resolved = path.resolve(strict=True)
+        descriptor = os.open(resolved, getattr(os, "O_PATH", os.O_RDONLY) | os.O_DIRECTORY)
+    except (OSError, RuntimeError):
+        return None
+    try:
+        device = os.fstat(descriptor).st_dev
+        # A mount ID distinguishes bind mounts sharing the same filesystem device.
+        try:
+            fdinfo = (PROC / "self/fdinfo" / str(descriptor)).read_text()
+        except OSError:
+            fdinfo = ""
+    finally:
+        os.close(descriptor)
+    mount_id = re.search(r"^mnt_id:\s*(\d+)$", fdinfo, re.MULTILINE)
+    return resolved, f"{os.major(device)}:{os.minor(device)}", mount_id[1] if mount_id else None
+
+
 def _show_nvme_mounts(mountinfo: str) -> dict[Path, str]:
     logger.info("NVMe mounts (target  source  filesystem  NVMe namespaces)")
     targets: set[str] = set()
     namespaces: set[str] = set()
     local_mounts: dict[Path, str] = {}
+    tmp_mount = _path_mount(Path("/tmp"))
+    tmp_details = "unavailable"
+    tmp_depth = -1
     for line in mountinfo.rstrip("\n").split("\n"):
         fields, filesystem_info = line.split(" - ", 1)
-        _, _, device, _, target, *_ = fields.split(" ")
-        filesystem, source, _ = filesystem_info.split(" ", 2)
+        mount_id, _, device, _, target, options, *_ = fields.split(" ")
+        filesystem, source, super_options = filesystem_info.split(" ", 2)
+        path = Path(re.sub(r"\\([0-7]{3})", lambda match: chr(int(match[1], 8)), target))
+        if tmp_mount is not None:
+            tmp_path, tmp_device, tmp_id = tmp_mount
+            exact_match = mount_id == tmp_id
+            device_match = tmp_id is None and device == tmp_device and tmp_path.is_relative_to(path)
+            if (exact_match or device_match) and len(path.parts) >= tmp_depth:
+                tmp_depth = len(path.parts)
+                tmp_details = f"target={target} source={source} fstype={filesystem} device={device} options={options}"
+                if filesystem in {"ext4", "xfs"}:
+                    tmp_details += f" super_options={super_options}"
         backing = _nvme_backing(SYSFS / "dev/block" / device)
         # A bind mount can expose an NVMe filesystem without exposing its block node.
         if not backing and source.startswith("/dev/") and (match := NVME_NAMESPACE.fullmatch(source[5:])):
@@ -61,26 +93,20 @@ def _show_nvme_mounts(mountinfo: str) -> dict[Path, str]:
             namespaces.update(backing)
             logger.info("  %s  %s  %s  %s", target, source, filesystem, ", ".join(sorted(backing)))
             if filesystem in {"ext4", "xfs"}:
-                path = re.sub(r"\\([0-7]{3})", lambda match: chr(int(match[1], 8)), target)
-                local_mounts[Path(path)] = device
+                local_mounts[path] = device
     logger.info("nvme_mountpoints=%d", len(targets))
     logger.info("mounted_nvme_namespaces=%d", len(namespaces))
+    logger.info("tmp_mount=%s", tmp_details)
     return local_mounts
 
 
 def _show_filesystem_usage() -> None:
     logger.info("\nFilesystems (df -h)")
-    try:
-        result = subprocess.run(
-            ["df", "-h"], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, errors="replace", check=False
-        )
-    except OSError as error:
-        logger.warning("Cannot run df -h: %s", error)
-        return
-    if result.stdout:
-        logger.info("%s", result.stdout.rstrip("\n"))
-    if result.returncode:
-        logger.warning("df -h exited with status %d", result.returncode)
+    if result := _run_probe(["df", "-h"]):
+        if result.stdout:
+            logger.info("%s", result.stdout.rstrip("\n"))
+        if result.returncode:
+            logger.warning("df -h exited with status %d", result.returncode)
 
 
 def _sysfs_port_links(ib_class: Path) -> list[dict[str, str]]:
@@ -263,44 +289,65 @@ def _show_gds(log_path: Path) -> None:
 
 
 def _gds_probe_dir(mounts: dict[Path, str], requested_dir: Path | None) -> Path | None:
-    candidates = [requested_dir] if requested_dir else [Path("/tmp"), *sorted(mounts)]
     device_ids = set(mounts.values())
+    if not device_ids:
+        return None
+    if requested_dir is not None:
+        candidates = [requested_dir]
+    else:
+        candidates = [Path("/tmp")]
+        if tmpdir := os.environ.get("TMPDIR"):
+            candidates.append(Path(tmpdir))
+        candidates.extend([Path("/var/tmp"), Path("."), *sorted(mounts)])
     for directory in candidates:
-        if not directory.is_dir() or not os.access(directory, os.W_OK | os.X_OK):
-            continue
         try:
+            directory = directory.resolve(strict=True)
+            if not directory.is_dir() or not os.access(directory, os.W_OK | os.X_OK):
+                continue
             device = directory.stat().st_dev
-        except OSError:
+        except (OSError, RuntimeError):
             continue
         if f"{os.major(device)}:{os.minor(device)}" in device_ids:
-            return directory.resolve()
+            return directory
     return None
 
 
-def _show_cufile_probe(log_path: Path, directory: Path | None) -> None:
+def _cufile_verdict(result: subprocess.CompletedProcess[str] | None, *, have_file: bool) -> tuple[str, str]:
+    if result is None:
+        return "blocked", "probe_unavailable"
+    lines = result.stdout.splitlines()
+    if any(line.startswith("cufile_library_load=failed") for line in lines):
+        return "blocked", "libcufile_unavailable"
+    if not any(line.startswith("cufile_driver_open=cuFile:0 ") for line in lines):
+        if any(line.startswith("cufile_driver_open=") for line in lines):
+            return "blocked", "driver_initialization_failed"
+        return "failed", "worker_failed_before_driver_initialization"
+    if result.returncode:
+        return "failed", "read_failed" if have_file else "worker_failed"
+    if not have_file:
+        return "blocked", "no_writable_nvme_target"
+    if f"cufile_read_bytes={GDS_PROBE_BYTES}" not in lines or "cufile_data_match=yes" not in lines:
+        return "failed", "read_integrity_unverified"
+    if "cufile_read_path=direct" in lines:
+        return "passed", "direct_read_verified"
+    if "cufile_read_path=posix" in lines or "cufile_read_path=mixed" in lines:
+        return "failed", "posix_reads_observed"
+    return "unverified", "read_succeeded_without_path_evidence"
+
+
+def _show_cufile_probe(log_path: Path, directory: Path | None) -> tuple[str, str]:
     logger.info("\ncuFile runtime probe (compatibility fallback disabled)")
     library = find_library("cufile")
     logger.info("libcufile lookup: %s", library or "no match")
-    cufile_log = log_path.with_suffix(".cufile-probe.log")
     command = [sys.executable, str(Path(__file__).resolve()), "--_cufile-probe", library or "libcufile.so.0"]
+    verdicts = []
     try:
         with ExitStack() as stack:
             config_dir = Path(
                 stack.enter_context(tempfile.TemporaryDirectory(prefix=".gds-config-", dir=log_path.parent))
             )
             config = config_dir / "cufile.json"
-            config.write_text(
-                json.dumps(
-                    {
-                        "properties": {
-                            "allow_compat_mode": False,
-                            "force_compat_mode": False,
-                            "use_pci_p2pdma": True,
-                        },
-                        "block": {"nvme": {"use_pci_p2pdma": True}},
-                    }
-                )
-            )
+            have_file = False
             if directory is None:
                 logger.info("cuFile read skipped (no writable, verified ext4/XFS NVMe directory)")
             else:
@@ -318,22 +365,56 @@ def _show_cufile_probe(log_path: Path, directory: Path | None) -> None:
                 else:
                     logger.info("cuFile read target: %s (%d bytes)", directory, GDS_PROBE_BYTES)
                     command.append(str(probe_file))
-            env = {
-                **os.environ,
-                "CUFILE_ENV_PATH_JSON": str(config),
-                "CUFILE_ALLOW_COMPAT_MODE": "false",
-                "CUFILE_FORCE_COMPAT_MODE": "false",
-                "CUFILE_USE_PCIP2PDMA": "true",
-                "CUFILE_LOGFILE_PATH": str(cufile_log),
-            }
-            if result := _run_probe(command, env=env):
-                if result.stdout:
-                    logger.info("%s", result.stdout.rstrip("\n"))
-                logger.info("cufile_probe_exit_code=%d", result.returncode)
+                    have_file = True
+            for prefer_p2p, suffix in ((True, ".cufile-probe.log"), (False, ".cufile-probe-nvfs.log")):
+                cufile_log = log_path.with_suffix(suffix)
+                config.write_text(
+                    json.dumps(
+                        {
+                            "properties": {
+                                "allow_compat_mode": False,
+                                "force_compat_mode": False,
+                                "use_pci_p2pdma": prefer_p2p,
+                            },
+                            "block": {"nvme": {"use_pci_p2pdma": prefer_p2p}},
+                            "profile": {"cufile_stats": 3},
+                        }
+                    )
+                )
+                env = {
+                    **os.environ,
+                    "CUFILE_ENV_PATH_JSON": str(config),
+                    "CUFILE_ALLOW_COMPAT_MODE": "false",
+                    "CUFILE_FORCE_COMPAT_MODE": "false",
+                    "CUFILE_USE_PCIP2PDMA": str(prefer_p2p).lower(),
+                    "CUFILE_STATS_LEVEL": "3",
+                    "CUFILE_LOGFILE_PATH": str(cufile_log),
+                    "CUFILE_LOGGING_LEVEL": os.environ.get("CUFILE_LOGGING_LEVEL") or "INFO",
+                }
+                logger.info("cuFile attempt: prefer_pci_p2pdma=%s", env["CUFILE_USE_PCIP2PDMA"])
+                result = _run_probe(command, env=env)
+                if result is not None:
+                    if result.stdout:
+                        logger.info("%s", result.stdout.rstrip("\n"))
+                    logger.info("cufile_probe_exit_code=%d", result.returncode)
+                if cufile_log.is_file():
+                    logger.info("cuFile probe log: %s", cufile_log)
+                verdict = _cufile_verdict(result, have_file=have_file)
+                verdicts.append(verdict)
+                if verdict[0] in {"passed", "unverified"} or verdict[1] in {
+                    "probe_unavailable",
+                    "libcufile_unavailable",
+                    "no_writable_nvme_target",
+                }:
+                    break
     except OSError as error:
         logger.warning("Cannot prepare cuFile probe: %s", error)
-    if cufile_log.is_file():
-        logger.info("cuFile probe log: %s", cufile_log)
+    priority = {"blocked": 0, "failed": 1, "unverified": 2, "passed": 3}
+    return max(
+        verdicts,
+        key=lambda verdict: (priority[verdict[0]], verdict[1] == "no_writable_nvme_target"),
+        default=("blocked", "probe_setup_failed"),
+    )
 
 
 def main() -> int:
@@ -365,6 +446,8 @@ def main() -> int:
         return 1
 
     logger.info("Host: %s", hostname)
+    kernel = os.uname()
+    logger.info("Kernel: %s %s %s", kernel.sysname, kernel.release, kernel.machine)
     nvme_mounts = _show_nvme_mounts(mountinfo)
     _show_rdma_links()
     uverbs = sorted(path.name for path in (DEV / "infiniband").glob("uverbs[0-9]*") if path.is_char_device())
@@ -374,8 +457,12 @@ def main() -> int:
     probe_dir = _gds_probe_dir(nvme_mounts, args.gds_test_dir)
     if args.gds_test_dir is not None and probe_dir is None:
         logger.warning("Requested cuFile target is outside the writable ext4/XFS NVMe mounts: %s", args.gds_test_dir)
-    _show_cufile_probe(log_path, probe_dir)
+    logger.info("gds_nvme_target=%s", probe_dir or "unavailable")
+    status, reason = _show_cufile_probe(log_path, probe_dir)
     _show_filesystem_usage()
+    logger.info("\nGDS test result")
+    logger.info("gds_test_status=%s", status)
+    logger.info("gds_test_reason=%s", reason)
     return 0
 
 
@@ -406,6 +493,93 @@ def _check_cuda(status: int, operation: str) -> None:
 def _check_cufile(status: _CuFileError, operation: str) -> None:
     if status.err:
         raise RuntimeError(f"{operation} failed with cuFile status {status.err}, CUDA status {status.cu_err}")
+
+
+_CUFILE_STATS_ADAPTER = r"""
+#include <cstdint>
+#include <cuda.h>
+#include <cufile.h>
+#if __has_include(<cufile_stats.h>)
+#include <cufile_stats.h>
+#endif
+
+// Let the installed CUDA headers define the size and layout of the stats ABI.
+using GetStats = CUfileError_t (*)(CUfileStatsLevel3_t *);
+extern "C" int snapshot_cufile_reads(GetStats get_stats, uint64_t *counts) {
+    CUfileStatsLevel3_t stats{};
+    const auto result = get_stats(&stats);
+    if (result.err != 0) return result.err;
+    if (stats.num_gpus > sizeof(stats.per_gpu_stats) / sizeof(stats.per_gpu_stats[0])) return -1;
+    for (uint32_t i = 0; i < stats.num_gpus; ++i) {
+        const auto &gpu = stats.per_gpu_stats[i];
+        counts[0] += gpu.n_total_reads;
+        counts[1] += gpu.n_p2p_reads;
+        counts[2] += gpu.n_nvfs_reads;
+        counts[3] += gpu.n_posix_reads;
+    }
+    return 0;
+}
+"""
+
+
+def _cufile_stats_snapshot(
+    cufile: ct.CDLL, cleanup: ExitStack, scratch: Path
+) -> tuple[ct._CFuncPtr, ct._CFuncPtr] | None:
+    try:
+        get_stats = _bind(cufile, "cuFileGetStatsL3", _CuFileError, ct.c_void_p)
+        set_level = _bind(cufile, "cuFileSetStatsLevel", _CuFileError, ct.c_int)
+        start = _bind(cufile, "cuFileStatsStart", _CuFileError)
+        stop = _bind(cufile, "cuFileStatsStop", _CuFileError)
+        compiler = shutil.which("c++")
+        if not compiler:
+            raise RuntimeError("C++ compiler unavailable")
+
+        # dladdr locates the loaded library rather than a potentially different CUDA_HOME.
+        info = (ct.c_void_p * 4)()
+        dladdr = _bind(ct.CDLL(None), "dladdr", ct.c_int, ct.c_void_p, ct.c_void_p)
+        include_flags = []
+        if dladdr(ct.cast(get_stats, ct.c_void_p), ct.byref(info)) and info[0]:
+            installed_library = Path(os.fsdecode(ct.string_at(info[0]))).resolve()
+            for root in installed_library.parents:
+                include = root / "include"
+                if (include / "cufile.h").is_file():
+                    include_flags = ["-I", str(include)]
+                    break
+
+        temp = Path(cleanup.enter_context(tempfile.TemporaryDirectory(prefix="gds-stats-", dir=scratch)))
+        adapter = temp / "stats.so"
+        result = subprocess.run(
+            [compiler, "-std=c++17", "-shared", "-fPIC", *include_flags, "-x", "c++", "-", "-o", str(adapter)],
+            input=_CUFILE_STATS_ADAPTER,
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+        if result.returncode:
+            raise RuntimeError(result.stderr.strip().splitlines()[0] if result.stderr.strip() else "compiler failed")
+        snapshot = _bind(
+            ct.CDLL(str(adapter)), "snapshot_cufile_reads", ct.c_int, ct.c_void_p, ct.POINTER(ct.c_uint64)
+        )
+        _check_cufile(set_level(3), "cuFileSetStatsLevel")
+        _check_cufile(start(), "cuFileStatsStart")
+        cleanup.callback(stop)
+        return snapshot, get_stats
+    except (AttributeError, OSError, RuntimeError, subprocess.SubprocessError) as error:
+        logger.info("cufile_stats_unavailable=%s", error)
+        return None
+
+
+def _cufile_read_counts(stats: tuple[ct._CFuncPtr, ct._CFuncPtr] | None) -> tuple[int, ...] | None:
+    if stats is None:
+        return None
+    snapshot, get_stats = stats
+    counts = (ct.c_uint64 * 4)()
+    status = snapshot(ct.cast(get_stats, ct.c_void_p), counts)
+    if status:
+        logger.info("cufile_stats_unavailable=cuFileGetStatsL3 status %d", status)
+        return None
+    return tuple(counts)
 
 
 def _read_cufile(cufile: ct.CDLL, path: Path, cleanup: ExitStack) -> None:
@@ -454,6 +628,8 @@ def _read_cufile(cufile: ct.CDLL, path: Path, cleanup: ExitStack) -> None:
 
     # Linux aarch64 and x86_64 both have a signed 64-bit off_t.
     read = _bind(cufile, "cuFileRead", ct.c_ssize_t, ct.c_void_p, ct.c_void_p, ct.c_size_t, ct.c_int64, ct.c_int64)
+    stats = _cufile_stats_snapshot(cufile, cleanup, path.parent)
+    before = _cufile_read_counts(stats)
     ct.set_errno(0)
     count = read(file_handle, gpu_pointer, GDS_PROBE_BYTES, 0, 0)
     error_number = ct.get_errno()
@@ -470,6 +646,20 @@ def _read_cufile(cufile: ct.CDLL, path: Path, cleanup: ExitStack) -> None:
         logger.info("cufile_data_match=no")
         raise RuntimeError("cuFileRead data integrity check failed")
     logger.info("cufile_data_match=yes")
+    after = _cufile_read_counts(stats) if before is not None else None
+    mode = "unverified"
+    if before is not None and after is not None:
+        total, p2p, nvfs, posix = (new - old for new, old in zip(after, before))
+        logger.info("cufile_read_counters=total:%d p2p:%d nvfs:%d posix:%d", total, p2p, nvfs, posix)
+        direct = p2p + nvfs
+        if min(total, p2p, nvfs, posix) >= 0 and total > 0:
+            if direct and posix:
+                mode = "mixed"
+            elif posix:
+                mode = "posix"
+            elif direct == total:
+                mode = "direct"
+    logger.info("cufile_read_path=%s", mode)
 
 
 def _cufile_worker(arguments: list[str]) -> int:
