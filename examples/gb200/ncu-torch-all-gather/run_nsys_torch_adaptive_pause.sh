@@ -11,6 +11,9 @@ Samples NVLink RX/TX bytes on all four GPUs at 200000 Hz and runs a matched cont
 
   --gpus LIST       Four numeric GPU indices in CUDA PCI bus order (default: CUDA_VISIBLE_DEVICES or 0,1,2,3)
   --rs-delay-ms N   Delay of the RS stream after the common GPU start gate (default: 1)
+  --base-pause-cycles N  AG pause in both runs when RS is absent (default: NCCL_SYM_AG_STMC_PAUSE_CYCLES or 1024)
+  --rs-pause-cycles N    AG pause during RS in the adaptive run (default: NCCL_SYM_AG_STMC_RS_PAUSE_CYCLES or 3072)
+  --nvlink-peak-gb-s N   Per-GPU, one-way denominator for NVLink percentages (default: 900)
   --nccl-lib PATH   NCCL 2.32.3-adaptive-pause libnccl.so.2
   --nsys PATH       Nsight Systems executable (also NSYS_BIN)
   --output-dir DIR  Default: results/gb200/ncu-torch-all-gather/nsys-adaptive-pause-<time>
@@ -26,6 +29,9 @@ repo_root="$(cd -- "$script_dir/../../.." && pwd)"
 worker="$script_dir/nsys_torch_adaptive_pause.py"
 gpus="${CUDA_VISIBLE_DEVICES:-0,1,2,3}"
 rs_delay_ms=1
+base_pause="${NCCL_SYM_AG_STMC_PAUSE_CYCLES:-1024}"
+adaptive_pause="${NCCL_SYM_AG_STMC_RS_PAUSE_CYCLES:-3072}"
+nvlink_peak_gb_s=900
 nccl_lib="$repo_root/nccl/nccl-2.32.3-adaptive-pause/build/lib/libnccl.so.2"
 nsys_bin="${NSYS_BIN:-$repo_root/NsightSystems-2026.6.1/bin/nsys}"
 if [[ -z "${NSYS_BIN:-}" && ! -x "$nsys_bin" ]]; then
@@ -38,11 +44,14 @@ while (( $# )); do
     case "$1" in
         -h|--help) usage; exit 0 ;;
         --dry-run) dry_run=true; shift ;;
-        --gpus|--rs-delay-ms|--nccl-lib|--nsys|--output-dir)
+        --gpus|--rs-delay-ms|--base-pause-cycles|--rs-pause-cycles|--nvlink-peak-gb-s|--nccl-lib|--nsys|--output-dir)
             [[ -n "${2:-}" && "$2" != --* ]] || die "$1 needs a value"
             case "$1" in
                 --gpus) gpus="$2" ;;
                 --rs-delay-ms) rs_delay_ms="$2" ;;
+                --base-pause-cycles) base_pause="$2" ;;
+                --rs-pause-cycles) adaptive_pause="$2" ;;
+                --nvlink-peak-gb-s) nvlink_peak_gb_s="$2" ;;
                 --nccl-lib) nccl_lib="$2" ;;
                 --nsys) nsys_bin="$2" ;;
                 --output-dir) output_dir="$2" ;;
@@ -60,6 +69,16 @@ for gpu in "${gpu_list[@]}"; do
     (( gpu <= 255 )) || die "--gpus indices must be between 0 and 255"
 done
 [[ "$rs_delay_ms" =~ ^[0-9]+([.][0-9]+)?$ && "$rs_delay_ms" =~ [1-9] ]] || die "--rs-delay-ms must be positive"
+[[ "$nvlink_peak_gb_s" =~ ^[0-9]+([.][0-9]+)?$ && "$nvlink_peak_gb_s" =~ [1-9] ]] \
+    || die "--nvlink-peak-gb-s must be positive"
+# Resolve NCCL's automatic settings for this fixed four-rank test.
+[[ "$base_pause" != -1 ]] || base_pause=1024
+[[ "$adaptive_pause" != -1 ]] || adaptive_pause=3072
+for cycles in "$base_pause" "$adaptive_pause"; do
+    [[ "$cycles" =~ ^(0|[1-9][0-9]{0,9})$ ]] && (( cycles <= 4294967295 )) \
+        || die "pause cycles must be -1 (automatic) or an integer in 0..4294967295"
+done
+(( adaptive_pause > base_pause )) || die "--rs-pause-cycles must exceed --base-pause-cycles in the adaptive run"
 poll_chunks="${NCCL_SYM_AG_STMC_PAUSE_POLL_CHUNKS:-4}"
 
 output_dir="${output_dir:-$repo_root/results/gb200/ncu-torch-all-gather/nsys-adaptive-pause-$(date +%Y%m%d-%H%M%S)}"
@@ -97,7 +116,7 @@ run() {
 }
 
 for mode in adaptive control; do
-    rs_pause=3072
+    rs_pause="$adaptive_pause"
     [[ "$mode" != control ]] || rs_pause=0
     mode_dir="$output_dir/$mode"
     cmd=("$nsys_bin" profile --trace=cuda,nvtx --sample=none --cpuctxsw=none
@@ -108,7 +127,7 @@ for mode in adaptive control; do
         NCCL_NVLS_ENABLE=1 NCCL_WIN_ENABLE=1 NCCL_CUMEM_ENABLE=1 NCCL_SYM_TMA_ENABLE=0
         NCCL_LAUNCH_ORDER_IMPLICIT=1 NCCL_SYM_CE_THRESHOLD=9223372036854775807
         "NCCL_SYM_KERNEL=AllGather:AllGather_STMC;ReduceScatter:ReduceScatter_LDMC"
-        NCCL_SYM_AG_STMC_PAUSE_CYCLES=1024 "NCCL_SYM_AG_STMC_RS_PAUSE_CYCLES=$rs_pause"
+        "NCCL_SYM_AG_STMC_PAUSE_CYCLES=$base_pause" "NCCL_SYM_AG_STMC_RS_PAUSE_CYCLES=$rs_pause"
         "NCCL_SYM_AG_STMC_PAUSE_POLL_CHUNKS=$poll_chunks"
         NCCL_DEBUG=INFO NCCL_DEBUG_SUBSYS=INIT,ENV,TUNING "NCCL_DEBUG_FILE=$mode_dir/nccl-%h-%p.log"
         "ADAPTIVE_PAUSE_NCCL_LIB=$nccl_lib" "LD_PRELOAD=$nccl_lib${LD_PRELOAD:+:$LD_PRELOAD}"
@@ -130,4 +149,5 @@ for mode in adaptive control; do
     run "$nsys_bin" export --type=sqlite --output="$mode_dir/profile.sqlite" "$mode_dir/profile.nsys-rep"
 done
 
-run uv run --no-sync python "$worker" analyse --output-dir "$output_dir" --gpus "$gpus"
+run uv run --no-sync python "$worker" analyse --output-dir "$output_dir" --gpus "$gpus" \
+    --nvlink-peak-gb-s "$nvlink_peak_gb_s"

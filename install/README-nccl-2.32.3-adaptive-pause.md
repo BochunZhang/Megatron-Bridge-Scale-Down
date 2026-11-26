@@ -66,15 +66,36 @@ AG 与 RS 各用一条 CUDA stream，RS 默认在共同 GPU 起跑点后延迟�
 bash examples/gb200/ncu-torch-all-gather/run_nsys_torch_adaptive_pause.sh --gpus 0,1,2,3
 ```
 
-两轮都用同一份 adaptive-pause 库和同样的 AG 单跑档 `1024`。第一轮用 RS 平衡档 `3072`，
-第二轮把 RS 档设为 0 作为对照。`--rs-delay-ms` 可以改变加入时间，
-`NCCL_SYM_AG_STMC_PAUSE_POLL_CHUNKS` 可覆盖默认的 4 tile。用 `--nccl-lib` 和 `--nsys` 指定安装路径。
+两轮都用同一份 adaptive-pause 库和同样的 AG 单跑档，默认 `1024` cycles。`--base-pause-cycles`
+或 `NCCL_SYM_AG_STMC_PAUSE_CYCLES` 可覆盖单跑档。`--rs-pause-cycles` 或 `NCCL_SYM_AG_STMC_RS_PAUSE_CYCLES`
+可覆盖 adaptive 轮的 RS 档，默认 `3072` cycles，须高于单跑档。命令行参数优先，control 轮 RS 档固定为 0。
+`--rs-delay-ms` 可改变加入时间，`NCCL_SYM_AG_STMC_PAUSE_POLL_CHUNKS` 可覆盖默认的 4 tile。
+用 `--nccl-lib` 和 `--nsys` 指定安装路径。
 
 Nsight Systems 需要 GPU 性能计数器权限。每轮用一个会话对四张卡采样，设置为 **200 kHz（标称 5 µs）**，
 采集 NVLink RX/TX 的 request/response user/protocol 字节数。采样分析会检查间隔，发现缺样会报错并保留原始报告。
 
-每轮在 `adaptive/` 或 `control/` 下保存 `profile.nsys-rep`、`profile.sqlite`、`kernel_timing.csv` 和
-`nvlink_by_phase.csv`。分析使用 CUDA kernel 时间戳核对 AG 先开始以及四张卡确实同时执行两个 kernel。
-Adaptive 轮还要求最后一个 RS 比第一个 AG 先结束，顺序不满足时测试返回非零。对照轮也保留相应尾段。
-打开 `adaptive/profile.nsys-rep`，对着 RS 的起止看 NVLink request user data 的三段速率，并对比
-`control/profile.nsys-rep`。Response user data 可用来观察 RS 期间的读取应答。
+分析使用 CUDA kernel 时间戳核对 AG 先开始以及四张卡确实同时执行两个 kernel。Adaptive 轮还要求最后一个
+RS 比第一个 AG 先结束，顺序不满足时测试返回非零。根目录的 `summary.md` 并排展示两轮的整次吞吐和分阶段带宽。
+
+- `kernel_timing.csv` 记录每卡的 kernel 时长和 algbw，AG 用 4 GiB 输出，RS 用 1 GiB 输入。
+  `summary.md` 用每种操作首个 kernel 开始到最后一个结束的跨度计算整次吞吐。
+- `nvlink_phase_summary.csv` 按卡、按阶段汇总 RX/TX GB/s 和占比。同方向的 request/response user/protocol
+  字节速率相加，除以单卡单向峰值。GB200 NVL72 默认用 900 GB/s，可用 `--nvlink-peak-gb-s` 覆盖。
+  RX request user 占比以 RX request 与 response 的 user 字节总量为分母。
+  [GB200 NVLink 规格](https://developer.nvidia.com/blog/nvidia-gb200-nvl72-delivers-trillion-parameter-llm-training-and-real-time-inference)
+- `nvlink_by_phase.csv` 保留单个计数器的速率和采样间隔。`profile.nsys-rep` 保留逐样本时间线，
+  `profile.sqlite` 用于离线重算。
+
+在 `summary.md` 的对照表中，先看 adaptive 轮的 `RX request user` 是否在 RS 重叠期间比 control 轮低，
+再看 RS 完成后是否回升。重叠期间的 `RX response user` 可判断 RS 的读取应答有没有在推进。
+打开 `adaptive/profile.nsys-rep` 可用 RS kernel 的起止对齐这三段，观察降速和恢复的波形。
+这些指标反映流量变化，逐 warp 的切换时刻和实际等待 cycles 需要 GPU 插桩。
+
+已有采集可直接重算。每轮可以提供 `profile.sqlite`，也可以提供旧的 `kernel_timing.csv` 和 `nvlink_by_phase.csv`。
+GPU 列表使用采集时的 rank 顺序。
+
+```bash
+uv run --no-sync python "$PWD/examples/gb200/ncu-torch-all-gather/nsys_torch_adaptive_pause.py" analyse \
+    --output-dir /path/to/existing-capture --gpus 0,1,2,3
+```

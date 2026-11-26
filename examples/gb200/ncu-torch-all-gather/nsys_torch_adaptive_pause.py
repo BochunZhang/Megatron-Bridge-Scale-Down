@@ -10,10 +10,12 @@ import math
 import os
 import sqlite3
 from collections import defaultdict
-from contextlib import closing
+from contextlib import ExitStack, closing
 from functools import partial
 from itertools import pairwise
 from pathlib import Path
+from statistics import mean
+from typing import NamedTuple
 
 
 LOGGER = logging.getLogger(__name__)
@@ -21,6 +23,7 @@ NUM_GPUS = 4
 AG_BYTES = 4 << 30
 RS_BYTES = 1 << 30
 SAMPLE_PERIOD_NS = 5_000
+NVLINK_PEAK_GB_S = 900.0
 METRICS = tuple(
     f"NVLink {direction} {packet} {data} Data"
     for direction in ("RX", "TX")
@@ -36,6 +39,27 @@ JOIN TARGET_INFO_CUDA_DEVICE AS d
 WHERE s.value = :kernel OR s.value GLOB :kernel || '_*'
 ORDER BY d.cudaId
 """
+PhaseRates = dict[tuple[int, str], dict[str, float]]
+
+
+class NvlinkRates(NamedTuple):
+    """Measured byte rates and fractions for one GPU and phase."""
+
+    rx_gb_s: float
+    rx_pct_of_peak: float
+    tx_gb_s: float
+    tx_pct_of_peak: float
+    rx_request_user_gb_s: float
+    rx_response_user_gb_s: float
+    rx_request_share_of_user_pct: float | None
+
+
+class CaptureSummary(NamedTuple):
+    """Collective spans and mean per-GPU rates for a capture."""
+
+    ag_ns: int
+    rs_ns: int
+    phases: dict[str, NvlinkRates]
 
 
 def _check_nccl_library() -> None:
@@ -196,35 +220,60 @@ def _write_csv(path: Path, columns: tuple[str, ...], rows: list[tuple]) -> None:
         writer.writerows(rows)
 
 
-def analyse(mode_dir: Path, gpus: tuple[int, ...], *, adaptive: bool) -> None:
-    """Validate kernel order and summarize every NVLink byte counter for each common phase."""
-    database = mode_dir / "profile.sqlite"
-    with closing(sqlite3.connect(f"{database.resolve().as_uri()}?mode=ro", uri=True)) as conn:
-        ag = _kernels(conn, gpus, kernel="ncclSymkDevKernel_AllGather_STMC")
-        rs = _kernels(conn, gpus, kernel="ncclSymkDevKernel_ReduceScatter_LDMC")
-        _write_csv(
-            mode_dir / "kernel_timing.csv",
-            ("rank", "gpu", "ag_start_ns", "ag_end_ns", "rs_start_ns", "rs_end_ns"),
-            [(rank, gpu, *ag[rank], *rs[rank]) for rank, gpu in enumerate(gpus)],
-        )
-        phases = _phases(ag, rs, adaptive=adaptive)
-        metric_ids = defaultdict(list)
-        for type_id, metric_id, name in conn.execute(
-            "SELECT DISTINCT typeId, metricId, metricName FROM TARGET_INFO_GPU_METRICS"
-        ):
-            name = name.removesuffix(" [Bytes]").removesuffix(" Bytes")
-            metric_ids[type_id & 255, name].append((type_id, metric_id))
+def _read_kernel_timing(path: Path, gpus: tuple[int, ...]) -> tuple[list[tuple[int, int]], list[tuple[int, int]]]:
+    with path.open(newline="", encoding="utf-8") as handle:
+        rows = sorted(csv.DictReader(handle), key=lambda row: int(row["rank"]))
+    if [(int(row["rank"]), int(row["gpu"])) for row in rows] != list(enumerate(gpus)):
+        raise ValueError(f"{path}: expected one timestamp row per rank on GPUs {gpus}")
+    ag = [(int(row["ag_start_ns"]), int(row["ag_end_ns"])) for row in rows]
+    rs = [(int(row["rs_start_ns"]), int(row["rs_end_ns"])) for row in rows]
+    return ag, rs
 
-        window_start = min(start for start, _ in phases.values()) - 2 * SAMPLE_PERIOD_NS
-        window_end = max(end for _, end in phases.values()) + 2 * SAMPLE_PERIOD_NS
-        samples = defaultdict(list)
-        for type_id, metric_id, timestamp, value in conn.execute(
-            "SELECT typeId, metricId, timestamp, value FROM GPU_METRICS "
-            "WHERE timestamp BETWEEN ? AND ? ORDER BY timestamp",
-            (window_start, window_end),
-        ):
-            samples[type_id, metric_id].append((timestamp, value))
 
+def _read_phase_rates(path: Path, gpus: tuple[int, ...], phases: dict[str, tuple[int, int]]) -> PhaseRates:
+    rates = defaultdict(dict)
+    with path.open(newline="", encoding="utf-8") as handle:
+        for row in csv.DictReader(handle):
+            rank, phase, name = int(row["rank"]), row["phase"], row["metric"]
+            window = int(row["start_ns"]), int(row["end_ns"])
+            value = float(row["GB/s"])
+            if (
+                not 0 <= rank < len(gpus)
+                or int(row["gpu"]) != gpus[rank]
+                or phases.get(phase) != window
+                or name not in METRICS
+                or name in rates[rank, phase]
+                or not math.isfinite(value)
+                or value < 0
+            ):
+                raise ValueError(f"{path}: invalid phase rate row {row}")
+            rates[rank, phase][name] = value
+    if any(len(rates[rank, phase]) != len(METRICS) for rank in range(len(gpus)) for phase in phases):
+        raise ValueError(f"{path}: incomplete NVLink metrics for the expected GPUs and phases")
+    return rates
+
+
+def _capture_phase_rates(
+    path: Path, conn: sqlite3.Connection, gpus: tuple[int, ...], phases: dict[str, tuple[int, int]]
+) -> PhaseRates:
+    metric_ids = defaultdict(list)
+    for type_id, metric_id, name in conn.execute(
+        "SELECT DISTINCT typeId, metricId, metricName FROM TARGET_INFO_GPU_METRICS"
+    ):
+        name = name.removesuffix(" [Bytes]").removesuffix(" Bytes")
+        metric_ids[type_id & 255, name].append((type_id, metric_id))
+
+    window_start = min(start for start, _ in phases.values()) - 2 * SAMPLE_PERIOD_NS
+    window_end = max(end for _, end in phases.values()) + 2 * SAMPLE_PERIOD_NS
+    samples = defaultdict(list)
+    for type_id, metric_id, timestamp, value in conn.execute(
+        "SELECT typeId, metricId, timestamp, value FROM GPU_METRICS "
+        "WHERE timestamp BETWEEN ? AND ? ORDER BY timestamp",
+        (window_start, window_end),
+    ):
+        samples[type_id, metric_id].append((timestamp, value))
+
+    rates = defaultdict(dict)
     rows = []
     for rank, gpu in enumerate(gpus):
         for name in METRICS:
@@ -236,13 +285,149 @@ def analyse(mode_dir: Path, gpus: tuple[int, ...], *, adaptive: bool) -> None:
                     rate, count, longest = _phase_rate(samples[ids[0]], start=start, end=end)
                 except ValueError as exc:
                     raise ValueError(f"GPU {gpu}, {phase}, {name}: {exc}") from exc
-                rows.append((rank, gpu, phase, start, end, name, round(rate, 3), count, longest))
+                rates[rank, phase][name] = round(rate, 3)
+                rows.append((rank, gpu, phase, start, end, name, rates[rank, phase][name], count, longest))
     _write_csv(
-        mode_dir / "nvlink_by_phase.csv",
+        path,
         ("rank", "gpu", "phase", "start_ns", "end_ns", "metric", "GB/s", "samples", "max_sample_gap_ns"),
         rows,
     )
+    return rates
+
+
+def _nvlink_totals(rates: dict[str, float], *, peak_gb_s: float) -> NvlinkRates:
+    rx = sum(value for name, value in rates.items() if name.startswith("NVLink RX "))
+    tx = sum(value for name, value in rates.items() if name.startswith("NVLink TX "))
+    requests = rates["NVLink RX Requests User Data"]
+    responses = rates["NVLink RX Responses User Data"]
+    user_share = 100 * requests / (requests + responses) if requests + responses > 0 else None
+    return NvlinkRates(rx, 100 * rx / peak_gb_s, tx, 100 * tx / peak_gb_s, requests, responses, user_share)
+
+
+def analyse(
+    mode_dir: Path, gpus: tuple[int, ...], *, adaptive: bool, peak_gb_s: float = NVLINK_PEAK_GB_S
+) -> CaptureSummary:
+    """Validate kernel order and derive throughput and NVLink utilization from a saved capture."""
+    database = mode_dir / "profile.sqlite"
+    timing_csv = mode_dir / "kernel_timing.csv"
+    phase_csv = mode_dir / "nvlink_by_phase.csv"
+    with ExitStack() as stack:
+        if database.is_file():
+            conn = stack.enter_context(closing(sqlite3.connect(f"{database.resolve().as_uri()}?mode=ro", uri=True)))
+            ag = _kernels(conn, gpus, kernel="ncclSymkDevKernel_AllGather_STMC")
+            rs = _kernels(conn, gpus, kernel="ncclSymkDevKernel_ReduceScatter_LDMC")
+        else:
+            conn = None
+            ag, rs = _read_kernel_timing(timing_csv, gpus)
+        kernel_rows = []
+        for rank, (gpu, (ag_start, ag_end), (rs_start, rs_end)) in enumerate(zip(gpus, ag, rs, strict=True)):
+            ag_ns, rs_ns = ag_end - ag_start, rs_end - rs_start
+            if min(ag_ns, rs_ns) <= 0:
+                raise ValueError(f"GPU {gpu}: invalid kernel duration")
+            kernel_rows.append(
+                (
+                    rank,
+                    gpu,
+                    ag_start,
+                    ag_end,
+                    rs_start,
+                    rs_end,
+                    ag_ns / 1e6,
+                    AG_BYTES / ag_ns,
+                    rs_ns / 1e6,
+                    RS_BYTES / rs_ns,
+                )
+            )
+        _write_csv(
+            timing_csv,
+            (
+                "rank",
+                "gpu",
+                "ag_start_ns",
+                "ag_end_ns",
+                "rs_start_ns",
+                "rs_end_ns",
+                "ag_ms",
+                "ag_algbw_gb_s",
+                "rs_ms",
+                "rs_algbw_gb_s",
+            ),
+            kernel_rows,
+        )
+        phases = _phases(ag, rs, adaptive=adaptive)
+        if conn is None:
+            rates = _read_phase_rates(phase_csv, gpus, phases)
+        else:
+            rates = _capture_phase_rates(phase_csv, conn, gpus, phases)
+
+    _write_csv(
+        mode_dir / "nvlink_phase_summary.csv",
+        ("rank", "gpu", "phase", "start_ns", "end_ns", "peak_one_way_gb_s", *NvlinkRates._fields),
+        [
+            (rank, gpu, phase, start, end, peak_gb_s, *_nvlink_totals(rates[rank, phase], peak_gb_s=peak_gb_s))
+            for rank, gpu in enumerate(gpus)
+            for phase, (start, end) in phases.items()
+        ],
+    )
+    averages = {}
+    for phase in phases:
+        mean_rates = {name: mean(rates[rank, phase][name] for rank in range(len(gpus))) for name in METRICS}
+        averages[phase] = _nvlink_totals(mean_rates, peak_gb_s=peak_gb_s)
+
     LOGGER.info("%s phase spans (ms): %s", mode_dir, {p: round((e - s) / 1e6, 3) for p, (s, e) in phases.items()})
+    ag_span = max(end for _, end in ag) - min(start for start, _ in ag)
+    rs_span = max(end for _, end in rs) - min(start for start, _ in rs)
+    return CaptureSummary(ag_span, rs_span, averages)
+
+
+def _write_summary(path: Path, captures: dict[str, CaptureSummary], errors: list[str], *, peak_gb_s: float) -> None:
+    lines = [
+        "# Adaptive pause comparison",
+        "",
+        "Throughput is the full tensor size divided by the span from the first kernel start to the last completion.",
+        "",
+        "| Run | AG ms | AG algbw (GB/s) | RS ms | RS algbw (GB/s) |",
+        "| --- | ---: | ---: | ---: | ---: |",
+    ]
+    for mode, capture in captures.items():
+        ag_ns, rs_ns = capture.ag_ns, capture.rs_ns
+        lines.append(
+            f"| {mode} | {ag_ns / 1e6:.3f} | {AG_BYTES / ag_ns:.2f} | {rs_ns / 1e6:.3f} | {RS_BYTES / rs_ns:.2f} |"
+        )
+    lines += [
+        "",
+        f"NVLink phase means are per GPU. RX and TX each use {peak_gb_s:g} GB/s as 100%.",
+        "",
+        "| Run | Phase | RX GB/s | RX % | TX GB/s | TX % | RX request user GB/s | RX response user GB/s | Request % of RX user |",
+        "| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
+    ]
+    for mode, capture in captures.items():
+        for phase, rates in capture.phases.items():
+            values = " | ".join(f"{value:.2f}" if value is not None else "—" for value in rates)
+            lines.append(f"| {mode} | {phase} | {values} |")
+    if "adaptive" in captures and "control" in captures:
+        adaptive = captures["adaptive"].phases
+        control = captures["control"].phases
+        overlap = adaptive["ag_rs_overlap"]
+        control_overlap = control["ag_rs_overlap"]
+        lines += [
+            "",
+            "## What changed after RS started",
+            "",
+            f"- RX request user bandwidth in the adaptive run is "
+            f"{adaptive['ag_before_rs'].rx_request_user_gb_s:.2f} GB/s before RS, "
+            f"{overlap.rx_request_user_gb_s:.2f} GB/s during RS and "
+            f"{adaptive['ag_after_rs'].rx_request_user_gb_s:.2f} GB/s after RS.",
+            f"- During overlap, adaptive minus control is "
+            f"{overlap.rx_request_user_gb_s - control_overlap.rx_request_user_gb_s:+.2f} GB/s RX request user and "
+            f"{overlap.rx_response_user_gb_s - control_overlap.rx_response_user_gb_s:+.2f} GB/s RX response user.",
+            "",
+            "Lower request traffic than the control during overlap and recovery after RS ends support a pause effect.",
+            "Response user traffic shows RS read replies. The Nsight report provides the per-sample timeline.",
+        ]
+    if errors:
+        lines += ["", "## Capture checks", "", *(f"- {error}" for error in errors)]
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
 def main() -> None:
@@ -255,19 +440,38 @@ def main() -> None:
     analysis = commands.add_parser("analyse")
     analysis.add_argument("--output-dir", type=Path, required=True)
     analysis.add_argument("--gpus", required=True)
+    analysis.add_argument("--nvlink-peak-gb-s", type=float, default=NVLINK_PEAK_GB_S)
     args = parser.parse_args()
     if args.command == "benchmark":
         if not math.isfinite(args.rs_delay_ms) or args.rs_delay_ms <= 0:
             parser.error("--rs-delay-ms must be finite and positive")
         benchmark(args.rs_delay_ms)
     else:
-        gpus = tuple(int(index) for index in args.gpus.split(","))
+        if not math.isfinite(args.nvlink_peak_gb_s) or args.nvlink_peak_gb_s <= 0:
+            parser.error("--nvlink-peak-gb-s must be finite and positive")
+        if not args.output_dir.is_dir():
+            parser.error(f"capture directory does not exist: {args.output_dir}")
+        try:
+            gpus = tuple(int(index) for index in args.gpus.split(","))
+        except ValueError:
+            parser.error("--gpus must contain four comma-separated GPU indices")
+        if len(set(gpus)) != NUM_GPUS or len(gpus) != NUM_GPUS or any(not 0 <= gpu <= 255 for gpu in gpus):
+            parser.error("--gpus must contain four distinct GPU indices in 0..255")
+        captures = {}
+        errors = []
         for mode in ("adaptive", "control"):
             mode_dir = args.output_dir / mode
             try:
-                analyse(mode_dir, gpus, adaptive=(mode == "adaptive"))
-            except (sqlite3.Error, ValueError) as exc:
-                parser.exit(1, f"{mode_dir}: {exc}\n")
+                captures[mode] = analyse(
+                    mode_dir, gpus, adaptive=(mode == "adaptive"), peak_gb_s=args.nvlink_peak_gb_s
+                )
+            except (OSError, sqlite3.Error, ValueError, KeyError) as exc:
+                errors.append(f"{mode_dir}: {exc}")
+        summary_path = args.output_dir / "summary.md"
+        _write_summary(summary_path, captures, errors, peak_gb_s=args.nvlink_peak_gb_s)
+        LOGGER.info("Adaptive pause report written to %s", summary_path)
+        if errors:
+            parser.exit(1, "\n".join(errors) + "\n")
 
 
 if __name__ == "__main__":
