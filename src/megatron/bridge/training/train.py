@@ -19,6 +19,7 @@ import sys
 import time
 from collections import deque
 from datetime import datetime, timedelta
+from functools import wraps
 from typing import Any, Callable, Optional, Union
 
 import torch
@@ -37,6 +38,7 @@ from megatron.core.optimizer.distrib_optimizer import DistributedOptimizer
 from megatron.core.optimizer.qk_clip import clip_qk
 from megatron.core.optimizer_param_scheduler import OptimizerParamScheduler
 from megatron.core.parallel_state import update_pg_timeout
+from megatron.core.pipeline_parallel import fine_grained_activation_offload
 from megatron.core.pipeline_parallel.p2p_communication import P2PCommunicator
 from megatron.core.pipeline_parallel.schedules import (
     forward_backward_pipelining_without_interleaving,
@@ -122,6 +124,27 @@ except ImportError:
     HAS_OPTIMIZER_CUDA_GRAPH = False
 
 
+def _release_activation_aio_on_train_exit(train_fn: Callable[..., None]) -> Callable[..., None]:
+    @wraps(train_fn)
+    def wrapped(
+        forward_step_func: ForwardStepCallable, model: list[MegatronModule], *args: Any, **kwargs: Any
+    ) -> None:
+        release = getattr(fine_grained_activation_offload, "release_layer_by_layer_activation_aio", None)
+        if release is None or not model:
+            return train_fn(forward_step_func, model, *args, **kwargs)
+        model_chunk = model[0]
+        model_config = get_model_config(model_chunk)
+        if getattr(model_config, "layer_by_layer_activation_nvme_backend", None) != "deepspeed":
+            return train_fn(forward_step_func, model, *args, **kwargs)
+        try:
+            return train_fn(forward_step_func, model, *args, **kwargs)
+        finally:
+            release(model_chunk)
+
+    return wrapped
+
+
+@_release_activation_aio_on_train_exit
 def train(
     forward_step_func: ForwardStepCallable,
     model: list[MegatronModule],
