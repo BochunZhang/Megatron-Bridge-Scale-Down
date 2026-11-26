@@ -5,7 +5,6 @@
 NCCL_DEFAULT_LIB="${NCCL_DEFAULT_LIB:-nccl/nccl-2.32.3-cta-with-pause/build/lib/libnccl.so.2}"
 # shellcheck source=../offload_study_common.sh
 source "$(dirname "${BASH_SOURCE[0]}")/../offload_study_common.sh" "$@"
-STUDY_SCRIPT="${BASH_SOURCE[1]##*/}"
 
 NCCL_LIB="${NCCL_LIB:-${REPO_ROOT}/${NCCL_DEFAULT_LIB}}"
 NCCL_BUILD=static-pause
@@ -78,6 +77,9 @@ run_nccl_case() {
     fi
     if [[ "${NCCL_BUILD}" != static-pause ]]; then
         launcher_env+=(NCCL_WIN_ENABLE=1)
+    fi
+    if (( STUDY_NNODES > 1 )); then
+        launcher_env+=(NCCL_MNNVL_ENABLE=1)
     fi
     if [[ "${NCCL_BUILD}" == adaptive-pause ]]; then
         launcher_env+=(NCCL_SYM_AG_STMC_RS_PAUSE_CYCLES=-1 NCCL_SYM_AG_STMC_PAUSE_POLL_CHUNKS=4)

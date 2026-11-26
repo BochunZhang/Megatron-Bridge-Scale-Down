@@ -633,6 +633,7 @@ def test_adaptive_pause_study_compares_matched_nccl_builds(tmp_path: Path):
         NCCL_LIB="static-pause/libnccl.so.2",
         NCCL_STOCK_LIB="",
         NCCL_ADAPTIVE_PAUSE_LIB="",
+        GPUS_PER_NODE="",
         LD_PRELOAD="",
     )
     assert result.returncode == 0, result.stderr
@@ -652,11 +653,48 @@ def test_adaptive_pause_study_compares_matched_nccl_builds(tmp_path: Path):
             "--stats=false",
             "qwen35_text_27b_pretrain_4gpu_gb200_bf16_fsdp1_config",
             "model.num_layers=8",
+            "--nproc_per_node=4",
+            "train.global_batch_size=16",
             "ddp.data_parallel_sharding_strategy=optim_grads_params",
             "dist.create_all_gather_group=true",
             "dist.create_reduce_scatter_group=true",
             "dist.high_priority_stream_groups=[dp_cp,ep_dp]",
             "ddp.nccl_ub=true",
+        }.issubset(shlex.split(command))
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(("gpu", "rank", "nnodes", "gbs"), [(32, 0, 8, 128), (64, 15, 16, 256)])
+def test_adaptive_pause_study_scales_batch_size_and_node_topology(
+    tmp_path: Path, gpu: int, rank: int, nnodes: int, gbs: int
+):
+    result = _run(
+        EXAMPLE / "05-nccl/04_adaptive_pause.sh",
+        "--gpu",
+        str(gpu),
+        "--dry-run",
+        "--output-dir",
+        str(tmp_path),
+        MASTER_ADDR="rank0",
+        MASTER_PORT="29511",
+        RANK=str(rank),
+        GPUS_PER_NODE="",
+        LD_PRELOAD="",
+    )
+    assert result.returncode == 0, result.stderr
+    assert result.stderr.count("num_microbatches=4 ") == 2
+    assert result.stderr.count("NCCL_MNNVL_ENABLE=1") == 2
+    for command, port in zip(_commands(result.stderr), (29511, 29512), strict=True):
+        assert _node_dir(command).name == f"node{rank}"
+        assert f"-gbs_{gbs}-gpus_{gpu}-" in _node_dir(command).parent.name
+        assert {
+            "--nproc_per_node=4",
+            f"--nnodes={nnodes}",
+            f"--node_rank={rank}",
+            "--master_addr=rank0",
+            f"--master_port={port}",
+            f"train.global_batch_size={gbs}",
+            "ddp.data_parallel_sharding_strategy=optim_grads_params",
         }.issubset(shlex.split(command))
 
 

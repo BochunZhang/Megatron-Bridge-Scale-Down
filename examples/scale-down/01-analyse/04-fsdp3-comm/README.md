@@ -26,7 +26,7 @@ Qwen3.8-2.4T-A95B 的 HF 配置是纯文本的 `Qwen3_5MoeForCausalLM`（没有 
 
 ### FSDP3 offload 专项实验
 
-以下五组在一台 4 卡 GB200 上运行。固定 BF16、full attention、GBS=16、27B 裁剪 8 层、2.4T 裁剪 4 层和 64 experts。默认 MBS=1，只有 `02_mbs.sh` 扫描 1、2、4。TP=CP=1 用 seq=4096，CP=4 或 TP=4 用 seq=16384。编号脚本默认采集 Nsight Systems CUDA/NVTX trace，`03_fsdp3.sh` 额外运行无 profiler 和 PyTorch Profiler 对照。Nsight 轮关闭 GPU metrics。
+以下五组默认在一台 4 卡 GB200 上运行，GBS=16。固定 BF16、full attention、27B 裁剪 8 层、2.4T 裁剪 4 层和 64 experts。默认 MBS=1，只有 `02_mbs.sh` 扫描 1、2、4。TP=CP=1 用 seq=4096，CP=4 或 TP=4 用 seq=16384。编号脚本默认采集 Nsight Systems CUDA/NVTX trace，`03_fsdp3.sh` 额外运行无 profiler 和 PyTorch Profiler 对照。Adaptive pause 对照额外采集 GPU metrics。
 
 | 组 | 脚本 | 对照 |
 | --- | --- | --- |
@@ -40,13 +40,24 @@ Qwen3.8-2.4T-A95B 的 HF 配置是纯文本的 `Qwen3_5MoeForCausalLM`（没有 
 
 `04_adaptive_pause.sh` 用 27B dense 的 8 层 BF16 FSDP3 配置比较两个 NCCL 2.32.3 构建。两组都启用 full-iteration CUDA Graph、对称缓冲区，以及各自独立的高优先级 AG 和 RS communicator。每组启动前都解除 GPU 锁频。采集保留带 GPU metrics 的 `.nsys-rep`，关闭 SQLite 导出。
 
+`--gpu N` 选择训练总卡数，默认 4。两组都按 DP=N 分片，MBS=1，每步 4 个 microbatch，因此 32 卡用 GBS=128，64 卡用 GBS=256。每节点默认 4 卡，可用 `GPUS_PER_NODE` 指定，节点数由总卡数除以每节点卡数得到。
+
+在同一 NVL72 域内，每个节点使用各自的 `NODE_RANK`（或 `RANK`）和同一个 `MASTER_ADDR`（或 `DLC_MASTER_ADDR`），从仓库根目录执行以下命令。64 卡时将 `--gpu 32` 改为 `--gpu 64`。
+
+```bash
+study=examples/scale-down/01-analyse/04-fsdp3-comm
+bash "$study/05-nccl/04_adaptive_pause.sh" --gpu 32
+```
+
+多节点自动开启 MNNVL，两轮依次使用 `MASTER_PORT`（默认 29501）和下一个端口。每节点写自己的 `nodeN/`，只在 `node0/` 采集报告。多节点重跑时给各节点传入同一个新的 `--output-dir`。
+
 两份库默认位于 `nccl/nccl-2.32.3/build/lib/libnccl.so.2` 和 `nccl/nccl-2.32.3-adaptive-pause/build/lib/libnccl.so.2`。可用 `NCCL_STOCK_LIB` 指定原版路径，用 `--nccl-lib FILE` 或 `NCCL_ADAPTIVE_PAUSE_LIB` 指定 adaptive pause 路径。Adaptive 轮采用库的默认档位，4 卡时 AG 单跑为 1024 cycles，检测到 RS 时为 3072 cycles。构建和 PyTorch 环境见 [adaptive pause 安装说明](../../../../install/README-nccl-2.32.3-adaptive-pause.md)。
 
 `01_cuda_graph.sh` 固定每个模型对照里的首个参数 bucket AG 位置。27B 的 eager 和 full-iteration Graph 都在首个 microbatch 的 forward 发起 embedding AG，两个 case 目录都带 `-forward-ag`。2.4T 的 eager 和 partial Graph 都在 optimizer 尾部发起下一步的首个参数 bucket AG。
 
 `01-baseline/02_mbs.sh` 默认以 FSDP1 扫描 MBS=1、2、4。每步累积完梯度后做梯度 RS，optimizer 更新并写回参数后，在同一个 optimizer step 内同步执行参数 AG。使用 `bash "$study/01-baseline/02_mbs.sh" --fsdp 3` 可按原 FSDP3 配置运行相同的 MBS 扫描。结果目录名中的 `fsdp_1` 和 `fsdp_3` 区分两组数据。
 
-从仓库根目录运行。默认结果根目录为 `results/01-analyse/04-fsdp3-comm/`。所有编号脚本使用 `<组名>/<小项目>/model_<配置>/node0/`。小项目名取脚本名去掉 `.sh` 并将下划线换成连字符。编号实验省略时间戳，`01-baseline` 省略 `-baseline`，其余组在 case 目录名中保留用于区分实验变体的标签。
+从仓库根目录运行。默认结果根目录为 `results/01-analyse/04-fsdp3-comm/`。编号脚本使用 `<组名>/<小项目>/model_<配置>/nodeN/`，单节点为 `node0/`。小项目名取脚本名去掉 `.sh` 并将下划线换成连字符。编号实验省略时间戳，`01-baseline` 省略 `-baseline`，其余组在 case 目录名中保留用于区分实验变体的标签。
 
 在同一台 4 卡 GB200 节点上运行全部编号实验：
 

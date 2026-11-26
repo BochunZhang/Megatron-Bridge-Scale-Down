@@ -10,6 +10,14 @@ REPO_ROOT="$(cd "${BENCHMARK_DIR}/../../../.." && pwd)"
 STUDY_DIR="$(cd "$(dirname "${BASH_SOURCE[1]}")" && pwd)"
 GROUP="${STUDY_DIR##*/}"
 STUDY_SCRIPT="${BASH_SOURCE[1]##*/}"
+if [[ "${STUDY_SCRIPT}" == nccl_common.sh ]]; then
+    STUDY_SCRIPT="${BASH_SOURCE[2]##*/}"
+fi
+STUDY_GPUS=4
+STUDY_GPUS_PER_NODE=4
+STUDY_NNODES=1
+STUDY_NODE_RANK=0
+STUDY_GBS=16
 OUTPUT_DIR="${OUTPUT_DIR:-${REPO_ROOT}/results/01-analyse/04-fsdp3-comm}"
 MODELS=(27b 2.4t)
 if [[ "${GROUP}" == 05-nccl ]]; then MODELS=(27b); fi
@@ -30,7 +38,7 @@ fail() { echo "$*" >&2; exit 2; }
 
 while (( $# )); do
     case "$1" in
-        --model|--output-dir|--nvme-path|--nccl-lib|--fsdp|--profile|--torch-thread)
+        --model|--output-dir|--nvme-path|--nccl-lib|--fsdp|--profile|--torch-thread|--gpu|--gpus)
             [[ -n "${2:-}" && "$2" != --* ]] || fail "Missing value for $1"
             case "$1" in
                 --model)
@@ -38,6 +46,11 @@ while (( $# )); do
                     [[ "${GROUP}" != 05-nccl || "$2" == 27b ]] || fail "05-nccl uses only the 27b model"
                     MODELS=("$2");;
                 --output-dir) OUTPUT_DIR="$2";;
+                --gpu|--gpus)
+                    [[ "${STUDY_SCRIPT}" == 04_adaptive_pause.sh ]] || fail "$1 applies to 04_adaptive_pause.sh"
+                    [[ "$2" =~ ^[1-9][0-9]*$ ]] && (( $2 >= 3 )) ||
+                        fail "$1 requires at least 3 GPUs for symmetric multicast"
+                    STUDY_GPUS="$2";;
                 --torch-thread)
                     [[ "$2" =~ ^[1-9][0-9]*$ ]] || fail "--torch-thread must be a positive integer"
                     TORCH_THREADS="$2";;
@@ -70,6 +83,11 @@ while (( $# )); do
             if [[ "${STUDY_SCRIPT}" == 02_mbs.sh ]]; then
                 echo '  --fsdp 1|3    MBS sweep sharding level (default: 1, synchronous parameter AG in optimizer step)'
             fi
+            if [[ "${STUDY_SCRIPT}" == 04_adaptive_pause.sh ]]; then
+                echo '  --gpu N      Total GPUs (default 4). GBS is four times the GPU count.'
+                echo '               For multiple nodes, set NODE_RANK (or RANK) and MASTER_ADDR.'
+                echo '               GPUS_PER_NODE defaults to 4, capped at the requested GPU count.'
+            fi
             case "${GROUP}" in
                 02-comm-overlap) echo '  --profile nsys|pytorch    Capture Nsight Systems (default) or per-rank PyTorch traces for HTA';;
                 04-nvme) echo '  --nvme-path DIR    Directory on local NVMe (default: /tmp/megatron-fsdp3-nvme, or set NVME_PATH)';;
@@ -96,13 +114,14 @@ run_case() {
     local script_name="${STUDY_SCRIPT%.sh}"
     local result_group="${GROUP}/${script_name//_/-}"
     local result_args=(--stable-result-dir)
-    if [[ "${RESUME_CASES}" == true ]]; then result_args+=(--resume); fi
+    if (( STUDY_NNODES == 1 )) && [[ "${RESUME_CASES}" == true ]]; then result_args+=(--resume); fi
     if [[ -n "${name}" ]]; then
         result_args+=(--run-name "${name}")
     fi
     local args=("${model_args[@]}"
-        --model "${model}" --full --dtype bf16 --gpu 4 --nproc-per-node 4 --nnodes 1 --node-rank 0
-        --gbs 16 --mbs "${mbs}" --seq "${seq}" --tp "${tp}" --cp "${cp}" --fsdp "${fsdp}" --cuda-graph "${graph}"
+        --model "${model}" --full --dtype bf16 --gpu "${STUDY_GPUS}" --nproc-per-node "${STUDY_GPUS_PER_NODE}"
+        --nnodes "${STUDY_NNODES}" --node-rank "${STUDY_NODE_RANK}" --gbs "${STUDY_GBS}"
+        --mbs "${mbs}" --seq "${seq}" --tp "${tp}" --cp "${cp}" --fsdp "${fsdp}" --cuda-graph "${graph}"
         --profile "${STUDY_PROFILE}" --train-iters 10 --profile-start 7 --profile-end 8
         --results-root "${OUTPUT_DIR}/${result_group}" "${result_args[@]}" "$@")
     [[ "${UNLOCK_GPU_CLOCKS}" == true ]] && args+=(--unlock)
@@ -125,14 +144,18 @@ run_case() {
             printf '%s\n' "${case_dir}"
             return 0
         fi
-        # Resumable cases need a separate claim so an incomplete result can be retried.
+        # Multi-node cases share a result root and each node claims its own directory.
         claim_dir="${case_dir}"
         local skip_reason=existing
-        if [[ "${RESUME_CASES}" == true ]]; then
+        if (( STUDY_NNODES > 1 )); then
+            [[ ! -e "${node_dir}" ]] || fail "Result already exists at ${node_dir}; use a fresh --output-dir on all nodes"
+            claim_dir="${node_dir}.lock"
+        elif [[ "${RESUME_CASES}" == true ]]; then
             claim_dir="${case_dir}.lock"
             skip_reason=active
         fi
         if [[ -d "${claim_dir}" ]]; then
+            (( STUDY_NNODES == 1 )) || fail "Another process is using ${node_dir}"
             printf 'skip %s case: %s\n' "${skip_reason}" "${case_dir}" >&2
             return 0
         fi
@@ -142,14 +165,15 @@ run_case() {
         mkdir -p -- "${claim_dir%/*}"
         if ! mkdir -- "${claim_dir}" 2>/dev/null; then
             [[ -d "${claim_dir}" ]] || fail "Cannot create case claim: ${claim_dir}"
+            (( STUDY_NNODES == 1 )) || fail "Another process is using ${node_dir}"
             printf 'skip %s case: %s\n' "${skip_reason}" "${case_dir}" >&2
             return 0
         fi
-        if [[ "${RESUME_CASES}" == true ]]; then ACTIVE_CASE_LOCK="${claim_dir}"; fi
+        if (( STUDY_NNODES > 1 )) || [[ "${RESUME_CASES}" == true ]]; then ACTIVE_CASE_LOCK="${claim_dir}"; fi
     fi
     printf 'case %s\n' "${label}" >&2
     if ! "${LAUNCHER[@]}" "${args[@]}"; then
-        if [[ -n "${case_dir}" && "${RESUME_CASES}" == false ]]; then
+        if (( STUDY_NNODES == 1 )) && [[ -n "${case_dir}" && "${RESUME_CASES}" == false ]]; then
             rmdir -- "${case_dir}" 2>/dev/null || true
         fi
         printf 'failed %s\n' "${label}" >&2
