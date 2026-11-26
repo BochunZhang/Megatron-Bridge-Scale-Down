@@ -136,6 +136,7 @@ microbatches=4
 model_name="model_27b-lbl-schedule-layers_${layers}-attn_full-cg_off-mbs_1-seq_4096-tp_1-cp_1"
 model_name+="-gbs_$((microbatches * world_size))-gpus_${world_size}"
 if [[ "${case_08}" == true ]]; then
+    case_name+="-${world_size}-gpus-${node_count}-nodes"
     model_name+="-nodes_${node_count}"
 fi
 model_name+="-param_${parameter_tier}-act_${activation_tier}-opt_${optimizer_tier}-iters_${train_iters}-profile_${profile}"

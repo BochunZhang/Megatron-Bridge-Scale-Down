@@ -167,7 +167,7 @@ bash "$study/08_param_cpu_act_nvme_opt_cpu_overlap.sh" \
   --node-rank "$NODE_RANK" --master-addr "$MASTER_ADDR" --master-port "${MASTER_PORT:-29500}"
 ```
 
-Add `--dry-run` to inspect the local command and `--print-result-dir` to see the path. The run above includes `gpus_4-nodes_4` in both the model output directory and the Nsight report name. Each tray prints `df -h`, disk space for its scratch directory, `ip addr`, and host memory from `free -h` before training, and saves the output in its `nodeN/host_info.txt`. Check the aggregate loss, optimizer steps, placement, and peak HBM in `node0/summary.csv`. Each tray's `run_info.txt` should show `status=0`. TensorBoard is written on the last tray.
+Add `--dry-run` to inspect the local command and `--print-result-dir` to see the path. The run above writes under `results/02-layer-by-layer/01-baseline/08-param-cpu-act-nvme-opt-cpu-overlap-4-gpus-4-nodes/`. The model directory and Nsight report names also include `gpus_4-nodes_4`. Each tray prints `df -h`, disk space for its scratch directory, `ip addr`, and host memory from `free -h` before training, and saves the output in its `nodeN/host_info.txt`. Check the aggregate loss, optimizer steps, placement, and peak HBM in `node0/summary.csv`. Each tray's `run_info.txt` should show `status=0`. TensorBoard is written on the last tray.
 
 ## Running and profiling the numbered cases
 

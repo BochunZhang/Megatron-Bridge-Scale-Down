@@ -82,7 +82,10 @@ def test_layer_by_layer_baseline_dry_run(
     result = subprocess.run([*args, "--print-result-dir"], env=env, check=True, capture_output=True, text=True)
     result_path = Path(result.stdout.strip())
     assert result_path.name == "node0"
-    assert result_path.parent.parent == results_root / "01-baseline" / case.replace("_", "-")
+    case_dir = case.replace("_", "-")
+    if case == CASE_08:
+        case_dir += "-4-gpus-1-nodes"
+    assert result_path.parent.parent == results_root / "01-baseline" / case_dir
     assert result_path.parent.name.startswith("model_27b-lbl-schedule-")
     report = Path(next(arg.removeprefix("--output=") for arg in command if arg.startswith("--output=")))
     assert report.parent == result_path
@@ -184,7 +187,8 @@ def test_case_08_uses_selected_gpus_per_tray(
     result_path = Path(result.stdout.strip())
     assert result_path.name == f"node{node_rank}"
     assert f"-gbs_{4 * world_size}-gpus_{world_size}-nodes_{node_count}-" in result_path.parent.name
-    assert result_path.parent.parent == results / "01-baseline" / "08-param-cpu-act-nvme-opt-cpu-overlap"
+    case_dir = f"{CASE_08.replace('_', '-')}-{world_size}-gpus-{node_count}-nodes"
+    assert result_path.parent.parent == results / "01-baseline" / case_dir
     report = Path(next(arg.removeprefix("--output=") for arg in command if arg.startswith("--output=")))
     assert report.parent == result_path
     assert f"-dp_{world_size}-gpus_{world_size}-nodes_{node_count}-" in report.name
