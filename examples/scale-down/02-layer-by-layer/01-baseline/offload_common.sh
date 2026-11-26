@@ -24,6 +24,8 @@ if [[ "${case_name}" == 08-param-cpu-act-nvme-opt-cpu-overlap ]]; then
     case_08=true
 fi
 node_count=1
+gpu_per_node=4
+use_gpu_per_node=""
 node_rank=""
 master_addr=""
 master_port=""
@@ -32,15 +34,19 @@ fail() { printf '%s\n' "$*" >&2; exit 2; }
 
 while (( $# )); do
     case "$1" in
-        --gpu|--node|--node-rank|--master-addr|--master-port)
+        --gpu-per-node|--node|--use-gpu-per-node)
+            [[ "${case_08}" == true ]] || fail "$1 is only supported by case 08"
+            [[ "${2:-}" =~ ^[1-9][0-9]*$ ]] || fail "$1 must be a positive integer"
+            case "$1" in
+                --gpu-per-node) gpu_per_node="$2";;
+                --node) node_count="$2";;
+                --use-gpu-per-node) use_gpu_per_node="$2";;
+            esac
+            shift 2;;
+        --node-rank|--master-addr|--master-port)
             [[ "${case_08}" == true ]] || fail "$1 is only supported by case 08"
             [[ -n "${2:-}" && "$2" != --* ]] || fail "Missing value for $1"
             case "$1" in
-                --gpu)
-                    [[ "$2" == 4 ]] || fail "Case 08 uses 4 GPUs total";;
-                --node)
-                    [[ "$2" == 1 || "$2" == 4 ]] || fail "--node must be 1 or 4 for case 08"
-                    node_count="$2";;
                 --node-rank) node_rank="$2";;
                 --master-addr) master_addr="$2";;
                 --master-port) master_port="$2";;
@@ -84,14 +90,15 @@ Run an 8-layer Qwen3.5-27B full-attention case on one four-GPU node by default.
 HELP
             if [[ "${case_08}" == true ]]; then
                 cat <<'HELP'
-  --gpu 4               Total GPU count (default: 4)
-  --node 1|4            Compute tray count (default: 1). Use GPU 0 per tray with --node 4.
+  --gpu-per-node N      Available GPUs per compute tray (default: 4)
+  --node N              Compute tray count (default: 1)
+  --use-gpu-per-node N  Use the first N GPUs per tray in PCI bus order (default: --gpu-per-node)
+  Case 08 uses /tmp for local NVMe scratch unless --nvme or NVME_PATH is set.
 
-With --node 4:
-  --node-rank N         Tray rank, 0 through 3 (or NODE_RANK / RANK)
+With multiple trays:
+  --node-rank N         Zero-based tray rank (or NODE_RANK / RANK)
   --master-addr HOST    Address of tray 0 (or MASTER_ADDR / DLC_MASTER_ADDR)
   --master-port PORT    Rendezvous port (or MASTER_PORT, default: 29500)
-  Set --nvme or NVME_PATH to this tray's local NVMe scratch directory.
 HELP
             fi
             exit 0;;
@@ -105,29 +112,31 @@ if [[ "${overlap_cpu_optimizer}" == true ]]; then
         fail "--overlap-cpu-optimizer requires CPU or NVMe weights and the CPU optimizer tier with GraceAdam"
 fi
 
-if [[ "${node_count}" == 4 ]]; then
+use_gpu_per_node="${use_gpu_per_node:-${gpu_per_node}}"
+(( use_gpu_per_node <= gpu_per_node )) || fail "--use-gpu-per-node cannot exceed --gpu-per-node"
+world_size=$((node_count * use_gpu_per_node))
+
+if (( node_count > 1 )); then
     node_rank="${node_rank:-${NODE_RANK:-${RANK:-}}}"
     master_addr="${master_addr:-${MASTER_ADDR:-${DLC_MASTER_ADDR:-}}}"
     master_port="${master_port:-${MASTER_PORT:-29500}}"
     if [[ "${dry_run}" == true || "${print_result_dir}" == true ]]; then
         node_rank="${node_rank:-0}"
         master_addr="${master_addr:-<rank0-host>}"
-        nvme_path="${nvme_path:-/local/nvme}"
     fi
-    [[ "${node_rank}" =~ ^[0-3]$ ]] || fail "Set --node-rank or NODE_RANK to a tray rank from 0 to 3"
-    if [[ "${print_result_dir}" == false ]]; then
-        [[ -n "${master_addr}" ]] || fail "Set --master-addr or MASTER_ADDR to the address of tray 0"
-        [[ -n "${nvme_path}" ]] || fail "Set --nvme or NVME_PATH to this tray's local NVMe directory"
-    fi
+    [[ "${node_rank}" =~ ^(0|[1-9][0-9]*)$ ]] && (( node_rank < node_count )) ||
+        fail "Set --node-rank or NODE_RANK to a tray rank from 0 to $((node_count - 1))"
+    [[ -n "${master_addr}" ]] || fail "Set --master-addr or MASTER_ADDR to the address of tray 0"
 elif [[ "${case_08}" == true ]]; then
-    [[ -z "${node_rank}${master_addr}${master_port}" ]] || fail "Rendezvous options require --node 4"
-    nvme_path="${nvme_path:-/tmp}"
+    [[ -z "${node_rank}${master_addr}${master_port}" ]] || fail "Rendezvous options require multiple nodes"
 fi
 
 [[ "${output_dir}" == /* ]] || output_dir="${PWD}/${output_dir}"
-model_name="model_27b-lbl-schedule-layers_${layers}-attn_full-cg_off-mbs_1-seq_4096-tp_1-cp_1-gbs_16-gpus_4"
-if [[ "${node_count}" == 4 ]]; then
-    model_name+="-nodes_4"
+microbatches=4
+model_name="model_27b-lbl-schedule-layers_${layers}-attn_full-cg_off-mbs_1-seq_4096-tp_1-cp_1"
+model_name+="-gbs_$((microbatches * world_size))-gpus_${world_size}"
+if [[ "${case_08}" == true ]]; then
+    model_name+="-nodes_${node_count}"
 fi
 model_name+="-param_${parameter_tier}-act_${activation_tier}-opt_${optimizer_tier}-iters_${train_iters}-profile_${profile}"
 result_dir="${output_dir%/}/01-baseline/${case_name}/${model_name}/node${node_rank:-0}"
@@ -137,7 +146,7 @@ if [[ "${print_result_dir}" == true ]]; then
 fi
 
 args=(--single-case-layout --results-dir "${result_dir}"
-    --layers "${layers}" --seq-length 4096 --micro-batch-size 1 --microbatches 4
+    --layers "${layers}" --seq-length 4096 --micro-batch-size 1 --microbatches "${microbatches}"
     --steps "${train_iters}" --parameter-tier "${parameter_tier}" --activation-tier "${activation_tier}"
     --optimizer-tier "${optimizer_tier}"
     --cpu-optimizer "${cpu_optimizer}"
@@ -146,7 +155,10 @@ args=(--single-case-layout --results-dir "${result_dir}"
 [[ "${dry_run}" == true ]] && args+=(--dry-run)
 [[ -z "${nvme_path}" ]] || args+=(--nvme-dir "${nvme_path}")
 [[ -z "${cpu_threads}" ]] || args+=(--cpu-threads "${cpu_threads}")
-if [[ "${node_count}" == 4 ]]; then
+if [[ "${case_08}" == true ]]; then
+    args+=(--nnodes "${node_count}" --gpu-per-node "${gpu_per_node}" --use-gpu-per-node "${use_gpu_per_node}")
+fi
+if (( node_count > 1 )); then
     args+=(--node-rank "${node_rank}" --master-addr "${master_addr}" --master-port "${master_port}")
 fi
 

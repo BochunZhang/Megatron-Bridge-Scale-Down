@@ -1,6 +1,6 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
-"""Run layer-by-layer training with four GPU ranks."""
+"""Run layer-by-layer training on GB200."""
 
 import argparse
 import csv
@@ -25,7 +25,7 @@ from launch_network import resolve_network
 
 _LOG = logging.getLogger(__name__)
 _REPO = Path(__file__).resolve().parents[3]
-_WORLD_SIZE = 4
+_DEFAULT_GPUS_PER_NODE = 4
 _NSYS_VERSION = "2026.6.1"
 _PLACEMENTS = ("gpu", "cpu", "nvme")
 _EXAMPLE_DIR = "examples/scale-down/02-layer-by-layer"
@@ -223,8 +223,11 @@ def _arguments() -> argparse.Namespace:
     parser.add_argument(
         "--single-case-layout", action="store_true", help="use node-level files for one depth"
     )
-    parser.add_argument("--node-rank", type=int, choices=range(_WORLD_SIZE), help="tray rank in a four-node case")
-    parser.add_argument("--master-addr", help="rendezvous host in a four-node case")
+    parser.add_argument("--nnodes", type=_positive, default=1, help="number of compute trays")
+    parser.add_argument("--gpu-per-node", type=_positive, help="available GPUs per compute tray")
+    parser.add_argument("--use-gpu-per-node", type=_positive, help="GPUs to use on each compute tray")
+    parser.add_argument("--node-rank", type=int, help="zero-based tray rank")
+    parser.add_argument("--master-addr", help="rendezvous host in a multi-node case")
     parser.add_argument("--master-port", type=_positive, default=29500)
     parser.add_argument("--prepare-case", type=Path, help=argparse.SUPPRESS)
     parser.add_argument(
@@ -251,10 +254,26 @@ def _arguments() -> argparse.Namespace:
         parser.error("--single-case-layout requires exactly one depth and --results-dir")
     if args.prepare_case and not args.single_case_layout:
         parser.error("--prepare-case requires --single-case-layout")
-    if args.node_rank is not None and (
-        not args.single_case_layout or not args.master_addr or args.master_port > 65535
-    ):
-        parser.error("--node-rank requires --single-case-layout, --master-addr, and --master-port in [1, 65535]")
+    if args.gpu_per_node is None:
+        if args.nnodes > 1 or args.use_gpu_per_node is not None:
+            parser.error("a custom GPU topology requires --gpu-per-node")
+        args.nproc_per_node = _DEFAULT_GPUS_PER_NODE
+        args.cuda_visible_devices = None
+    else:
+        if not args.single_case_layout:
+            parser.error("--gpu-per-node requires --single-case-layout")
+        args.nproc_per_node = args.use_gpu_per_node or args.gpu_per_node
+        if args.nproc_per_node > args.gpu_per_node:
+            parser.error("--use-gpu-per-node cannot exceed --gpu-per-node")
+        args.cuda_visible_devices = ",".join(str(gpu) for gpu in range(args.nproc_per_node))
+    args.world_size = args.nnodes * args.nproc_per_node
+    if args.nnodes > 1:
+        if args.node_rank is None or not 0 <= args.node_rank < args.nnodes:
+            parser.error("multi-node cases require 0 <= --node-rank < --nnodes")
+        if not args.master_addr or args.master_port > 65535:
+            parser.error("multi-node cases require --master-addr and --master-port in [1, 65535]")
+    elif args.node_rank is not None or args.master_addr is not None:
+        parser.error("rendezvous options require multiple nodes")
     if args.profile == "nsys":
         if args.profile_start is None:
             args.profile_start = min(7, args.steps - 1)
@@ -291,18 +310,19 @@ def _check_nsys_version() -> str:
 def _profile_report(args: argparse.Namespace, layers: int, results: Path) -> Path:
     model = "qwen35_tiny" if args.tiny else "qwen35_27b"
     seq = f"{args.seq_length // 1024}k" if args.seq_length % 1024 == 0 else str(args.seq_length)
-    gbs = args.micro_batch_size * args.microbatches * _WORLD_SIZE
+    gbs = args.micro_batch_size * args.microbatches * args.world_size
+    topology = f"-gpus_{args.world_size}-nodes_{args.nnodes}" if args.gpu_per_node is not None else ""
     overlap = "-opt_overlap" if args.overlap_cpu_optimizer else ""
     return results / (
-        f"{model}-lbl-layers_{layers}-attn_full-bf16-cg_off-tp_1-cp_1-pp_1-dp_{_WORLD_SIZE}"
+        f"{model}-lbl-layers_{layers}-attn_full-bf16-cg_off-tp_1-cp_1-pp_1-dp_{args.world_size}{topology}"
         f"-mbs_{args.micro_batch_size}-gbs_{gbs}-seq_{seq}-iters_{args.steps}"
         f"-param_{args.parameter_tier}-act_{args.activation_tier}-opt_{args.optimizer_tier}{overlap}.nsys-rep"
     )
 
 
-def _numa_worker(*, single_rank_per_node: bool) -> tuple[str, list[str]]:
-    # numarun assumes at least one local worker per CPU socket.
-    if single_rank_per_node:
+def _numa_worker(args: argparse.Namespace) -> tuple[str, list[str]]:
+    # Keep the existing numarun mapping for one full four-GPU tray.
+    if args.nnodes > 1 or args.nproc_per_node != _DEFAULT_GPUS_PER_NODE:
         return "inherited", []
     if shutil.which("numarun"):
         return "numarun", ["numarun"]
@@ -326,19 +346,21 @@ def _command(
     )
     config_path = report.parent / ("config.yaml" if args.single_case_layout else f"layers-{layers}.config.yaml")
     tensorboard_dir = report.parent / ("tensorboard" if args.single_case_layout else f"layers-{layers}.tensorboard")
-    multi_node = args.node_rank is not None
-    _, numa_wrapper = _numa_worker(single_rank_per_node=multi_node)
-    torchrun_topology = ["--standalone", "--nnodes=1", f"--nproc-per-node={_WORLD_SIZE}"]
-    gpu_env = []
-    if multi_node:
-        torchrun_topology = [
-            f"--nnodes={_WORLD_SIZE}",
-            "--nproc-per-node=1",
+    _, numa_wrapper = _numa_worker(args)
+    torchrun_topology = [f"--nnodes={args.nnodes}", f"--nproc-per-node={args.nproc_per_node}"]
+    if args.nnodes > 1:
+        torchrun_topology += [
             f"--node-rank={args.node_rank}",
             f"--master-addr={args.master_addr}",
             f"--master-port={args.master_port}",
         ]
-        gpu_env = ["CUDA_DEVICE_ORDER=PCI_BUS_ID", "CUDA_VISIBLE_DEVICES=0"]
+    else:
+        torchrun_topology.append("--standalone")
+    gpu_env = (
+        ["CUDA_DEVICE_ORDER=PCI_BUS_ID", f"CUDA_VISIBLE_DEVICES={args.cuda_visible_devices}"]
+        if args.cuda_visible_devices is not None
+        else []
+    )
     worker_env = []
     if args.optimizer_backend is not None:
         worker_env = ["env", f"OMP_NUM_THREADS={args.cpu_threads}", "OMP_DYNAMIC=FALSE", "OMP_PROC_BIND=FALSE"]
@@ -364,7 +386,7 @@ def _command(
         "model.linear_attention_freq=1",
         f"dataset.seq_length={args.seq_length}",
         f"train.micro_batch_size={args.micro_batch_size}",
-        f"train.global_batch_size={args.micro_batch_size * args.microbatches * _WORLD_SIZE}",
+        f"train.global_batch_size={args.micro_batch_size * args.microbatches * args.world_size}",
         f"train.train_iters={args.steps}",
         f"layer_by_layer.parameter_tier={args.parameter_tier}",
         f"layer_by_layer.activation_tier={args.activation_tier}",
@@ -396,6 +418,9 @@ def _command(
                 f"profiling.profile_step_end={args.profile_end}",
             )
         )
+        if args.gpu_per_node is not None:
+            # The recipe defaults to ranks 0-3. Every tray needs a capture at larger world sizes.
+            command.append("profiling.profile_ranks=[]")
         if args.optimizer_tier == "cpu" and args.optimizer_backend == "grace_adam":
             command.append("profiling.nvtx_ranges=true")
         command = [
@@ -436,6 +461,7 @@ def _read_result(
     optimizer_backend: str | None,
     overlap_cpu_optimizer: bool,
     expect_result: bool,
+    world_size: int,
 ) -> dict:
     result = {
         "layers": layers,
@@ -488,7 +514,7 @@ def _read_result(
         metrics.get("schedule") == "layer_by_layer"
         and metrics.get("parameter_backend") == "megatron_fsdp"
         and metrics.get("fsdp_strategy") == "optim_grads_params"
-        and metrics.get("world_size") == _WORLD_SIZE
+        and metrics.get("world_size") == world_size
         and isinstance(offload, list)
         and all(isinstance(component, str) for component in offload)
         and sorted(offload) == expected_offload
@@ -522,9 +548,30 @@ def _read_result(
             parameter_backend=metrics["parameter_backend"],
             fsdp_strategy=metrics["fsdp_strategy"],
             fsdp_cpu_offload=",".join(expected_offload),
-            world_size=_WORLD_SIZE,
+            world_size=world_size,
         )
     return result
+
+
+def _host_info(nvme_dir: Path | None) -> str:
+    commands = [["df", "-h"]]
+    if nvme_dir is not None:
+        commands.append(["df", "-h", "--", str(nvme_dir)])
+    commands.extend((["ip", "addr"], ["free", "-h"]))
+    lines = [f"Host: {socket.gethostname()}"]
+    for command in commands:
+        lines.append(f"\n$ {shlex.join(command)}")
+        try:
+            result = subprocess.run(
+                command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, errors="replace", check=False
+            )
+        except OSError as exc:
+            lines.append(str(exc))
+            continue
+        lines.append(result.stdout.rstrip())
+        if result.returncode:
+            lines.append(f"Exit status: {result.returncode}")
+    return "\n".join(lines) + "\n"
 
 
 def _write_launch(
@@ -535,7 +582,6 @@ def _write_launch(
     nsys_version: str | None,
     source_metadata: dict[str, str | None],
 ) -> None:
-    multi_node = args.node_rank is not None
     launch = {
         "model": "Qwen/Qwen3.5-27B",
         "recipe": _RECIPE,
@@ -546,22 +592,23 @@ def _write_launch(
         "tiny": args.tiny,
         "schedule": "layer_by_layer",
         "fully_sharded": True,
-        "data_parallel_size": _WORLD_SIZE,
+        "data_parallel_size": args.world_size,
         "pipeline_model_parallel_size": 1,
         "tensor_model_parallel_size": 1,
         "context_parallel_size": 1,
         "seq_length": args.seq_length,
         "micro_batch_size": args.micro_batch_size,
-        "global_batch_size": args.micro_batch_size * args.microbatches * _WORLD_SIZE,
+        "global_batch_size": args.micro_batch_size * args.microbatches * args.world_size,
         "num_microbatches": args.microbatches,
         "train_iters": args.steps,
-        "gpu_count": _WORLD_SIZE,
-        "nnodes": _WORLD_SIZE if multi_node else 1,
-        "node_rank": args.node_rank if multi_node else 0,
-        "nproc_per_node": 1 if multi_node else _WORLD_SIZE,
+        "gpu_count": args.world_size,
+        "gpu_per_node": args.gpu_per_node,
+        "nnodes": args.nnodes,
+        "node_rank": args.node_rank or 0,
+        "nproc_per_node": args.nproc_per_node,
         "host": socket.gethostname(),
-        "cuda_visible_devices": "0" if multi_node else os.environ.get("CUDA_VISIBLE_DEVICES"),
-        "numa_mode": _numa_worker(single_rank_per_node=multi_node)[0],
+        "cuda_visible_devices": args.cuda_visible_devices or os.environ.get("CUDA_VISIBLE_DEVICES"),
+        "numa_mode": _numa_worker(args)[0],
         "parameter_tier": args.parameter_tier,
         "activation_tier": args.activation_tier,
         "optimizer_tier": args.optimizer_tier,
@@ -639,6 +686,7 @@ def _collect_case(args: argparse.Namespace, layers: int, results: Path, log_path
         optimizer_backend=args.optimizer_backend,
         overlap_cpu_optimizer=args.overlap_cpu_optimizer,
         expect_result=args.node_rank in (None, 0),
+        world_size=args.world_size,
     )
     if args.profile == "nsys" and case["status"] in ("passed", "worker_completed"):
         report = _profile_report(args, layers, results)
@@ -685,6 +733,9 @@ def _prepare_case(
     state = {
         "results": str(results),
         "layers": layers,
+        "nnodes": args.nnodes,
+        "gpu_per_node": args.gpu_per_node,
+        "world_size": args.world_size,
         "node_rank": args.node_rank,
         "steps": args.steps,
         "microbatches": args.microbatches,
@@ -709,6 +760,9 @@ def _finish_case(state_dir: Path, returncode: int) -> int:
     state = json.loads((state_dir / "case.json").read_text(encoding="utf-8"))
     state.setdefault("node_rank", None)
     state.setdefault("overlap_cpu_optimizer", False)
+    state.setdefault("gpu_per_node", None)
+    state.setdefault("nnodes", 1)
+    state.setdefault("world_size", _DEFAULT_GPUS_PER_NODE)
     args = argparse.Namespace(single_case_layout=True, **state)
     results = Path(args.results)
     case = _collect_case(args, args.layers, results, results / "train.log", returncode)
@@ -738,13 +792,15 @@ def main() -> int:
     if nvme_dir is not None and not nvme_dir.is_dir():
         _LOG.error("NVMe directory does not exist: %s", nvme_dir)
         return 2
+    host_info = None
+    if args.gpu_per_node is not None:
+        host_info = _host_info(nvme_dir)
+        _LOG.info("%s", host_info.rstrip())
     try:
         lm_dir = _installed_megatron_lm()
         nsys_version = _check_nsys_version() if args.profile == "nsys" else None
         worker_overrides = (
-            resolve_network(os.environ, multi_node=args.node_rank is not None)
-            if args.single_case_layout or nsys_version
-            else {}
+            resolve_network(os.environ, multi_node=args.nnodes > 1) if args.single_case_layout or nsys_version else {}
         )
     except RuntimeError as exc:
         _LOG.error("%s", exc)
@@ -766,6 +822,8 @@ def main() -> int:
     else:
         results = args.results_dir.resolve()
         results.mkdir(parents=True, exist_ok=False)
+    if host_info is not None:
+        (results / "host_info.txt").write_text(host_info, encoding="utf-8")
 
     bridge_revision = subprocess.check_output(
         ["git", "rev-parse", "HEAD"], cwd=_REPO, text=True

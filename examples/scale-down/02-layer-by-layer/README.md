@@ -18,7 +18,7 @@ git switch v0.6.0-scale-down
 git pull --ff-only origin v0.6.0-scale-down
 ```
 
-The capacity launchers use Bridge's configured CUDA environment through `uv run --no-sync` and the native scheduler and Megatron-FSDP from the installed Megatron-LM checkout. The default is one GB200 node with four CUDA/NCCL ranks. Case 08 also supports four GB200 trays with one rank per tray. Set `PYTHON` to use an explicit interpreter with that same environment configuration.
+The capacity launchers use Bridge's configured CUDA environment through `uv run --no-sync` and the native scheduler and Megatron-FSDP from the installed Megatron-LM checkout. The default is one GB200 node with four CUDA/NCCL ranks. Case 08 also supports selecting GPUs on each of multiple GB200 trays. Set `PYTHON` to use an explicit interpreter with that same environment configuration.
 
 If the environment resolves the older pinned submodule, put the updated sibling checkout first on the Python import path from the Bridge root.
 
@@ -147,37 +147,37 @@ Results go under `results/02-layer-by-layer/01-baseline/07-param-nvme-act-nvme-o
 
 ## 8-layer CPU parameters and NVMe activations
 
-Case 08 uses the CPU parameter and GraceAdam overlap settings from case 05 with the NVMe activation path from case 07. The model still uses eight decoder layers, sequence length 4096, GBS 16, and 10 steps by default. By default it uses all four GPUs on one tray and the shared scratch root `/tmp`. Pass `--nvme DIR` or set `NVME_PATH` to select another local NVMe directory. Activation reads and writes are synchronous. GraceAdam updates can overlap later backward work.
+Case 08 uses the CPU parameter and GraceAdam overlap settings from case 05 with the NVMe activation path from case 07. The test uses eight decoder layers, sequence length 4096, four microbatches per rank, and 10 steps by default. Activation reads and writes are synchronous. GraceAdam updates can overlap later backward work.
 
 ```bash
 study=examples/scale-down/02-layer-by-layer/01-baseline
 bash "$study/08_param_cpu_act_nvme_opt_cpu_overlap.sh" --dry-run
 ```
 
-Use `--gpu 4 --node 4` for four trays with four ranks total. The launcher uses only GPU 0 in PCI bus order on each tray. Each rank uses its own tray's NVMe for saved activations.
+Set `--gpu-per-node` to the available GPUs on each tray (default 4) and `--node` to the number of trays (default 1). Set `--use-gpu-per-node N` to select the first `N` local GPUs in PCI bus order. It defaults to `--gpu-per-node`. The total rank count is `node × use-gpu-per-node`, and GBS is four times that count.
 
-Prepare the same Megatron-LM layer-by-layer sources, patched DeepSpeed CPUAdam, and `megatron_nvme_aio` environment on all four trays. Before launching, check `findmnt --target "$NVME_PATH"` on each tray and verify the path is backed by that tray's local NVMe. Reserve the device for the test. Pass that directory with `--nvme` or `NVME_PATH`. Each launcher creates and removes its own scratch directory.
+Prepare the same Megatron-LM layer-by-layer sources, patched DeepSpeed CPUAdam, and `megatron_nvme_aio` environment on all trays. NVMe scratch defaults to `/tmp` on each tray. Pass `--nvme DIR` or set `NVME_PATH` to override it. Before launching, verify the chosen directory is backed by that tray's local NVMe. Each launcher creates and removes its own scratch directory.
 
-Run this command once on each tray, with `NODE_RANK` set to 0, 1, 2, or 3 and the same reachable tray-0 `MASTER_ADDR` and `MASTER_PORT` across trays.
+To run on GPU 0 of each of four trays, launch once per tray with `NODE_RANK` set to 0, 1, 2, or 3 and the same reachable tray-0 `MASTER_ADDR` and `MASTER_PORT`. On trays with one available GPU, use `--gpu-per-node 1` with the same `--node 4 --use-gpu-per-node 1` for world size 4.
 
 ```bash
 study=examples/scale-down/02-layer-by-layer/01-baseline
-bash "$study/08_param_cpu_act_nvme_opt_cpu_overlap.sh" --gpu 4 --node 4 \
-  --node-rank "$NODE_RANK" --master-addr "$MASTER_ADDR" --master-port "${MASTER_PORT:-29500}" \
-  --nvme "$NVME_PATH"
+bash "$study/08_param_cpu_act_nvme_opt_cpu_overlap.sh" \
+  --gpu-per-node 4 --node 4 --use-gpu-per-node 1 \
+  --node-rank "$NODE_RANK" --master-addr "$MASTER_ADDR" --master-port "${MASTER_PORT:-29500}"
 ```
 
-Add `--dry-run` to inspect the local command. For a repeat, use a fresh `--output-dir` on every tray. The four-tray run adds `-nodes_4` to the model output directory name and keeps per-tray logs and Nsight reports in `node0/` through `node3/`. Check the aggregate loss, optimizer steps, placement, and peak HBM in `node0/summary.csv`. All four `run_info.txt` files should show `status=0`, with `case_status=passed` on node 0 and `case_status=worker_completed` on nodes 1–3. TensorBoard is written on node 3.
+Add `--dry-run` to inspect the local command and `--print-result-dir` to see the path. The run above includes `gpus_4-nodes_4` in both the model output directory and the Nsight report name. Each tray prints `df -h`, disk space for its scratch directory, `ip addr`, and host memory from `free -h` before training, and saves the output in its `nodeN/host_info.txt`. Check the aggregate loss, optimizer steps, placement, and peak HBM in `node0/summary.csv`. Each tray's `run_info.txt` should show `status=0`. TensorBoard is written on the last tray.
 
 ## Running and profiling the numbered cases
 
-The numbered scripts select the experiment settings and call `run_pretrain_layer_by_layer.sh`. That Bash launcher wraps each local torchrun agent in Nsight Systems and runs Bridge's `scripts/training/run_recipe.py --recipe qwen35_text_27b_pretrain_4gpu_gb200_bf16_layer_by_layer_config --mode pretrain --dataset mock` on each rank. Bridge calls the layer-by-layer schedule through its normal training step. Single-tray runs use the same NUMA selection order as the FSDP3 study. The four-tray run inherits the CPU affinity on each tray.
+The numbered scripts select the experiment settings and call `run_pretrain_layer_by_layer.sh`. That Bash launcher wraps each local torchrun agent in Nsight Systems and runs Bridge's `scripts/training/run_recipe.py --recipe qwen35_text_27b_pretrain_4gpu_gb200_bf16_layer_by_layer_config --mode pretrain --dataset mock` on each rank. Bridge calls the layer-by-layer schedule through its normal training step. Single-tray runs using four GPUs use the same NUMA selection order as the FSDP3 study. Other case 08 topologies inherit the CPU affinity on each tray.
 
 The cases use Nsight Systems **2026.6.1** to capture CUDA, NVTX, and system-wide CPU thread scheduling. System-wide scheduling requires Linux perf access. Expand a training process in the timeline to inspect when its threads run on the CPU. CPU call-stack sampling and GPU metrics sampling are disabled. The default window is iteration 8 (step 7, zero-based). With `--train-iters 3`, capture covers iteration 3. The launcher checks `NsightSystems-2026.6.1/bin/nsys` under the Bridge repository root or the executable set through `NSYS_BIN`. Use `--profile none` for an unprofiled run. [Nsight Systems CLI reference](https://docs.nvidia.com/nsight-systems/UserGuide/)
 
 The eight-layer baseline uses outer NVTX ranges `forward.embedding`, `forward.transformer.0` through `forward.transformer.7`, and `forward.output`. Each contains `fwd.microbatch.{mb}.{stage}` ranges, such as `fwd.microbatch.0.transformer.0`. Backward uses `backward.output`, `backward.transformer.7` through `backward.transformer.0`, and `backward.embedding`. Decoder checkpoint replay has separate `recompute.microbatch.{mb}.transformer.{layer}` ranges. The `bwd.microbatch.{mb}.{stage}` ranges track gradient work through autograd hooks. Decoder and output ranges end when their stage-input gradient is ready. Embedding ranges end when the grouped backward completes because token IDs have no gradient and weight-gradient accumulation is shared. Microbatch ranges can overlap. Microbatch and decoder layer indices are zero-based.
 
-On each node the launcher checks IPv4 addresses on up interfaces. It honors valid `GLOO_SOCKET_IFNAME` and `NCCL_SOCKET_IFNAME` values. Automatic selection tries `eth0`, then `bond1`, then an IPv4 default-route interface. The four-tray run tries `bond1` first. NCCL uses an exact interface name. The selected interfaces and Nsight version are recorded in `run_info.txt`.
+On each node the launcher checks IPv4 addresses on up interfaces. It honors valid `GLOO_SOCKET_IFNAME` and `NCCL_SOCKET_IFNAME` values. Automatic selection tries `eth0`, then `bond1`, then an IPv4 default-route interface. Multi-tray runs try `bond1` first. NCCL uses an exact interface name. The selected interfaces and Nsight version are recorded in `run_info.txt`.
 
 The all-GPU baseline writes to `results/02-layer-by-layer/01-baseline/01-param-gpu-act-gpu-opt-gpu/model_27b-lbl-schedule-.../node0/` in Bridge. The Nsight report is named `qwen35_27b-lbl-layers_8-attn_full-bf16-cg_off-tp_1-cp_1-pp_1-dp_4-mbs_1-gbs_16-seq_4k-iters_10-param_gpu-act_gpu-opt_gpu.nsys-rep`. `launch.json` records its filename. The same directory contains `command.txt`, `config.yaml`, `run_info.txt`, `train.log`, `summary.csv`, `tensorboard/`, and the source revisions and hashes. Use `--print-result-dir` to resolve the path or `--output-dir` for a fresh repeat.
 

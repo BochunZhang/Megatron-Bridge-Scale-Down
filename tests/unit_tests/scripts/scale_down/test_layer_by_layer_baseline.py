@@ -11,6 +11,7 @@ import pytest
 
 BASELINE_DIR = Path(__file__).resolve().parents[4] / "examples/scale-down/02-layer-by-layer/01-baseline"
 SWEEP = BASELINE_DIR.parent / "sweep.py"
+CASE_08 = "08_param_cpu_act_nvme_opt_cpu_overlap"
 
 
 @pytest.mark.unit
@@ -24,7 +25,7 @@ SWEEP = BASELINE_DIR.parent / "sweep.py"
         ("05_param_cpu_act_cpu_opt_cpu_overlap", "cpu", "cpu", "cpu"),
         ("06_param_nvme_act_cpu_opt_cpu_overlap", "nvme", "cpu", "cpu"),
         ("07_param_nvme_act_nvme_opt_cpu_overlap", "nvme", "nvme", "cpu"),
-        ("08_param_cpu_act_nvme_opt_cpu_overlap", "cpu", "nvme", "cpu"),
+        (CASE_08, "cpu", "nvme", "cpu"),
     ],
 )
 def test_layer_by_layer_baseline_dry_run(
@@ -85,13 +86,19 @@ def test_layer_by_layer_baseline_dry_run(
     assert result_path.parent.name.startswith("model_27b-lbl-schedule-")
     report = Path(next(arg.removeprefix("--output=") for arg in command if arg.startswith("--output=")))
     assert report.parent == result_path
+    if case == CASE_08:
+        assert "-gpus_4-nodes_1-" in result_path.parent.name
+        assert "-gpus_4-nodes_1-" in report.name
+        assert "CUDA_VISIBLE_DEVICES=0,1,2,3" in command
     overlap_suffix = "-opt_overlap" if overlap else ""
     assert report.name.endswith(f"-param_{parameter_tier}-act_{activation_tier}-opt_{optimizer_tier}{overlap_suffix}")
     assert not results_root.exists()
 
 
 @pytest.mark.unit
-@pytest.mark.parametrize("case", ["06_param_nvme_act_cpu_opt_cpu_overlap", "07_param_nvme_act_nvme_opt_cpu_overlap"])
+@pytest.mark.parametrize(
+    "case", ["06_param_nvme_act_cpu_opt_cpu_overlap", "07_param_nvme_act_nvme_opt_cpu_overlap", CASE_08]
+)
 def test_layer_by_layer_baseline_nvme_path_override(tmp_path: Path, case: str) -> None:
     script = BASELINE_DIR / f"{case}.sh"
     nvme = tmp_path / "shared NVMe"
@@ -108,10 +115,21 @@ def test_layer_by_layer_baseline_nvme_path_override(tmp_path: Path, case: str) -
 
 
 @pytest.mark.unit
-@pytest.mark.parametrize("node_rank", range(4))
-def test_case_08_uses_one_gpu_per_tray(tmp_path: Path, node_rank: int) -> None:
-    script = BASELINE_DIR / "08_param_cpu_act_nvme_opt_cpu_overlap.sh"
-    nvme = tmp_path / "tray NVMe"
+@pytest.mark.parametrize(
+    ("gpu_per_node", "node_count", "use_gpu_per_node", "node_rank"),
+    [
+        (4, 4, 1, 0),
+        (1, 4, 1, 2),
+        (4, 4, 2, 3),
+        (4, 4, None, 1),
+        (4, 1, 2, 0),
+        (4, 3, 1, 2),
+    ],
+)
+def test_case_08_uses_selected_gpus_per_tray(
+    tmp_path: Path, gpu_per_node: int, node_count: int, use_gpu_per_node: int | None, node_rank: int
+) -> None:
+    script = BASELINE_DIR / f"{CASE_08}.sh"
     results = tmp_path / "shared results"
     numarun = tmp_path / "numarun"
     numarun.touch(mode=0o755)
@@ -120,65 +138,74 @@ def test_case_08_uses_one_gpu_per_tray(tmp_path: Path, node_rank: int) -> None:
         "PYTHON": sys.executable,
         "PATH": f"{tmp_path}{os.pathsep}{os.environ['PATH']}",
         "CUDA_VISIBLE_DEVICES": "3,2,1,0",
-        "NVME_PATH": str(nvme),
     }
+    env.pop("NVME_PATH", None)
     args = [
         "bash",
         str(script),
-        "--gpu",
-        "4",
+        "--gpu-per-node",
+        str(gpu_per_node),
         "--node",
-        "4",
-        "--node-rank",
-        str(node_rank),
-        "--master-addr",
-        "tray0",
-        "--master-port",
-        "29531",
+        str(node_count),
         "--output-dir",
         str(results),
     ]
+    if use_gpu_per_node is not None:
+        args.extend(("--use-gpu-per-node", str(use_gpu_per_node)))
+    if node_count > 1:
+        args.extend(("--node-rank", str(node_rank), "--master-addr", "tray0", "--master-port", "29531"))
     result = subprocess.run([*args, "--dry-run"], env=env, capture_output=True, text=True, check=True)
     command = shlex.split(result.stderr)
+    nproc_per_node = use_gpu_per_node or gpu_per_node
+    world_size = nproc_per_node * node_count
+    visible_devices = ",".join(str(gpu) for gpu in range(nproc_per_node))
     assert {
         "CUDA_DEVICE_ORDER=PCI_BUS_ID",
-        "CUDA_VISIBLE_DEVICES=0",
-        "--nnodes=4",
-        "--nproc-per-node=1",
-        f"--node-rank={node_rank}",
-        "--master-addr=tray0",
-        "--master-port=29531",
-        "train.global_batch_size=16",
+        f"CUDA_VISIBLE_DEVICES={visible_devices}",
+        f"--nnodes={node_count}",
+        f"--nproc-per-node={nproc_per_node}",
+        f"train.global_batch_size={4 * world_size}",
         "layer_by_layer.parameter_tier=cpu",
         "layer_by_layer.activation_tier=nvme",
         "layer_by_layer.optimizer_tier=cpu",
         "layer_by_layer.cpu_optimizer=grace_adam",
         "layer_by_layer.overlap_cpu_optimizer=true",
-        f"layer_by_layer.nvme_dir={json.dumps(str(nvme / 'layer-by-layer-8-<unique>'))}",
+        'layer_by_layer.nvme_dir="/tmp/layer-by-layer-8-<unique>"',
+        "profiling.profile_ranks=[]",
     } <= set(command)
-    assert not {"--standalone", "numarun", "CUDA_VISIBLE_DEVICES=3,2,1,0"} & set(command)
+    if node_count > 1:
+        assert {f"--node-rank={node_rank}", "--master-addr=tray0", "--master-port=29531"} <= set(command)
+        assert "--standalone" not in command
+    else:
+        assert "--standalone" in command
+    assert not {"numarun", "CUDA_VISIBLE_DEVICES=3,2,1,0"} & set(command)
 
     result = subprocess.run([*args, "--print-result-dir"], env=env, capture_output=True, text=True, check=True)
     result_path = Path(result.stdout.strip())
     assert result_path.name == f"node{node_rank}"
-    assert "-nodes_4-" in result_path.parent.name
+    assert f"-gbs_{4 * world_size}-gpus_{world_size}-nodes_{node_count}-" in result_path.parent.name
     assert result_path.parent.parent == results / "01-baseline" / "08-param-cpu-act-nvme-opt-cpu-overlap"
     report = Path(next(arg.removeprefix("--output=") for arg in command if arg.startswith("--output=")))
     assert report.parent == result_path
+    assert f"-dp_{world_size}-gpus_{world_size}-nodes_{node_count}-" in report.name
+    assert f"-gbs_{4 * world_size}-" in report.name
     assert not results.exists()
-    assert not nvme.exists()
 
 
 @pytest.mark.unit
-def test_case_08_requires_explicit_nvme_for_four_trays() -> None:
-    script = BASELINE_DIR / "08_param_cpu_act_nvme_opt_cpu_overlap.sh"
-    env = {**os.environ, "RANK": "1", "DLC_MASTER_ADDR": "tray0"}
-    env.pop("NODE_RANK", None)
-    env.pop("MASTER_ADDR", None)
-    env.pop("NVME_PATH", None)
-    result = subprocess.run(["bash", str(script), "--gpu", "4", "--node", "4"], env=env, capture_output=True, text=True)
+@pytest.mark.parametrize(
+    ("args", "error"),
+    [
+        (["--node", "0"], "--node must be a positive integer"),
+        (["--gpu-per-node", "2", "--use-gpu-per-node", "3"], "--use-gpu-per-node cannot exceed --gpu-per-node"),
+        (["--node", "2", "--node-rank", "2"], "a tray rank from 0 to 1"),
+    ],
+)
+def test_case_08_rejects_invalid_topology(args: list[str], error: str) -> None:
+    script = BASELINE_DIR / f"{CASE_08}.sh"
+    result = subprocess.run(["bash", str(script), "--dry-run", *args], capture_output=True, text=True)
     assert result.returncode == 2
-    assert "this tray's local NVMe directory" in result.stderr
+    assert error in result.stderr
 
 
 @pytest.mark.unit
@@ -382,20 +409,24 @@ def test_baseline_result_checks_native_fsdp_metrics(
 
 @pytest.mark.unit
 @pytest.mark.parametrize(
-    ("node_rank", "profile", "returncode", "case_status"),
+    ("node_rank", "profile", "returncode", "has_report", "case_status"),
     [
-        (0, "none", 0, "invalid_result"),
-        (1, "none", 0, "worker_completed"),
-        (2, "nsys", 0, "invalid_profile"),
-        (3, "none", 1, "failed"),
+        (0, "none", 0, False, "invalid_result"),
+        (1, "none", 0, False, "worker_completed"),
+        (2, "nsys", 0, False, "invalid_profile"),
+        (2, "nsys", 0, True, "worker_completed"),
+        (3, "none", 1, False, "failed"),
     ],
 )
 def test_case_08_validates_training_result_on_tray_zero(
-    tmp_path: Path, node_rank: int, profile: str, returncode: int, case_status: str
+    tmp_path: Path, node_rank: int, profile: str, returncode: int, has_report: bool, case_status: str
 ) -> None:
     state = {
         "results": str(tmp_path),
         "node_rank": node_rank,
+        "nnodes": 4,
+        "gpu_per_node": 4,
+        "world_size": 8,
         "layers": 8,
         "steps": 10,
         "microbatches": 4,
@@ -413,6 +444,12 @@ def test_case_08_validates_training_result_on_tray_zero(
     }
     (tmp_path / "case.json").write_text(json.dumps(state), encoding="utf-8")
     (tmp_path / "train.log").touch()
+    if has_report:
+        report = tmp_path / (
+            "qwen35_27b-lbl-layers_8-attn_full-bf16-cg_off-tp_1-cp_1-pp_1-dp_8-gpus_8-nodes_4"
+            "-mbs_1-gbs_32-seq_4k-iters_10-param_cpu-act_nvme-opt_cpu-opt_overlap.nsys-rep"
+        )
+        report.write_bytes(b"synthetic report")
     result = subprocess.run(
         [sys.executable, str(SWEEP), "--finish-case", str(tmp_path), str(returncode)],
         capture_output=True,
@@ -425,6 +462,28 @@ def test_case_08_validates_training_result_on_tray_zero(
     assert f"status={expected_exit}" in run_info
 
 
+@pytest.mark.unit
+@pytest.mark.parametrize(("reported_world_size", "expected_status"), [(8, "passed"), (4, "invalid_result")])
+def test_case_08_validates_configured_world_size(
+    tmp_path: Path, reported_world_size: int, expected_status: str
+) -> None:
+    verify_baseline_result(
+        tmp_path,
+        "cpu",
+        "nvme",
+        {
+            "optimizer_tier": "cpu",
+            "fsdp_layer_by_layer_cpu_optimizer": True,
+            "fsdp_layer_by_layer_overlap_cpu_optimizer": True,
+            "clip_grad": 0.0,
+            "world_size": reported_world_size,
+        },
+        expected_status,
+        launch_overlap=True,
+        launch_world_size=8,
+    )
+
+
 def verify_baseline_result(
     tmp_path: Path,
     parameter_tier: str,
@@ -433,6 +492,7 @@ def verify_baseline_result(
     expected_status: str,
     *,
     launch_overlap: bool | None = None,
+    launch_world_size: int | None = None,
 ) -> None:
     state_dir = tmp_path / "state"
     state_dir.mkdir()
@@ -458,6 +518,8 @@ def verify_baseline_result(
     }
     if launch_overlap is not None:
         state["overlap_cpu_optimizer"] = launch_overlap
+    if launch_world_size is not None:
+        state["world_size"] = launch_world_size
     (state_dir / "case.json").write_text(json.dumps(state), encoding="utf-8")
     metrics = {
         **shared,
@@ -489,3 +551,4 @@ def verify_baseline_result(
         assert row["overlap_cpu_optimizer"] == str(bool(launch_overlap))
         assert row["fsdp_cpu_offload"] == ",".join(sorted(expected_offload))
         assert row["peak_allocated_bytes"] == "1024"
+        assert row["world_size"] == str(launch_world_size or 4)
