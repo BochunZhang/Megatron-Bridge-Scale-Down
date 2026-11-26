@@ -21,6 +21,7 @@ from unittest.mock import Mock, patch
 import pytest
 from megatron.core.distributed.fsdp.mcore_fsdp_adapter import FullyShardedDataParallel as megatron_FSDP
 from megatron.core.optimizer.distrib_optimizer import DistributedOptimizer
+from megatron.core.pipeline_parallel import fine_grained_activation_offload
 from megatron.core.transformer import cuda_graphs
 
 from megatron.bridge.training.train import (
@@ -28,6 +29,7 @@ from megatron.bridge.training.train import (
     _dummy_train_step,
     _handle_mxfp8_param_buffer_copy,
     _maybe_register_fsdp_buffers,
+    _release_activation_aio_on_train_exit,
     _should_skip_and_handle_iteration,
     checkpoint_and_decide_exit,
     force_param_sync,
@@ -42,6 +44,34 @@ from megatron.bridge.training.utils.train_utils import maybe_inject_state
 
 
 pytestmark = pytest.mark.unit
+
+
+@pytest.mark.parametrize("backend", ["native", "deepspeed"])
+@pytest.mark.parametrize("fail", [False, True])
+def test_train_exit_releases_activation_aio(monkeypatch, tmp_path, backend, fail):
+    release = Mock()
+    monkeypatch.setattr(
+        fine_grained_activation_offload, "release_layer_by_layer_activation_aio", release, raising=False
+    )
+    model = SimpleNamespace(
+        config=SimpleNamespace(
+            layer_by_layer_activation_nvme_backend=backend,
+            layer_by_layer_activation_nvme_path=str(tmp_path),
+        )
+    )
+
+    @_release_activation_aio_on_train_exit
+    def run_training(forward_step_func, model):
+        release.assert_not_called()
+        if fail:
+            raise RuntimeError("training failed")
+
+    if fail:
+        with pytest.raises(RuntimeError, match="training failed"):
+            run_training(None, [model])
+    else:
+        run_training(None, [model])
+    release.assert_called_once_with(model)
 
 
 def test_delete_local_cuda_graphs_releases_layer_graphs_before_mcore_cleanup():

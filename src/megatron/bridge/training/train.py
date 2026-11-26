@@ -134,7 +134,7 @@ def _release_activation_aio_on_train_exit(train_fn: Callable[..., None]) -> Call
             return train_fn(forward_step_func, model, *args, **kwargs)
         model_chunk = model[0]
         model_config = get_model_config(model_chunk)
-        if getattr(model_config, "layer_by_layer_activation_nvme_backend", None) != "deepspeed":
+        if getattr(model_config, "layer_by_layer_activation_nvme_path", None) is None:
             return train_fn(forward_step_func, model, *args, **kwargs)
         try:
             return train_fn(forward_step_func, model, *args, **kwargs)
