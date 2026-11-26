@@ -1,4 +1,4 @@
-# Qwen3.5-27B layer-by-layer capacity test
+# Qwen3.5 layer-by-layer capacity test
 
 The numbered experiments and capacity sweep run Bridge pretraining with Megatron's layer-by-layer schedule at `PP=1` and four-way Megatron-FSDP parameter, gradient, and optimizer sharding. The model uses BF16 and gated full attention in every decoder layer.
 
@@ -38,6 +38,34 @@ bash examples/scale-down/02-layer-by-layer/run_sweep.sh \
 ```
 
 The scheduler runs all microbatches through a decoder layer before advancing, then traverses the layers in reverse during backward. It uses Megatron activation checkpointing across the microbatches of each decoder layer. Bridge runs the standard GPT data and loss path, Megatron gradient finalization, and a standard optimizer step after backward.
+
+## Expert baseline
+
+Pass `--model-type expert` to any numbered case or to the capacity sweep.
+The expert workload uses eight full-attention layers from the Qwen3.5-35B-A3B
+architecture, 16 routed experts per layer, and top-8 routing with a shared expert.
+On four GB200 GPUs it uses BF16, EP=4, four routed experts per rank, HybridEP
+dispatch, and Megatron-FSDP. Install DeepEP's `hybrid-ep` build so the training
+interpreter can import `deep_ep.HybridEPBuffer`.
+
+```bash
+study=examples/scale-down/02-layer-by-layer/01-baseline
+bash "$study/01_param_gpu_act_gpu_opt_gpu.sh" --model-type expert --dry-run
+bash "$study/01_param_gpu_act_gpu_opt_gpu.sh" --model-type expert --profile none --train-iters 3
+```
+
+Omit `--profile none --train-iters 3` for the 10-step Nsight Systems baseline.
+Use `--num-experts N` to change the routed expert count. Top-8 routing and EP=4
+require at least eight experts and a multiple of four. Case 08 can use the same
+expert configuration across trays with a total GPU count divisible by four.
+HybridEP detects the NVLink domain within each EP group and requires the routed
+expert count per NVLink domain to be divisible by four. The default 16 experts
+satisfy this with one, two, or four EP ranks per domain.
+
+The result directory and report name include `experts_16-ep_4-hybridep`.
+`launch.json` records the requested model settings. The rank-zero
+`LAYER_BY_LAYER_RESULT` must report the same expert count, EP size, and
+dispatcher for `summary.csv` to mark the case as passed.
 
 ## 8-layer all-GPU baseline
 
@@ -173,7 +201,7 @@ Add `--activation-nvme-backend deepspeed` to the case 08 command on all trays to
 
 ## Running and profiling the numbered cases
 
-The numbered scripts select the experiment settings and call `run_pretrain_layer_by_layer.sh`. That Bash launcher wraps each local torchrun agent in Nsight Systems and runs Bridge's `scripts/training/run_recipe.py --recipe qwen35_text_27b_pretrain_4gpu_gb200_bf16_layer_by_layer_config --mode pretrain --dataset mock` on each rank. Bridge calls the layer-by-layer schedule through its normal training step. Single-tray runs using four GPUs use the same NUMA selection order as the FSDP3 study. Other case 08 topologies inherit the CPU affinity on each tray.
+The numbered scripts select the experiment settings and call `run_pretrain_layer_by_layer.sh`. That Bash launcher wraps each local torchrun agent in Nsight Systems and runs the selected recipe through Bridge's `scripts/training/run_recipe.py --mode pretrain --dataset mock` on each rank. Bridge calls the layer-by-layer schedule through its normal training step. Single-tray runs using four GPUs use the same NUMA selection order as the FSDP3 study. Other case 08 topologies inherit the CPU affinity on each tray.
 
 The cases use Nsight Systems **2026.6.1** to capture CUDA, NVTX, and system-wide CPU thread scheduling. System-wide scheduling requires Linux perf access. Expand a training process in the timeline to inspect when its threads run on the CPU. CPU call-stack sampling and GPU metrics sampling are disabled. The default window is iteration 8 (step 7, zero-based). With `--train-iters 3`, capture covers iteration 3. The launcher checks `NsightSystems-2026.6.1/bin/nsys` under the Bridge repository root or the executable set through `NSYS_BIN`. Use `--profile none` for an unprofiled run. [Nsight Systems CLI reference](https://docs.nvidia.com/nsight-systems/UserGuide/)
 

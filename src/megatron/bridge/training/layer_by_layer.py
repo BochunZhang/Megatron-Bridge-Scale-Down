@@ -64,8 +64,8 @@ def configure_layer_by_layer(config: ConfigContainer) -> None:
         raise ValueError("Layer-by-layer requires a valid CPU optimizer and a positive CPU thread count.")
 
     model = config.model
-    if not isinstance(model, GPTModelProvider) or model.num_moe_experts:
-        raise ValueError("Layer-by-layer training requires a dense GPT model provider.")
+    if not isinstance(model, GPTModelProvider):
+        raise ValueError("Layer-by-layer training requires a GPT model provider.")
     if not hasattr(model, "layer_by_layer_schedule"):
         raise ValueError("Layer-by-layer training requires the updated Megatron-LM layer-by-layer branch.")
     cpu_activations = offload.activation_tier == "cpu"
@@ -84,15 +84,14 @@ def configure_layer_by_layer(config: ConfigContainer) -> None:
             model.tensor_model_parallel_size,
             model.pipeline_model_parallel_size,
             model.context_parallel_size,
-            model.expert_model_parallel_size,
-            model.expert_tensor_parallel_size,
         )
-        != (1, 1, 1, 1, 1)
+        != (1, 1, 1)
+        or model.expert_tensor_parallel_size not in (None, 1)
         or model.virtual_pipeline_model_parallel_size is not None
         or model.pipeline_model_parallel_layout is not None
         or model.sequence_parallel
     ):
-        raise ValueError("Layer-by-layer training requires TP=PP=CP=EP=ETP=1 without sequence or virtual parallelism.")
+        raise ValueError("Layer-by-layer training requires TP=PP=CP=ETP=1 without sequence or virtual parallelism.")
     if model.position_embedding_type != "rope" or model.share_embeddings_and_output_weights:
         raise ValueError("Layer-by-layer training requires rotary embeddings and untied output weights.")
     if not model.bf16 or model.params_dtype != torch.bfloat16 or model.fp16 or model.fp8 or model.fp4:
@@ -112,7 +111,9 @@ def configure_layer_by_layer(config: ConfigContainer) -> None:
         or model.overlap_moe_expert_parallel_comm
         or model.mtp_num_layers
     ):
-        raise ValueError("Layer-by-layer training requires eager Megatron-FSDP and standard dense GPT layers.")
+        raise ValueError("Layer-by-layer training requires eager Megatron-FSDP and standard GPT layers.")
+    if getattr(model, "moe_enable_routing_replay", False) or getattr(model, "moe_paged_stash", False):
+        raise ValueError("Layer-by-layer training does not support MoE routing replay or paged stash.")
     if model.recompute_granularity is not None and (
         model.recompute_granularity,
         model.recompute_method,
@@ -277,6 +278,10 @@ def log_layer_by_layer_result(
                 "optimizer_backend": optimizer_backend,
                 "steps": steps,
                 "layers": config.model.num_layers,
+                "num_moe_experts": config.model.num_moe_experts,
+                "expert_model_parallel_size": config.model.expert_model_parallel_size,
+                "moe_token_dispatcher_type": config.model.moe_token_dispatcher_type,
+                "moe_flex_dispatcher_backend": config.model.moe_flex_dispatcher_backend,
                 "loss": final_loss if final_loss is not None and math.isfinite(final_loss) else None,
                 "peak_allocated_bytes": allocated,
                 "peak_reserved_bytes": reserved,

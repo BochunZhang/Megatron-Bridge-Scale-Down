@@ -29,7 +29,11 @@ _DEFAULT_GPUS_PER_NODE = 4
 _NSYS_VERSION = "2026.6.1"
 _PLACEMENTS = ("gpu", "cpu", "nvme")
 _EXAMPLE_DIR = "examples/scale-down/02-layer-by-layer"
-_RECIPE = "qwen35_text_27b_pretrain_4gpu_gb200_bf16_layer_by_layer_config"
+_DENSE_RECIPE = "qwen35_text_27b_pretrain_4gpu_gb200_bf16_layer_by_layer_config"
+_EXPERT_RECIPE = "qwen35_text_35b_a3b_pretrain_4gpu_gb200_bf16_layer_by_layer_config"
+_DEFAULT_NUM_EXPERTS = 16
+_EXPERT_PARALLEL_SIZE = 4
+_EXPERT_ROUTER_TOPK = 8
 _RECIPE_RUNNER = "scripts/training/run_recipe.py"
 _LM_FSDP_SOURCE = "megatron/core/distributed/fsdp/src/megatron_fsdp/megatron_fsdp.py"
 _BRIDGE_SOURCE_FILES = (
@@ -72,6 +76,11 @@ _LM_SOURCE_FILES = (
     "megatron/core/tensor_parallel/random.py",
     "megatron/core/transformer/transformer_config.py",
     "megatron/training/layer_by_layer_workload.py",
+)
+_LM_EXPERT_SOURCE_FILES = (
+    "megatron/core/transformer/moe/fused_a2a.py",
+    "megatron/core/transformer/moe/router.py",
+    "megatron/core/transformer/moe/token_dispatcher.py",
 )
 _CASE_SCRIPTS = tuple(
     f"{_EXAMPLE_DIR}/01-baseline/{name}"
@@ -117,6 +126,10 @@ _RESULT_COLUMNS = (
     "fsdp_cpu_offload",
     "world_size",
     "log",
+    "num_moe_experts",
+    "expert_model_parallel_size",
+    "moe_token_dispatcher_type",
+    "moe_flex_dispatcher_backend",
 )
 
 
@@ -198,6 +211,8 @@ def _arguments() -> argparse.Namespace:
     parser.add_argument(
         "--layers", type=_positive, nargs="+", default=[8], help="depths to attempt"
     )
+    parser.add_argument("--model-type", choices=("dense", "expert"), default="dense")
+    parser.add_argument("--num-experts", type=_positive, help="routed experts per layer (expert default: 16)")
     parser.add_argument("--seq-length", type=_positive, default=4096)
     parser.add_argument("--micro-batch-size", type=_positive, default=1)
     parser.add_argument(
@@ -271,6 +286,21 @@ def _arguments() -> argparse.Namespace:
             parser.error("--use-gpu-per-node cannot exceed --gpu-per-node")
         args.cuda_visible_devices = ",".join(str(gpu) for gpu in range(args.nproc_per_node))
     args.world_size = args.nnodes * args.nproc_per_node
+    args.expert_config = {}
+    if args.model_type == "expert":
+        num_experts = args.num_experts or _DEFAULT_NUM_EXPERTS
+        if num_experts < _EXPERT_ROUTER_TOPK or num_experts % _EXPERT_PARALLEL_SIZE:
+            parser.error("--num-experts must be at least 8 and a multiple of 4 for the expert baseline")
+        if args.world_size % _EXPERT_PARALLEL_SIZE:
+            parser.error("the EP=4 expert baseline requires a total GPU count divisible by 4")
+        args.expert_config = {
+            "num_moe_experts": num_experts,
+            "expert_model_parallel_size": _EXPERT_PARALLEL_SIZE,
+            "moe_token_dispatcher_type": "flex",
+            "moe_flex_dispatcher_backend": "hybridep",
+        }
+    elif args.num_experts is not None:
+        parser.error("--num-experts requires --model-type expert")
     if args.nnodes > 1:
         if args.node_rank is None or not 0 <= args.node_rank < args.nnodes:
             parser.error("multi-node cases require 0 <= --node-rank < --nnodes")
@@ -313,6 +343,11 @@ def _check_nsys_version() -> str:
 
 def _profile_report(args: argparse.Namespace, layers: int, results: Path) -> Path:
     model = "qwen35_tiny" if args.tiny else "qwen35_27b"
+    if args.expert_config:
+        model = (
+            f"qwen35_35b_a3b{'_tiny' if args.tiny else ''}"
+            f"-experts_{args.expert_config['num_moe_experts']}-ep_{_EXPERT_PARALLEL_SIZE}-hybridep"
+        )
     seq = f"{args.seq_length // 1024}k" if args.seq_length % 1024 == 0 else str(args.seq_length)
     gbs = args.micro_batch_size * args.microbatches * args.world_size
     topology = f"-gpus_{args.world_size}-nodes_{args.nnodes}" if args.gpu_per_node is not None else ""
@@ -383,7 +418,7 @@ def _command(
         *python,
         str(_REPO / _RECIPE_RUNNER),
         "--recipe",
-        _RECIPE,
+        _EXPERT_RECIPE if args.expert_config else _DENSE_RECIPE,
         "--mode",
         "pretrain",
         "--dataset",
@@ -404,6 +439,7 @@ def _command(
         f"logger.tensorboard_dir={json.dumps(str(tensorboard_dir))}",
         f"logger.save_config_filepath={json.dumps(str(config_path))}",
     ]
+    command.extend(f"model.{name}={value}" for name, value in args.expert_config.items())
     if args.tiny:
         command.append("layer_by_layer.tiny=true")
     if args.learning_rate is not None:
@@ -471,9 +507,11 @@ def _read_result(
     overlap_cpu_optimizer: bool,
     expect_result: bool,
     world_size: int,
+    expert_config: dict[str, int | str],
 ) -> dict:
     result = {
         "layers": layers,
+        **expert_config,
         "parameter_tier": parameter_tier,
         "activation_tier": activation_tier,
         "activation_nvme_backend": activation_nvme_backend,
@@ -520,11 +558,13 @@ def _read_result(
         expected_offload.extend(("gradient", "optimizer"))
     if parameter_tier != "gpu":
         expected_offload.append("weight")
+    expected_model = expert_config or {"num_moe_experts": None}
     if (
         metrics.get("schedule") == "layer_by_layer"
         and metrics.get("parameter_backend") == "megatron_fsdp"
         and metrics.get("fsdp_strategy") == "optim_grads_params"
         and metrics.get("world_size") == world_size
+        and all(metrics.get(key) == value for key, value in expected_model.items())
         and isinstance(offload, list)
         and all(isinstance(component, str) for component in offload)
         and sorted(offload) == expected_offload
@@ -594,8 +634,10 @@ def _write_launch(
     source_metadata: dict[str, str | None],
 ) -> None:
     launch = {
-        "model": "Qwen/Qwen3.5-27B",
-        "recipe": _RECIPE,
+        "model": "Qwen/Qwen3.5-35B-A3B-Base" if args.expert_config else "Qwen/Qwen3.5-27B",
+        "recipe": _EXPERT_RECIPE if args.expert_config else _DENSE_RECIPE,
+        "model_type": args.model_type,
+        **args.expert_config,
         "dtype": "bf16",
         "num_layers": args.layers[0],
         "attention": "full",
@@ -700,6 +742,7 @@ def _collect_case(args: argparse.Namespace, layers: int, results: Path, log_path
         overlap_cpu_optimizer=args.overlap_cpu_optimizer,
         expect_result=args.node_rank in (None, 0),
         world_size=args.world_size,
+        expert_config=args.expert_config,
     )
     if args.profile == "nsys" and case["status"] in ("passed", "worker_completed"):
         report = _profile_report(args, layers, results)
@@ -755,6 +798,7 @@ def _prepare_case(
         "micro_batch_size": args.micro_batch_size,
         "seq_length": args.seq_length,
         "tiny": args.tiny,
+        "expert_config": args.expert_config,
         "parameter_tier": args.parameter_tier,
         "activation_tier": args.activation_tier,
         "activation_nvme_backend": args.activation_nvme_backend,
@@ -778,6 +822,7 @@ def _finish_case(state_dir: Path, returncode: int) -> int:
     state.setdefault("gpu_per_node", None)
     state.setdefault("nnodes", 1)
     state.setdefault("world_size", _DEFAULT_GPUS_PER_NODE)
+    state.setdefault("expert_config", {})
     args = argparse.Namespace(single_case_layout=True, **state)
     results = Path(args.results)
     case = _collect_case(args, args.layers, results, results / "train.log", returncode)
@@ -864,11 +909,12 @@ def main() -> int:
             },
         )
         bridge_source_files += _CASE_SCRIPTS
+    lm_source_files = _LM_SOURCE_FILES + (_LM_EXPERT_SOURCE_FILES if args.expert_config else ())
     source_hashes = {
         f"{prefix}/{path}": hashlib.sha256((root / path).read_bytes()).hexdigest()
         for prefix, root, paths in (
             ("bridge", _REPO, bridge_source_files),
-            ("megatron-lm", lm_dir, _LM_SOURCE_FILES),
+            ("megatron-lm", lm_dir, lm_source_files),
         )
         for path in paths
     }

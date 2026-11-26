@@ -13,6 +13,8 @@ nvme_path="${NVME_PATH:-}"
 activation_nvme_backend=native
 output_dir="${OUTPUT_DIR:-${repo_root}/results/02-layer-by-layer}"
 layers=8
+model_type=dense
+num_experts=""
 train_iters=10
 profile=nsys
 cpu_optimizer=torch
@@ -53,9 +55,16 @@ while (( $# )); do
                 --master-port) master_port="$2";;
             esac
             shift 2;;
-        --nvme|--nvme-path|--activation-nvme-backend|--output-dir|--train-iters|--profile|--cpu-optimizer|--cpu-threads)
+        --model-type|--num-experts|--nvme|--nvme-path|--activation-nvme-backend|--output-dir|\
+        --train-iters|--profile|--cpu-optimizer|--cpu-threads)
             [[ -n "${2:-}" && "$2" != --* ]] || fail "Missing value for $1"
             case "$1" in
+                --model-type)
+                    [[ "$2" == dense || "$2" == expert ]] || fail "--model-type must be dense or expert"
+                    model_type="$2";;
+                --num-experts)
+                    [[ "$2" =~ ^[1-9][0-9]*$ ]] || fail "--num-experts must be a positive integer"
+                    num_experts="$2";;
                 --nvme|--nvme-path) nvme_path="$2";;
                 --activation-nvme-backend)
                     case "$2" in
@@ -84,6 +93,8 @@ while (( $# )); do
             cat <<'HELP'
 Run an 8-layer Qwen3.5-27B full-attention case on one four-GPU node by default.
 
+  --model-type dense|expert   Expert uses Qwen3.5-35B-A3B with EP=4 and HybridEP
+  --num-experts N       Routed experts per layer (expert default: 16)
   --nvme DIR            Local scratch directory when an NVMe tier is selected
   --activation-nvme-backend native|deepspeed   File I/O backend for NVMe activations (default: native)
   --output-dir DIR      Result root (default: results/02-layer-by-layer)
@@ -126,6 +137,16 @@ fi
 use_gpu_per_node="${use_gpu_per_node:-${gpu_per_node}}"
 (( use_gpu_per_node <= gpu_per_node )) || fail "--use-gpu-per-node cannot exceed --gpu-per-node"
 world_size=$((node_count * use_gpu_per_node))
+model_id=27b
+if [[ "${model_type}" == expert ]]; then
+    num_experts="${num_experts:-16}"
+    (( num_experts >= 8 && num_experts % 4 == 0 )) ||
+        fail "--num-experts must be at least 8 and a multiple of 4 for the expert baseline"
+    (( world_size % 4 == 0 )) || fail "the EP=4 expert baseline requires a total GPU count divisible by 4"
+    model_id="35b_a3b-experts_${num_experts}-ep_4-hybridep"
+elif [[ -n "${num_experts}" ]]; then
+    fail "--num-experts requires --model-type expert"
+fi
 
 if (( node_count > 1 )); then
     node_rank="${node_rank:-${NODE_RANK:-${RANK:-}}}"
@@ -144,7 +165,7 @@ fi
 
 [[ "${output_dir}" == /* ]] || output_dir="${PWD}/${output_dir}"
 microbatches=4
-model_name="model_27b-lbl-schedule-layers_${layers}-attn_full-cg_off-mbs_1-seq_4096-tp_1-cp_1"
+model_name="model_${model_id}-lbl-schedule-layers_${layers}-attn_full-cg_off-mbs_1-seq_4096-tp_1-cp_1"
 model_name+="-gbs_$((microbatches * world_size))-gpus_${world_size}"
 if [[ "${case_08}" == true ]]; then
     case_name+="-${world_size}-gpus-${node_count}-nodes"
@@ -161,11 +182,13 @@ if [[ "${print_result_dir}" == true ]]; then
 fi
 
 args=(--single-case-layout --results-dir "${result_dir}"
+    --model-type "${model_type}"
     --layers "${layers}" --seq-length 4096 --micro-batch-size 1 --microbatches "${microbatches}"
     --steps "${train_iters}" --parameter-tier "${parameter_tier}" --activation-tier "${activation_tier}"
     --optimizer-tier "${optimizer_tier}"
     --cpu-optimizer "${cpu_optimizer}"
     --profile "${profile}")
+[[ -z "${num_experts}" ]] || args+=(--num-experts "${num_experts}")
 [[ "${overlap_cpu_optimizer}" == true ]] && args+=(--overlap-cpu-optimizer)
 [[ "${dry_run}" == true ]] && args+=(--dry-run)
 [[ -z "${nvme_path}" ]] || args+=(--nvme-dir "${nvme_path}")

@@ -100,6 +100,50 @@ def test_layer_by_layer_baseline_dry_run(
 
 @pytest.mark.unit
 @pytest.mark.parametrize(
+    ("case", "extra_args", "num_experts"),
+    [
+        ("01_param_gpu_act_gpu_opt_gpu", [], 16),
+        (CASE_08, ["--num-experts", "32", "--node", "4", "--use-gpu-per-node", "1"], 32),
+    ],
+)
+def test_expert_baseline_uses_hybridep(tmp_path: Path, case: str, extra_args: list[str], num_experts: int) -> None:
+    args = [
+        "bash",
+        str(BASELINE_DIR / f"{case}.sh"),
+        "--model-type",
+        "expert",
+        "--output-dir",
+        str(tmp_path / "results"),
+        *extra_args,
+    ]
+    env = {
+        **os.environ,
+        "PYTHON": sys.executable,
+        "NSYS_BIN": "/example/nsys",
+        "NODE_RANK": "0",
+        "MASTER_ADDR": "tray0",
+    }
+    result = subprocess.run([*args, "--dry-run"], env=env, text=True, capture_output=True, check=True)
+    command = shlex.split(result.stderr)
+    assert {
+        "qwen35_text_35b_a3b_pretrain_4gpu_gb200_bf16_layer_by_layer_config",
+        f"model.num_moe_experts={num_experts}",
+        "model.expert_model_parallel_size=4",
+        "model.moe_token_dispatcher_type=flex",
+        "model.moe_flex_dispatcher_backend=hybridep",
+        "model.num_layers=8",
+        "train.global_batch_size=16",
+    } <= set(command)
+    report = Path(next(arg.removeprefix("--output=") for arg in command if arg.startswith("--output=")))
+    result = subprocess.run([*args, "--print-result-dir"], env=env, text=True, capture_output=True, check=True)
+    assert Path(result.stdout.strip()) == report.parent
+    workload = f"experts_{num_experts}-ep_4-hybridep"
+    assert workload in report.name and workload in str(report.parent)
+    assert not report.parent.exists()
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
     "case", ["06_param_nvme_act_cpu_opt_cpu_overlap", "07_param_nvme_act_nvme_opt_cpu_overlap", CASE_08]
 )
 def test_layer_by_layer_baseline_nvme_path_override(tmp_path: Path, case: str) -> None:
@@ -376,6 +420,34 @@ def test_baseline_result_checks_optimizer_overlap(
 
 @pytest.mark.unit
 @pytest.mark.parametrize(
+    ("reported_config", "expected_status"),
+    [
+        ({}, "passed"),
+        ({"num_moe_experts": 32}, "invalid_result"),
+        ({"moe_flex_dispatcher_backend": None, "moe_token_dispatcher_type": "alltoall"}, "invalid_result"),
+    ],
+)
+def test_expert_baseline_result_checks_the_requested_dispatcher(
+    tmp_path: Path, reported_config: dict, expected_status: str
+) -> None:
+    expert_config = {
+        "num_moe_experts": 16,
+        "expert_model_parallel_size": 4,
+        "moe_token_dispatcher_type": "flex",
+        "moe_flex_dispatcher_backend": "hybridep",
+    }
+    verify_baseline_result(
+        tmp_path,
+        "gpu",
+        "gpu",
+        {**expert_config, **reported_config},
+        expected_status,
+        launch_expert_config=expert_config,
+    )
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
     ("nvme_metrics", "expected_status"),
     [
         ({"fsdp_nvme_weights_only": True}, "passed"),
@@ -543,6 +615,7 @@ def verify_baseline_result(
     launch_overlap: bool | None = None,
     launch_world_size: int | None = None,
     launch_activation_nvme_backend: str | None = None,
+    launch_expert_config: dict | None = None,
 ) -> None:
     state_dir = tmp_path / "state"
     state_dir.mkdir()
@@ -572,6 +645,8 @@ def verify_baseline_result(
         state["world_size"] = launch_world_size
     if launch_activation_nvme_backend is not None:
         state["activation_nvme_backend"] = launch_activation_nvme_backend
+    if launch_expert_config is not None:
+        state["expert_config"] = launch_expert_config
     (state_dir / "case.json").write_text(json.dumps(state), encoding="utf-8")
     metrics = {
         **shared,
@@ -604,3 +679,5 @@ def verify_baseline_result(
         assert row["fsdp_cpu_offload"] == ",".join(sorted(expected_offload))
         assert row["peak_allocated_bytes"] == "1024"
         assert row["world_size"] == str(launch_world_size or 4)
+        for name, value in (launch_expert_config or {}).items():
+            assert row[name] == str(value)

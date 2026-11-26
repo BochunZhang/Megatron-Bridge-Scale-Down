@@ -40,6 +40,7 @@ from megatron.bridge.training.config import (
     DistributedInitConfig,
     GPTDatasetConfig,
     GPTFIMDatasetConfig,
+    LayerByLayerRecipeConfig,
     LoggerConfig,
     MockGPTDatasetConfig,
     NVRxStragglerDetectionConfig,
@@ -55,6 +56,7 @@ from megatron.bridge.training.config import (
     apply_environment_variables,
     megatron_mimo_runtime_config_update,
 )
+from megatron.bridge.training.layer_by_layer import configure_layer_by_layer
 from megatron.bridge.training.mixed_precision import MixedPrecisionConfig
 from megatron.bridge.training.tokenizers.config import TokenizerConfig
 from megatron.bridge.utils.cuda_graph import (
@@ -93,6 +95,33 @@ def create_test_gpt_config(**kwargs: Any) -> GPTModelProvider:
     }
     defaults.update(kwargs)
     return GPTModelProvider(**defaults)
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("expert_parallel_size", [1, 4])
+def test_layer_by_layer_accepts_expert_parallel_gpt(expert_parallel_size: int) -> None:
+    if not hasattr(GPTModelProvider, "layer_by_layer_schedule"):
+        pytest.skip("Requires the Megatron-LM layer-by-layer branch.")
+    model = create_test_gpt_config(
+        num_moe_experts=4,
+        moe_ffn_hidden_size=128,
+        expert_model_parallel_size=expert_parallel_size,
+        expert_tensor_parallel_size=1,
+        bf16=True,
+        params_dtype=torch.bfloat16,
+        position_embedding_type="rope",
+        share_embeddings_and_output_weights=False,
+        vocab_size=1024,
+    )
+    cfg, _, _ = create_test_config_container(4, model)
+    cfg.layer_by_layer = LayerByLayerRecipeConfig()
+
+    configure_layer_by_layer(cfg)
+
+    assert cfg.model.layer_by_layer_schedule
+    assert cfg.model.expert_model_parallel_size == expert_parallel_size
+    assert cfg.ddp.use_megatron_fsdp
+    assert cfg.ddp.data_parallel_sharding_strategy == "optim_grads_params"
 
 
 def create_test_deepseek_config(**kwargs: Any) -> MLAModelProvider:
@@ -909,6 +938,12 @@ class TestConfigContainerValidation:
                 prof_cfg.finalize()
         else:
             prof_cfg.finalize()  # Should pass without error
+
+    def test_memory_usage_start_step_validation(self):
+        """Test validation for the memory usage counter reset step."""
+        ProfilingConfig(memory_usage_start_step=0).finalize()
+        with pytest.raises(AssertionError, match="memory_usage_start_step must be >= 0"):
+            ProfilingConfig(memory_usage_start_step=-1).finalize()
 
     def test_packed_sequence_micro_batch_size_validation_error(self, monkeypatch):
         """Test validation error when micro_batch_size > 1 with packed sequences."""

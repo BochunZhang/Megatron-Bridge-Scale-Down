@@ -462,6 +462,34 @@ def qwen35_text_27b_pretrain_4gpu_gb200_bf16_fsdp1_config() -> ConfigContainer:
     return _qwen35_text_4gpu_gb200_fsdp1_config(_QWEN35_27B_BASE, "Qwen3_5ForCausalLM", is_moe=False)
 
 
+def qwen35_text_35b_a3b_pretrain_4gpu_gb200_bf16_layer_by_layer_config() -> ConfigContainer:
+    """Return a 16-expert Qwen3.5 layer-by-layer mock recipe for four GB200 GPUs."""
+    cfg = _qwen35_text_4gpu_gb200_fsdp1_config(_QWEN35_35B_A3B_BASE, "Qwen3_5MoeForCausalLM", is_moe=True)
+    cfg.model.num_moe_experts = 16
+    cfg.model.moe_router_topk = 8
+    cfg.model.expert_model_parallel_size = 4
+    cfg.model.moe_token_dispatcher_type = "flex"
+    cfg.model.moe_flex_dispatcher_backend = "hybridep"
+    cfg.model.moe_flex_dispatcher_num_sms = 32
+    cfg.model.cuda_graph_impl = "none"
+    cfg.model.cuda_graph_modules = None
+    cfg.model.use_te_rng_tracker = False
+    cfg.rng.te_rng_tracker = False
+    cfg.model.mtp_num_layers = None
+    cfg.model.init_model_with_meta_device = True
+    cfg.model.gradient_accumulation_fusion = False
+    cfg.model.disable_parameter_transpose_cache = True
+    cfg.tokenizer = TokenizerConfig(tokenizer_type="NullTokenizer", vocab_size=cfg.model.vocab_size)
+    cfg.train.train_iters = 10
+    cfg.train.global_batch_size = 16
+    cfg.validation.eval_iters = 0
+    cfg.validation.eval_interval = None
+    cfg.scheduler.lr_decay_style = "constant"
+    cfg.scheduler.lr_warmup_iters = 0
+    cfg.layer_by_layer = LayerByLayerRecipeConfig()
+    return cfg
+
+
 def qwen35_text_27b_pretrain_4gpu_gb200_bf16_layer_by_layer_config() -> ConfigContainer:
     """Return the eight-layer Qwen3.5 Megatron-FSDP layer-by-layer mock recipe."""
     cfg = _pretrain_common()
