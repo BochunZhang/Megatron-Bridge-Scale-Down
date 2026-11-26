@@ -213,6 +213,34 @@ def test_case_08_rejects_invalid_topology(args: list[str], error: str) -> None:
 
 
 @pytest.mark.unit
+def test_case_08_deepspeed_activation_backend_has_distinct_artifacts(tmp_path: Path) -> None:
+    script = BASELINE_DIR / f"{CASE_08}.sh"
+    args = [
+        "bash",
+        str(script),
+        "--activation-nvme-backend",
+        "deepspeed",
+        "--node",
+        "4",
+        "--node-rank",
+        "1",
+        "--use-gpu-per-node",
+        "1",
+        "--output-dir",
+        str(tmp_path / "results"),
+    ]
+    env = {**os.environ, "PYTHON": sys.executable, "MASTER_ADDR": "tray0", "MASTER_PORT": "29500"}
+    result = subprocess.run([*args, "--dry-run"], env=env, capture_output=True, text=True, check=True)
+    command = shlex.split(result.stderr)
+    assert "layer_by_layer.activation_nvme_backend=deepspeed" in command
+    report = Path(next(arg.removeprefix("--output=") for arg in command if arg.startswith("--output=")))
+    result_dir = Path(subprocess.check_output([*args, "--print-result-dir"], env=env, text=True).strip())
+    assert report.parent == result_dir
+    assert report.name.endswith("-act_aio_deepspeed")
+    assert result_dir.parent.name.endswith("-act_aio_deepspeed")
+
+
+@pytest.mark.unit
 @pytest.mark.parametrize("case", ["04_param_cpu_act_cpu_opt_cpu", "05_param_cpu_act_cpu_opt_cpu_overlap"])
 def test_layer_by_layer_baseline_grace_adam_cpu_threads(case: str) -> None:
     script = BASELINE_DIR / f"{case}.sh"
@@ -488,6 +516,23 @@ def test_case_08_validates_configured_world_size(
     )
 
 
+@pytest.mark.unit
+@pytest.mark.parametrize(("backend", "status"), [("deepspeed", "passed"), ("native", "invalid_result")])
+def test_case_08_validates_activation_nvme_backend(tmp_path: Path, backend: str, status: str) -> None:
+    verify_baseline_result(
+        tmp_path,
+        "cpu",
+        "nvme",
+        {
+            "activation_nvme_backend": backend,
+            "optimizer_tier": "cpu",
+            "fsdp_layer_by_layer_cpu_optimizer": True,
+        },
+        status,
+        launch_activation_nvme_backend="deepspeed",
+    )
+
+
 def verify_baseline_result(
     tmp_path: Path,
     parameter_tier: str,
@@ -497,6 +542,7 @@ def verify_baseline_result(
     *,
     launch_overlap: bool | None = None,
     launch_world_size: int | None = None,
+    launch_activation_nvme_backend: str | None = None,
 ) -> None:
     state_dir = tmp_path / "state"
     state_dir.mkdir()
@@ -524,6 +570,8 @@ def verify_baseline_result(
         state["overlap_cpu_optimizer"] = launch_overlap
     if launch_world_size is not None:
         state["world_size"] = launch_world_size
+    if launch_activation_nvme_backend is not None:
+        state["activation_nvme_backend"] = launch_activation_nvme_backend
     (state_dir / "case.json").write_text(json.dumps(state), encoding="utf-8")
     metrics = {
         **shared,

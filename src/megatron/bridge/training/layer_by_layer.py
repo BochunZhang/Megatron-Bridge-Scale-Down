@@ -56,6 +56,10 @@ def configure_layer_by_layer(config: ConfigContainer) -> None:
         raise ValueError("Layer-by-layer NVMe parameters require the CPU or NVMe optimizer tier.")
     if (nvme_parameters or nvme_activations) and not offload.nvme_dir:
         raise ValueError("Layer-by-layer NVMe requires layer_by_layer.nvme_dir.")
+    if offload.activation_nvme_backend not in ("native", "deepspeed"):
+        raise ValueError("Layer-by-layer activation_nvme_backend must be native or deepspeed.")
+    if offload.activation_nvme_backend == "deepspeed" and not nvme_activations:
+        raise ValueError("Layer-by-layer DeepSpeed AIO requires activation_tier=nvme.")
     if offload.cpu_optimizer not in ("grace_adam", "torch") or offload.cpu_threads < 1:
         raise ValueError("Layer-by-layer requires a valid CPU optimizer and a positive CPU thread count.")
 
@@ -73,6 +77,8 @@ def configure_layer_by_layer(config: ConfigContainer) -> None:
         raise ValueError(
             "Layer-by-layer NVMe activation offload requires the updated Megatron-LM layer-by-layer branch."
         )
+    if offload.activation_nvme_backend == "deepspeed" and not hasattr(model, "layer_by_layer_activation_nvme_backend"):
+        raise ValueError("Layer-by-layer DeepSpeed AIO requires the updated Megatron-LM layer-by-layer branch.")
     if (
         (
             model.tensor_model_parallel_size,
@@ -192,6 +198,8 @@ def configure_layer_by_layer(config: ConfigContainer) -> None:
         model.layer_by_layer_activation_offload = cpu_activations
     if hasattr(model, "layer_by_layer_activation_nvme_path"):
         model.layer_by_layer_activation_nvme_path = offload.nvme_dir if nvme_activations else None
+    if hasattr(model, "layer_by_layer_activation_nvme_backend"):
+        model.layer_by_layer_activation_nvme_backend = offload.activation_nvme_backend
     if config.tokenizer.tokenizer_type == "NullTokenizer":
         config.tokenizer.vocab_size = model.vocab_size
 
@@ -264,6 +272,7 @@ def log_layer_by_layer_result(
                 "clip_grad": config.optimizer.clip_grad,
                 "parameter_tier": offload.parameter_tier,
                 "activation_tier": offload.activation_tier,
+                "activation_nvme_backend": getattr(config.model, "layer_by_layer_activation_nvme_backend", "native"),
                 "optimizer_tier": offload.optimizer_tier,
                 "optimizer_backend": optimizer_backend,
                 "steps": steps,

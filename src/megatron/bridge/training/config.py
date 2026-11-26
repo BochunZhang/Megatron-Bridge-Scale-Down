@@ -988,6 +988,8 @@ class LayerByLayerRecipeConfig:
 
     parameter_tier: Literal["gpu", "cpu", "nvme", "gpu_param", "cpu_param", "nvme_param"] = "gpu"
     activation_tier: Literal["gpu", "cpu", "nvme", "gpu_act", "cpu_act", "nvme_act"] = "gpu"
+    activation_nvme_backend: Literal["native", "deepspeed"] = "native"
+    """File I/O backend for NVMe activations."""
     optimizer_tier: Literal["gpu", "cpu", "nvme"] | None = None
     """Optimizer state placement. Defaults to the parameter tier."""
 

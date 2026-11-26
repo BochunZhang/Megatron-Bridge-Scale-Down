@@ -101,6 +101,7 @@ _RESULT_COLUMNS = (
     "layers",
     "parameter_tier",
     "activation_tier",
+    "activation_nvme_backend",
     "optimizer_tier",
     "optimizer_backend",
     "overlap_cpu_optimizer",
@@ -209,6 +210,7 @@ def _arguments() -> argparse.Namespace:
     parser.add_argument(
         "--activation-tier", type=lambda tier: tier.removesuffix("_act"), choices=_PLACEMENTS, default="gpu"
     )
+    parser.add_argument("--activation-nvme-backend", choices=("native", "deepspeed"), default="native")
     parser.add_argument("--optimizer-tier", choices=_PLACEMENTS, default="gpu")
     parser.add_argument("--cpu-optimizer", choices=("torch", "grace_adam"), default="torch")
     parser.add_argument(
@@ -240,6 +242,8 @@ def _arguments() -> argparse.Namespace:
         parser.error("--parameter-tier nvme requires --optimizer-tier cpu or nvme")
     if "nvme" in (args.parameter_tier, args.activation_tier) and args.nvme_dir is None:
         parser.error("NVMe requires --nvme-dir")
+    if args.activation_nvme_backend == "deepspeed" and args.activation_tier != "nvme":
+        parser.error("--activation-nvme-backend deepspeed requires --activation-tier nvme")
     args.optimizer_backend = None if args.optimizer_tier == "gpu" else args.cpu_optimizer
     if args.overlap_cpu_optimizer and (
         args.parameter_tier == "gpu" or (args.optimizer_tier, args.optimizer_backend) != ("cpu", "grace_adam")
@@ -313,10 +317,12 @@ def _profile_report(args: argparse.Namespace, layers: int, results: Path) -> Pat
     gbs = args.micro_batch_size * args.microbatches * args.world_size
     topology = f"-gpus_{args.world_size}-nodes_{args.nnodes}" if args.gpu_per_node is not None else ""
     overlap = "-opt_overlap" if args.overlap_cpu_optimizer else ""
+    activation_aio = "-act_aio_deepspeed" if args.activation_nvme_backend == "deepspeed" else ""
     return results / (
         f"{model}-lbl-layers_{layers}-attn_full-bf16-cg_off-tp_1-cp_1-pp_1-dp_{args.world_size}{topology}"
         f"-mbs_{args.micro_batch_size}-gbs_{gbs}-seq_{seq}-iters_{args.steps}"
-        f"-param_{args.parameter_tier}-act_{args.activation_tier}-opt_{args.optimizer_tier}{overlap}.nsys-rep"
+        f"-param_{args.parameter_tier}-act_{args.activation_tier}-opt_{args.optimizer_tier}"
+        f"{overlap}{activation_aio}.nsys-rep"
     )
 
 
@@ -408,6 +414,8 @@ def _command(
         )
     if args.overlap_cpu_optimizer:
         command.append("layer_by_layer.overlap_cpu_optimizer=true")
+    if args.activation_nvme_backend == "deepspeed":
+        command.append("layer_by_layer.activation_nvme_backend=deepspeed")
     if scratch is not None:
         command.append(f"layer_by_layer.nvme_dir={json.dumps(str(scratch))}")
     if args.profile == "nsys":
@@ -457,6 +465,7 @@ def _read_result(
     steps: int,
     parameter_tier: str,
     activation_tier: str,
+    activation_nvme_backend: str,
     optimizer_tier: str,
     optimizer_backend: str | None,
     overlap_cpu_optimizer: bool,
@@ -467,6 +476,7 @@ def _read_result(
         "layers": layers,
         "parameter_tier": parameter_tier,
         "activation_tier": activation_tier,
+        "activation_nvme_backend": activation_nvme_backend,
         "optimizer_tier": optimizer_tier,
         "optimizer_backend": optimizer_backend,
         "overlap_cpu_optimizer": overlap_cpu_optimizer,
@@ -523,6 +533,7 @@ def _read_result(
         and metrics.get("steps") == steps
         and metrics.get("parameter_tier") == parameter_tier
         and metrics.get("activation_tier") == activation_tier
+        and metrics.get("activation_nvme_backend", "native") == activation_nvme_backend
         and metrics.get("optimizer_tier") == optimizer_tier
         and metrics.get("fsdp_nvme_weights_only", False) is (parameter_tier == "nvme" and optimizer_tier == "cpu")
         and isinstance(actual_optimizer, str)
@@ -611,6 +622,7 @@ def _write_launch(
         "numa_mode": _numa_worker(args)[0],
         "parameter_tier": args.parameter_tier,
         "activation_tier": args.activation_tier,
+        "activation_nvme_backend": args.activation_nvme_backend,
         "optimizer_tier": args.optimizer_tier,
         "optimizer_backend": args.optimizer_backend,
         "overlap_cpu_optimizer": args.overlap_cpu_optimizer,
@@ -682,6 +694,7 @@ def _collect_case(args: argparse.Namespace, layers: int, results: Path, log_path
         steps=args.steps,
         parameter_tier=args.parameter_tier,
         activation_tier=args.activation_tier,
+        activation_nvme_backend=args.activation_nvme_backend,
         optimizer_tier=args.optimizer_tier,
         optimizer_backend=args.optimizer_backend,
         overlap_cpu_optimizer=args.overlap_cpu_optimizer,
@@ -744,6 +757,7 @@ def _prepare_case(
         "tiny": args.tiny,
         "parameter_tier": args.parameter_tier,
         "activation_tier": args.activation_tier,
+        "activation_nvme_backend": args.activation_nvme_backend,
         "optimizer_tier": args.optimizer_tier,
         "optimizer_backend": args.optimizer_backend,
         "overlap_cpu_optimizer": args.overlap_cpu_optimizer,
@@ -760,6 +774,7 @@ def _finish_case(state_dir: Path, returncode: int) -> int:
     state = json.loads((state_dir / "case.json").read_text(encoding="utf-8"))
     state.setdefault("node_rank", None)
     state.setdefault("overlap_cpu_optimizer", False)
+    state.setdefault("activation_nvme_backend", "native")
     state.setdefault("gpu_per_node", None)
     state.setdefault("nnodes", 1)
     state.setdefault("world_size", _DEFAULT_GPUS_PER_NODE)

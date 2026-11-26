@@ -10,6 +10,7 @@ activation_tier="$3"
 optimizer_tier="$4"
 shift 4
 nvme_path="${NVME_PATH:-}"
+activation_nvme_backend=native
 output_dir="${OUTPUT_DIR:-${repo_root}/results/02-layer-by-layer}"
 layers=8
 train_iters=10
@@ -52,10 +53,15 @@ while (( $# )); do
                 --master-port) master_port="$2";;
             esac
             shift 2;;
-        --nvme|--nvme-path|--output-dir|--train-iters|--profile|--cpu-optimizer|--cpu-threads)
+        --nvme|--nvme-path|--activation-nvme-backend|--output-dir|--train-iters|--profile|--cpu-optimizer|--cpu-threads)
             [[ -n "${2:-}" && "$2" != --* ]] || fail "Missing value for $1"
             case "$1" in
                 --nvme|--nvme-path) nvme_path="$2";;
+                --activation-nvme-backend)
+                    case "$2" in
+                        native|deepspeed) activation_nvme_backend="$2";;
+                        *) fail "--activation-nvme-backend must be native or deepspeed";;
+                    esac;;
                 --output-dir) output_dir="$2";;
                 --cpu-optimizer)
                     [[ "$2" == grace_adam || "$2" == torch ]] || fail "--cpu-optimizer must be grace_adam or torch"
@@ -79,6 +85,7 @@ while (( $# )); do
 Run an 8-layer Qwen3.5-27B full-attention case on one four-GPU node by default.
 
   --nvme DIR            Local scratch directory when an NVMe tier is selected
+  --activation-nvme-backend native|deepspeed   File I/O backend for NVMe activations (default: native)
   --output-dir DIR      Result root (default: results/02-layer-by-layer)
   --train-iters N       Optimizer steps (default: 10)
   --profile nsys|none   Use Nsight Systems 2026.6.1 (default: nsys)
@@ -105,6 +112,10 @@ HELP
         *) fail "Unknown option $1";;
     esac
 done
+
+if [[ "${activation_nvme_backend}" == deepspeed && "${activation_tier}" != nvme ]]; then
+    fail "--activation-nvme-backend deepspeed requires NVMe activations"
+fi
 
 if [[ "${overlap_cpu_optimizer}" == true ]]; then
     [[ ( "${parameter_tier}" == cpu || "${parameter_tier}" == nvme ) &&
@@ -140,6 +151,9 @@ if [[ "${case_08}" == true ]]; then
     model_name+="-nodes_${node_count}"
 fi
 model_name+="-param_${parameter_tier}-act_${activation_tier}-opt_${optimizer_tier}-iters_${train_iters}-profile_${profile}"
+if [[ "${activation_nvme_backend}" == deepspeed ]]; then
+    model_name+="-act_aio_deepspeed"
+fi
 result_dir="${output_dir%/}/01-baseline/${case_name}/${model_name}/node${node_rank:-0}"
 if [[ "${print_result_dir}" == true ]]; then
     printf '%s\n' "${result_dir}"
@@ -155,6 +169,7 @@ args=(--single-case-layout --results-dir "${result_dir}"
 [[ "${overlap_cpu_optimizer}" == true ]] && args+=(--overlap-cpu-optimizer)
 [[ "${dry_run}" == true ]] && args+=(--dry-run)
 [[ -z "${nvme_path}" ]] || args+=(--nvme-dir "${nvme_path}")
+args+=(--activation-nvme-backend "${activation_nvme_backend}")
 [[ -z "${cpu_threads}" ]] || args+=(--cpu-threads "${cpu_threads}")
 if [[ "${case_08}" == true ]]; then
     args+=(--nnodes "${node_count}" --gpu-per-node "${gpu_per_node}" --use-gpu-per-node "${use_gpu_per_node}")
