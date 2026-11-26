@@ -18,7 +18,7 @@ git switch v0.6.0-scale-down
 git pull --ff-only origin v0.6.0-scale-down
 ```
 
-The capacity launchers use Bridge's configured CUDA environment through `uv run --no-sync` and the native scheduler and Megatron-FSDP from the installed Megatron-LM checkout. Run them on one GB200 node with four CUDA/NCCL ranks. Set `PYTHON` to use an explicit interpreter with that same environment configuration.
+The capacity launchers use Bridge's configured CUDA environment through `uv run --no-sync` and the native scheduler and Megatron-FSDP from the installed Megatron-LM checkout. The default is one GB200 node with four CUDA/NCCL ranks. Case 08 also supports four GB200 trays with one rank per tray. Set `PYTHON` to use an explicit interpreter with that same environment configuration.
 
 If the environment resolves the older pinned submodule, put the updated sibling checkout first on the Python import path from the Bridge root.
 
@@ -26,7 +26,7 @@ If the environment resolves the older pinned submodule, put the updated sibling 
 export PYTHONPATH="$PWD/../megatron-lm${PYTHONPATH:+:$PYTHONPATH}"
 ```
 
-The sweep defaults to PyTorch CPU AdamW for CPU and NVMe optimizer tiers. Cases 04 through 06 default to GraceAdam, which requires Megatron-LM's native Megatron-FSDP GraceAdam support and an SVE-enabled build of DeepSpeed `v0.20.1`. The launchers use `--cpu-threads` (default 32) for PyTorch intra-op and OpenMP parallelism, per rank. Overlap cases also pass the thread count to the patched native CPUAdam update. For a direct recipe launch, set `OMP_NUM_THREADS` before startup to match `layer_by_layer.cpu_threads`. When enabling `layer_by_layer.overlap_cpu_optimizer`, also set `MEGATRON_GRACEADAM_OMP_THREADS` to the same value and apply the CPUAdam patches below.
+The sweep defaults to PyTorch CPU AdamW for CPU and NVMe optimizer tiers. Cases 04 through 08 default to GraceAdam, which requires Megatron-LM's native Megatron-FSDP GraceAdam support and an SVE-enabled build of DeepSpeed `v0.20.1`. The launchers use `--cpu-threads` (default 32) for PyTorch intra-op and OpenMP parallelism, per rank. Overlap cases also pass the thread count to the patched native CPUAdam update. For a direct recipe launch, set `OMP_NUM_THREADS` before startup to match `layer_by_layer.cpu_threads`. When enabling `layer_by_layer.overlap_cpu_optimizer`, also set `MEGATRON_GRACEADAM_OMP_THREADS` to the same value and apply the CPUAdam patches below.
 
 ## Native schedule smoke test
 
@@ -131,15 +131,53 @@ bash "$study/06_param_nvme_act_cpu_opt_cpu_overlap.sh" --cpu-threads 32
 
 All four ranks share the NVMe root `/tmp`. Each launch creates a temporary directory there with separate swap files per rank. To select another local NVMe directory, pass `--nvme DIR` or set `NVME_PATH`. Results go under `results/02-layer-by-layer/01-baseline/06-param-nvme-act-cpu-opt-cpu-overlap/`. The result records `parameter_tier=nvme`, `optimizer_tier=cpu`, and `fsdp_nvme_weights_only=true`.
 
+## 8-layer NVMe parameters and activations with CPU optimizer overlap
+
+Case 07 uses the same BF16 NVMe parameter shards and GraceAdam overlap as case 06. The updated BF16 shards are written back to NVMe before the next forward. The four ranks use one shared `/tmp` scratch root and write separate parameter and activation swap files there. The same `megatron_nvme_aio` extension handles host direct I/O for both, so the case runs without GPUDirect Storage.
+
+Each rank uses two reusable pinned slots for saved layer-boundary activations, one for forward writes and one for backward reads. The host AIO worker uses a reusable page-aligned buffer for direct I/O. Forward waits for the GPU-to-host copy before writing to NVMe and waits for the write before reusing the slot. Backward waits for the NVMe read and the CPU staging copy before submitting the host-to-GPU copy. That copy completes on the requesting CUDA stream before the activation is used and before the read slot is reused. Activation I/O runs synchronously. The overlap in the case name refers to GraceAdam running alongside later backward work.
+
+```bash
+study=examples/scale-down/02-layer-by-layer/01-baseline
+bash "$study/07_param_nvme_act_nvme_opt_cpu_overlap.sh" --dry-run
+bash "$study/07_param_nvme_act_nvme_opt_cpu_overlap.sh" --cpu-threads 32
+```
+
+Results go under `results/02-layer-by-layer/01-baseline/07-param-nvme-act-nvme-opt-cpu-overlap/`. The result records `parameter_tier=nvme`, `activation_tier=nvme`, `optimizer_tier=cpu`, and `fsdp_nvme_weights_only=true`.
+
+## 8-layer CPU parameters and NVMe activations
+
+Case 08 uses the CPU parameter and GraceAdam overlap settings from case 05 with the NVMe activation path from case 07. The model still uses eight decoder layers, sequence length 4096, GBS 16, and 10 steps by default. By default it uses all four GPUs on one tray and the shared scratch root `/tmp`. Pass `--nvme DIR` or set `NVME_PATH` to select another local NVMe directory. Activation reads and writes are synchronous. GraceAdam updates can overlap later backward work.
+
+```bash
+study=examples/scale-down/02-layer-by-layer/01-baseline
+bash "$study/08_param_cpu_act_nvme_opt_cpu_overlap.sh" --dry-run
+```
+
+Use `--gpu 4 --node 4` for four trays with four ranks total. The launcher uses only GPU 0 in PCI bus order on each tray. Each rank uses its own tray's NVMe for saved activations.
+
+Prepare the same Megatron-LM layer-by-layer sources, patched DeepSpeed CPUAdam, and `megatron_nvme_aio` environment on all four trays. Before launching, check `findmnt --target "$NVME_PATH"` on each tray and verify the path is backed by that tray's local NVMe. Reserve the device for the test. Pass that directory with `--nvme` or `NVME_PATH`. Each launcher creates and removes its own scratch directory.
+
+Run this command once on each tray, with `NODE_RANK` set to 0, 1, 2, or 3 and the same reachable tray-0 `MASTER_ADDR` and `MASTER_PORT` across trays.
+
+```bash
+study=examples/scale-down/02-layer-by-layer/01-baseline
+bash "$study/08_param_cpu_act_nvme_opt_cpu_overlap.sh" --gpu 4 --node 4 \
+  --node-rank "$NODE_RANK" --master-addr "$MASTER_ADDR" --master-port "${MASTER_PORT:-29500}" \
+  --nvme "$NVME_PATH"
+```
+
+Add `--dry-run` to inspect the local command. For a repeat, use a fresh `--output-dir` on every tray. The four-tray run adds `-nodes_4` to the model output directory name and keeps per-tray logs and Nsight reports in `node0/` through `node3/`. Check the aggregate loss, optimizer steps, placement, and peak HBM in `node0/summary.csv`. All four `run_info.txt` files should show `status=0`, with `case_status=passed` on node 0 and `case_status=worker_completed` on nodes 1–3. TensorBoard is written on node 3.
+
 ## Running and profiling the numbered cases
 
-The numbered scripts select the experiment settings and call `run_pretrain_layer_by_layer.sh`. That Bash launcher wraps four torchrun workers in Nsight Systems and runs Bridge's `scripts/training/run_recipe.py --recipe qwen35_text_27b_pretrain_4gpu_gb200_bf16_layer_by_layer_config --mode pretrain --dataset mock` on each rank. Bridge calls the layer-by-layer schedule through its normal training step. The launcher uses the same NUMA selection order as the FSDP3 study.
+The numbered scripts select the experiment settings and call `run_pretrain_layer_by_layer.sh`. That Bash launcher wraps each local torchrun agent in Nsight Systems and runs Bridge's `scripts/training/run_recipe.py --recipe qwen35_text_27b_pretrain_4gpu_gb200_bf16_layer_by_layer_config --mode pretrain --dataset mock` on each rank. Bridge calls the layer-by-layer schedule through its normal training step. Single-tray runs use the same NUMA selection order as the FSDP3 study. The four-tray run inherits the CPU affinity on each tray.
 
 The cases use Nsight Systems **2026.6.1** to capture CUDA, NVTX, and system-wide CPU thread scheduling. System-wide scheduling requires Linux perf access. Expand a training process in the timeline to inspect when its threads run on the CPU. CPU call-stack sampling and GPU metrics sampling are disabled. The default window is iteration 8 (step 7, zero-based). With `--train-iters 3`, capture covers iteration 3. The launcher checks `NsightSystems-2026.6.1/bin/nsys` under the Bridge repository root or the executable set through `NSYS_BIN`. Use `--profile none` for an unprofiled run. [Nsight Systems CLI reference](https://docs.nvidia.com/nsight-systems/UserGuide/)
 
 The eight-layer baseline uses outer NVTX ranges `forward.embedding`, `forward.transformer.0` through `forward.transformer.7`, and `forward.output`. Each contains `fwd.microbatch.{mb}.{stage}` ranges, such as `fwd.microbatch.0.transformer.0`. Backward uses `backward.output`, `backward.transformer.7` through `backward.transformer.0`, and `backward.embedding`. Decoder checkpoint replay has separate `recompute.microbatch.{mb}.transformer.{layer}` ranges. The `bwd.microbatch.{mb}.{stage}` ranges track gradient work through autograd hooks. Decoder and output ranges end when their stage-input gradient is ready. Embedding ranges end when the grouped backward completes because token IDs have no gradient and weight-gradient accumulation is shared. Microbatch ranges can overlap. Microbatch and decoder layer indices are zero-based.
 
-On each node the launcher checks IPv4 addresses on up interfaces. It honors valid `GLOO_SOCKET_IFNAME` and `NCCL_SOCKET_IFNAME` values. Automatic selection tries `eth0`, then `bond1`, then an IPv4 default-route interface. NCCL uses an exact interface name. The selected interfaces and Nsight version are recorded in `run_info.txt`.
+On each node the launcher checks IPv4 addresses on up interfaces. It honors valid `GLOO_SOCKET_IFNAME` and `NCCL_SOCKET_IFNAME` values. Automatic selection tries `eth0`, then `bond1`, then an IPv4 default-route interface. The four-tray run tries `bond1` first. NCCL uses an exact interface name. The selected interfaces and Nsight version are recorded in `run_info.txt`.
 
 The all-GPU baseline writes to `results/02-layer-by-layer/01-baseline/01-param-gpu-act-gpu-opt-gpu/model_27b-lbl-schedule-.../node0/` in Bridge. The Nsight report is named `qwen35_27b-lbl-layers_8-attn_full-bf16-cg_off-tp_1-cp_1-pp_1-dp_4-mbs_1-gbs_16-seq_4k-iters_10-param_gpu-act_gpu-opt_gpu.nsys-rep`. `launch.json` records its filename. The same directory contains `command.txt`, `config.yaml`, `run_info.txt`, `train.log`, `summary.csv`, `tensorboard/`, and the source revisions and hashes. Use `--print-result-dir` to resolve the path or `--output-dir` for a fresh repeat.
 
@@ -156,7 +194,7 @@ bash examples/scale-down/02-layer-by-layer/run_sweep.sh \
 
 Defaults are eight decoder layers, sequence length 4096, micro-batch size 1, four microbatches per rank per step, three optimizer steps, and GPU placement for every tier. Choose `gpu` or `cpu` independently for `--parameter-tier`, `--activation-tier`, and `--optimizer-tier`. CPU activation placement covers the saved layer boundaries. CPU-tier PyTorch AdamW uses CPU gradient accumulation. CPU-tier GraceAdam uses the direct per-layer FP32 transfer from case 04. Add `--overlap-cpu-optimizer` with `--parameter-tier cpu --optimizer-tier cpu --cpu-optimizer grace_adam` to enable case 05's optimizer scheduling.
 
-Use `--parameter-tier nvme --optimizer-tier cpu --nvme-dir /path/to/local/nvme` to swap BF16 compute weights. Use `--optimizer-tier nvme` with the same parameter tier to swap both weights and optimizer state. Both modes require the `megatron_nvme_aio` extension from the Megatron-LM checkout's `src/nvme/deepspeed`. Each NVMe case uses a fresh scratch directory. Its filesystem holds all four ranks' files. With `--optimizer-tier nvme` at full depth, FP32 master weights and the two Adam moments alone require roughly 324 GB in total, with additional storage for compute weights and staging.
+Use `--parameter-tier nvme --optimizer-tier cpu --nvme-dir /tmp` to swap BF16 compute weights and add `--activation-tier nvme` to swap saved layer-boundary activations. Use `--optimizer-tier nvme` with the same parameter tier to swap both weights and optimizer state. Any NVMe tier requires `--nvme-dir` and the `megatron_nvme_aio` extension from the Megatron-LM checkout's `src/nvme/deepspeed`. Each NVMe case uses a fresh scratch directory. Its filesystem holds all four ranks' files. With `--optimizer-tier nvme` at full depth, FP32 master weights and the two Adam moments alone require roughly 324 GB in total, with additional storage for compute weights and staging.
 
 Add `--dry-run` to inspect the commands. To narrow the capacity limit, rerun at depths between the largest passing case and the first allocation failure.
 

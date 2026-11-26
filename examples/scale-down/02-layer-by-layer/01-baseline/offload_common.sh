@@ -19,11 +19,33 @@ overlap_cpu_optimizer=false
 cpu_threads=""
 dry_run=false
 print_result_dir=false
+case_08=false
+if [[ "${case_name}" == 08-param-cpu-act-nvme-opt-cpu-overlap ]]; then
+    case_08=true
+fi
+node_count=1
+node_rank=""
+master_addr=""
+master_port=""
 
 fail() { printf '%s\n' "$*" >&2; exit 2; }
 
 while (( $# )); do
     case "$1" in
+        --gpu|--node|--node-rank|--master-addr|--master-port)
+            [[ "${case_08}" == true ]] || fail "$1 is only supported by case 08"
+            [[ -n "${2:-}" && "$2" != --* ]] || fail "Missing value for $1"
+            case "$1" in
+                --gpu)
+                    [[ "$2" == 4 ]] || fail "Case 08 uses 4 GPUs total";;
+                --node)
+                    [[ "$2" == 1 || "$2" == 4 ]] || fail "--node must be 1 or 4 for case 08"
+                    node_count="$2";;
+                --node-rank) node_rank="$2";;
+                --master-addr) master_addr="$2";;
+                --master-port) master_port="$2";;
+            esac
+            shift 2;;
         --nvme|--nvme-path|--output-dir|--train-iters|--profile|--cpu-optimizer|--cpu-threads)
             [[ -n "${2:-}" && "$2" != --* ]] || fail "Missing value for $1"
             case "$1" in
@@ -48,7 +70,7 @@ while (( $# )); do
         --print-result-dir) print_result_dir=true; shift;;
         -h|--help)
             cat <<'HELP'
-Run an 8-layer Qwen3.5-27B full-attention case on one four-GPU node.
+Run an 8-layer Qwen3.5-27B full-attention case on one four-GPU node by default.
 
   --nvme DIR            Local scratch directory when an NVMe tier is selected
   --output-dir DIR      Result root (default: results/02-layer-by-layer)
@@ -58,8 +80,20 @@ Run an 8-layer Qwen3.5-27B full-attention case on one four-GPU node.
   --overlap-cpu-optimizer  Start GraceAdam updates as CPU main gradients become ready
   --cpu-threads N       CPU optimizer and PyTorch intra-op threads per rank (default: 32)
   --dry-run             Show the training command
-  --print-result-dir    Print the node0 result directory
+  --print-result-dir    Print this node's result directory
 HELP
+            if [[ "${case_08}" == true ]]; then
+                cat <<'HELP'
+  --gpu 4               Total GPU count (default: 4)
+  --node 1|4            Compute tray count (default: 1). Use GPU 0 per tray with --node 4.
+
+With --node 4:
+  --node-rank N         Tray rank, 0 through 3 (or NODE_RANK / RANK)
+  --master-addr HOST    Address of tray 0 (or MASTER_ADDR / DLC_MASTER_ADDR)
+  --master-port PORT    Rendezvous port (or MASTER_PORT, default: 29500)
+  Set --nvme or NVME_PATH to this tray's local NVMe scratch directory.
+HELP
+            fi
             exit 0;;
         *) fail "Unknown option $1";;
     esac
@@ -71,10 +105,32 @@ if [[ "${overlap_cpu_optimizer}" == true ]]; then
         fail "--overlap-cpu-optimizer requires CPU or NVMe weights and the CPU optimizer tier with GraceAdam"
 fi
 
+if [[ "${node_count}" == 4 ]]; then
+    node_rank="${node_rank:-${NODE_RANK:-${RANK:-}}}"
+    master_addr="${master_addr:-${MASTER_ADDR:-${DLC_MASTER_ADDR:-}}}"
+    master_port="${master_port:-${MASTER_PORT:-29500}}"
+    if [[ "${dry_run}" == true || "${print_result_dir}" == true ]]; then
+        node_rank="${node_rank:-0}"
+        master_addr="${master_addr:-<rank0-host>}"
+        nvme_path="${nvme_path:-/local/nvme}"
+    fi
+    [[ "${node_rank}" =~ ^[0-3]$ ]] || fail "Set --node-rank or NODE_RANK to a tray rank from 0 to 3"
+    if [[ "${print_result_dir}" == false ]]; then
+        [[ -n "${master_addr}" ]] || fail "Set --master-addr or MASTER_ADDR to the address of tray 0"
+        [[ -n "${nvme_path}" ]] || fail "Set --nvme or NVME_PATH to this tray's local NVMe directory"
+    fi
+elif [[ "${case_08}" == true ]]; then
+    [[ -z "${node_rank}${master_addr}${master_port}" ]] || fail "Rendezvous options require --node 4"
+    nvme_path="${nvme_path:-/tmp}"
+fi
+
 [[ "${output_dir}" == /* ]] || output_dir="${PWD}/${output_dir}"
 model_name="model_27b-lbl-schedule-layers_${layers}-attn_full-cg_off-mbs_1-seq_4096-tp_1-cp_1-gbs_16-gpus_4"
+if [[ "${node_count}" == 4 ]]; then
+    model_name+="-nodes_4"
+fi
 model_name+="-param_${parameter_tier}-act_${activation_tier}-opt_${optimizer_tier}-iters_${train_iters}-profile_${profile}"
-result_dir="${output_dir%/}/01-baseline/${case_name}/${model_name}/node0"
+result_dir="${output_dir%/}/01-baseline/${case_name}/${model_name}/node${node_rank:-0}"
 if [[ "${print_result_dir}" == true ]]; then
     printf '%s\n' "${result_dir}"
     exit 0
@@ -90,5 +146,8 @@ args=(--single-case-layout --results-dir "${result_dir}"
 [[ "${dry_run}" == true ]] && args+=(--dry-run)
 [[ -z "${nvme_path}" ]] || args+=(--nvme-dir "${nvme_path}")
 [[ -z "${cpu_threads}" ]] || args+=(--cpu-threads "${cpu_threads}")
+if [[ "${node_count}" == 4 ]]; then
+    args+=(--node-rank "${node_rank}" --master-addr "${master_addr}" --master-port "${master_port}")
+fi
 
 exec bash "${script_dir}/../run_pretrain_layer_by_layer.sh" "${args[@]}"

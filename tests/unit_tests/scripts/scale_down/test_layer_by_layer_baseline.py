@@ -23,6 +23,8 @@ SWEEP = BASELINE_DIR.parent / "sweep.py"
         ("04_param_cpu_act_cpu_opt_cpu", "cpu", "cpu", "cpu"),
         ("05_param_cpu_act_cpu_opt_cpu_overlap", "cpu", "cpu", "cpu"),
         ("06_param_nvme_act_cpu_opt_cpu_overlap", "nvme", "cpu", "cpu"),
+        ("07_param_nvme_act_nvme_opt_cpu_overlap", "nvme", "nvme", "cpu"),
+        ("08_param_cpu_act_nvme_opt_cpu_overlap", "cpu", "nvme", "cpu"),
     ],
 )
 def test_layer_by_layer_baseline_dry_run(
@@ -31,7 +33,7 @@ def test_layer_by_layer_baseline_dry_run(
     script = BASELINE_DIR / f"{case}.sh"
     results_root = tmp_path / "results with spaces"
     args = ["bash", str(script), "--output-dir", str(results_root)]
-    env = {**os.environ, "PYTHON": sys.executable, "NSYS_BIN": "/example/nsys"}
+    env = {**os.environ, "PYTHON": sys.executable, "NSYS_BIN": "/example/nsys", "RANK": "3", "MASTER_ADDR": "tray0"}
     env.pop("NVME_PATH", None)
     result = subprocess.run([*args, "--dry-run"], env=env, check=True, capture_output=True, text=True)
     command = shlex.split(result.stderr.strip())
@@ -40,6 +42,8 @@ def test_layer_by_layer_baseline_dry_run(
         "--sample=none",
         "--cpuctxsw=system-wide",
         "--gpu-metrics-devices=none",
+        "--standalone",
+        "--nnodes=1",
         "--nproc-per-node=4",
         "model.num_layers=8",
         "model.linear_attention_freq=1",
@@ -69,13 +73,14 @@ def test_layer_by_layer_baseline_dry_run(
     assert graceadam_threads == (["MEGATRON_GRACEADAM_OMP_THREADS=32"] if overlap else [])
     assert all(not arg.startswith("layer_by_layer.backend=") for arg in command)
     nvme_args = [arg for arg in command if arg.startswith("layer_by_layer.nvme_dir=")]
-    if parameter_tier == "nvme":
+    if "nvme" in (parameter_tier, activation_tier):
         assert nvme_args == ['layer_by_layer.nvme_dir="/tmp/layer-by-layer-8-<unique>"']
     else:
         assert not nvme_args
 
     result = subprocess.run([*args, "--print-result-dir"], env=env, check=True, capture_output=True, text=True)
     result_path = Path(result.stdout.strip())
+    assert result_path.name == "node0"
     assert result_path.parent.parent == results_root / "01-baseline" / case.replace("_", "-")
     assert result_path.parent.name.startswith("model_27b-lbl-schedule-")
     report = Path(next(arg.removeprefix("--output=") for arg in command if arg.startswith("--output=")))
@@ -86,8 +91,9 @@ def test_layer_by_layer_baseline_dry_run(
 
 
 @pytest.mark.unit
-def test_layer_by_layer_baseline_nvme_path_override(tmp_path: Path) -> None:
-    script = BASELINE_DIR / "06_param_nvme_act_cpu_opt_cpu_overlap.sh"
+@pytest.mark.parametrize("case", ["06_param_nvme_act_cpu_opt_cpu_overlap", "07_param_nvme_act_nvme_opt_cpu_overlap"])
+def test_layer_by_layer_baseline_nvme_path_override(tmp_path: Path, case: str) -> None:
+    script = BASELINE_DIR / f"{case}.sh"
     nvme = tmp_path / "shared NVMe"
     result = subprocess.run(
         ["bash", str(script), "--dry-run", "--nvme", str(nvme)],
@@ -99,6 +105,80 @@ def test_layer_by_layer_baseline_nvme_path_override(tmp_path: Path) -> None:
     scratch = nvme / "layer-by-layer-8-<unique>"
     assert f"layer_by_layer.nvme_dir={json.dumps(str(scratch))}" in shlex.split(result.stderr)
     assert not nvme.exists()
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("node_rank", range(4))
+def test_case_08_uses_one_gpu_per_tray(tmp_path: Path, node_rank: int) -> None:
+    script = BASELINE_DIR / "08_param_cpu_act_nvme_opt_cpu_overlap.sh"
+    nvme = tmp_path / "tray NVMe"
+    results = tmp_path / "shared results"
+    numarun = tmp_path / "numarun"
+    numarun.touch(mode=0o755)
+    env = {
+        **os.environ,
+        "PYTHON": sys.executable,
+        "PATH": f"{tmp_path}{os.pathsep}{os.environ['PATH']}",
+        "CUDA_VISIBLE_DEVICES": "3,2,1,0",
+        "NVME_PATH": str(nvme),
+    }
+    args = [
+        "bash",
+        str(script),
+        "--gpu",
+        "4",
+        "--node",
+        "4",
+        "--node-rank",
+        str(node_rank),
+        "--master-addr",
+        "tray0",
+        "--master-port",
+        "29531",
+        "--output-dir",
+        str(results),
+    ]
+    result = subprocess.run([*args, "--dry-run"], env=env, capture_output=True, text=True, check=True)
+    command = shlex.split(result.stderr)
+    assert {
+        "CUDA_DEVICE_ORDER=PCI_BUS_ID",
+        "CUDA_VISIBLE_DEVICES=0",
+        "--nnodes=4",
+        "--nproc-per-node=1",
+        f"--node-rank={node_rank}",
+        "--master-addr=tray0",
+        "--master-port=29531",
+        "train.global_batch_size=16",
+        "layer_by_layer.parameter_tier=cpu",
+        "layer_by_layer.activation_tier=nvme",
+        "layer_by_layer.optimizer_tier=cpu",
+        "layer_by_layer.cpu_optimizer=grace_adam",
+        "layer_by_layer.overlap_cpu_optimizer=true",
+        f"layer_by_layer.nvme_dir={json.dumps(str(nvme / 'layer-by-layer-8-<unique>'))}",
+    } <= set(command)
+    assert not {"--standalone", "numarun", "CUDA_VISIBLE_DEVICES=3,2,1,0"} & set(command)
+
+    result = subprocess.run([*args, "--print-result-dir"], env=env, capture_output=True, text=True, check=True)
+    result_path = Path(result.stdout.strip())
+    assert result_path.name == f"node{node_rank}"
+    assert "-nodes_4-" in result_path.parent.name
+    assert result_path.parent.parent == results / "01-baseline" / "08-param-cpu-act-nvme-opt-cpu-overlap"
+    report = Path(next(arg.removeprefix("--output=") for arg in command if arg.startswith("--output=")))
+    assert report.parent == result_path
+    assert not results.exists()
+    assert not nvme.exists()
+
+
+@pytest.mark.unit
+def test_case_08_requires_explicit_nvme_for_four_trays() -> None:
+    script = BASELINE_DIR / "08_param_cpu_act_nvme_opt_cpu_overlap.sh"
+    env = {**os.environ, "RANK": "1", "DLC_MASTER_ADDR": "tray0"}
+    env.pop("NODE_RANK", None)
+    env.pop("MASTER_ADDR", None)
+    env.pop("NVME_PATH", None)
+    result = subprocess.run(["bash", str(script), "--gpu", "4", "--node", "4"], env=env, capture_output=True, text=True)
+    assert result.returncode == 2
+    assert "this tray's local NVMe directory" in result.stderr
 
 
 @pytest.mark.unit
@@ -166,27 +246,22 @@ def test_layer_by_layer_sweep_placements(extra_args: list[str], expected: set[st
 
 
 @pytest.mark.unit
-def test_layer_by_layer_sweep_nvme_uses_case_scratch(tmp_path: Path) -> None:
+@pytest.mark.parametrize(
+    "tiers",
+    [{"parameter": "nvme", "optimizer": "nvme"}, {"parameter": "gpu", "activation": "nvme", "optimizer": "gpu"}],
+)
+def test_layer_by_layer_sweep_nvme_uses_case_scratch(tmp_path: Path, tiers: dict[str, str]) -> None:
     nvme = tmp_path / "nvme with spaces"
     nvme.mkdir()
+    tier_args = [arg for component, tier in tiers.items() for arg in (f"--{component}-tier", tier)]
     result = subprocess.run(
-        [
-            sys.executable,
-            str(SWEEP),
-            "--dry-run",
-            "--parameter-tier",
-            "nvme",
-            "--optimizer-tier",
-            "nvme",
-            "--nvme",
-            str(nvme),
-        ],
+        [sys.executable, str(SWEEP), "--dry-run", *tier_args, "--nvme", str(nvme)],
         capture_output=True,
         text=True,
         check=True,
     )
     command = shlex.split(result.stderr)
-    assert {"layer_by_layer.parameter_tier=nvme", "layer_by_layer.optimizer_tier=nvme"} <= set(command)
+    assert {f"layer_by_layer.{component}_tier={tier}" for component, tier in tiers.items()} <= set(command)
     scratch = next(
         arg.removeprefix("layer_by_layer.nvme_dir=") for arg in command if arg.startswith("layer_by_layer.nvme_dir=")
     )
@@ -249,11 +324,14 @@ def test_baseline_result_checks_optimizer_overlap(
         ({}, "invalid_result"),
     ],
 )
-def test_baseline_result_checks_nvme_weights_only(tmp_path: Path, nvme_metrics: dict, expected_status: str) -> None:
+@pytest.mark.parametrize("activation_tier", ["cpu", "nvme"])
+def test_baseline_result_checks_nvme_weights_only(
+    tmp_path: Path, nvme_metrics: dict, expected_status: str, activation_tier: str
+) -> None:
     verify_baseline_result(
         tmp_path,
         "nvme",
-        "cpu",
+        activation_tier,
         {
             "optimizer_tier": "cpu",
             "fsdp_layer_by_layer_cpu_optimizer": True,
@@ -274,6 +352,7 @@ def test_baseline_result_checks_nvme_weights_only(tmp_path: Path, nvme_metrics: 
         ("cpu", "gpu", {}, "passed"),
         ("cpu", "cpu", {}, "passed"),
         ("cpu", "cpu", {"optimizer_tier": "cpu", "fsdp_layer_by_layer_cpu_optimizer": True}, "passed"),
+        ("cpu", "nvme", {"optimizer_tier": "cpu", "fsdp_layer_by_layer_cpu_optimizer": True}, "passed"),
         ("cpu", "cpu", {"optimizer_tier": "cpu", "optimizer_backend": "torch"}, "passed"),
         ("cpu", "cpu", {"optimizer_tier": "cpu", "fsdp_layer_by_layer_cpu_optimizer": False}, "invalid_result"),
         (
@@ -299,6 +378,51 @@ def test_baseline_result_checks_native_fsdp_metrics(
     tmp_path: Path, parameter_tier: str, activation_tier: str, fsdp_result: dict, expected_status: str
 ) -> None:
     verify_baseline_result(tmp_path, parameter_tier, activation_tier, fsdp_result, expected_status)
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    ("node_rank", "profile", "returncode", "case_status"),
+    [
+        (0, "none", 0, "invalid_result"),
+        (1, "none", 0, "worker_completed"),
+        (2, "nsys", 0, "invalid_profile"),
+        (3, "none", 1, "failed"),
+    ],
+)
+def test_case_08_validates_training_result_on_tray_zero(
+    tmp_path: Path, node_rank: int, profile: str, returncode: int, case_status: str
+) -> None:
+    state = {
+        "results": str(tmp_path),
+        "node_rank": node_rank,
+        "layers": 8,
+        "steps": 10,
+        "microbatches": 4,
+        "micro_batch_size": 1,
+        "seq_length": 4096,
+        "tiny": False,
+        "parameter_tier": "cpu",
+        "activation_tier": "nvme",
+        "optimizer_tier": "cpu",
+        "optimizer_backend": "grace_adam",
+        "overlap_cpu_optimizer": True,
+        "profile": profile,
+        "worker_overrides": {"GLOO_SOCKET_IFNAME": "bond1", "NCCL_SOCKET_IFNAME": "=bond1"},
+        "nsys_version": None,
+    }
+    (tmp_path / "case.json").write_text(json.dumps(state), encoding="utf-8")
+    (tmp_path / "train.log").touch()
+    result = subprocess.run(
+        [sys.executable, str(SWEEP), "--finish-case", str(tmp_path), str(returncode)],
+        capture_output=True,
+        text=True,
+    )
+    expected_exit = int(case_status != "worker_completed")
+    assert result.returncode == expected_exit, result.stderr
+    run_info = (tmp_path / "run_info.txt").read_text(encoding="utf-8").splitlines()
+    assert f"case_status={case_status}" in run_info
+    assert f"status={expected_exit}" in run_info
 
 
 def verify_baseline_result(

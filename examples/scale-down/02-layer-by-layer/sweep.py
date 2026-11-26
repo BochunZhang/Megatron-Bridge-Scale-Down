@@ -1,6 +1,6 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
-"""Sweep transformer depth on a four-GPU layer-by-layer training node."""
+"""Run layer-by-layer training with four GPU ranks."""
 
 import argparse
 import csv
@@ -12,6 +12,7 @@ import os
 import re
 import shlex
 import shutil
+import socket
 import subprocess
 import sys
 import tempfile
@@ -81,6 +82,8 @@ _CASE_SCRIPTS = tuple(
         "04_param_cpu_act_cpu_opt_cpu.sh",
         "05_param_cpu_act_cpu_opt_cpu_overlap.sh",
         "06_param_nvme_act_cpu_opt_cpu_overlap.sh",
+        "07_param_nvme_act_nvme_opt_cpu_overlap.sh",
+        "08_param_cpu_act_nvme_opt_cpu_overlap.sh",
         "offload_common.sh",
     )
 )
@@ -204,7 +207,7 @@ def _arguments() -> argparse.Namespace:
         "--parameter-tier", type=lambda tier: tier.removesuffix("_param"), choices=_PLACEMENTS, default="gpu"
     )
     parser.add_argument(
-        "--activation-tier", type=lambda tier: tier.removesuffix("_act"), choices=("gpu", "cpu"), default="gpu"
+        "--activation-tier", type=lambda tier: tier.removesuffix("_act"), choices=_PLACEMENTS, default="gpu"
     )
     parser.add_argument("--optimizer-tier", choices=_PLACEMENTS, default="gpu")
     parser.add_argument("--cpu-optimizer", choices=("torch", "grace_adam"), default="torch")
@@ -220,6 +223,9 @@ def _arguments() -> argparse.Namespace:
     parser.add_argument(
         "--single-case-layout", action="store_true", help="use node-level files for one depth"
     )
+    parser.add_argument("--node-rank", type=int, choices=range(_WORLD_SIZE), help="tray rank in a four-node case")
+    parser.add_argument("--master-addr", help="rendezvous host in a four-node case")
+    parser.add_argument("--master-port", type=_positive, default=29500)
     parser.add_argument("--prepare-case", type=Path, help=argparse.SUPPRESS)
     parser.add_argument(
         "--dry-run", action="store_true", help="show commands without writing or launching"
@@ -227,11 +233,10 @@ def _arguments() -> argparse.Namespace:
     args = parser.parse_args()
     if args.optimizer_tier == "nvme" and args.parameter_tier != "nvme":
         parser.error("--optimizer-tier nvme requires --parameter-tier nvme")
-    if args.parameter_tier == "nvme":
-        if args.optimizer_tier == "gpu":
-            parser.error("--parameter-tier nvme requires --optimizer-tier cpu or nvme")
-        if args.nvme_dir is None:
-            parser.error("NVMe requires --nvme-dir")
+    if args.parameter_tier == "nvme" and args.optimizer_tier == "gpu":
+        parser.error("--parameter-tier nvme requires --optimizer-tier cpu or nvme")
+    if "nvme" in (args.parameter_tier, args.activation_tier) and args.nvme_dir is None:
+        parser.error("NVMe requires --nvme-dir")
     args.optimizer_backend = None if args.optimizer_tier == "gpu" else args.cpu_optimizer
     if args.overlap_cpu_optimizer and (
         args.parameter_tier == "gpu" or (args.optimizer_tier, args.optimizer_backend) != ("cpu", "grace_adam")
@@ -246,6 +251,10 @@ def _arguments() -> argparse.Namespace:
         parser.error("--single-case-layout requires exactly one depth and --results-dir")
     if args.prepare_case and not args.single_case_layout:
         parser.error("--prepare-case requires --single-case-layout")
+    if args.node_rank is not None and (
+        not args.single_case_layout or not args.master_addr or args.master_port > 65535
+    ):
+        parser.error("--node-rank requires --single-case-layout, --master-addr, and --master-port in [1, 65535]")
     if args.profile == "nsys":
         if args.profile_start is None:
             args.profile_start = min(7, args.steps - 1)
@@ -291,7 +300,10 @@ def _profile_report(args: argparse.Namespace, layers: int, results: Path) -> Pat
     )
 
 
-def _numa_worker() -> tuple[str, list[str]]:
+def _numa_worker(*, single_rank_per_node: bool) -> tuple[str, list[str]]:
+    # numarun assumes at least one local worker per CPU socket.
+    if single_rank_per_node:
+        return "inherited", []
     if shutil.which("numarun"):
         return "numarun", ["numarun"]
     if shutil.which("numactl"):
@@ -314,7 +326,19 @@ def _command(
     )
     config_path = report.parent / ("config.yaml" if args.single_case_layout else f"layers-{layers}.config.yaml")
     tensorboard_dir = report.parent / ("tensorboard" if args.single_case_layout else f"layers-{layers}.tensorboard")
-    _, numa_wrapper = _numa_worker()
+    multi_node = args.node_rank is not None
+    _, numa_wrapper = _numa_worker(single_rank_per_node=multi_node)
+    torchrun_topology = ["--standalone", "--nnodes=1", f"--nproc-per-node={_WORLD_SIZE}"]
+    gpu_env = []
+    if multi_node:
+        torchrun_topology = [
+            f"--nnodes={_WORLD_SIZE}",
+            "--nproc-per-node=1",
+            f"--node-rank={args.node_rank}",
+            f"--master-addr={args.master_addr}",
+            f"--master-port={args.master_port}",
+        ]
+        gpu_env = ["CUDA_DEVICE_ORDER=PCI_BUS_ID", "CUDA_VISIBLE_DEVICES=0"]
     worker_env = []
     if args.optimizer_backend is not None:
         worker_env = ["env", f"OMP_NUM_THREADS={args.cpu_threads}", "OMP_DYNAMIC=FALSE", "OMP_PROC_BIND=FALSE"]
@@ -324,9 +348,7 @@ def _command(
         *python,
         "-m",
         "torch.distributed.run",
-        "--standalone",
-        "--nnodes=1",
-        f"--nproc-per-node={_WORLD_SIZE}",
+        *torchrun_topology,
         "--no-python",
         *numa_wrapper,
         *worker_env,
@@ -396,6 +418,7 @@ def _command(
         "NCCL_DEBUG_FILE",
         "NCCL_DEBUG=WARN",
         "PYTHONUNBUFFERED=1",
+        *gpu_env,
         *(f"{key}={value}" for key, value in (worker_overrides or {}).items()),
         *command,
     ]
@@ -412,6 +435,7 @@ def _read_result(
     optimizer_tier: str,
     optimizer_backend: str | None,
     overlap_cpu_optimizer: bool,
+    expect_result: bool,
 ) -> dict:
     result = {
         "layers": layers,
@@ -440,6 +464,9 @@ def _read_result(
     if returncode:
         if len(resource_errors) == 1:
             result["status"] = resource_errors.pop()
+        return result
+    if not expect_result:
+        result["status"] = "worker_completed"
         return result
     result["status"] = "invalid_result"
     if len(records) != 1 or not isinstance(records[0], dict):
@@ -508,6 +535,7 @@ def _write_launch(
     nsys_version: str | None,
     source_metadata: dict[str, str | None],
 ) -> None:
+    multi_node = args.node_rank is not None
     launch = {
         "model": "Qwen/Qwen3.5-27B",
         "recipe": _RECIPE,
@@ -528,9 +556,12 @@ def _write_launch(
         "num_microbatches": args.microbatches,
         "train_iters": args.steps,
         "gpu_count": _WORLD_SIZE,
-        "nnodes": 1,
-        "node_rank": 0,
-        "numa_mode": _numa_worker()[0],
+        "nnodes": _WORLD_SIZE if multi_node else 1,
+        "node_rank": args.node_rank if multi_node else 0,
+        "nproc_per_node": 1 if multi_node else _WORLD_SIZE,
+        "host": socket.gethostname(),
+        "cuda_visible_devices": "0" if multi_node else os.environ.get("CUDA_VISIBLE_DEVICES"),
+        "numa_mode": _numa_worker(single_rank_per_node=multi_node)[0],
         "parameter_tier": args.parameter_tier,
         "activation_tier": args.activation_tier,
         "optimizer_tier": args.optimizer_tier,
@@ -607,8 +638,9 @@ def _collect_case(args: argparse.Namespace, layers: int, results: Path, log_path
         optimizer_tier=args.optimizer_tier,
         optimizer_backend=args.optimizer_backend,
         overlap_cpu_optimizer=args.overlap_cpu_optimizer,
+        expect_result=args.node_rank in (None, 0),
     )
-    if args.profile == "nsys" and case["status"] == "passed":
+    if args.profile == "nsys" and case["status"] in ("passed", "worker_completed"):
         report = _profile_report(args, layers, results)
         if not report.is_file() or report.stat().st_size == 0:
             _LOG.error("Missing or empty Nsight Systems report: %s", report)
@@ -616,8 +648,8 @@ def _collect_case(args: argparse.Namespace, layers: int, results: Path, log_path
     return case
 
 
-def _write_run_info(results: Path, case: dict, worker_overrides: dict[str, str], nsys_version: str | None) -> None:
-    status = 0 if case["status"] == "passed" else case["returncode"] or 1
+def _write_run_info(results: Path, case: dict, worker_overrides: dict[str, str], nsys_version: str | None) -> int:
+    status = 0 if case["status"] in ("passed", "worker_completed") else case["returncode"] or 1
     info = [
         f"case_status={case['status']}",
         f"returncode={case['returncode']}",
@@ -628,6 +660,7 @@ def _write_run_info(results: Path, case: dict, worker_overrides: dict[str, str],
         info.append(f"nsys_version={nsys_version}")
     info.append(f"status={status}")
     (results / "run_info.txt").write_text("\n".join(info) + "\n", encoding="utf-8")
+    return status
 
 
 def _prepare_case(
@@ -652,6 +685,7 @@ def _prepare_case(
     state = {
         "results": str(results),
         "layers": layers,
+        "node_rank": args.node_rank,
         "steps": args.steps,
         "microbatches": args.microbatches,
         "micro_batch_size": args.micro_batch_size,
@@ -673,6 +707,7 @@ def _prepare_case(
 def _finish_case(state_dir: Path, returncode: int) -> int:
     """Validate the worker's output and write the numbered case's summary."""
     state = json.loads((state_dir / "case.json").read_text(encoding="utf-8"))
+    state.setdefault("node_rank", None)
     state.setdefault("overlap_cpu_optimizer", False)
     args = argparse.Namespace(single_case_layout=True, **state)
     results = Path(args.results)
@@ -681,9 +716,9 @@ def _finish_case(state_dir: Path, returncode: int) -> int:
         writer = csv.DictWriter(summary, fieldnames=_RESULT_COLUMNS)
         writer.writeheader()
         writer.writerow(case)
-    _write_run_info(results, case, args.worker_overrides, args.nsys_version)
+    status = _write_run_info(results, case, args.worker_overrides, args.nsys_version)
     _LOG.info("%d layers: %s. Results at %s", args.layers, case["status"], results)
-    return int(case["status"] != "passed")
+    return int(status != 0)
 
 
 def main() -> int:
@@ -692,7 +727,7 @@ def main() -> int:
     if sys.argv[1:2] == ["--finish-case"]:
         return _finish_case(Path(sys.argv[2]), int(sys.argv[3]))
     args = _arguments()
-    nvme_dir = args.nvme_dir.absolute() if args.parameter_tier == "nvme" else None
+    nvme_dir = args.nvme_dir.absolute() if "nvme" in (args.parameter_tier, args.activation_tier) else None
     if args.dry_run:
         results = args.results_dir or Path("results/02-layer-by-layer-<unique>")
         for layers in args.layers:
@@ -707,7 +742,9 @@ def main() -> int:
         lm_dir = _installed_megatron_lm()
         nsys_version = _check_nsys_version() if args.profile == "nsys" else None
         worker_overrides = (
-            resolve_network(os.environ) if args.single_case_layout or nsys_version else {}
+            resolve_network(os.environ, multi_node=args.node_rank is not None)
+            if args.single_case_layout or nsys_version
+            else {}
         )
     except RuntimeError as exc:
         _LOG.error("%s", exc)

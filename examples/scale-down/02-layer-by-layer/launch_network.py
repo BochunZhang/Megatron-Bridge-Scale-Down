@@ -1,10 +1,11 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
-"""Select local socket interfaces for the single-node layer-by-layer launcher."""
+"""Select local socket interfaces for the layer-by-layer launcher."""
 
 import logging
 import subprocess
 from collections.abc import Mapping
+
 
 _LOG = logging.getLogger(__name__)
 
@@ -25,8 +26,8 @@ def _ip_lines(env: Mapping[str, str], *args: str) -> list[str]:
     return result.stdout.splitlines()
 
 
-def _default_interface(env: Mapping[str, str], interfaces: set[str]) -> str:
-    for name in ("eth0", "bond1"):
+def _default_interface(env: Mapping[str, str], interfaces: set[str], *, multi_node: bool) -> str:
+    for name in ("bond1", "eth0") if multi_node else ("eth0", "bond1"):
         if name in interfaces:
             return name
     for line in _ip_lines(env, "route", "show", "default"):
@@ -41,7 +42,7 @@ def _default_interface(env: Mapping[str, str], interfaces: set[str]) -> str:
     )
 
 
-def resolve_network(env: Mapping[str, str]) -> dict[str, str]:
+def resolve_network(env: Mapping[str, str], *, multi_node: bool = False) -> dict[str, str]:
     """Return validated Gloo and exact-match NCCL interfaces for one node."""
     interfaces = set()
     for line in _ip_lines(env, "addr", "show", "up"):
@@ -53,7 +54,7 @@ def resolve_network(env: Mapping[str, str]) -> dict[str, str]:
     if gloo not in interfaces:
         if gloo:
             _LOG.warning("Ignoring GLOO_SOCKET_IFNAME=%r. Select an active IPv4 interface.", gloo)
-        gloo = _default_interface(env, interfaces)
+        gloo = _default_interface(env, interfaces, multi_node=multi_node)
 
     nccl_override = env.get("NCCL_SOCKET_IFNAME", "")
     nccl = nccl_override.removeprefix("=")

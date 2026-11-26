@@ -48,14 +48,13 @@ def configure_layer_by_layer(config: ConfigContainer) -> None:
         if offload.optimizer_tier is None
         else _normalize_tier(offload.optimizer_tier, "optimizer_tier")
     )
-    if offload.activation_tier == "nvme":
-        raise ValueError("Layer-by-layer boundary activations support GPU or CPU placement.")
-    use_nvme = offload.parameter_tier == "nvme"
-    if offload.optimizer_tier == "nvme" and not use_nvme:
+    nvme_parameters = offload.parameter_tier == "nvme"
+    nvme_activations = offload.activation_tier == "nvme"
+    if offload.optimizer_tier == "nvme" and not nvme_parameters:
         raise ValueError("Layer-by-layer NVMe optimizer state requires NVMe parameters.")
-    if use_nvme and offload.optimizer_tier == "gpu":
+    if nvme_parameters and offload.optimizer_tier == "gpu":
         raise ValueError("Layer-by-layer NVMe parameters require the CPU or NVMe optimizer tier.")
-    if use_nvme and not offload.nvme_dir:
+    if (nvme_parameters or nvme_activations) and not offload.nvme_dir:
         raise ValueError("Layer-by-layer NVMe requires layer_by_layer.nvme_dir.")
     if offload.cpu_optimizer not in ("grace_adam", "torch") or offload.cpu_threads < 1:
         raise ValueError("Layer-by-layer requires a valid CPU optimizer and a positive CPU thread count.")
@@ -65,10 +64,14 @@ def configure_layer_by_layer(config: ConfigContainer) -> None:
         raise ValueError("Layer-by-layer training requires a dense GPT model provider.")
     if not hasattr(model, "layer_by_layer_schedule"):
         raise ValueError("Layer-by-layer training requires the updated Megatron-LM layer-by-layer branch.")
-    host_activations = offload.activation_tier == "cpu"
-    if host_activations and not hasattr(model, "layer_by_layer_activation_offload"):
+    cpu_activations = offload.activation_tier == "cpu"
+    if cpu_activations and not hasattr(model, "layer_by_layer_activation_offload"):
         raise ValueError(
             "Layer-by-layer CPU activation offload requires the updated Megatron-LM layer-by-layer branch."
+        )
+    if nvme_activations and not hasattr(model, "layer_by_layer_activation_nvme_path"):
+        raise ValueError(
+            "Layer-by-layer NVMe activation offload requires the updated Megatron-LM layer-by-layer branch."
         )
     if (
         (
@@ -113,7 +116,7 @@ def configure_layer_by_layer(config: ConfigContainer) -> None:
 
     ddp = config.ddp
     optimizer = config.optimizer
-    nvme_weights_only = use_nvme and offload.optimizer_tier == "cpu"
+    nvme_weights_only = nvme_parameters and offload.optimizer_tier == "cpu"
     if nvme_weights_only and not hasattr(ddp, "fsdp_nvme_weights_only"):
         raise ValueError(
             "Layer-by-layer NVMe parameters with the CPU optimizer require the updated Megatron-LM backend."
@@ -178,7 +181,7 @@ def configure_layer_by_layer(config: ConfigContainer) -> None:
     ddp.fsdp_cpu_offload = tuple(components)
     ddp.fsdp_cpu_grad_accumulation = cpu_optimizer and not layerwise_grace_adam
     ddp.fsdp_cpu_optimizer = cpu_optimizer
-    ddp.fsdp_nvme_path = offload.nvme_dir if use_nvme else None
+    ddp.fsdp_nvme_path = offload.nvme_dir if nvme_parameters else None
     if hasattr(ddp, "fsdp_nvme_weights_only"):
         ddp.fsdp_nvme_weights_only = nvme_weights_only
     config.checkpoint.ckpt_format = "fsdp_dtensor"
@@ -186,7 +189,9 @@ def configure_layer_by_layer(config: ConfigContainer) -> None:
     _apply_workload_geometry(model, tiny=offload.tiny)
     model.layer_by_layer_schedule = True
     if hasattr(model, "layer_by_layer_activation_offload"):
-        model.layer_by_layer_activation_offload = host_activations
+        model.layer_by_layer_activation_offload = cpu_activations
+    if hasattr(model, "layer_by_layer_activation_nvme_path"):
+        model.layer_by_layer_activation_nvme_path = offload.nvme_dir if nvme_activations else None
     if config.tokenizer.tokenizer_type == "NullTokenizer":
         config.tokenizer.vocab_size = model.vocab_size
 
