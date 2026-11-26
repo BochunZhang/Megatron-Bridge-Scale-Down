@@ -1,0 +1,275 @@
+diff --git a/makefiles/version.mk b/makefiles/version.mk
+index db924347f06261d672fff1c912e79a216a275980..9f1af744abec80fe8d5ddce35b5c7b2c771f2b4a 100644
+--- a/makefiles/version.mk
++++ b/makefiles/version.mk
+@@ -9,5 +9,5 @@
+ NCCL_MAJOR   := 2
+ NCCL_MINOR   := 32
+ NCCL_PATCH   := 3
+-NCCL_SUFFIX  :=
++NCCL_SUFFIX  := -adaptive-pause
+ PKG_REVISION := 1
+diff --git a/src/device/common.cu b/src/device/common.cu
+index bb915830360ae9e4c617b58d8e1bd904ed230140..7a3a30a0007528c5c40a1195686b8d13c070e633 100644
+--- a/src/device/common.cu
++++ b/src/device/common.cu
+@@ -26,6 +26,17 @@ __global__ void ncclDevKernel_Generic(ncclDevKernelArgs4K NCCL_GRID_CONSTANT con
+
+ __device__ void ncclDevFunc_Nop() {}
+
++// The symmetric kernels are compiled in separate device modules. Pass the address
++// of this one context-local counter to them from the host.
++static __device__ __align__(128) uint32_t ncclSymkRsActiveCtas = 0;
++
++ncclResult_t ncclSymkGetRsActiveCtas(uint32_t** counter) {
++  void* ptr;
++  CUDACHECK(cudaGetSymbolAddress(&ptr, ncclSymkRsActiveCtas));
++  *counter = static_cast<uint32_t*>(ptr);
++  return ncclSuccess;
++}
++
+ // Capture %globaltimer for optional CPU/GPU clock calibration in init.cc.
+ __global__ void ncclProgressCounterCaptureGpuTime(uint64_t* out) {
+   if (threadIdx.x == 0) *out = globaltimer();
+diff --git a/src/device/symmetric/all_gather.cuh b/src/device/symmetric/all_gather.cuh
+index a44f152be873d38acb48d3c4768e391c3a3f8a50..a5f6bad468d4f26778ee8a7d14a5dc8927a554cc 100644
+--- a/src/device/symmetric/all_gather.cuh
++++ b/src/device/symmetric/all_gather.cuh
+@@ -301,7 +301,8 @@ __device__ __forceinline__ void ncclSymkRun_AllGather_STMC_impl(ncclSymkDevWorkA
+     int t =
+       flattenIx(threadIdx.x % WARP_SIZE, WARP_SIZE, block, nBlocks, threadIdx.x / WARP_SIZE, blockDim.x / WARP_SIZE);
+     int tn = nBlocks * blockDim.x;
+-    bcastMultimem<char, EnableTma>(handler, tn, t, input, output + rank * nAllElts, nElts, rank);
++    bcastMultimem<char, EnableTma, /*EnablePause=*/true>(handler, tn, t, input, output + rank * nAllElts, nElts, rank,
++                                                       args);
+   });
+
+   if NCCL_IF_CONSTEXPR (EnableProfiler) ncclSymkProfilerPhase(args, NCCL_KERNEL_PHASE_BEFORE_CLOSE);
+diff --git a/src/device/symmetric/primitives.cuh b/src/device/symmetric/primitives.cuh
+index 109979cfa23b38f600d01f5f36112f21a966b8de..65e5ee167b1cce2df7878436a100a5395690d0d8 100644
+--- a/src/device/symmetric/primitives.cuh
++++ b/src/device/symmetric/primitives.cuh
+@@ -335,10 +335,16 @@ static __device__ __forceinline__ void tmaLoadStoreMc(char* dest, char* smem, ch
+ }
+ #endif
+
++static __device__ __forceinline__ void ncclSymkPauseCycles(uint32_t cycles) {
++  uint64_t start = clock64();
++  while (uint64_t(clock64()) - start < cycles) {}
++}
++
+ // TODO: move this into data_ops.cuh
+-template <typename T, bool EnableTma = false>
++template <typename T, bool EnableTma = false, bool EnablePause = false>
+ static __device__ void bcastMultimem(ncclSymkArgsHandler& handler, int tn, int t, ncclSymPtr<T> input,
+-                                     ncclSymPtr<T> output, size_t nElts, uint32_t rank = 0) {
++                                     ncclSymPtr<T> output, size_t nElts, uint32_t rank = 0,
++                                     const ncclSymkDevWorkArgs* pauseArgs = nullptr) {
+   size_t nBytes = nElts * sizeof(T);
+   uintptr_t inputUptr = reinterpret_cast<uintptr_t>(input.localPtr());
+   uintptr_t outputUptr = reinterpret_cast<uintptr_t>(output.multimemPtr(handler.comm.lsaMultimem));
+@@ -387,8 +393,31 @@ static __device__ void bcastMultimem(ncclSymkArgsHandler& handler, int tn, int t
+     cursor += (t / WARP_SIZE) * UnrollPacks * WARP_SIZE * BytePerPack;
+     cursor += (t % WARP_SIZE) * BytePerPack;
+     int nIters = (int)nChunks - (int)(t / WARP_SIZE);
++    uint32_t pauseCycles = 0;
++    uint32_t chunksUntilPoll = 0;
++    uint32_t* rsActiveCtas = nullptr;
++    if NCCL_IF_CONSTEXPR (EnablePause) {
++      pauseCycles = pauseArgs->agStmcPauseCycles;
++      rsActiveCtas = pauseArgs->rsActiveCtas;
++    }
+     NVCC_PRAGMA_UNROLL_DISABLED
+     while (0 < nIters) {
++      if NCCL_IF_CONSTEXPR (EnablePause) {
++        if (rsActiveCtas != nullptr) {
++          if (chunksUntilPoll == 0) {
++            uint32_t active = 0;
++            if (t % WARP_SIZE == 0) {
++              active = cuda::atomic_ref<uint32_t, cuda::thread_scope_device>(*rsActiveCtas).load(
++                cuda::memory_order_relaxed);
++            }
++            // The main loop's tile count is uniform within each warp.
++            active = __shfl_sync(0xffffffffu, active, 0);
++            pauseCycles = active != 0 ? pauseArgs->agStmcRsPauseCycles : pauseArgs->agStmcPauseCycles;
++            chunksUntilPoll = pauseArgs->agStmcPausePollChunks;
++          }
++          --chunksUntilPoll;
++        }
++      }
+       if (cursor >= wrapAt) cursor -= nMainBytes;
+ #if __CUDA_ARCH__ >= 1000
+       if NCCL_IF_CONSTEXPR (EnableTma) {
+@@ -408,6 +437,9 @@ static __device__ void bcastMultimem(ncclSymkArgsHandler& handler, int tn, int t
+           multimem_st_global(outputUptr + cursor + u * WARP_SIZE * BytePerPack, tmp[u]);
+         }
+       }
++      if NCCL_IF_CONSTEXPR (EnablePause) {
++        if (pauseCycles != 0) ncclSymkPauseCycles(pauseCycles);
++      }
+       cursor += tn * UnrollPacks * BytePerPack;
+       nIters -= tn / WARP_SIZE;
+     }
+diff --git a/src/device/symmetric/reduce_scatter.cuh b/src/device/symmetric/reduce_scatter.cuh
+index 091805e4410782740eeb82c451341b99df7ba868..43386cede1f39497647fc2db92c62434ae518b67 100644
+--- a/src/device/symmetric/reduce_scatter.cuh
++++ b/src/device/symmetric/reduce_scatter.cuh
+@@ -467,6 +467,14 @@ __device__ __forceinline__ void ncclSymkRun_ReduceScatter_LDMC(ncclSymkDevWorkAr
+   auto const& multimem = handler.comm.lsaMultimem;
+
+   bar.sync(ncclCoopCta(), cuda::memory_order_acquire);
++  uint32_t* const rsActiveCtas = args->rsActiveCtas;
++  if (rsActiveCtas != nullptr) {
++    if (threadIdx.x == 0) {
++      cuda::atomic_ref<uint32_t, cuda::thread_scope_device>(*rsActiveCtas).fetch_add(1, cuda::memory_order_relaxed);
++    }
++    // Publish this CTA's activity before any of its warps can issue multimem loads.
++    __syncthreads();
++  }
+   if NCCL_IF_CONSTEXPR (EnableProfiler) ncclSymkProfilerPhase(args, NCCL_KERNEL_PHASE_AFTER_OPEN);
+
+   handler.forEachWork<T>([&] __device__(int block, int nBlocks, size_t nElts, size_t nAllElts, ncclSymPtr<T> input,
+@@ -481,6 +489,11 @@ __device__ __forceinline__ void ncclSymkRun_ReduceScatter_LDMC(ncclSymkDevWorkAr
+
+   if NCCL_IF_CONSTEXPR (EnableProfiler) ncclSymkProfilerPhase(args, NCCL_KERNEL_PHASE_BEFORE_CLOSE);
+   bar.sync(ncclCoopCta(), cuda::memory_order_relaxed);
++  if (rsActiveCtas != nullptr && threadIdx.x == 0) {
++    // The close barrier has joined the CTA. Other CTAs and overlapping RS
++    // launches keep their own references until they have also finished.
++    cuda::atomic_ref<uint32_t, cuda::thread_scope_device>(*rsActiveCtas).fetch_sub(1, cuda::memory_order_relaxed);
++  }
+ }
+
+ // T is user type, EltType is the most aligned type
+diff --git a/src/include/sym_kernels.h b/src/include/sym_kernels.h
+index 7138fcde5fa66eecacee90940ecebc6767ce5e1c..26056a551fb38c6684b8408ecfaa2066dde8eb23 100644
+--- a/src/include/sym_kernels.h
++++ b/src/include/sym_kernels.h
+@@ -96,6 +96,7 @@ struct ncclSymkState {
+   bool initialized;
+   bool hasLsaMultimem;
+   int maxGinInboxBlocks;
++  uint32_t* rsActiveCtas;
+   struct ncclSymkDevComm kcomm;
+ };
+
+@@ -127,6 +128,10 @@ struct alignas(16) ncclSymkDevWorkArgs {
+   int nMaxChannels;
+   int maxDynamicSmem;
+   uint8_t profilerMode; // ncclDevProfilerMode bits; nonzero means profilerWorkCounters[nMaxChannels] follows
++  uint32_t agStmcPauseCycles;
++  uint32_t agStmcRsPauseCycles;
++  uint32_t agStmcPausePollChunks;
++  uint32_t* rsActiveCtas;
+   // Variable-length trailing data layout:
+   //   if profilerMode: uint64_t profilerWorkCounters[nMaxChannels] (aligned to 16)
+   //   ncclSymkChannelWorkRange[nChannels] (aligned to 16)
+@@ -165,6 +170,7 @@ typedef enum {
+ } ncclSymRegType_t;
+
+ // We assume ncclComm contains a field: `ncclSymkState symkState`
++ncclResult_t ncclSymkGetRsActiveCtas(uint32_t** counter);
+ ncclResult_t ncclSymkInitOnce(struct ncclComm* comm);
+ ncclResult_t ncclSymkFinalize(struct ncclComm* comm);
+
+diff --git a/src/scheduler/symmetric_sched.cc b/src/scheduler/symmetric_sched.cc
+index e453d66f73bc3cbcfb02dbb0453581bf9b575592..08cd4b59fc44d77dc806862430b6bfa95d6534e1 100644
+--- a/src/scheduler/symmetric_sched.cc
++++ b/src/scheduler/symmetric_sched.cc
+@@ -15,12 +15,48 @@
+ #include "enqueue.h"
+ #include "config/algorithm_registry.h"
+ #include "profiler.h"
++#include <algorithm>
+ #include <cuda_fp16.h>
+ #if defined(__CUDA_FP8_TYPES_EXIST__)
+ #include <cuda_fp8.h>
+ #endif
+
+ extern int64_t ncclParamSingleProcMemRegEnable();
++extern int64_t ncclParamSymAgStmcRsPauseCycles();
++NCCL_PARAM(SymAgStmcPauseCycles, "SYM_AG_STMC_PAUSE_CYCLES", -1)
++NCCL_PARAM(SymAgStmcPausePollChunks, "SYM_AG_STMC_PAUSE_POLL_CHUNKS", 4)
++
++static uint32_t symAgStmcPauseCycles(int64_t cycles) {
++  return static_cast<uint32_t>(std::clamp(cycles, int64_t{0}, int64_t{UINT32_MAX}));
++}
++
++struct ncclSymkAgStmcPauseDefaults {
++  uint32_t idleCycles;
++  uint32_t rsCycles;
++};
++
++static ncclSymkAgStmcPauseDefaults symAgStmcPauseDefaults(int nRanks, int nChannels, int nWarps) {
++  // GB200 1 GiB STMC + LDMC sweep: the AG-only bandwidth plateau and the
++  // minimum AG+RS makespan for each measured communicator size.
++  switch (nRanks) {
++  case 4:
++  case 8:
++  case 16:
++    return {1024, 3072};
++  case 32:
++    return {4096, 7168};
++  case 64:
++    return {9728, 16384};
++  default:
++    break;
++  }
++
++  // Estimate the overlap pause from the number of sending warps for other sizes.
++  const int64_t writers = int64_t(nRanks) * nChannels * nWarps;
++  if (writers <= 256) return {0, symAgStmcPauseCycles(12 * writers)};
++  if (writers <= 512) return {0, symAgStmcPauseCycles(3072 + 16 * (writers - 256))};
++  return {0, symAgStmcPauseCycles(7168 + 18 * (writers - 512))};
++}
+
+ ncclDevRedOp_t symkRedOp(ncclRedOp_t redOp, ncclDevRedOp_t devRedOp) {
+   if (redOp == ncclAvg) {
+@@ -409,6 +445,19 @@ ncclResult_t ncclSymmetricTaskScheduler(struct ncclComm* comm,
+   // At this point, curChannel indexes the first _empty_ channel.
+
+   memcpy(&argsBuf->kcomm, &comm->symkState.kcomm, sizeof(comm->symkState.kcomm));
++  if (kernelId == ncclSymkKernelId_ReduceScatter_LDMC) {
++    argsBuf->rsActiveCtas = comm->symkState.rsActiveCtas;
++  } else if (kernelId == ncclSymkKernelId_AllGather_STMC || kernelId == ncclSymkKernelId_AllGather_TmaSTMC) {
++    const auto defaults = symAgStmcPauseDefaults(comm->nRanks, curChannel, headTask->nWarps);
++    const int64_t idlePauseCycles = ncclParamSymAgStmcPauseCycles();
++    const int64_t rsPauseCycles = ncclParamSymAgStmcRsPauseCycles();
++    argsBuf->agStmcPauseCycles = idlePauseCycles < 0 ? defaults.idleCycles : symAgStmcPauseCycles(idlePauseCycles);
++    argsBuf->agStmcRsPauseCycles = rsPauseCycles < 0 ? defaults.rsCycles : symAgStmcPauseCycles(rsPauseCycles);
++    if (argsBuf->agStmcRsPauseCycles > argsBuf->agStmcPauseCycles) {
++      argsBuf->rsActiveCtas = comm->symkState.rsActiveCtas;
++      argsBuf->agStmcPausePollChunks = std::max(1u, symAgStmcPauseCycles(ncclParamSymAgStmcPausePollChunks()));
++    }
++  }
+   plan->workBytes = totalCount * ncclTypeSize(headTask->datatype);
+   // curChannel == 0 is not expected here (the caller ensures symTaskQueue is
+   // non-empty), but guard it anyway to avoid the undefined behavior of shifting
+diff --git a/src/sym_kernels.cc b/src/sym_kernels.cc
+index 454dfa9f2df03a39925f3828d4e172b307aa1dc8..92a642be35fd4cfc0427b846b9935106b6af837d 100644
+--- a/src/sym_kernels.cc
++++ b/src/sym_kernels.cc
+@@ -181,6 +181,7 @@ static void getRequirements_gin(struct ncclComm* comm, int* out_nBlocks, size_t*
+ }
+
+ extern int64_t ncclParamSymCTAs();
++NCCL_PARAM(SymAgStmcRsPauseCycles, "SYM_AG_STMC_RS_PAUSE_CYCLES", -1)
+
+ ncclResult_t ncclSymkInitOnce(struct ncclComm* comm) {
+   // ncclTeamLsa() below calls this internally but drops the error code so we do it here.
+@@ -188,11 +189,14 @@ ncclResult_t ncclSymkInitOnce(struct ncclComm* comm) {
+
+   struct ncclSymkState* symk = &comm->symkState;
+   if (!symk->initialized) {
+-    symk->initialized = true;
+     struct ncclDevCommRequirements reqs = NCCL_DEV_COMM_REQUIREMENTS_INITIALIZER;
+     // Disable LSA multicast for cross-clique since NVLS isn't available across cliques
+     symk->hasLsaMultimem =
+       ncclNvlsSymmetricMultimemEnabled(comm) && ncclTeamLsa(comm).nRanks > 2 && !comm->p2pCrossClique;
++    if (symk->hasLsaMultimem && ncclParamSymAgStmcRsPauseCycles() != 0) {
++      NCCLCHECK(ncclSymkGetRsActiveCtas(&symk->rsActiveCtas));
++    }
++    symk->initialized = true;
+     reqs.lsaMultimem = symk->hasLsaMultimem;
+     reqs.lsaBarrierCount = ncclSymkMaxBlocks;
+     reqs.ginStrongSignalsRequired = false;
