@@ -2,15 +2,18 @@
 # Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
 # Licensed under the Apache License, Version 2.0.
 
-"""Report and save NVMe mounts and RDMA interfaces visible inside a Linux container."""
+"""Report and save NVMe, RDMA, and GPUDirect Storage diagnostics from a Linux container."""
 
 import argparse
 import json
 import logging
+import os
 import re
+import shutil
 import socket
 import subprocess
 import sys
+from ctypes.util import find_library
 from datetime import datetime
 from pathlib import Path
 
@@ -18,7 +21,8 @@ from pathlib import Path
 logger = logging.getLogger(__name__)
 SYSFS = Path("/sys")
 DEV = Path("/dev")
-MOUNTINFO = Path("/proc/self/mountinfo")
+PROC = Path("/proc")
+MOUNTINFO = PROC / "self/mountinfo"
 NVME_NAMESPACE = re.compile(r"(nvme[0-9]+)(?:c[0-9]+)?(n[0-9]+)(?:p[0-9]+)?")
 
 
@@ -129,6 +133,83 @@ def _show_rdma_links() -> None:
     logger.info("rdma_netdevs=%s", len(netdevs) if visible_names is not None else "unavailable")
 
 
+def _find_gdscheck() -> str | None:
+    cuda_home = os.environ.get("CUDA_HOME") or os.environ.get("CUDA_PATH")
+    cuda_dirs = sorted(
+        Path("/usr/local").glob("cuda-[0-9]*"),
+        key=lambda path: tuple(map(int, re.findall(r"[0-9]+", path.name))),
+        reverse=True,
+    )
+    search_dirs = [*os.get_exec_path(), "/usr/local/cuda/gds/tools", *(str(path / "gds/tools") for path in cuda_dirs)]
+    if cuda_home:
+        search_dirs.insert(0, str(Path(cuda_home) / "gds/tools"))
+    for directory in search_dirs:
+        if checker := shutil.which("gdscheck", path=directory) or shutil.which("gdscheck.py", path=directory):
+            return checker
+    return None
+
+
+def _show_gds(log_path: Path) -> None:
+    logger.info("\nGPUDirect Storage (GDS) platform diagnostics")
+    try:
+        loaded = {line.split()[0] for line in (PROC / "modules").read_text().splitlines() if line}
+    except OSError as error:
+        logger.info("/proc/modules unavailable: %s", error)
+        loaded = set()
+
+    logger.info("GDS and related kernel modules (container view)")
+    for name in ("nvidia_fs", "nvidia", "nvidia_uvm", "nvme", "nvme_core", "nvidia_peermem", "ib_core", "mlx5_ib"):
+        if name in loaded:
+            status = "loaded (/proc/modules)"
+        elif (SYSFS / "module" / name).is_dir():
+            status = "visible (/sys/module)"
+        else:
+            status = "not visible"
+        logger.info("  %s  %s", name, status)
+
+    for name in ("version", "devcount"):
+        path = PROC / "driver/nvidia-fs" / name
+        try:
+            value = path.read_text().strip()
+        except OSError as error:
+            value = f"unavailable ({error.strerror})"
+        logger.info("%s: %s", path, value)
+    nodes = sorted(str(path) for path in DEV.glob("nvidia[_-]fs*") if path.is_char_device())
+    logger.info("nvidia_fs_device_nodes=%d (%s)", len(nodes), ", ".join(nodes) or "none visible")
+
+    checker = _find_gdscheck()
+    if checker is None:
+        logger.info("gdscheck unavailable in PATH or CUDA toolkit directories")
+        logger.info("libcufile lookup: %s", find_library("cufile") or "no match")
+        return
+
+    cufile_log = log_path.with_suffix(".cufile.log")
+    logger.info("Running %s -p", checker)
+    try:
+        result = subprocess.run(
+            [checker, "-p"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            errors="replace",
+            env={**os.environ, "CUFILE_LOGFILE_PATH": str(cufile_log)},
+            timeout=30,
+            check=False,
+        )
+    except subprocess.TimeoutExpired as error:
+        if error.output:
+            logger.info("%s", error.output.decode(errors="replace").rstrip("\n"))
+        logger.warning("gdscheck -p timed out after %s seconds", error.timeout)
+    except OSError as error:
+        logger.warning("Cannot run gdscheck -p: %s", error)
+    else:
+        if result.stdout:
+            logger.info("%s", result.stdout.rstrip("\n"))
+        logger.info("gdscheck_exit_code=%d", result.returncode)
+    if cufile_log.is_file():
+        logger.info("cuFile log: %s", cufile_log)
+
+
 def main() -> int:
     """Report device visibility using read-only Linux kernel interfaces."""
     argparse.ArgumentParser(
@@ -158,6 +239,7 @@ def main() -> int:
     _show_rdma_links()
     uverbs = sorted(path.name for path in (DEV / "infiniband").glob("uverbs[0-9]*") if path.is_char_device())
     logger.info("uverbs_device_nodes=%d (%s)", len(uverbs), ", ".join(uverbs) or "none")
+    _show_gds(log_path)
     _show_filesystem_usage()
     return 0
 
