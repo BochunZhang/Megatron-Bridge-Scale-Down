@@ -16,7 +16,7 @@ Usage: benchmark_fsdp3_all.sh [--output-dir DIR] [--torch-thread N] [--unlock] [
 
 Run the numbered single-node studies in order on one 4-GPU GB200 node.
 Cases normally lock GPU clocks to TDP. The adaptive pause study always resets GPU clocks.
-Run 05-nccl/05_cp_adaptive_pause.sh directly for the 32-GPU CP sweep.
+Run 05-nccl/05_cp_adaptive_pause.sh directly for the CP sweep.
 Use --unlock to reset GPU clocks before every case.
 Defaults to results/01-analyse/04-fsdp3-comm-tdp (-unlocked with --unlock).
 Use NVME_PATH for the NVMe scratch path, NCCL_LIB for the static pause build and

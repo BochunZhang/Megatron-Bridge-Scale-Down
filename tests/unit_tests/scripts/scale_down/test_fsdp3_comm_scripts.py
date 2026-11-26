@@ -700,15 +700,24 @@ def test_adaptive_pause_study_scales_batch_size_and_node_topology(
 
 
 @pytest.mark.unit
-@pytest.mark.parametrize(("rank", "fixed_gbs"), [(0, ""), (7, "128")])
-def test_cp_adaptive_pause_study_pairs_layouts(tmp_path: Path, rank: int, fixed_gbs: str):
+@pytest.mark.parametrize(
+    ("gpu", "rank", "fixed_gbs"),
+    [(None, 0, ""), (4, 0, ""), (8, 1, ""), (16, 3, "4"), (32, 7, "128"), (64, 15, "")],
+)
+def test_cp_adaptive_pause_study_pairs_layouts(tmp_path: Path, gpu: int | None, rank: int, fixed_gbs: str):
+    gpu_args = () if gpu is None else ("--gpu", str(gpu))
+    total_gpus = gpu or 32
+    nodes = total_gpus // 4
     result = _run(
         CP_ADAPTIVE_PAUSE_STUDY,
+        *gpu_args,
         "--dry-run",
         "--output-dir",
         str(tmp_path),
-        NODE_RANK=str(rank),
-        MASTER_ADDR="rank0",
+        NODE_RANK="" if nodes == 1 else str(rank),
+        RANK="",
+        MASTER_ADDR="" if nodes == 1 else "rank0",
+        DLC_MASTER_ADDR="",
         MASTER_PORT="29501",
         CP_SWEEP_GBS=fixed_gbs,
         NCCL_STOCK_LIB="",
@@ -716,18 +725,22 @@ def test_cp_adaptive_pause_study_pairs_layouts(tmp_path: Path, rank: int, fixed_
         LD_PRELOAD="",
     )
     assert result.returncode == 0, result.stderr
-    layouts = [(cp, variant) for cp in (4, 8, 16, 32) for variant in ("stock", "adaptive-pause")]
+    layouts = [(cp, variant) for cp in (4, 8, 16, 32) if cp <= total_gpus for variant in ("stock", "adaptive-pause")]
+    assert result.stderr.count("nccl_algo=AllGather:Ring;ReduceScatter:Ring") == len(layouts)
+    assert result.stderr.count("nccl_sym_kernel=AllGather:AllGather_STMC;ReduceScatter:ReduceScatter_LDMC") == len(
+        layouts
+    )
+    topology = {"--standalone"} if nodes == 1 else {f"--nnodes={nodes}", f"--node_rank={rank}"}
     for offset, (command, (cp, variant)) in enumerate(zip(_commands(result.stderr), layouts, strict=True)):
         node_dir = _node_dir(command)
-        gbs = int(fixed_gbs) if fixed_gbs else 128 // cp
+        gbs = int(fixed_gbs) if fixed_gbs else 4 * total_gpus // cp
+        port = 29501 if nodes == 1 else 29501 + offset
         assert node_dir.name == f"node{rank}"
         assert f"-seq_{4096 * cp}-cp_{cp}-" in node_dir.parent.name
-        assert f"-gbs_{gbs}-gpus_32-profile_nsys-{variant}-" in node_dir.parent.name
-        assert {
+        assert f"-gbs_{gbs}-gpus_{total_gpus}-profile_nsys-{variant}-" in node_dir.parent.name
+        expected = {
             "--nproc_per_node=4",
-            "--nnodes=8",
-            f"--node_rank={rank}",
-            f"--master_port={29501 + offset}",
+            f"--master_port={port}",
             f"model.context_parallel_size={cp}",
             f"train.global_batch_size={gbs}",
             "train.train_iters=30",
@@ -735,7 +748,22 @@ def test_cp_adaptive_pause_study_pairs_layouts(tmp_path: Path, rank: int, fixed_
             "ddp.nccl_ub=true",
             "dist.create_all_gather_group=true",
             "dist.create_reduce_scatter_group=true",
-        }.issubset(shlex.split(command))
+        }
+        assert (expected | topology).issubset(shlex.split(command))
+
+
+@pytest.mark.unit
+def test_cp_adaptive_pause_study_rejects_existing_single_node_results(tmp_path: Path):
+    args = ("--gpu", "4", "--output-dir", str(tmp_path))
+    plan = _run(CP_ADAPTIVE_PAUSE_STUDY, *args, "--print-case-dirs")
+    assert plan.returncode == 0, plan.stderr
+    node_dir = Path(plan.stdout.splitlines()[0]) / "node0"
+    node_dir.mkdir(parents=True)
+    (node_dir / "run_info.txt").write_text("status=0\n")
+    (node_dir / "multimem_check.txt").write_text("status=1\n")
+    result = _run(CP_ADAPTIVE_PAUSE_STUDY, *args)
+    assert result.returncode == 2
+    assert f"Result already exists at {node_dir}" in result.stderr
 
 
 @pytest.mark.unit

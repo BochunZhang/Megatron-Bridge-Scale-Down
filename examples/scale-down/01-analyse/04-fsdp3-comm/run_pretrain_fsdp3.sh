@@ -44,6 +44,7 @@ OVERLAP=false
 SEPARATE_RS=false
 TP_COMM_OVERLAP=false
 SYMMETRIC=false
+MULTIMEM=false
 OFFLOAD=""
 CPU_GRAD_ACCUMULATION=false
 CPU_OPTIMIZER=false
@@ -106,6 +107,9 @@ Options:
                                  communicator (ddp.nccl_ub), so NCCL runs its symmetric
                                  kernels. Exports NCCL_NVLS_ENABLE=1 and refuses
                                  NCCL_ALGO. Names get "-symm"
+  --multimem                     With --symmetric and NCCL 2.32.3, select STMC
+                                 AllGather and LDMC ReduceScatter, with Ring for
+                                 buffers without symmetric windows
   --tp N                         Tensor parallel size; N > 1 turns on sequence
                                  parallelism (default: 1)
   --tp-comm-overlap              Enable TE TP communication overlap (requires TP > 1);
@@ -219,6 +223,7 @@ while [[ $# -gt 0 ]]; do
         --overlap) OVERLAP=true; shift;;
         --separate-rs) SEPARATE_RS=true; shift;;
         --symmetric) SYMMETRIC=true; shift;;
+        --multimem) MULTIMEM=true; shift;;
         --cpu-grad-accumulation) CPU_GRAD_ACCUMULATION=true; shift;;
         --cpu-optimizer) CPU_OPTIMIZER=true; shift;;
         --torch-thread)
@@ -364,6 +369,15 @@ fi
 # collective on the classic ring / NVLS kernels even on registered windows.
 [[ "${SYMMETRIC}" == false || "${FSDP_LEVEL}" != ddp ]] || { echo "--symmetric requires --fsdp 1, 2 or 3" >&2; exit 2; }
 [[ "${SYMMETRIC}" == false || -z "${NCCL_ALGO:-}" ]] || { echo "--symmetric requires NCCL_ALGO to be unset (got ${NCCL_ALGO})" >&2; exit 2; }
+if [[ "${MULTIMEM}" == true ]]; then
+    [[ "${SYMMETRIC}" == true ]] || { echo "--multimem requires --symmetric" >&2; exit 2; }
+    # NCCL 2.32.3 tries symmetric kernels before the general-kernel fallback.
+    # Bridge registers FSDP windows after step 1, so keep Ring available for warmup.
+    export NCCL_ALGO='AllGather:Ring;ReduceScatter:Ring'
+    export NCCL_SYM_KERNEL='AllGather:AllGather_STMC;ReduceScatter:ReduceScatter_LDMC'
+    export NCCL_WIN_ENABLE=1 NCCL_SYM_CE_THRESHOLD=9223372036854775807
+    unset NCCL_CTA_POLICY
+fi
 for name in SEQ_LENGTH TENSOR_PARALLEL CONTEXT_PARALLEL MICRO_BATCH_SIZE GLOBAL_BATCH_SIZE TRAIN_ITERS GPU_COUNT GPUS_PER_NODE MASTER_PORT HYBRIDEP_NUM_SMS; do
     [[ "${!name}" =~ ^[1-9][0-9]*$ ]] || { echo "${name} must be a positive integer" >&2; exit 2; }
 done
@@ -790,6 +804,9 @@ INFO=(
     "cpu_grad_accumulation=${CPU_GRAD_ACCUMULATION}" "cpu_optimizer=${CPU_OPTIMIZER}" "nvme=$([[ -n ${NVME_PATH} ]] && echo true || echo false)"
 )
 [[ -n "${TORCH_THREAD}" ]] && INFO+=("torch_thread=${TORCH_THREAD}")
+if [[ "${MULTIMEM}" == true ]]; then
+    INFO+=("nccl_algo=${NCCL_ALGO}" "nccl_sym_kernel=${NCCL_SYM_KERNEL}")
+fi
 if [[ "${DRY_RUN}" == true ]]; then
     printf '%s\n' "${INFO[*]}" >&2
     printf 'gpu_clocks=%s\n' "${GPU_CLOCK_MODE}" >&2

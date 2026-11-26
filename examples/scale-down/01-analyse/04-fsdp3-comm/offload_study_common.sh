@@ -14,6 +14,7 @@ if [[ "${STUDY_SCRIPT}" == nccl_common.sh ]]; then
     STUDY_SCRIPT="${BASH_SOURCE[2]##*/}"
 fi
 STUDY_GPUS=4
+if [[ "${STUDY_SCRIPT}" == 05_cp_adaptive_pause.sh ]]; then STUDY_GPUS=32; fi
 STUDY_GPUS_PER_NODE=4
 STUDY_NNODES=1
 STUDY_NODE_RANK=0
@@ -48,9 +49,14 @@ while (( $# )); do
                     MODELS=("$2");;
                 --output-dir) OUTPUT_DIR="$2";;
                 --gpu|--gpus)
-                    [[ "${STUDY_SCRIPT}" == 04_adaptive_pause.sh ]] || fail "$1 applies to 04_adaptive_pause.sh"
-                    [[ "$2" =~ ^[1-9][0-9]*$ ]] && (( $2 >= 3 )) ||
-                        fail "$1 requires at least 3 GPUs for symmetric multicast"
+                    case "${STUDY_SCRIPT}" in
+                        04_adaptive_pause.sh)
+                            [[ "$2" =~ ^[1-9][0-9]*$ ]] && (( $2 >= 3 )) ||
+                                fail "$1 requires at least 3 GPUs for symmetric multicast";;
+                        05_cp_adaptive_pause.sh)
+                            [[ "$2" =~ ^(4|8|16|32|64)$ ]] || fail "$1 must be one of 4, 8, 16, 32, 64";;
+                        *) fail "$1 applies to the adaptive pause studies";;
+                    esac
                     STUDY_GPUS="$2";;
                 --torch-thread)
                     [[ "$2" =~ ^[1-9][0-9]*$ ]] || fail "--torch-thread must be a positive integer"
@@ -88,6 +94,8 @@ while (( $# )); do
                 echo '  --gpu N      Total GPUs (default 4). GBS is four times the GPU count.'
                 echo '               For multiple nodes, set NODE_RANK (or RANK) and MASTER_ADDR.'
                 echo '               GPUS_PER_NODE defaults to 4, capped at the requested GPU count.'
+            elif [[ "${STUDY_SCRIPT}" == 05_cp_adaptive_pause.sh ]]; then
+                echo '  --gpu N      Total GPUs (4, 8, 16, 32, or 64; default 32).'
             fi
             case "${GROUP}" in
                 02-comm-overlap) echo '  --profile nsys|pytorch    Capture Nsight Systems (default) or per-rank PyTorch traces for HTA';;
@@ -115,8 +123,11 @@ run_case() {
     fi
     local script_name="${STUDY_SCRIPT%.sh}"
     local result_group="${GROUP}/${script_name//_/-}"
+    # A validated case must publish a new verdict for the current run.
+    local fresh_node_dir=false
+    if (( STUDY_NNODES > 1 )) || declare -F finish_case >/dev/null; then fresh_node_dir=true; fi
     local result_args=(--stable-result-dir)
-    if (( STUDY_NNODES == 1 )) && [[ "${RESUME_CASES}" == true ]]; then result_args+=(--resume); fi
+    if [[ "${fresh_node_dir}" == false && "${RESUME_CASES}" == true ]]; then result_args+=(--resume); fi
     if [[ -n "${name}" ]]; then
         result_args+=(--run-name "${name}")
     fi
@@ -149,7 +160,7 @@ run_case() {
         # Multi-node cases share a result root and each node claims its own directory.
         claim_dir="${case_dir}"
         local skip_reason=existing
-        if (( STUDY_NNODES > 1 )); then
+        if [[ "${fresh_node_dir}" == true ]]; then
             [[ ! -e "${node_dir}" ]] || fail "Result already exists at ${node_dir}; use a fresh --output-dir on all nodes"
             claim_dir="${node_dir}.lock"
         elif [[ "${RESUME_CASES}" == true ]]; then
@@ -157,7 +168,7 @@ run_case() {
             skip_reason=active
         fi
         if [[ -d "${claim_dir}" ]]; then
-            (( STUDY_NNODES == 1 )) || fail "Another process is using ${node_dir}"
+            [[ "${fresh_node_dir}" == false ]] || fail "Another process is using ${node_dir}"
             printf 'skip %s case: %s\n' "${skip_reason}" "${case_dir}" >&2
             return 0
         fi
@@ -167,11 +178,11 @@ run_case() {
         mkdir -p -- "${claim_dir%/*}"
         if ! mkdir -- "${claim_dir}" 2>/dev/null; then
             [[ -d "${claim_dir}" ]] || fail "Cannot create case claim: ${claim_dir}"
-            (( STUDY_NNODES == 1 )) || fail "Another process is using ${node_dir}"
+            [[ "${fresh_node_dir}" == false ]] || fail "Another process is using ${node_dir}"
             printf 'skip %s case: %s\n' "${skip_reason}" "${case_dir}" >&2
             return 0
         fi
-        if (( STUDY_NNODES > 1 )) || [[ "${RESUME_CASES}" == true ]]; then ACTIVE_CASE_LOCK="${claim_dir}"; fi
+        if [[ "${fresh_node_dir}" == true || "${RESUME_CASES}" == true ]]; then ACTIVE_CASE_LOCK="${claim_dir}"; fi
     fi
     printf 'case %s\n' "${label}" >&2
     local run_status=0
@@ -180,7 +191,7 @@ run_case() {
         finish_case "${node_dir}" "${run_status}" || run_status=$?
     fi
     if (( run_status != 0 )); then
-        if (( STUDY_NNODES == 1 )) && [[ -n "${case_dir}" && "${RESUME_CASES}" == false ]]; then
+        if [[ "${fresh_node_dir}" == false && -n "${case_dir}" && "${RESUME_CASES}" == false ]]; then
             rmdir -- "${case_dir}" 2>/dev/null || true
         fi
         printf 'failed %s\n' "${label}" >&2

@@ -4,16 +4,17 @@
 
 if [[ "${1:-}" == --help || "${1:-}" == -h ]]; then
     cat <<'EOF'
-Usage: 05_cp_adaptive_pause.sh [--output-dir DIR] [--nccl-lib FILE] [--dry-run | --print-case-dirs]
+Usage: 05_cp_adaptive_pause.sh [--gpu N] [--output-dir DIR] [--nccl-lib FILE] [--dry-run | --print-case-dirs]
 
-On each of eight 4-GPU nodes in the same NVL72 domain, set NODE_RANK (or RANK),
-the same MASTER_ADDR (or DLC_MASTER_ADDR), and a shared output directory.
-The eight cases use consecutive ports starting at MASTER_PORT (default 29501).
+Use 4, 8, 16, 32, or 64 GPUs (default 32), with four GPUs per node. For
+multi-node runs in one NVL72 domain, set NODE_RANK (or RANK), the same
+MASTER_ADDR (or DLC_MASTER_ADDR), and a shared output directory on each node.
+Multi-node cases use consecutive ports starting at MASTER_PORT (default 29501).
 
 Runs stock and adaptive-pause NCCL 2.32.3 at CP 4/8/16/32 with sequences
-16K/32K/64K/128K, 32 FSDP shards, MBS=1, and 30 training steps per case.
-GBS defaults to 32/16/8/4 for four microbatches per step at every CP size.
-Set CP_SWEEP_GBS to a positive multiple of 8 to use one GBS for all sizes.
+16K/32K/64K/128K, selecting only CP sizes up to --gpu. FSDP shards across all
+GPUs. Each case uses MBS=1 and 30 steps. GBS defaults to four microbatches per
+step. Set CP_SWEEP_GBS to a positive multiple of (GPU count / 4) for fixed GBS.
 Set NCCL_STOCK_LIB or NCCL_ADAPTIVE_PAUSE_LIB to override the library paths.
 The node 0 step-8 trace must show only STMC AllGather and LDMC ReduceScatter.
 Use a fresh --output-dir on every node when repeating the sweep.
@@ -26,21 +27,31 @@ NCCL_LIB="${NCCL_ADAPTIVE_PAUSE_LIB:-}"
 # shellcheck source=nccl_common.sh
 source "$(dirname "${BASH_SOURCE[0]}")/nccl_common.sh" --unlock "$@"
 
-STUDY_GPUS=32
-STUDY_GPUS_PER_NODE=4
-STUDY_NNODES=8
-STUDY_NODE_RANK="${NODE_RANK:-${RANK:-}}"
-[[ "${STUDY_NODE_RANK}" =~ ^[0-7]$ ]] || fail "Set NODE_RANK or RANK to the node index (0–7)"
+STUDY_NNODES=$((STUDY_GPUS / STUDY_GPUS_PER_NODE))
+if (( STUDY_NNODES > 1 )); then
+    STUDY_NODE_RANK="${NODE_RANK:-${RANK:-}}"
+    [[ "${STUDY_NODE_RANK}" =~ ^(0|[1-9][0-9]?)$ ]] && (( STUDY_NODE_RANK < STUDY_NNODES )) ||
+        fail "Set NODE_RANK or RANK to a node index from 0 to $((STUDY_NNODES - 1))"
+fi
+cp_sizes=()
+for cp in 4 8 16 32; do
+    if (( cp <= STUDY_GPUS )); then cp_sizes+=("${cp}"); fi
+done
 port="${MASTER_PORT:-29501}"
-[[ "${port}" =~ ^[1-9][0-9]{0,4}$ ]] && (( port <= 65528 )) || fail "MASTER_PORT must be between 1 and 65528"
+port_stride=$((STUDY_NNODES > 1))
+if (( STUDY_NNODES > 1 )); then
+    case_count=$((2 * ${#cp_sizes[@]}))
+    [[ "${port}" =~ ^[1-9][0-9]{0,4}$ ]] && (( port + case_count - 1 <= 65535 )) ||
+        fail "MASTER_PORT must be between 1 and $((65536 - case_count)) for ${case_count} cases"
+fi
 if [[ -n "${CP_SWEEP_GBS:-}" ]]; then
-    [[ "${CP_SWEEP_GBS}" =~ ^[1-9][0-9]*$ ]] && (( CP_SWEEP_GBS % 8 == 0 )) ||
-        fail "CP_SWEEP_GBS must be a positive multiple of 8"
+    min_cp_dp=$((STUDY_GPUS / cp_sizes[0]))
+    [[ "${CP_SWEEP_GBS}" =~ ^[1-9][0-9]*$ ]] && (( CP_SWEEP_GBS % min_cp_dp == 0 )) ||
+        fail "CP_SWEEP_GBS must be a positive multiple of ${min_cp_dp}"
 fi
 
 export NSYS_BIN="${NSYS_BIN:-${REPO_ROOT}/NsightSystems-2026.6.1/bin/nsys}"
 export UV_PROJECT_ENVIRONMENT="${UV_PROJECT_ENVIRONMENT:-${REPO_ROOT}/.venv/python3.12-torch2.13-nccl2.32.3}"
-unset NCCL_CTA_POLICY
 NSYS_REPORT_ONLY=true
 
 verify_multimem_trace() (
@@ -118,18 +129,16 @@ finish_case() {
 }
 
 stock_lib="${NCCL_STOCK_LIB:-${REPO_ROOT}/nccl/nccl-2.32.3/build/lib/libnccl.so.2}"
-# FSDP registers its symmetric windows after step 1. Validate the steady-state
-# kernels instead of globally pinning STMC/LDMC during the unregistered warmup.
-case_args=(--overlap --separate-rs --symmetric --metric --train-iters 30
+case_args=(--overlap --separate-rs --symmetric --multimem --metric --train-iters 30
     --override ddp.num_distributed_optimizer_instances=1)
 
-for STUDY_CONTEXT_PARALLEL in 4 8 16 32; do
+for STUDY_CONTEXT_PARALLEL in "${cp_sizes[@]}"; do
     STUDY_SEQ_LENGTH=$((4096 * STUDY_CONTEXT_PARALLEL))
     STUDY_GBS="${CP_SWEEP_GBS:-$((4 * STUDY_GPUS / STUDY_CONTEXT_PARALLEL))}"
     NCCL_BUILD=stock NCCL_LIB="${stock_lib}" run_nccl_case stock high 0 "${case_args[@]}" --master-port "${port}"
     (( FAILED == 0 )) || exit 1
-    port=$((port + 1))
+    port=$((port + port_stride))
     NCCL_BUILD=adaptive-pause run_nccl_case adaptive-pause high -1 "${case_args[@]}" --master-port "${port}"
     (( FAILED == 0 )) || exit 1
-    port=$((port + 1))
+    port=$((port + port_stride))
 done
