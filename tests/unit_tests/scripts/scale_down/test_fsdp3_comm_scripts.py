@@ -574,6 +574,53 @@ def test_comm_overlap_studies_support_pytorch_profile(tmp_path: Path, script: Pa
 
 
 @pytest.mark.unit
+@pytest.mark.parametrize(
+    ("script", "cases_per_length"),
+    [(EXAMPLE / "02-comm-overlap/01_fsdp3_cp_overlap.sh", 4), (DDP_CP_TP_STUDY, 3)],
+    ids=["fsdp3-cp-overlap", "ddp-cp-tp"],
+)
+def test_comm_overlap_studies_sweep_lengths_with_nvlink_metrics(
+    tmp_path: Path, script: Path, cases_per_length: int
+) -> None:
+    args = ("--model", "27b", "--output-dir", str(tmp_path), "--metric", "--seq", "16k,65536,128K,256k")
+    result = _run(script, *args, "--dry-run")
+    assert result.returncode == 0, result.stderr
+    commands = _commands(result.stderr)
+    expected_lengths = [seq for seq in (16384, 65536, 131072, 262144) for _ in range(cases_per_length)]
+    for seq, command in zip(expected_lengths, commands, strict=True):
+        training_args = shlex.split(command)
+        assert "--gpu-metrics-frequency=50000" in training_args
+        assert f"model.seq_length={seq}" in training_args
+        assert f"dataset.seq_length={seq}" in training_args
+        assert "dataset.create_attention_mask=false" in training_args
+        case_name = _node_dir(command).parent.name
+        assert f"-seq_{seq}-" in case_name and case_name.endswith("-metric_50000")
+
+    plan = _run(script, *args, "--print-case-dirs")
+    assert plan.returncode == 0, plan.stderr
+    assert list(map(Path, plan.stdout.splitlines())) == [_node_dir(command).parent for command in commands]
+
+
+@pytest.mark.unit
+def test_comm_overlap_metrics_require_nsys() -> None:
+    result = _run(DDP_CP_TP_STUDY, "--metric", "--profile", "pytorch", "--dry-run")
+    assert result.returncode == 2
+    assert "--metric requires --profile nsys" in result.stderr
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    ("lengths", "error"),
+    [("16k,,64k", "expects token counts"), ("16k,65537", "must be divisible by 8 for CP4")],
+)
+def test_comm_overlap_rejects_invalid_sequence_lengths(lengths: str, error: str) -> None:
+    result = _run(DDP_CP_TP_STUDY, "--seq", lengths, "--dry-run")
+    assert result.returncode == 2
+    assert error in result.stderr
+    assert not _commands(result.stderr)
+
+
+@pytest.mark.unit
 @pytest.mark.parametrize("model", ["27b", "2.4t"])
 def test_ddp_cp_tp_study_compares_matched_tp_overlap_cases(tmp_path: Path, model: str):
     result = _run(DDP_CP_TP_STUDY, "--model", model, "--dry-run", "--output-dir", str(tmp_path))

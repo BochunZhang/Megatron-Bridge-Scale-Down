@@ -20,6 +20,7 @@ STUDY_NNODES=1
 STUDY_NODE_RANK=0
 STUDY_GBS=16
 STUDY_SEQ_LENGTH=""
+STUDY_SEQ_LENGTHS=("")
 OUTPUT_DIR="${OUTPUT_DIR:-${REPO_ROOT}/results/01-analyse/04-fsdp3-comm}"
 MODELS=(27b 2.4t)
 if [[ "${GROUP}" == 05-nccl ]]; then MODELS=(27b); fi
@@ -31,6 +32,7 @@ DRY_RUN=false
 PRINT_CASE_DIRS=false
 RESUME_CASES=false
 STUDY_PROFILE=nsys
+STUDY_NVLINK_METRICS=false
 ACTIVE_CASE_LOCK=""
 FAILED=0
 NVME_PATH="${NVME_PATH:-}"
@@ -38,15 +40,33 @@ NCCL_LIB="${NCCL_LIB:-}"
 
 fail() { echo "$*" >&2; exit 2; }
 
+parse_study_sequences() {
+    # Bound the digit count so converting a K suffix fits in Bash integer arithmetic.
+    local entry='[1-9][0-9]{0,14}[kK]?'
+    [[ "$1" =~ ^${entry}(,${entry})*$ ]] || fail "--seq expects token counts such as 16k,64k,128k,256k"
+    local lengths=() length tokens
+    IFS=, read -r -a lengths <<<"$1"
+    STUDY_SEQ_LENGTHS=()
+    for length in "${lengths[@]}"; do
+        tokens="${length%[kK]}"
+        if [[ "${length}" == *[kK] ]]; then tokens=$((tokens * 1024)); fi
+        (( tokens % 8 == 0 )) || fail "--seq lengths must be divisible by 8 for CP4: ${length}"
+        STUDY_SEQ_LENGTHS+=("${tokens}")
+    done
+}
+
 while (( $# )); do
     case "$1" in
-        --model|--output-dir|--nvme-path|--nccl-lib|--fsdp|--profile|--torch-thread|--gpu|--gpus)
+        --model|--seq|--output-dir|--nvme-path|--nccl-lib|--fsdp|--profile|--torch-thread|--gpu|--gpus)
             [[ -n "${2:-}" && "$2" != --* ]] || fail "Missing value for $1"
             case "$1" in
                 --model)
                     [[ "$2" == 27b || "$2" == 2.4t ]] || fail "--model must be 27b or 2.4t"
                     [[ "${GROUP}" != 05-nccl || "$2" == 27b ]] || fail "05-nccl uses only the 27b model"
                     MODELS=("$2");;
+                --seq)
+                    [[ "${GROUP}" == 02-comm-overlap ]] || fail "--seq applies to 02-comm-overlap"
+                    parse_study_sequences "$2";;
                 --output-dir) OUTPUT_DIR="$2";;
                 --gpu|--gpus)
                     case "${STUDY_SCRIPT}" in
@@ -78,6 +98,9 @@ while (( $# )); do
                     NCCL_LIB="$2";;
             esac
             shift 2;;
+        --metric)
+            [[ "${GROUP}" == 02-comm-overlap ]] || fail "--metric applies to 02-comm-overlap"
+            STUDY_NVLINK_METRICS=true; shift;;
         --unlock) UNLOCK_GPU_CLOCKS=true; shift;;
         --dry-run) DRY_RUN=true; shift;;
         --print-case-dirs) PRINT_CASE_DIRS=true; shift;;
@@ -98,7 +121,10 @@ while (( $# )); do
                 echo '  --gpu N      Total GPUs (4, 8, 16, 32, or 64; default 32).'
             fi
             case "${GROUP}" in
-                02-comm-overlap) echo '  --profile nsys|pytorch    Capture Nsight Systems (default) or per-rank PyTorch traces for HTA';;
+                02-comm-overlap)
+                    echo '  --seq LENGTHS             Sweep comma-separated token counts such as 16k,64k,128k,256k'
+                    echo '  --profile nsys|pytorch    Capture Nsight Systems (default) or per-rank PyTorch traces for HTA'
+                    echo '  --metric                  Sample GPU metrics including GB200 NVLink RX/TX at 50 kHz (20 us, nsys only)';;
                 04-nvme) echo '  --nvme-path DIR    Directory on local NVMe (default: /tmp/megatron-fsdp3-nvme, or set NVME_PATH)';;
                 05-nccl)
                     echo '  --nccl-lib FILE    Override the patched NCCL library for this 27b study'
@@ -108,6 +134,7 @@ while (( $# )); do
         *) fail "Unknown option: $1";;
     esac
 done
+[[ "${STUDY_NVLINK_METRICS}" == false || "${STUDY_PROFILE}" == nsys ]] || fail "--metric requires --profile nsys"
 
 # run_case MODEL NAME FSDP GRAPH TP CP MBS [launcher flags...]
 # An empty NAME omits the case suffix.
@@ -137,6 +164,11 @@ run_case() {
         --mbs "${mbs}" --seq "${seq}" --tp "${tp}" --cp "${cp}" --fsdp "${fsdp}" --cuda-graph "${graph}"
         --profile "${STUDY_PROFILE}" --train-iters 10 --profile-start 7 --profile-end 8
         --results-root "${OUTPUT_DIR}/${result_group}" "${result_args[@]}" "$@")
+    if [[ "${GROUP}" == 02-comm-overlap && -n "${STUDY_SEQ_LENGTH}" ]]; then
+        # The training step uses the attention backend's causal mask.
+        args+=(--override dataset.create_attention_mask=false)
+    fi
+    [[ "${STUDY_NVLINK_METRICS}" == true ]] && args+=(--metric 50000)
     [[ "${UNLOCK_GPU_CLOCKS}" == true ]] && args+=(--unlock)
     [[ "${NSYS_REPORT_ONLY}" == true ]] && args+=(--nsys-report-only)
     [[ -n "${TORCH_THREADS}" ]] && args+=(--torch-thread "${TORCH_THREADS}")

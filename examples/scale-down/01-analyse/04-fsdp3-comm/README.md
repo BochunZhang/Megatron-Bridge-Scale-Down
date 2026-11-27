@@ -104,6 +104,69 @@ python "$study/hta_overlap.py" --include-tp-userbuffers /path/to/case/node0/torc
 
 输出按 rank 统计通信与计算重叠的百分比、通信区间总时长和未被计算覆盖的通信时长。脚本识别 HybridEP dispatch、combine 和路由信息 gather；`--include-tp-userbuffers` 额外计入 TE Userbuffers 数据、信号 kernel 及显式 PtoP 拷贝。`--include-ep-sync` 可将 HybridEP 的跨卡同步计入通信时间。
 
+#### NVLink 带宽与 CP overlap
+
+两个 `02-comm-overlap` 脚本都接受 `--metric`。Nsight Systems 以 **50 kHz**（约 **20 µs** 一次）采样 GPU 指标，结果目录和报告名带 `-metric_50000`。在 GPU 节点上使用 Nsight Systems 2026.6.1，从仓库根目录运行。
+
+```bash
+study="$PWD/examples/scale-down/01-analyse/04-fsdp3-comm"
+lengths=16k,64k,128k,256k
+output="$PWD/results/01-analyse/04-fsdp3-comm-seq-sweep"
+bash "$study/02-comm-overlap/02_ddp_cp_tp.sh" --model 27b --seq "$lengths" --metric --output-dir "$output"
+bash "$study/02-comm-overlap/01_fsdp3_cp_overlap.sh" --model 27b --seq "$lengths" --metric --output-dir "$output"
+```
+
+`--seq` 接受以逗号分隔的 token 数，`k` 或 `K` 表示乘以 1024。每个长度都跑完整对照，DDP 每模型 12 个 case，FSDP3 每模型 16 个 case。显式扫长度时，mock 数据关闭二次方大小的 attention mask 分配，attention kernel 使用自身的 causal mask。可在命令末尾加 `--dry-run` 查看矩阵。
+
+1. 打开 `node0/` 下的 `.nsys-rep`。在同一张 GPU 的时间线上对齐 NCCL `SendRecv` 与 FlashAttention。`cp_comm_type=p2p` 在 forward 交换 KV，在 backward 交换 KV 和 dKV。FSDP3 的参数 AG 和梯度 RS 使用各自的 kernel，可另算它们与 CP 的时间交集。
+2. 每卡合并 CP P2P kernel 的时间区间得到 $C$，合并 attention kernel 的时间区间得到 $A$。`overlap%` 是 $100 \times |C \cap A| / |C|$，未被 attention 覆盖的时间是 $|C| - |C \cap A|$。按卡查看，定位到具体层时在该层的 forward 或 backward 窗口内分别计算。
+3. 展开同一卡的 `NVLink RX Bandwidth` 和 `NVLink TX Bandwidth`，查看 `GB/s` 子指标。每个方向的有效载荷速率为 `Requests User Data` 与 `Responses User Data` 之和。CP kernel 驻留时间包含 peer 等待，用带宽曲线核对重叠期间的实际传输。指标汇总该卡的 NVLink 流量，同时运行的 AG、RS 或 EP 通信也会贡献带宽。用 27B DDP CP4 的 attention 窗口观察 CP 带宽最直接。
+
+<details>
+<summary>从 27B DDP CP4 的报告计算每卡覆盖率</summary>
+
+这组配置的 CP kernel 为 `ncclDevKernel_SendRecv`，计算集合取 `flash_attn` kernel。命令统计整个采样训练步。对其他配置先在时间线核对 CP kernel、通信组和 attention kernel 名称。
+
+```bash
+nsys export --type=sqlite --output=cp4.sqlite \
+  '--tables=^CUPTI_ACTIVITY_KIND_KERNEL$,^StringIds$' /path/to/cp4.nsys-rep
+sqlite3 -header -column cp4.sqlite <<'SQL'
+WITH kernels AS (
+    SELECT k.deviceId AS gpu, k.start, k.end,
+           s.value = 'ncclDevKernel_SendRecv' AS cp,
+           s.value LIKE '%flash_attn%' AS attn
+    FROM CUPTI_ACTIVITY_KIND_KERNEL AS k
+    JOIN StringIds AS s ON s.id = k.shortName
+    WHERE k.end > k.start
+), events AS (
+    SELECT gpu, start AS t, cp AS cp_delta, attn AS attn_delta FROM kernels WHERE cp OR attn
+    UNION ALL
+    SELECT gpu, end, -cp, -attn FROM kernels WHERE cp OR attn
+), segments AS (
+    SELECT gpu, LEAD(t) OVER timeline - t AS ns,
+           SUM(SUM(cp_delta)) OVER timeline AS cp_active,
+           SUM(SUM(attn_delta)) OVER timeline AS attn_active
+    FROM events
+    GROUP BY gpu, t
+    WINDOW timeline AS (PARTITION BY gpu ORDER BY t)
+), totals AS (
+    SELECT gpu,
+           SUM(CASE WHEN cp_active > 0 THEN ns ELSE 0 END) AS cp_ns,
+           SUM(CASE WHEN cp_active > 0 AND attn_active > 0 THEN ns ELSE 0 END) AS overlap_ns
+    FROM segments
+    GROUP BY gpu
+)
+SELECT gpu, ROUND(cp_ns / 1e6, 3) AS cp_ms,
+       ROUND(overlap_ns / 1e6, 3) AS overlap_ms,
+       ROUND((cp_ns - overlap_ns) / 1e6, 3) AS uncovered_ms,
+       ROUND(100.0 * overlap_ns / NULLIF(cp_ns, 0), 2) AS overlap_pct
+FROM totals
+ORDER BY gpu;
+SQL
+```
+
+</details>
+
 ### FSDP1 / FSDP2 / FSDP3 baseline
 
 `03_fsdp3.sh` 依次运行三轮，每轮覆盖 27B 和 2.4T 上的 FSDP1、FSDP2、FSDP3，共 18 个 case。第一轮 `none` 用于比较稳态步耗时，第二轮 `nsys` 生成 CUDA/NVTX 报告，第三轮 `pytorch` 使用 PyTorch Profiler。两个 profiler 都采集 step 7（从 0 计数，对应日志 iteration 8）。结果名中的 `profile_none`、`profile_nsys` 和 `profile_pytorch` 对应三个采集模式。

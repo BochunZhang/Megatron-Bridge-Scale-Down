@@ -7,10 +7,12 @@ source "$(dirname "${BASH_SOURCE[0]}")/../offload_study_common.sh" "$@"
 
 RESUME_CASES=true
 # On four GPUs TP=4 has a one-rank dense FSDP group. Use DDP to trace CP/TP.
-for model in "${MODELS[@]}"; do
-    run_case "${model}" cp4 ddp on 1 4 1
-    run_case "${model}" tp4 ddp on 4 1 1
-    run_case "${model}" tp4-overlap ddp on 4 1 1 --tp-comm-overlap
+for STUDY_SEQ_LENGTH in "${STUDY_SEQ_LENGTHS[@]}"; do
+    for model in "${MODELS[@]}"; do
+        run_case "${model}" cp4 ddp on 1 4 1
+        run_case "${model}" tp4 ddp on 4 1 1
+        run_case "${model}" tp4-overlap ddp on 4 1 1 --tp-comm-overlap
+    done
 done
 
 (( FAILED == 0 ))
