@@ -866,6 +866,33 @@ def fake_nsys_env(tmp_path: Path) -> dict[str, str]:
 
 @pytest.mark.unit
 @pytest.mark.parametrize(
+    "script",
+    [EXAMPLE / "02-comm-overlap/01_fsdp3_cp_overlap.sh", DDP_CP_TP_STUDY],
+    ids=["fsdp3-cp-overlap", "ddp-cp-tp"],
+)
+def test_comm_overlap_unlock_runs_with_existing_locked_results(
+    tmp_path: Path, fake_nsys_env: dict[str, str], script: Path
+) -> None:
+    output_dir = tmp_path / "results"
+    args = ("--model", "27b", "--seq", "16k", "--metric", "--output-dir", str(output_dir))
+    locked = _run(script, *args, **fake_nsys_env)
+    assert locked.returncode == 0, locked.stderr
+    unlocked = _run(script, *args, "--unlock", **fake_nsys_env)
+    assert unlocked.returncode == 0, unlocked.stderr
+
+    study_dir = output_dir / "02-comm-overlap" / script.stem.replace("_", "-")
+    locked_runs = sorted(study_dir.glob("*/node0/run_info.txt"))
+    unlocked_runs = sorted(study_dir.with_name(f"{study_dir.name}-unlocked").glob("*/node0/run_info.txt"))
+    assert locked_runs
+    assert [run.parent.parent.name for run in unlocked_runs] == [run.parent.parent.name for run in locked_runs]
+    assert all("gpu_clocks=tdp,tdp" in run.read_text().splitlines() for run in locked_runs)
+    assert all("gpu_clocks=unlocked" in run.read_text().splitlines() for run in unlocked_runs)
+    clock_commands = Path(fake_nsys_env["TEST_SMI_LOG"]).read_text().splitlines()
+    assert clock_commands == ["--lock-gpu-clocks=tdp,tdp"] * len(locked_runs) + ["--reset-gpu-clocks"] * len(unlocked_runs)
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
     ("options", "clock_flag", "clock_mode"),
     [((), "--lock-gpu-clocks=tdp,tdp", "tdp,tdp"), (("--unlock",), "--reset-gpu-clocks", "unlocked")],
 )

@@ -150,6 +150,9 @@ run_case() {
     fi
     local script_name="${STUDY_SCRIPT%.sh}"
     local result_group="${GROUP}/${script_name//_/-}"
+    if [[ "${GROUP}" == 02-comm-overlap && "${UNLOCK_GPU_CLOCKS}" == true ]]; then
+        result_group+="-unlocked"
+    fi
     # A validated case must publish a new verdict for the current run.
     local fresh_node_dir=false
     if (( STUDY_NNODES > 1 )) || declare -F finish_case >/dev/null; then fresh_node_dir=true; fi

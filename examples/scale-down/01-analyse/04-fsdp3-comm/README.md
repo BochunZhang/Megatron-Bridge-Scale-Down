@@ -22,7 +22,7 @@ Qwen3.8-2.4T-A95B 的 HF 配置是纯文本的 `Qwen3_5MoeForCausalLM`（没有 
 - `benchmark_fsdp3_suite.sh`：原 8 项综合矩阵，使用 GBS=8。
 - `benchmark_fsdp3_all.sh`：按编号串行运行 `01-baseline` 到 `05-nccl` 下的全部实验脚本。
 
-每个实际启动的 case 默认在本节点执行 `nvidia-smi --lock-gpu-clocks=tdp,tdp`。通用启动器、矩阵和编号实验都接受 `--unlock`，在启动前执行 `nvidia-smi --reset-gpu-clocks`。启动账户需具备修改 GPU 频率的权限。设置作用于本节点上 `nvidia-smi` 可见的所有 GPU，并持续到重新设置或重置。结果元数据记录 `gpu_clocks`。对照两种频率模式时，为新的运行指定单独的 `--output-dir`（通用启动器使用 `--results-root`），以免续跑直接复用已完成的 case。
+每个实际启动的 case 默认在本节点执行 `nvidia-smi --lock-gpu-clocks=tdp,tdp`。通用启动器、矩阵和编号实验都接受 `--unlock`，在启动前执行 `nvidia-smi --reset-gpu-clocks`。启动账户需具备修改 GPU 频率的权限。设置作用于本节点上 `nvidia-smi` 可见的所有 GPU，并持续到重新设置或重置。结果元数据记录 `gpu_clocks`。`02-comm-overlap` 的解锁运行在小项目目录名加 `-unlocked`。其余实验对照两种频率模式时，为新的运行指定单独的 `--output-dir`（通用启动器使用 `--results-root`），以免续跑直接复用已完成的 case。
 
 ### FSDP3 offload 专项实验
 
@@ -112,8 +112,10 @@ python "$study/hta_overlap.py" --include-tp-userbuffers /path/to/case/node0/torc
 study="$PWD/examples/scale-down/01-analyse/04-fsdp3-comm"
 lengths=16k,64k,128k,256k
 output="$PWD/results/01-analyse/04-fsdp3-comm-seq-sweep"
-bash "$study/02-comm-overlap/02_ddp_cp_tp.sh" --model 27b --seq "$lengths" --metric --output-dir "$output"
-bash "$study/02-comm-overlap/01_fsdp3_cp_overlap.sh" --model 27b --seq "$lengths" --metric --output-dir "$output"
+bash "$study/02-comm-overlap/02_ddp_cp_tp.sh" \
+  --model 27b --seq "$lengths" --metric --unlock --output-dir "$output"
+bash "$study/02-comm-overlap/01_fsdp3_cp_overlap.sh" \
+  --model 27b --seq "$lengths" --metric --unlock --output-dir "$output"
 ```
 
 `--seq` 接受以逗号分隔的 token 数，`k` 或 `K` 表示乘以 1024。每个长度都跑完整对照，DDP 每模型 12 个 case，FSDP3 每模型 16 个 case。显式扫长度时，mock 数据关闭二次方大小的 attention mask 分配，attention kernel 使用自身的 causal mask。可在命令末尾加 `--dry-run` 查看矩阵。
