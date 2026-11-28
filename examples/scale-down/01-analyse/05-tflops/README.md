@@ -36,6 +36,14 @@ bash "$study" --model 2.4t --fsdp 2 --parallel tp4 --precision mxfp8
 bash "$study" --profile none --precision bf16,mxfp8
 ```
 
+解锁频率后测试 Qwen3.5-27B 的 MXFP8 和 NVFP4 训练耗时。以下命令使用 4 层全注意力、FSDP1、整轮 forward/backward CUDA Graph 和三种并行布局。
+
+```bash
+bash "$study" --model qwen35-27b --fsdp 1 --precision mxfp8,nvfp4 --unlock --profile none
+```
+
+每个 case 启动前默认执行 `nvidia-smi --lock-gpu-clocks=tdp,tdp`。加 `--unlock` 会执行 `nvidia-smi --reset-gpu-clocks`。对照两种频率模式时，请使用不同的 `RUN_DATE` 或 `--results-root`。
+
 每个 case 跑 20 个训练 iteration，预热 3 轮，第 4 轮捕获 CUDA Graph。默认与 `04-fsdp3-comm` 对齐，只采集从 0 开始计数的 `[7, 8)`，即训练日志的第 8 轮。NSYS 记录 4 个 rank，并展开 CUDA Graph 内的 kernel。比较稳态 TFLOP/s 或迭代耗时时，使用同一筛选条件加 `--profile none`，查看图捕获之后的日志数据。
 
 结果写入 `results/01-analyse/05-tflops/<RUN_DATE>/`。结果目录和报告名包含模型、FSDP 等级、精度和并行布局。每个 case 的 `node0/` 下有 `train.log`（逐轮耗时及 TFLOP/s/GPU）、`config.yaml`、`launch.json`、`command.txt` 和 NSYS 模式下的 `.nsys-rep`。指定同一个 `RUN_DATE` 加 `--resume` 可跳过已完成的 case。

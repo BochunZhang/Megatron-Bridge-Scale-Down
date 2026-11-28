@@ -396,6 +396,38 @@ def test_tflops_uses_native_fsdp_graphs_for_all_precisions(tmp_path: Path):
         assert any(f"-{dtype}-" in report for dtype in ("bf16", "mxfp8", "nvfp4"))
 
 
+@pytest.mark.unit
+def test_tflops_selects_qwen35_for_unlocked_quantized_fsdp1(tmp_path: Path):
+    result = _run(
+        TFLOPS,
+        "--model",
+        "qwen35-27b",
+        "--fsdp",
+        "1",
+        "--precision",
+        "mxfp8,nvfp4",
+        "--unlock",
+        "--profile",
+        "none",
+        "--results-root",
+        str(tmp_path),
+        "--dry-run",
+        RUN_DATE=RUN_DATE,
+    )
+    assert result.returncode == 0, result.stderr
+    commands = _commands(result.stderr)
+    assert len(commands) == 6
+    assert result.stderr.splitlines().count("gpu_clocks=unlocked") == len(commands)
+    assert sum("mixed_precision.fp8_recipe=mxfp8" in command for command in commands) == 3
+    assert sum("mixed_precision.fp4_recipe=nvfp4" in command for command in commands) == 3
+    for command in commands:
+        args = shlex.split(command)
+        assert "qwen35_text_27b_pretrain_4gpu_gb200_bf16_fsdp1_config" in args
+        assert "ddp.data_parallel_sharding_strategy=optim" in args
+        assert "model.cuda_graph_impl=full_iteration" in args
+        assert "model.num_layers=4" in args and "model.linear_attention_freq=1" in args
+
+
 def test_partial_cuda_graph_for_moe_fsdp(tmp_path: Path):
     for dispatcher in ("hybridep", "alltoall"):
         commands = _sweep(
@@ -862,6 +894,55 @@ def fake_nsys_env(tmp_path: Path) -> dict[str, str]:
         "GLOO_SOCKET_IFNAME": "eth0",
         "TEST_SMI_LOG": str(tmp_path / "nvidia-smi.log"),
     }
+
+
+@pytest.mark.unit
+def test_unlocked_fsdp2_launch_sets_fp32_gradient_communication(tmp_path: Path, fake_nsys_env: dict[str, str]):
+    output_dir = tmp_path / "results"
+    result = _run(
+        BENCHMARK,
+        "--model",
+        "27b",
+        "--fsdp",
+        "2",
+        "--seq",
+        "4096",
+        "--full",
+        "--dtype",
+        "bf16",
+        "--cuda-graph",
+        "on",
+        "--grad-comm-dtype",
+        "fp32",
+        "--unlock",
+        "--profile",
+        "nsys",
+        "--output-dir",
+        str(output_dir),
+        "--run-date",
+        RUN_DATE,
+        **fake_nsys_env,
+    )
+    assert result.returncode == 0, result.stderr
+    (launch_path,) = output_dir.glob("*/node0/launch.json")
+    launch = json.loads(launch_path.read_text())
+    assert launch["model"] == "Qwen/Qwen3.5-27B"
+    assert launch["fsdp"] == 2 and launch["dtype"] == "bf16"
+    assert launch["cuda_graph_impl"] == "full_iteration"
+    assert launch["fsdp_grad_comm_dtype"] == "fp32"
+    assert launch["gpu_clocks"] == "unlocked"
+    assert Path(fake_nsys_env["TEST_SMI_LOG"]).read_text().splitlines() == ["--reset-gpu-clocks"]
+
+    command = (launch_path.parent / "command.txt").read_text()
+    args = shlex.split(command)
+    assert "ddp.data_parallel_sharding_strategy=optim_grads" in args
+    assert "comm_overlap.overlap_grad_reduce=true" in args
+    assert (
+        "ddp.megatron_fsdp_grad_comm_dtype="
+        "{_target_:megatron.bridge.utils.activation_map.str_to_dtype,name:fp32}"
+    ) in args
+    assert "-grad_comm_fp32" in launch_path.parent.parent.name
+    assert "-grad_comm_fp32" in _report_base(command).name
 
 
 @pytest.mark.unit

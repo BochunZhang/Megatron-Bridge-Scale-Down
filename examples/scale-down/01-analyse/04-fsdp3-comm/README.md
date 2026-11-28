@@ -175,6 +175,14 @@ SQL
 
 FSDP1/2 都在 optimizer 更新并写回模型参数后，在同一个 optimizer step 内同步 all-gather 参数。FSDP2 仍然在每个 microbatch 的 backward 做梯度 reduce-scatter overlap。2.4T 的 FSDP2 partial Graph 由 Bridge 固定的 Megatron-LM 版本提供。使用 `MEGATRON_LM_DIR` 切换至外部 checkout 时，该 checkout 需要包含 `8e771a34f`。
 
+Qwen3.5-27B 的 FP32 reduce-scatter 测试沿用 27B baseline 的 4 卡、8 层全注意力和 4096 token。计算和参数 all-gather 使用 BF16，梯度 reduce-scatter 的输入和输出使用 FP32 buffer。
+
+```bash
+bash examples/scale-down/01-analyse/04-fsdp3-comm/benchmark_fsdp3.sh \
+  --model 27b --fsdp 2 --cuda-graph on --dtype bf16 --grad-comm-dtype fp32 \
+  --seq 4096 --full --unlock --profile nsys
+```
+
 ```bash
 git submodule update --init 3rdparty/Megatron-LM
 bash examples/scale-down/01-analyse/04-fsdp3-comm/01-baseline/03_fsdp3.sh \
@@ -231,6 +239,7 @@ MEGATRON_LM_DIR=/path/to/megatron-lm bash "$study/05-nccl/03_ag_pause.sh" --outp
 | `--dispatcher` | `hybridep`、`alltoall` | MoE dispatcher，默认 `hybridep` |
 | `--force-balance` | — | 见「强制均衡路由」 |
 | `--dtype` / `--mxfp8` | `bf16`、`mxfp8` | 默认 BF16 |
+| `--grad-comm-dtype` | `bf16`、`fp32` | 指定 FSDP2/3 的梯度 reduce-scatter dtype，结果目录和报告名追加 `-grad_comm_<dtype>` |
 | `--offload` | `optimizer`、`weight`、`gradient`，可逗号组合 | 每个 case 卸载指定模块，目录和 nsys 报告名追加 `-offload_<模块>` |
 | `--profile` / `--nsys` | `none`、`nsys`、`pytorch` | sweep 默认 `nsys`，单 case 默认 `none`。`--nsys` 等价于 `--profile nsys` |
 | `--metric [HZ]` | 10–200000 Hz | 启用 nsys 并采集 node 0 上所有 GPU 的硬件指标。默认 20000 Hz，可用 `--metric 10000` 指定频率。结果目录和报告名追加 `-metric_<HZ>` |
@@ -268,7 +277,7 @@ FSDP 每个 micro-batch 的单次通信量与 seq、MBS 无关，因此计算强
 | 2.4t，128 experts | 约 6.6B | 约 32.2B | 约 145 GiB |
 | 2.4t，64 experts | 约 6.6B | 约 16.1B | 约 85 GiB |
 
-梯度精度：启动器传的 `grad_reduce_in_fp32=true` 只作用于 MCore DDP（`--fsdp ddp` 的梯度 buffer 与 reduce-scatter 都是 fp32）。Megatron-FSDP 不读这个字段，梯度 buffer 的 dtype 由 `ddp.megatron_fsdp_main_grads_dtype` 决定，默认 `None` 即跟随参数 dtype；Bridge 在包 FSDP 之前已用 `Float16Module` 把参数转成 bf16，所以 FSDP 的梯度累加、reduce-scatter（`megatron_fsdp_grad_comm_dtype=None` 时等于梯度 dtype）和参数 all-gather 都是 bf16，只有 main weight（`megatron_fsdp_main_params_dtype`，默认 fp32）与 Adam 状态是 fp32。
+MCore DDP（`--fsdp ddp`）通过 `grad_reduce_in_fp32=true` 将梯度 buffer 和 reduce-scatter 设为 FP32。Megatron-FSDP 默认按 BF16 参数的 dtype 做梯度累加和 reduce-scatter。`--grad-comm-dtype` 设置 FSDP2/3 的 `ddp.megatron_fsdp_grad_comm_dtype`。梯度累加仍由 `ddp.megatron_fsdp_main_grads_dtype` 决定，参数 all-gather 使用 BF16，main weight 与 Adam 状态默认使用 FP32。
 
 GB200 每卡约 185 GiB。此外还要加上 FSDP double buffer、激活、248K 词表的 fp32 logits（seq 4096 时每份约 3.8 GiB），以及 CUDA graph 的内存池。FSDP1 / FSDP2 / DDP 不切分参数，2.4t 64 experts 的 dense 部分每卡约多 30 GiB。TP 会把 dense 参数和激活再按 TP 切分。
 

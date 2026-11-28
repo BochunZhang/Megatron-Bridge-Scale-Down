@@ -32,6 +32,7 @@ ATTENTION_FLAG=""
 MTP_NUM_LAYERS="${MTP_NUM_LAYERS:-0}"
 DISPATCHER="${DISPATCHER:-hybridep}"
 DTYPE="${DTYPE:-bf16}"
+GRAD_COMM_ARGS=()
 PROFILE="${PROFILE:-nsys}"
 METRIC_ARG=""
 TRAIN_ITERS="${TRAIN_ITERS:-10}"
@@ -106,6 +107,7 @@ Options:
   --force-balance               Uniform random routing for MoE cases (benchmark
                                 only; 27b is unaffected); names get "-fb"
   --dtype bf16|mxfp8            Compute mode (default: bf16); --mxfp8 is an alias
+  --grad-comm-dtype bf16|fp32   Gradient reduce-scatter dtype for FSDP2/3
   --offload MODULE[,MODULE...]  CPU offload for optimizer, weight, and/or gradient in each case
   --cpu-grad-accumulation       Accumulate reduced gradient shards on CPU in each case
   --cpu-optimizer               CPU AdamW and host gradient accumulation in each case
@@ -169,6 +171,7 @@ while [[ $# -gt 0 ]]; do
         --force-balance) FORCE_BALANCE=true; shift;;
         --dtype|--precision) need_value "$@"; DTYPE="$2"; shift 2;;
         --mxfp8) DTYPE=mxfp8; shift;;
+        --grad-comm-dtype) need_value "$@"; GRAD_COMM_ARGS=("$1" "$2"); shift 2;;
         --profile) need_value "$@"; PROFILE="$2"; shift 2;;
         --nsys) PROFILE=nsys; shift;;
         --metric)
@@ -242,6 +245,7 @@ case_args() {
     [[ "${SEPARATE_RS}" == true && "${fsdp}" == 3 ]] && ARGS+=(--separate-rs)
     [[ "${TP_COMM_OVERLAP}" == true && "${tp}" -gt 1 ]] && ARGS+=(--tp-comm-overlap)
     [[ "${SYMMETRIC}" == true && "${fsdp}" != ddp ]] && ARGS+=(--symmetric)
+    if (( ${#GRAD_COMM_ARGS[@]} )); then ARGS+=("${GRAD_COMM_ARGS[@]}"); fi
     [[ -n "${OFFLOAD}" ]] && ARGS+=(--offload "${OFFLOAD}")
     if (( ${#OFFLOAD_ARGS[@]} )); then ARGS+=("${OFFLOAD_ARGS[@]}"); fi
     [[ -n "${TORCH_THREAD}" ]] && ARGS+=(--torch-thread "${TORCH_THREAD}")

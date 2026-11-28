@@ -21,17 +21,19 @@ usage() {
 Usage: benchmark_tflops.sh [options]
 
 Run the 4-GPU CUDA Graph training matrix for Qwen3.8-27B and Qwen3.8-2.4T.
-Use full-iteration graphs for 27B and native local MoE partial graphs for 2.4T.
+Select Qwen3.5-27B with --model qwen35-27b. Use full-iteration graphs for
+both 27B models and native local MoE partial graphs for 2.4T.
 Each case runs 20 iterations with 4 full-attention layers, no MTP, GBS=32,
 MBS=1, BF16 gradient communication and FP32 main gradients. MoE uses 64
 experts and EP=4.
 
-  --model 27b|2.4t              Defaults to both models
+  --model 27b|qwen35-27b|2.4t   Defaults to 27b (Qwen3.8-27B) and 2.4t
   --fsdp 1|2                    Defaults to both FSDP levels
   --precision bf16|mxfp8|nvfp4  Defaults to all three precisions
   --parallel dp4|cp4|tp4        Defaults to all three layouts (4K/16K/16K)
   --profile nsys|none           Defaults to nsys, capturing step [7,8)
   --results-root DIR            Store this matrix under DIR/$RUN_DATE
+  --unlock                      Restore automatic GPU clocks (TDP lock by default)
   --resume                      Reuse a RUN_DATE and skip completed cases
   --dry-run                     Print the case names and commands without launching
   -h, --help                    Show this help
@@ -48,7 +50,7 @@ while (( $# > 0 )); do
         --model|--fsdp|--precision|--parallel)
             option="$1"
             case "${option}" in
-                --model) allowed="27b 2.4t";;
+                --model) allowed="27b qwen35-27b 2.4t";;
                 --fsdp) allowed="1 2";;
                 --precision) allowed="bf16 mxfp8 nvfp4";;
                 --parallel) allowed="dp4 cp4 tp4";;
@@ -56,7 +58,7 @@ while (( $# > 0 )); do
             shift
             selected=()
             while (( $# > 0 )) && [[ "$1" != -* ]]; do
-                [[ "$1" =~ ^[a-z0-9.]+(,[a-z0-9.]+)*$ ]] || die "Invalid value for ${option}: $1"
+                [[ "$1" =~ ^[a-z0-9.-]+(,[a-z0-9.-]+)*$ ]] || die "Invalid value for ${option}: $1"
                 IFS=' ' read -r -a values <<<"${1//,/ }"
                 for value in "${values[@]}"; do
                     [[ " ${allowed} " == *" ${value} "* ]] || die "${option} accepts: ${allowed}"
@@ -83,7 +85,7 @@ while (( $# > 0 )); do
             fi
             shift 2
             ;;
-        --resume|--dry-run) RUN_OPTIONS+=("$1"); shift;;
+        --unlock|--resume|--dry-run) RUN_OPTIONS+=("$1"); shift;;
         -h|--help) usage; exit 0;;
         *) die "Unknown option: $1";;
     esac
@@ -116,8 +118,9 @@ failed=()
 
 for model in "${MODELS[@]}"; do
     case "${model}" in
-        27b) model_args=(--model qwen38-27b --ep 1);;
-        2.4t) model_args=(--model 2.4t --num-experts 64 --ep 4 --dispatcher hybridep);;
+        27b) model_args=(--model qwen38-27b --ep 1); model_label=qwen3.8-27b;;
+        qwen35-27b) model_args=(--model 27b --ep 1); model_label=qwen3.5-27b;;
+        2.4t) model_args=(--model 2.4t --num-experts 64 --ep 4 --dispatcher hybridep); model_label=qwen3.8-2.4t;;
     esac
     for layout in "${LAYOUTS[@]}"; do
         case "${layout}" in
@@ -128,7 +131,7 @@ for model in "${MODELS[@]}"; do
         for fsdp in "${FSDP_LEVELS[@]}"; do
             for precision in "${PRECISIONS[@]}"; do
                 case_number=$((case_number + 1))
-                label="qwen3.8-${model}-fsdp${fsdp}-${precision}-${layout}"
+                label="${model_label}-fsdp${fsdp}-${precision}-${layout}"
                 printf '[%d/%d] %s\n' "${case_number}" "${total}" "${label}"
                 if ! bash "${RUNNER}" "${common[@]}" "${model_args[@]}" "${parallel_args[@]}" \
                     --fsdp "${fsdp}" --precision "${precision}" --run-name "${layout}-grad_bf16-main_grad_fp32" \
